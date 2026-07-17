@@ -242,7 +242,7 @@ Run: `cargo test -p temporal-model && cargo test -p temporal-types`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/temporal-model && git commit -m "feat: add bitemporal model oracle"`
 
@@ -256,7 +256,7 @@ Run: `git add crates/temporal-model && git commit -m "feat: add bitemporal model
 **Interfaces:**
 - Produces: `GraphValue`, `CanonicalElement`, `CodecError`, `encode`, and `decode`.
 
-- [ ] **Step 1: Write the failing round-trip tests**
+- [x] **Step 1: Write the failing round-trip tests**
 
 ```rust
 use std::collections::BTreeMap;
@@ -271,7 +271,7 @@ fn canonical_payload_round_trips_without_type_loss() {
         (4, GraphValue::List(vec![GraphValue::Boolean(true), GraphValue::Null])),
     ]);
     let element = CanonicalElement::new(9, properties);
-    let bytes = element.encode();
+    let bytes = element.encode().unwrap();
     assert_eq!(CanonicalElement::decode(&bytes).unwrap(), element);
 }
 
@@ -285,30 +285,31 @@ fn canonical_encoding_is_independent_of_insertion_order() {
         (2, GraphValue::String("x".to_owned())),
         (7, GraphValue::Integer(8)),
     ]));
-    assert_eq!(left.encode(), right.encode());
+    assert_eq!(left.encode().unwrap(), right.encode().unwrap());
 }
 
 #[test]
 fn decoder_rejects_trailing_or_truncated_data() {
     let value = CanonicalElement::new(1, BTreeMap::new());
-    let mut trailing = value.encode();
+    let encoded = value.encode().unwrap();
+    let mut trailing = encoded.clone();
     trailing.push(0);
     assert!(CanonicalElement::decode(&trailing).is_err());
-    assert!(CanonicalElement::decode(&value.encode()[..5]).is_err());
+    assert!(CanonicalElement::decode(&encoded[..5]).is_err());
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p temporal-types --test canonical_codec`
 
 Expected: compile failure because canonical types do not exist.
 
-- [ ] **Step 3: Implement versioned canonical encoding**
+- [x] **Step 3: Implement versioned canonical encoding**
 
-Use magic bytes `DTP1`, big-endian integers, a schema-version `u64`, a property-count `u32`, sorted property IDs, explicit one-byte value tags, and `u32` length prefixes. Supported values are Null, Boolean, Integer, FloatBits, String, Bytes, TimestampMicros, and recursive List. Decoder bounds-checks every read, validates UTF-8, rejects unknown tags, caps recursion at 64, and rejects trailing bytes.
+Use magic bytes `DTP1`, big-endian integers, a schema-version `u64`, a property-count `u32`, sorted property IDs, explicit one-byte value tags, and `u32` length prefixes. Supported values are Null, Boolean, Integer, FloatBits, String, Bytes, TimestampMicros, and recursive List. Encoder and decoder cap recursion at 64; the decoder also bounds-checks every read, validates UTF-8, rejects unknown tags, and rejects trailing bytes.
 
-- [ ] **Step 4: Run GREEN and regression tests**
+- [x] **Step 4: Run GREEN and regression tests**
 
 Run: `cargo test -p temporal-types && cargo clippy -p temporal-types --all-targets -- -D warnings`
 
