@@ -7,7 +7,7 @@ use adapter_memory::MemoryAdapter;
 use storage_api::{AdapterError, StorageAdapter};
 use temporal_storage::{
     CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
-    TemporalStore, TemporalStoreError, TemporalTransaction, VertexMutation,
+    PrepareContext, TemporalStore, TemporalStoreError, TemporalTransaction, VertexMutation,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -111,6 +111,36 @@ fn one_batch_atomically_commits_two_vertices_an_edge_and_both_adjacencies() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[test]
+fn deterministic_prepare_does_not_touch_the_adapter_until_committed_apply() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let transaction = TemporalTransaction::new().with_vertex(
+        VertexMutation::put(
+            vertex(1),
+            LabelId::new(1),
+            interval(1, Some(10)),
+            payload("prepared"),
+        )
+        .unwrap(),
+    );
+    let prepare = PrepareContext::new(3, 1, tx(0), tx(100));
+
+    let first = block_on(store.prepare_transaction(prepare, transaction.clone())).unwrap();
+    let second = block_on(store.prepare_transaction(prepare, transaction.clone())).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(store.adapter().applied_log_index().unwrap(), 0);
+    assert_eq!(
+        block_on(store.vertex_current(vertex(1), valid(5))).unwrap(),
+        None
+    );
+
+    block_on(store.commit_transaction(context(1, 0, 100), transaction)).unwrap();
+    assert_eq!(
+        block_on(store.vertex_current(vertex(1), valid(5))).unwrap(),
+        Some(payload("prepared"))
     );
 }
 

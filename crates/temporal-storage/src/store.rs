@@ -5,8 +5,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use storage_api::{
-    AdapterError, ApplyReceipt, CommittedMutationBatch, KeySpan, Keyspace, Mutation,
-    MutationOperation, StorageAdapter,
+    AdapterError, ApplyReceipt, KeySpan, Keyspace, Mutation, MutationOperation,
+    PreparedMutationBatch, StorageAdapter,
 };
 use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
@@ -50,6 +50,42 @@ impl CommitContext {
             read_ts,
             commit_ts,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrepareContext {
+    shard_id: u32,
+    txn_id: u128,
+    read_ts: TransactionTime,
+    commit_ts: TransactionTime,
+}
+
+impl PrepareContext {
+    #[must_use]
+    pub const fn new(
+        shard_id: u32,
+        txn_id: u128,
+        read_ts: TransactionTime,
+        commit_ts: TransactionTime,
+    ) -> Self {
+        Self {
+            shard_id,
+            txn_id,
+            read_ts,
+            commit_ts,
+        }
+    }
+}
+
+impl From<CommitContext> for PrepareContext {
+    fn from(context: CommitContext) -> Self {
+        Self::new(
+            context.shard_id,
+            context.txn_id,
+            context.read_ts,
+            context.commit_ts,
+        )
     }
 }
 
@@ -231,200 +267,227 @@ where
                 }
                 .into());
             }
-            let mut operations = transaction.into_operations();
-            if operations.is_empty() {
-                return Err(TemporalStoreError::EmptyTransaction);
-            }
-            operations.sort_by_key(TemporalOperation::element);
-            for pair in operations.windows(2) {
-                if pair[0].element() == pair[1].element() {
-                    return Err(TemporalStoreError::DuplicateElementOperation {
-                        element: pair[0].element(),
-                    });
-                }
-            }
+            let prepared = self
+                .prepare_transaction_inner(context.into(), transaction, Some(context.log_index))
+                .await?;
+            Ok(self
+                .adapter
+                .apply_committed(prepared.commit_at(context.log_index))
+                .await?)
+        })
+    }
 
-            let mut staged_vertices = BTreeMap::new();
-            let mut guarded_vertices = BTreeMap::new();
-            let mut staged_edges = BTreeMap::new();
-            let mut writes = Vec::new();
-            for operation in operations {
-                match operation {
-                    TemporalOperation::Vertex(mutation) => {
-                        let removes_valid_time = mutation.replacement.is_none();
-                        let identity = VertexIdentity::new(mutation.element, mutation.label)?;
-                        self.validate_vertex_identity(&identity).await?;
-                        let current = self.load_current_projection(mutation.element).await?;
-                        self.validate_commit_frontier(
-                            mutation.element,
-                            current.as_ref(),
-                            context,
-                            mutation.valid,
-                        )
+    pub fn prepare_transaction<'a>(
+        &'a self,
+        context: PrepareContext,
+        transaction: TemporalTransaction,
+    ) -> TemporalStoreFuture<'a, PreparedMutationBatch> {
+        Box::pin(async move {
+            self.prepare_transaction_inner(context, transaction, None)
+                .await
+        })
+    }
+
+    async fn prepare_transaction_inner(
+        &self,
+        context: PrepareContext,
+        transaction: TemporalTransaction,
+        replay_log_index: Option<u64>,
+    ) -> Result<PreparedMutationBatch, TemporalStoreError> {
+        if context.commit_ts <= context.read_ts {
+            return Err(TemporalStoreError::InvalidCommitOrder);
+        }
+        let mut operations = transaction.into_operations();
+        if operations.is_empty() {
+            return Err(TemporalStoreError::EmptyTransaction);
+        }
+        operations.sort_by_key(TemporalOperation::element);
+        for pair in operations.windows(2) {
+            if pair[0].element() == pair[1].element() {
+                return Err(TemporalStoreError::DuplicateElementOperation {
+                    element: pair[0].element(),
+                });
+            }
+        }
+
+        let mut staged_vertices = BTreeMap::new();
+        let mut guarded_vertices = BTreeMap::new();
+        let mut staged_edges = BTreeMap::new();
+        let mut writes = Vec::new();
+        for operation in operations {
+            match operation {
+                TemporalOperation::Vertex(mutation) => {
+                    let removes_valid_time = mutation.replacement.is_none();
+                    let identity = VertexIdentity::new(mutation.element, mutation.label)?;
+                    self.validate_vertex_identity(&identity).await?;
+                    let current = self.load_current_projection(mutation.element).await?;
+                    self.validate_commit_frontier(
+                        mutation.element,
+                        current.as_ref(),
+                        context,
+                        mutation.valid,
+                        replay_log_index,
+                    )
+                    .await?;
+                    let recent_entries = self
+                        .load_history_chain_at(mutation.element, context.commit_ts)
                         .await?;
-                        let recent_entries = self
-                            .load_history_chain_at(mutation.element, context.commit_ts)
-                            .await?;
-                        let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-                        let projection = rewrite_projection(
-                            current.as_ref().unwrap_or(&empty),
-                            context.commit_ts,
-                            mutation.valid,
-                            mutation.replacement.clone(),
-                        )?;
-                        let history = entry_for_commit(
-                            &recent_entries,
-                            context.commit_ts,
-                            mutation.valid,
-                            mutation.replacement,
-                            projection.clone(),
-                        )?;
-                        writes.push(MutationOperation::Put {
-                            key: vertex_identity_key(mutation.element),
-                            value: identity.encode(),
-                        });
-                        writes.push(MutationOperation::Put {
-                            key: current_vertex_key(mutation.element),
-                            value: projection.encode()?,
-                        });
-                        writes.push(MutationOperation::Put {
-                            key: history_anchor_key(mutation.element, context.commit_ts, 0),
-                            value: history.encode()?,
-                        });
-                        if removes_valid_time {
-                            guarded_vertices.insert(mutation.element, projection.clone());
-                        }
-                        staged_vertices.insert(mutation.element, projection);
+                    let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
+                    let projection = rewrite_projection(
+                        current.as_ref().unwrap_or(&empty),
+                        context.commit_ts,
+                        mutation.valid,
+                        mutation.replacement.clone(),
+                    )?;
+                    let history = entry_for_commit(
+                        &recent_entries,
+                        context.commit_ts,
+                        mutation.valid,
+                        mutation.replacement,
+                        projection.clone(),
+                    )?;
+                    writes.push(MutationOperation::Put {
+                        key: vertex_identity_key(mutation.element),
+                        value: identity.encode(),
+                    });
+                    writes.push(MutationOperation::Put {
+                        key: current_vertex_key(mutation.element),
+                        value: projection.encode()?,
+                    });
+                    writes.push(MutationOperation::Put {
+                        key: history_anchor_key(mutation.element, context.commit_ts, 0),
+                        value: history.encode()?,
+                    });
+                    if removes_valid_time {
+                        guarded_vertices.insert(mutation.element, projection.clone());
                     }
-                    TemporalOperation::Edge(mutation) => {
-                        let identity = EdgeIdentity::new(
-                            mutation.element,
-                            mutation.edge_type,
-                            mutation.source,
-                            mutation.destination,
-                        )?;
-                        self.validate_edge_identity(&identity).await?;
-                        let current = self.load_current_projection(mutation.element).await?;
-                        self.validate_commit_frontier(
-                            mutation.element,
-                            current.as_ref(),
-                            context,
-                            mutation.valid,
-                        )
-                        .await?;
-                        if mutation.replacement.is_some() {
-                            for endpoint_id in [mutation.source, mutation.destination] {
-                                let endpoint = ElementRef::vertex(
-                                    mutation.element.graph(),
-                                    mutation.element.partition(),
-                                    endpoint_id,
-                                );
-                                let endpoint_projection =
-                                    if let Some(projection) = staged_vertices.get(&endpoint) {
-                                        Some(projection.clone())
-                                    } else {
-                                        self.load_current_projection(endpoint).await?
-                                    };
-                                if endpoint_projection.as_ref().is_none_or(|projection| {
-                                    !projection_covers(projection, mutation.valid)
-                                }) {
-                                    return Err(TemporalStoreError::EndpointNotPresent {
-                                        vertex: endpoint,
-                                    });
-                                }
+                    staged_vertices.insert(mutation.element, projection);
+                }
+                TemporalOperation::Edge(mutation) => {
+                    let identity = EdgeIdentity::new(
+                        mutation.element,
+                        mutation.edge_type,
+                        mutation.source,
+                        mutation.destination,
+                    )?;
+                    self.validate_edge_identity(&identity).await?;
+                    let current = self.load_current_projection(mutation.element).await?;
+                    self.validate_commit_frontier(
+                        mutation.element,
+                        current.as_ref(),
+                        context,
+                        mutation.valid,
+                        replay_log_index,
+                    )
+                    .await?;
+                    if mutation.replacement.is_some() {
+                        for endpoint_id in [mutation.source, mutation.destination] {
+                            let endpoint = ElementRef::vertex(
+                                mutation.element.graph(),
+                                mutation.element.partition(),
+                                endpoint_id,
+                            );
+                            let endpoint_projection =
+                                if let Some(projection) = staged_vertices.get(&endpoint) {
+                                    Some(projection.clone())
+                                } else {
+                                    self.load_current_projection(endpoint).await?
+                                };
+                            if endpoint_projection.as_ref().is_none_or(|projection| {
+                                !projection_covers(projection, mutation.valid)
+                            }) {
+                                return Err(TemporalStoreError::EndpointNotPresent {
+                                    vertex: endpoint,
+                                });
                             }
                         }
-                        let recent_entries = self
-                            .load_history_chain_at(mutation.element, context.commit_ts)
-                            .await?;
-                        let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-                        let projection = rewrite_projection(
-                            current.as_ref().unwrap_or(&empty),
-                            context.commit_ts,
-                            mutation.valid,
-                            mutation.replacement.clone(),
-                        )?;
-                        let history = entry_for_commit(
-                            &recent_entries,
-                            context.commit_ts,
-                            mutation.valid,
-                            mutation.replacement,
-                            projection.clone(),
-                        )?;
-                        let projection_bytes = projection.encode()?;
-                        let out_key = out_adjacency_key(
-                            mutation.element.graph(),
-                            mutation.element.partition(),
-                            mutation.source,
-                            mutation.edge_type,
-                            0,
-                            mutation.destination,
-                            mutation.element.id(),
-                        );
-                        let in_key = in_adjacency_key(
-                            mutation.element.graph(),
-                            mutation.element.partition(),
-                            mutation.destination,
-                            mutation.edge_type,
-                            0,
-                            mutation.source,
-                            mutation.element.id(),
-                        );
+                    }
+                    let recent_entries = self
+                        .load_history_chain_at(mutation.element, context.commit_ts)
+                        .await?;
+                    let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
+                    let projection = rewrite_projection(
+                        current.as_ref().unwrap_or(&empty),
+                        context.commit_ts,
+                        mutation.valid,
+                        mutation.replacement.clone(),
+                    )?;
+                    let history = entry_for_commit(
+                        &recent_entries,
+                        context.commit_ts,
+                        mutation.valid,
+                        mutation.replacement,
+                        projection.clone(),
+                    )?;
+                    let projection_bytes = projection.encode()?;
+                    let out_key = out_adjacency_key(
+                        mutation.element.graph(),
+                        mutation.element.partition(),
+                        mutation.source,
+                        mutation.edge_type,
+                        0,
+                        mutation.destination,
+                        mutation.element.id(),
+                    );
+                    let in_key = in_adjacency_key(
+                        mutation.element.graph(),
+                        mutation.element.partition(),
+                        mutation.destination,
+                        mutation.edge_type,
+                        0,
+                        mutation.source,
+                        mutation.element.id(),
+                    );
+                    writes.push(MutationOperation::Put {
+                        key: edge_identity_key(mutation.element),
+                        value: identity.encode(),
+                    });
+                    writes.push(MutationOperation::Put {
+                        key: current_edge_key(mutation.element),
+                        value: projection_bytes.clone(),
+                    });
+                    writes.push(MutationOperation::Put {
+                        key: history_anchor_key(mutation.element, context.commit_ts, 0),
+                        value: history.encode()?,
+                    });
+                    if projection.segments().is_empty() {
+                        writes.push(MutationOperation::Delete { key: out_key });
+                        writes.push(MutationOperation::Delete { key: in_key });
+                    } else {
                         writes.push(MutationOperation::Put {
-                            key: edge_identity_key(mutation.element),
-                            value: identity.encode(),
-                        });
-                        writes.push(MutationOperation::Put {
-                            key: current_edge_key(mutation.element),
+                            key: out_key,
                             value: projection_bytes.clone(),
                         });
                         writes.push(MutationOperation::Put {
-                            key: history_anchor_key(mutation.element, context.commit_ts, 0),
-                            value: history.encode()?,
+                            key: in_key,
+                            value: projection_bytes,
                         });
-                        if projection.segments().is_empty() {
-                            writes.push(MutationOperation::Delete { key: out_key });
-                            writes.push(MutationOperation::Delete { key: in_key });
-                        } else {
-                            writes.push(MutationOperation::Put {
-                                key: out_key,
-                                value: projection_bytes.clone(),
-                            });
-                            writes.push(MutationOperation::Put {
-                                key: in_key,
-                                value: projection_bytes,
-                            });
-                        }
-                        staged_edges.insert(mutation.element, projection);
                     }
+                    staged_edges.insert(mutation.element, projection);
                 }
             }
+        }
 
-            for (vertex, projection) in guarded_vertices {
-                self.validate_incident_edge_coverage(vertex, &projection, &staged_edges)
-                    .await?;
-            }
+        for (vertex, projection) in guarded_vertices {
+            self.validate_incident_edge_coverage(vertex, &projection, &staged_edges)
+                .await?;
+        }
 
-            let mutations = writes
-                .into_iter()
-                .enumerate()
-                .map(|(sequence, operation)| {
-                    Ok(Mutation {
-                        sequence: u32::try_from(sequence)
-                            .map_err(|_| TemporalStoreError::TooManyMutations)?,
-                        operation,
-                    })
+        let mutations = writes
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, operation)| {
+                Ok(Mutation {
+                    sequence: u32::try_from(sequence)
+                        .map_err(|_| TemporalStoreError::TooManyMutations)?,
+                    operation,
                 })
-                .collect::<Result<Vec<_>, TemporalStoreError>>()?;
-            Ok(self
-                .adapter
-                .apply_committed(CommittedMutationBatch {
-                    shard_id: context.shard_id,
-                    log_index: context.log_index,
-                    txn_id: context.txn_id,
-                    mutations,
-                })
-                .await?)
+            })
+            .collect::<Result<Vec<_>, TemporalStoreError>>()?;
+        Ok(PreparedMutationBatch {
+            shard_id: context.shard_id,
+            txn_id: context.txn_id,
+            mutations,
         })
     }
 
@@ -857,17 +920,22 @@ where
         &self,
         element: ElementRef,
         current: Option<&ProjectionRecord>,
-        context: CommitContext,
+        context: PrepareContext,
         changed_valid: Interval<ValidTime>,
+        replay_log_index: Option<u64>,
     ) -> Result<(), TemporalStoreError> {
         if let Some(current) = current {
             if current.commit_ts() > context.commit_ts {
                 return Err(TemporalStoreError::NonMonotonicCommit);
             }
-            if current.commit_ts() == context.commit_ts
-                && context.log_index > self.adapter.applied_log_index()?
-            {
-                return Err(TemporalStoreError::NonMonotonicCommit);
+            if current.commit_ts() == context.commit_ts {
+                let is_unapplied_commit = match replay_log_index {
+                    Some(log_index) => log_index > self.adapter.applied_log_index()?,
+                    None => true,
+                };
+                if is_unapplied_commit {
+                    return Err(TemporalStoreError::NonMonotonicCommit);
+                }
             }
         }
         let intervening = self

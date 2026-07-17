@@ -20,7 +20,7 @@ pub use record::{
     ValidSegment, VertexIdentity,
 };
 pub use store::{
-    CommitContext, EdgeMutation, EdgeView, TemporalStore, TemporalStoreError, TemporalStoreFuture,
-    VertexMutation,
+    CommitContext, EdgeMutation, EdgeView, PrepareContext, TemporalStore, TemporalStoreError,
+    TemporalStoreFuture, VertexMutation,
 };
 pub use transaction::TemporalTransaction;

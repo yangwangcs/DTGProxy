@@ -277,6 +277,37 @@ impl Mutation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedMutationBatch {
+    pub shard_id: u32,
+    pub txn_id: u128,
+    pub mutations: Vec<Mutation>,
+}
+
+impl PreparedMutationBatch {
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        let mut fingerprint = Fnv1a::new();
+        fingerprint.write(&self.shard_id.to_be_bytes());
+        fingerprint.write(&self.txn_id.to_be_bytes());
+        fingerprint.write_len(self.mutations.len());
+        for mutation in &self.mutations {
+            fingerprint.write(&mutation.fingerprint().to_be_bytes());
+        }
+        fingerprint.finish()
+    }
+
+    #[must_use]
+    pub fn commit_at(self, log_index: u64) -> CommittedMutationBatch {
+        CommittedMutationBatch {
+            shard_id: self.shard_id,
+            log_index,
+            txn_id: self.txn_id,
+            mutations: self.mutations,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedMutationBatch {
     pub shard_id: u32,
     pub log_index: u64,

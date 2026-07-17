@@ -6,7 +6,7 @@ The repository is being delivered in independently verifiable phases. The implem
 
 - `temporal-types`: bitemporal primitives and canonical values;
 - `temporal-model`: executable in-memory semantic oracle;
-- `storage-api`: backend-neutral committed-mutation contract;
+- `storage-api`: backend-neutral prepared/committed mutation contracts;
 - `adapter-memory`: atomic and idempotent reference adapter;
 - `adapter-rocksdb`: durable RocksDB 0.24.0 adapter with atomic cross-keyspace writes,
   idempotent replay, restart recovery, snapshot reads, and checkpoints;
@@ -23,7 +23,9 @@ implemented and tested. Bounded Anchor+Delta history, atomic multi-element singl
 transactions, typed Temporal IR, the local executor, and the minimal text query frontend are also
 implemented in Phase 1C. The replicated shard runtime, distributed transactions, external
 database adapters, and analytics integration remain active implementation phases described by the
-design.
+design. Phase 2 has started with a deterministic prepare/apply boundary: temporal validation and
+graph rewriting produce a log-position-independent `PreparedMutationBatch`, while only committed
+state-machine application assigns the Raft log index and touches the Adapter.
 
 The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
 `adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column
@@ -138,6 +140,12 @@ assumption with replicated Raft proposal/apply and safe-time tracking; Phase 3 m
 timestamp oracle, intents, cross-shard 2PC, epoch checks, recovery, and edge guard locks. Endpoint
 references currently use one graph partition; cross-partition edge projections are therefore not
 claimed by Phase 1C.
+
+The Phase 2 `PrepareContext` deliberately omits a log index. `prepare_transaction` is read-only and
+deterministic for one applied shard state; `commit_transaction` remains a compatibility wrapper
+that prepares and locally applies. The replicated runtime will serialize state-dependent prepare
+operations per shard before proposing them so concurrent proposals cannot validate against the
+same stale applied frontier.
 
 Only Memory and RocksDB adapters are implemented. Neo4j and other graph backends remain subject to
 the same capability contract and TCK. Historical expansion is semantically complete but performs a
