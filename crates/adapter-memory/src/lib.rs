@@ -157,11 +157,13 @@ fn fingerprint_mutation(mutation: &Mutation) -> u64 {
     match &mutation.operation {
         MutationOperation::Put { key, value } => {
             fingerprint.write(&[1]);
+            fingerprint.write(&[key.keyspace().tag()]);
             fingerprint.write_length_delimited(key.as_bytes());
             fingerprint.write_length_delimited(value);
         }
         MutationOperation::Delete { key } => {
             fingerprint.write(&[2]);
+            fingerprint.write(&[key.keyspace().tag()]);
             fingerprint.write_length_delimited(key.as_bytes());
         }
     }

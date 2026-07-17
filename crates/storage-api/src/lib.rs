@@ -11,18 +11,65 @@ pub struct AdapterCapabilities {
     pub idempotent_apply: bool,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Keyspace {
+    Meta = 0,
+    Identity = 1,
+    Current = 2,
+    AdjOut = 3,
+    AdjIn = 4,
+    History = 5,
+    TemporalIndex = 6,
+    Txn = 7,
+}
+
+impl Keyspace {
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn column_family(self) -> &'static str {
+        match self {
+            Self::Meta => "meta",
+            Self::Identity => "identity",
+            Self::Current => "current",
+            Self::AdjOut => "adj_out",
+            Self::AdjIn => "adj_in",
+            Self::History => "history",
+            Self::TemporalIndex => "temporal_index",
+            Self::Txn => "txn",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct LogicalKey(Vec<u8>);
+pub struct LogicalKey {
+    keyspace: Keyspace,
+    bytes: Vec<u8>,
+}
 
 impl LogicalKey {
     #[must_use]
     pub const fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self::in_keyspace(Keyspace::Current, bytes)
+    }
+
+    #[must_use]
+    pub const fn in_keyspace(keyspace: Keyspace, bytes: Vec<u8>) -> Self {
+        Self { keyspace, bytes }
+    }
+
+    #[must_use]
+    pub const fn keyspace(&self) -> Keyspace {
+        self.keyspace
     }
 
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 }
 

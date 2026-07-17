@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
-use storage_api::{AdapterError, CommittedMutationBatch, LogicalKey, Mutation, StorageAdapter};
+use storage_api::{
+    AdapterError, CommittedMutationBatch, Keyspace, LogicalKey, Mutation, StorageAdapter,
+};
 
 fn key(value: &str) -> LogicalKey {
     LogicalKey::new(value.as_bytes().to_vec())
@@ -158,6 +160,28 @@ fn duplicate_sequence_inside_one_batch_is_rejected_atomically() {
     assert_eq!(
         block_on(adapter.multi_get(&[key("a"), key("b")])).unwrap(),
         vec![None, None]
+    );
+}
+
+#[test]
+fn identical_bytes_in_current_and_history_are_isolated() {
+    let adapter = MemoryAdapter::new();
+    let current = LogicalKey::in_keyspace(Keyspace::Current, b"same".to_vec());
+    let history = LogicalKey::in_keyspace(Keyspace::History, b"same".to_vec());
+
+    block_on(adapter.apply_committed(batch(
+        1,
+        14,
+        vec![
+            Mutation::put(0, current.clone(), b"current".to_vec()),
+            Mutation::put(1, history.clone(), b"history".to_vec()),
+        ],
+    )))
+    .unwrap();
+
+    assert_eq!(
+        block_on(adapter.multi_get(&[current, history])).unwrap(),
+        vec![Some(b"current".to_vec()), Some(b"history".to_vec())]
     );
 }
 
