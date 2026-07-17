@@ -11,16 +11,52 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use storage_api::{
     AdapterCapabilities, AdapterCompatibilityError, AdapterDescriptorV1, AdapterError,
     AdapterFuture, AdapterRequirement, ApplyReceipt, CommittedMutationBatch, KeySpan, KeyValue,
-    LogicalKey, StorageAdapter,
+    LogicalKey, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
+    LogicalSnapshotReader, StorageAdapter,
 };
 
 pub type AdapterFactoryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Arc<dyn StorageAdapter>, AdapterFactoryError>> + Send + 'a>>;
 
+pub type AdapterRestoreSessionFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Box<dyn AdapterRestoreSession + 'a>, AdapterFactoryError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+pub type AdapterRestoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, AdapterFactoryError>> + Send + 'a>>;
+
+pub trait AdapterRestoreSession: Send {
+    fn write_chunk<'a>(&'a mut self, chunk: LogicalSnapshotChunkV1)
+    -> AdapterRestoreFuture<'a, ()>;
+
+    fn finish<'a>(
+        self: Box<Self>,
+        manifest: LogicalSnapshotManifestV1,
+    ) -> AdapterRestoreFuture<'a, Arc<dyn StorageAdapter>>
+    where
+        Self: 'a;
+}
+
 pub trait AdapterFactory: Send + Sync {
     fn provider_name(&self) -> &'static str;
 
     fn open<'a>(&'a self, request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a>;
+
+    fn begin_restore<'a>(
+        &'a self,
+        _request: &'a AdapterOpenRequest,
+        _header: LogicalSnapshotHeaderV1,
+    ) -> AdapterRestoreSessionFuture<'a> {
+        Box::pin(async {
+            Err(AdapterFactoryError::new(
+                "Adapter factory does not support logical snapshot restore",
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,6 +264,38 @@ impl AdapterRegistry {
             adapter,
         })
     }
+
+    pub async fn restore<'a>(
+        &self,
+        provider: &str,
+        request: &AdapterOpenRequest,
+        requirement: AdapterRequirement,
+        mut reader: Box<dyn LogicalSnapshotReader + 'a>,
+    ) -> Result<OpenedAdapter, RegistryError> {
+        Self::validate_provider_name(provider)?;
+        let factory =
+            self.factories
+                .get(provider)
+                .ok_or_else(|| RegistryError::UnknownProvider {
+                    provider: provider.to_owned(),
+                })?;
+        let mut restore = factory
+            .begin_restore(request, reader.header().clone())
+            .await?;
+        while let Some(chunk) = reader.next_chunk().await? {
+            restore.write_chunk(chunk).await?;
+        }
+        let manifest = reader.finish().await?;
+        let adapter = restore.finish(manifest).await?;
+        let descriptor = adapter.descriptor();
+        descriptor.validate(requirement)?;
+        Ok(OpenedAdapter {
+            provider_name: provider.to_owned(),
+            instance_id: request.instance_id.clone(),
+            descriptor,
+            adapter,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -236,6 +304,7 @@ pub enum RegistryError {
     DuplicateProvider { provider: String },
     UnknownProvider { provider: String },
     Factory(AdapterFactoryError),
+    Source(AdapterError),
     Incompatible(AdapterCompatibilityError),
 }
 
@@ -255,6 +324,7 @@ impl Display for RegistryError {
                 write!(formatter, "Adapter provider {provider} is not registered")
             }
             Self::Factory(error) => write!(formatter, "Adapter factory failed: {error}"),
+            Self::Source(error) => write!(formatter, "snapshot source failed: {error}"),
             Self::Incompatible(error) => Display::fmt(error, formatter),
         }
     }
@@ -264,6 +334,7 @@ impl Error for RegistryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Factory(error) => Some(error),
+            Self::Source(error) => Some(error),
             Self::Incompatible(error) => Some(error),
             _ => None,
         }
@@ -273,6 +344,12 @@ impl Error for RegistryError {
 impl From<AdapterFactoryError> for RegistryError {
     fn from(error: AdapterFactoryError) -> Self {
         Self::Factory(error)
+    }
+}
+
+impl From<AdapterError> for RegistryError {
+    fn from(error: AdapterError) -> Self {
+        Self::Source(error)
     }
 }
 

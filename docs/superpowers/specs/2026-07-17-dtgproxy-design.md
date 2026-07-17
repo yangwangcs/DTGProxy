@@ -484,17 +484,17 @@ sequenceDiagram
 ```rust
 pub struct AdapterCapabilities {
     pub local_atomic_batch: bool,
-    pub conditional_write: bool,
-    pub consistent_snapshot: bool,
+    pub idempotent_apply: bool,
+    pub consistent_multi_get: bool,
     pub ordered_scan: bool,
-    pub native_out_expand: bool,
-    pub native_in_expand: bool,
+    pub durable_applied_index: bool,
+    pub durability: Durability,
+    pub snapshot: SnapshotCapability,
+    pub logical_export: bool,
+    pub logical_restore: bool,
     pub predicate_pushdown: bool,
-    pub aggregation_pushdown: bool,
-    pub bulk_load: bool,
-    pub checkpoint_restore: bool,
+    pub adjacency_pushdown: bool,
     pub change_feed: bool,
-    pub delegated_replication: bool,
 }
 ```
 
@@ -505,23 +505,20 @@ Planner 只根据已注册并通过合约测试的能力下推，不根据数据
 ```rust
 #[async_trait]
 pub trait StorageAdapter: Send + Sync {
+    fn descriptor(&self) -> AdapterDescriptorV1;
     fn capabilities(&self) -> AdapterCapabilities;
 
-    async fn read_snapshot(&self, barrier: ReadBarrier) -> Result<SnapshotHandle>;
-    async fn multi_get(&self, snapshot: &SnapshotHandle, keys: &[LogicalKey])
-        -> Result<Vec<Option<Record>>>;
-    async fn scan(&self, snapshot: &SnapshotHandle, span: KeySpan)
-        -> Result<RecordStream>;
-    async fn expand(&self, snapshot: &SnapshotHandle, request: ExpandRequest)
-        -> Result<AdjacencyStream>;
-
+    async fn multi_get(&self, keys: &[LogicalKey]) -> Result<Vec<Option<Vec<u8>>>>;
+    async fn scan(&self, span: KeySpan) -> Result<Vec<KeyValue>>;
     async fn apply_committed(&self, batch: CommittedMutationBatch)
         -> Result<ApplyReceipt>;
-    async fn checkpoint(&self, request: CheckpointRequest)
-        -> Result<CheckpointManifest>;
-    async fn restore(&self, manifest: CheckpointManifest) -> Result<()>;
+    fn applied_log_index(&self) -> Result<u64>;
+    async fn begin_logical_export(&self, request: LogicalSnapshotExportRequest)
+        -> Result<Box<dyn LogicalSnapshotReader>>;
 }
 ```
+
+同构副本恢复使用 Adapter 原生 checkpoint；跨后端迁移使用规范逻辑快照。逻辑流按 `(keyspace, key)` 全局严格排序，分块携带 Snapshot ID、Ordinal 与 BLAKE3，最终 Manifest 绑定 applied index、总块数、总记录数和全流摘要。恢复由目标 Factory 在隐藏 generation 中执行，Manifest 完整验证后才原子发布 Adapter。
 
 `CommittedMutationBatch` 已包含完整区间拆分、当前投影、历史投影和索引 Mutation。Adapter Apply 期间不得重新读取业务数据来决定结果，否则各 Replica 可能产生不同状态。
 

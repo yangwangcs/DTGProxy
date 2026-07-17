@@ -41,6 +41,8 @@ message Capabilities {
   bool predicate_pushdown = 8;
   bool adjacency_pushdown = 9;
   bool change_feed = 10;
+  bool logical_export = 11;
+  bool logical_restore = 12;
 }
 message DescriptorResponse {
   uint32 spi_version = 1;

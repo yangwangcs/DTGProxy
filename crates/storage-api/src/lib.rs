@@ -6,6 +6,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub const ADAPTER_SPI_VERSION: u16 = 1;
+pub const LOGICAL_SNAPSHOT_FORMAT_VERSION: u16 = 1;
+pub const MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES: usize = 65_536;
+pub const MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendFamily {
@@ -41,6 +44,8 @@ pub struct AdapterCapabilities {
     pub durable_applied_index: bool,
     pub durability: Durability,
     pub snapshot: SnapshotCapability,
+    pub logical_export: bool,
+    pub logical_restore: bool,
     pub predicate_pushdown: bool,
     pub adjacency_pushdown: bool,
     pub change_feed: bool,
@@ -154,7 +159,7 @@ impl AdapterDescriptorV1 {
             ),
             (
                 self.capabilities.snapshot != SnapshotCapability::None,
-                RequiredCapability::PortableSnapshot,
+                RequiredCapability::SnapshotRecovery,
             ),
         ] {
             if !available {
@@ -162,6 +167,25 @@ impl AdapterDescriptorV1 {
                     adapter: self.implementation.clone(),
                     capability,
                 });
+            }
+        }
+        if requirement == AdapterRequirement::HotPluggableReplica {
+            for (available, capability) in [
+                (
+                    self.capabilities.logical_export,
+                    RequiredCapability::LogicalExport,
+                ),
+                (
+                    self.capabilities.logical_restore,
+                    RequiredCapability::LogicalRestore,
+                ),
+            ] {
+                if !available {
+                    return Err(AdapterCompatibilityError::MissingCapability {
+                        adapter: self.implementation.clone(),
+                        capability,
+                    });
+                }
             }
         }
         Ok(())
@@ -172,6 +196,7 @@ impl AdapterDescriptorV1 {
 pub enum AdapterRequirement {
     Development,
     ManagedReplica,
+    HotPluggableReplica,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,7 +207,9 @@ pub enum RequiredCapability {
     OrderedScan,
     DurableAppliedIndex,
     SynchronousDurability,
-    PortableSnapshot,
+    SnapshotRecovery,
+    LogicalExport,
+    LogicalRestore,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,6 +466,430 @@ impl KeyValue {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogicalSnapshotExportRequest {
+    max_entries_per_chunk: usize,
+    max_bytes_per_chunk: usize,
+}
+
+impl LogicalSnapshotExportRequest {
+    pub fn new(
+        max_entries_per_chunk: usize,
+        max_bytes_per_chunk: usize,
+    ) -> Result<Self, LogicalSnapshotError> {
+        if !(1..=MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES).contains(&max_entries_per_chunk) {
+            return Err(LogicalSnapshotError::InvalidChunkEntryLimit {
+                max: MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES,
+                actual: max_entries_per_chunk,
+            });
+        }
+        if !(1..=MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES).contains(&max_bytes_per_chunk) {
+            return Err(LogicalSnapshotError::InvalidChunkByteLimit {
+                max: MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES,
+                actual: max_bytes_per_chunk,
+            });
+        }
+        Ok(Self {
+            max_entries_per_chunk,
+            max_bytes_per_chunk,
+        })
+    }
+
+    #[must_use]
+    pub const fn max_entries_per_chunk(self) -> usize {
+        self.max_entries_per_chunk
+    }
+
+    #[must_use]
+    pub const fn max_bytes_per_chunk(self) -> usize {
+        self.max_bytes_per_chunk
+    }
+}
+
+impl Default for LogicalSnapshotExportRequest {
+    fn default() -> Self {
+        Self {
+            max_entries_per_chunk: 4_096,
+            max_bytes_per_chunk: 4 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalSnapshotHeaderV1 {
+    format_version: u16,
+    snapshot_id: u128,
+    applied_log_index: u64,
+}
+
+impl LogicalSnapshotHeaderV1 {
+    #[must_use]
+    pub const fn new(snapshot_id: u128, applied_log_index: u64) -> Self {
+        Self {
+            format_version: LOGICAL_SNAPSHOT_FORMAT_VERSION,
+            snapshot_id,
+            applied_log_index,
+        }
+    }
+
+    #[must_use]
+    pub const fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(&self) -> u128 {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalSnapshotChunkV1 {
+    snapshot_id: u128,
+    ordinal: u64,
+    entries: Vec<KeyValue>,
+    digest: [u8; 32],
+}
+
+impl LogicalSnapshotChunkV1 {
+    pub fn new(
+        snapshot_id: u128,
+        ordinal: u64,
+        entries: Vec<KeyValue>,
+    ) -> Result<Self, LogicalSnapshotError> {
+        validate_snapshot_entries(&entries)?;
+        let digest = hash_snapshot_chunk(snapshot_id, ordinal, &entries);
+        Ok(Self {
+            snapshot_id,
+            ordinal,
+            entries,
+            digest,
+        })
+    }
+
+    pub fn from_parts(
+        snapshot_id: u128,
+        ordinal: u64,
+        entries: Vec<KeyValue>,
+        digest: [u8; 32],
+    ) -> Result<Self, LogicalSnapshotError> {
+        let chunk = Self::new(snapshot_id, ordinal, entries)?;
+        if chunk.digest != digest {
+            return Err(LogicalSnapshotError::ChunkDigestMismatch { ordinal });
+        }
+        Ok(chunk)
+    }
+
+    #[must_use]
+    pub const fn snapshot_id(&self) -> u128 {
+        self.snapshot_id
+    }
+
+    #[must_use]
+    pub const fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[KeyValue] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    #[must_use]
+    pub fn payload_bytes(&self) -> usize {
+        self.entries.iter().fold(0_usize, |total, entry| {
+            total
+                .saturating_add(1)
+                .saturating_add(8)
+                .saturating_add(entry.key().as_bytes().len())
+                .saturating_add(8)
+                .saturating_add(entry.value().len())
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalSnapshotManifestV1 {
+    header: LogicalSnapshotHeaderV1,
+    total_chunks: u64,
+    total_entries: u64,
+    content_digest: [u8; 32],
+}
+
+impl LogicalSnapshotManifestV1 {
+    pub fn from_parts(
+        header: LogicalSnapshotHeaderV1,
+        total_chunks: u64,
+        total_entries: u64,
+        content_digest: [u8; 32],
+    ) -> Result<Self, LogicalSnapshotError> {
+        if header.format_version != LOGICAL_SNAPSHOT_FORMAT_VERSION {
+            return Err(LogicalSnapshotError::UnsupportedFormatVersion {
+                expected: LOGICAL_SNAPSHOT_FORMAT_VERSION,
+                actual: header.format_version,
+            });
+        }
+        Ok(Self {
+            header,
+            total_chunks,
+            total_entries,
+            content_digest,
+        })
+    }
+
+    #[must_use]
+    pub const fn header(&self) -> &LogicalSnapshotHeaderV1 {
+        &self.header
+    }
+
+    #[must_use]
+    pub const fn total_chunks(&self) -> u64 {
+        self.total_chunks
+    }
+
+    #[must_use]
+    pub const fn total_entries(&self) -> u64 {
+        self.total_entries
+    }
+
+    #[must_use]
+    pub const fn content_digest(&self) -> [u8; 32] {
+        self.content_digest
+    }
+}
+
+#[derive(Clone)]
+pub struct LogicalSnapshotAccumulator {
+    header: LogicalSnapshotHeaderV1,
+    next_ordinal: u64,
+    total_entries: u64,
+    previous_key: Option<LogicalKey>,
+    hasher: blake3::Hasher,
+}
+
+impl LogicalSnapshotAccumulator {
+    #[must_use]
+    pub fn new(header: LogicalSnapshotHeaderV1) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"DTGProxy/LogicalSnapshot/V1");
+        hasher.update(&header.format_version.to_be_bytes());
+        hasher.update(&header.snapshot_id.to_be_bytes());
+        hasher.update(&header.applied_log_index.to_be_bytes());
+        Self {
+            header,
+            next_ordinal: 0,
+            total_entries: 0,
+            previous_key: None,
+            hasher,
+        }
+    }
+
+    pub fn observe(&mut self, chunk: &LogicalSnapshotChunkV1) -> Result<(), LogicalSnapshotError> {
+        if chunk.snapshot_id != self.header.snapshot_id {
+            return Err(LogicalSnapshotError::SnapshotIdMismatch {
+                expected: self.header.snapshot_id,
+                actual: chunk.snapshot_id,
+            });
+        }
+        if chunk.ordinal != self.next_ordinal {
+            return Err(LogicalSnapshotError::ChunkOrdinalMismatch {
+                expected: self.next_ordinal,
+                actual: chunk.ordinal,
+            });
+        }
+        validate_snapshot_entries(&chunk.entries)?;
+        if hash_snapshot_chunk(chunk.snapshot_id, chunk.ordinal, &chunk.entries) != chunk.digest {
+            return Err(LogicalSnapshotError::ChunkDigestMismatch {
+                ordinal: chunk.ordinal,
+            });
+        }
+        if let (Some(previous), Some(first)) = (&self.previous_key, chunk.entries.first())
+            && previous >= first.key()
+        {
+            return Err(LogicalSnapshotError::EntriesNotStrictlyOrdered);
+        }
+        for entry in &chunk.entries {
+            hash_snapshot_entry(&mut self.hasher, entry);
+        }
+        self.total_entries = self
+            .total_entries
+            .checked_add(
+                u64::try_from(chunk.entries.len())
+                    .map_err(|_| LogicalSnapshotError::CountOverflow)?,
+            )
+            .ok_or(LogicalSnapshotError::CountOverflow)?;
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or(LogicalSnapshotError::CountOverflow)?;
+        self.previous_key = chunk.entries.last().map(|entry| entry.key().clone());
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn complete(self) -> LogicalSnapshotManifestV1 {
+        LogicalSnapshotManifestV1 {
+            header: self.header,
+            total_chunks: self.next_ordinal,
+            total_entries: self.total_entries,
+            content_digest: *self.hasher.finalize().as_bytes(),
+        }
+    }
+
+    pub fn verify(self, manifest: &LogicalSnapshotManifestV1) -> Result<(), LogicalSnapshotError> {
+        let actual = self.complete();
+        if &actual == manifest {
+            Ok(())
+        } else {
+            Err(LogicalSnapshotError::ManifestMismatch)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LogicalSnapshotError {
+    InvalidChunkEntryLimit { max: usize, actual: usize },
+    InvalidChunkByteLimit { max: usize, actual: usize },
+    EmptyChunk,
+    TooManyChunkEntries { max: usize, actual: usize },
+    ChunkTooLarge { max: usize, actual: usize },
+    EntriesNotStrictlyOrdered,
+    SnapshotIdMismatch { expected: u128, actual: u128 },
+    ChunkOrdinalMismatch { expected: u64, actual: u64 },
+    ChunkDigestMismatch { ordinal: u64 },
+    UnsupportedFormatVersion { expected: u16, actual: u16 },
+    CountOverflow,
+    ManifestMismatch,
+    ExportNotExhausted,
+    EntryTooLarge { max: usize, actual: usize },
+}
+
+impl Display for LogicalSnapshotError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidChunkEntryLimit { max, actual } => write!(
+                formatter,
+                "logical snapshot chunk entry limit {actual} is outside 1..={max}"
+            ),
+            Self::InvalidChunkByteLimit { max, actual } => write!(
+                formatter,
+                "logical snapshot chunk byte limit {actual} is outside 1..={max}"
+            ),
+            Self::EmptyChunk => formatter.write_str("logical snapshot chunk is empty"),
+            Self::TooManyChunkEntries { max, actual } => write!(
+                formatter,
+                "logical snapshot chunk has {actual} entries; maximum is {max}"
+            ),
+            Self::ChunkTooLarge { max, actual } => write!(
+                formatter,
+                "logical snapshot chunk has {actual} bytes; maximum is {max}"
+            ),
+            Self::EntriesNotStrictlyOrdered => {
+                formatter.write_str("logical snapshot entries are not in strict key order")
+            }
+            Self::SnapshotIdMismatch { expected, actual } => write!(
+                formatter,
+                "logical snapshot ID {actual} differs from expected ID {expected}"
+            ),
+            Self::ChunkOrdinalMismatch { expected, actual } => write!(
+                formatter,
+                "logical snapshot chunk ordinal {actual} differs from expected {expected}"
+            ),
+            Self::ChunkDigestMismatch { ordinal } => {
+                write!(
+                    formatter,
+                    "logical snapshot chunk {ordinal} digest mismatch"
+                )
+            }
+            Self::UnsupportedFormatVersion { expected, actual } => write!(
+                formatter,
+                "logical snapshot format {actual} differs from supported version {expected}"
+            ),
+            Self::CountOverflow => formatter.write_str("logical snapshot count overflow"),
+            Self::ManifestMismatch => formatter.write_str("logical snapshot manifest mismatch"),
+            Self::ExportNotExhausted => {
+                formatter.write_str("logical snapshot export was not fully consumed")
+            }
+            Self::EntryTooLarge { max, actual } => write!(
+                formatter,
+                "logical snapshot entry has {actual} bytes; chunk maximum is {max}"
+            ),
+        }
+    }
+}
+
+impl Error for LogicalSnapshotError {}
+
+fn validate_snapshot_entries(entries: &[KeyValue]) -> Result<(), LogicalSnapshotError> {
+    if entries.is_empty() {
+        return Err(LogicalSnapshotError::EmptyChunk);
+    }
+    if entries.len() > MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES {
+        return Err(LogicalSnapshotError::TooManyChunkEntries {
+            max: MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES,
+            actual: entries.len(),
+        });
+    }
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].key() >= pair[1].key())
+    {
+        return Err(LogicalSnapshotError::EntriesNotStrictlyOrdered);
+    }
+    let bytes = entries.iter().fold(0_usize, |total, entry| {
+        total
+            .saturating_add(1)
+            .saturating_add(8)
+            .saturating_add(entry.key().as_bytes().len())
+            .saturating_add(8)
+            .saturating_add(entry.value().len())
+    });
+    if bytes > MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES {
+        return Err(LogicalSnapshotError::ChunkTooLarge {
+            max: MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES,
+            actual: bytes,
+        });
+    }
+    Ok(())
+}
+
+fn hash_snapshot_chunk(snapshot_id: u128, ordinal: u64, entries: &[KeyValue]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"DTGProxy/LogicalSnapshotChunk/V1");
+    hasher.update(&snapshot_id.to_be_bytes());
+    hasher.update(&ordinal.to_be_bytes());
+    for entry in entries {
+        hash_snapshot_entry(&mut hasher, entry);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_snapshot_entry(hasher: &mut blake3::Hasher, entry: &KeyValue) {
+    hasher.update(&[entry.key().keyspace().tag()]);
+    hasher.update(
+        &u64::try_from(entry.key().as_bytes().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(entry.key().as_bytes());
+    hasher.update(
+        &u64::try_from(entry.value().len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(entry.value());
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MutationOperation {
     Put { key: LogicalKey, value: Vec<u8> },
@@ -553,6 +1004,8 @@ pub enum AdapterError {
     CommittedLogReplayMismatch { log_index: u64 },
     DuplicateMutationSequence { txn_id: u128, sequence: u32 },
     MutationReplayMismatch { txn_id: u128, sequence: u32 },
+    UnsupportedOperation { operation: &'static str },
+    LogicalSnapshot(LogicalSnapshotError),
     Backend(String),
     LockPoisoned,
 }
@@ -584,6 +1037,10 @@ impl Display for AdapterError {
                     "transaction {txn_id} mutation sequence {sequence} changed during replay"
                 )
             }
+            Self::UnsupportedOperation { operation } => {
+                write!(formatter, "Adapter does not support {operation}")
+            }
+            Self::LogicalSnapshot(error) => Display::fmt(error, formatter),
             Self::Backend(message) => write!(formatter, "storage backend error: {message}"),
             Self::LockPoisoned => formatter.write_str("adapter state lock is poisoned"),
         }
@@ -592,7 +1049,23 @@ impl Display for AdapterError {
 
 impl Error for AdapterError {}
 
+impl From<LogicalSnapshotError> for AdapterError {
+    fn from(error: LogicalSnapshotError) -> Self {
+        Self::LogicalSnapshot(error)
+    }
+}
+
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
+
+pub trait LogicalSnapshotReader: Send {
+    fn header(&self) -> &LogicalSnapshotHeaderV1;
+
+    fn next_chunk<'a>(&'a mut self) -> AdapterFuture<'a, Option<LogicalSnapshotChunkV1>>;
+
+    fn finish<'a>(self: Box<Self>) -> AdapterFuture<'a, LogicalSnapshotManifestV1>
+    where
+        Self: 'a;
+}
 
 pub trait StorageAdapter: Send + Sync {
     fn descriptor(&self) -> AdapterDescriptorV1 {
@@ -614,6 +1087,17 @@ pub trait StorageAdapter: Send + Sync {
     fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>>;
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>>;
+
+    fn begin_logical_export<'a>(
+        &'a self,
+        _request: LogicalSnapshotExportRequest,
+    ) -> AdapterFuture<'a, Box<dyn LogicalSnapshotReader + 'a>> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "logical snapshot export",
+            })
+        })
+    }
 
     fn applied_log_index(&self) -> Result<u64, AdapterError>;
 }

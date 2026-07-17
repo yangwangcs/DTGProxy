@@ -22,7 +22,8 @@ Date: 2026-07-17. This is a single-machine engineering baseline, not a distribut
 - leader/follower ReadIndex, term, epoch, applied-index, and safe-time fences;
 - PrimaryReplica and SharedNothing routing with logical partition/physical Shard separation;
 - SPI capability rejection, registry selection, secret redaction, and index-fenced backend cutover;
-- all Sidecar request/response codecs, corrupt/oversize frame rejection, client response invariant checks, persistent TCP, bounded server shutdown, and same-request-ID reconnect retry.
+- all Sidecar request/response codecs, corrupt/oversize frame rejection, client response invariant checks, persistent TCP, bounded server shutdown, and same-request-ID reconnect retry;
+- canonical logical snapshot chunk/manifest verification, RocksDB point-in-time logical export, hidden-generation restore, bad-manifest non-publication, and post-restore Raft-log replay.
 
 Exact commands:
 

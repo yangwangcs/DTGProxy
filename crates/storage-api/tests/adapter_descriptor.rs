@@ -12,6 +12,8 @@ fn production_capabilities(snapshot: SnapshotCapability) -> AdapterCapabilities 
         durable_applied_index: true,
         durability: Durability::Synchronous,
         snapshot,
+        logical_export: false,
+        logical_restore: false,
         predicate_pushdown: false,
         adjacency_pushdown: false,
         change_feed: false,
@@ -48,6 +50,36 @@ fn managed_replica_accepts_physical_or_logical_snapshot_backends() {
             Ok(())
         );
     }
+}
+
+#[test]
+fn hot_pluggable_replica_requires_both_portable_export_and_restore() {
+    let mut capabilities = production_capabilities(SnapshotCapability::PhysicalCheckpoint);
+    let descriptor =
+        AdapterDescriptorV1::new("rocksdb", "1", BackendFamily::KeyValue, capabilities);
+    assert!(matches!(
+        descriptor.validate(AdapterRequirement::HotPluggableReplica),
+        Err(AdapterCompatibilityError::MissingCapability {
+            capability: RequiredCapability::LogicalExport,
+            ..
+        })
+    ));
+    capabilities.logical_export = true;
+    let descriptor =
+        AdapterDescriptorV1::new("rocksdb", "1", BackendFamily::KeyValue, capabilities);
+    assert!(matches!(
+        descriptor.validate(AdapterRequirement::HotPluggableReplica),
+        Err(AdapterCompatibilityError::MissingCapability {
+            capability: RequiredCapability::LogicalRestore,
+            ..
+        })
+    ));
+    capabilities.logical_restore = true;
+    let descriptor =
+        AdapterDescriptorV1::new("rocksdb", "1", BackendFamily::KeyValue, capabilities);
+    descriptor
+        .validate(AdapterRequirement::HotPluggableReplica)
+        .unwrap();
 }
 
 #[test]

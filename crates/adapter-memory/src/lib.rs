@@ -129,6 +129,8 @@ impl StorageAdapter for MemoryAdapter {
             durable_applied_index: false,
             durability: Durability::Volatile,
             snapshot: SnapshotCapability::None,
+            logical_export: false,
+            logical_restore: false,
             predicate_pushdown: false,
             adjacency_pushdown: false,
             change_feed: false,

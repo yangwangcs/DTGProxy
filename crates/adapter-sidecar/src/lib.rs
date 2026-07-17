@@ -612,6 +612,8 @@ fn encode_adapter_error(error: &AdapterError) -> RemoteError {
         AdapterError::MutationReplayMismatch { .. } => (4, false),
         AdapterError::Backend(_) => (5, true),
         AdapterError::LockPoisoned => (6, true),
+        AdapterError::UnsupportedOperation { .. } => (7, false),
+        AdapterError::LogicalSnapshot(_) => (8, false),
     };
     RemoteError {
         code,
@@ -1387,6 +1389,8 @@ fn encode_descriptor(descriptor: &AdapterDescriptorV1) -> wire::DescriptorRespon
             durable_applied_index: capabilities.durable_applied_index,
             durability: encode_durability(capabilities.durability),
             snapshot: encode_snapshot(capabilities.snapshot),
+            logical_export: capabilities.logical_export,
+            logical_restore: capabilities.logical_restore,
             predicate_pushdown: capabilities.predicate_pushdown,
             adjacency_pushdown: capabilities.adjacency_pushdown,
             change_feed: capabilities.change_feed,
@@ -1415,6 +1419,8 @@ fn decode_descriptor(
             durable_applied_index: capabilities.durable_applied_index,
             durability: decode_durability(capabilities.durability)?,
             snapshot: decode_snapshot(capabilities.snapshot)?,
+            logical_export: capabilities.logical_export,
+            logical_restore: capabilities.logical_restore,
             predicate_pushdown: capabilities.predicate_pushdown,
             adjacency_pushdown: capabilities.adjacency_pushdown,
             change_feed: capabilities.change_feed,
@@ -1715,6 +1721,10 @@ mod wire {
         pub adjacency_pushdown: bool,
         #[prost(bool, tag = "10")]
         pub change_feed: bool,
+        #[prost(bool, tag = "11")]
+        pub logical_export: bool,
+        #[prost(bool, tag = "12")]
+        pub logical_restore: bool,
     }
 
     #[derive(Clone, PartialEq, Message)]

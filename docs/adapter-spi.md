@@ -6,13 +6,14 @@ Status: SPI v1, capability gate, registry, RocksDB factory, index-fenced hot-swa
 
 The temporal model, Raft command, transaction protocol, and query IR remain backend-independent. A backend receives deterministic logical key/value mutations representing Identity, Current, History, outbound/inbound adjacency, temporal indexes, transaction records, and Replica metadata. Native graph/SQL layouts are projections and acceleration structures; they never become the only copy of DTGProxy transaction truth.
 
-The core trait has five correctness operations:
+The core trait has six correctness operations:
 
 - describe capabilities;
 - atomically and idempotently apply one committed Raft batch;
 - consistently read multiple logical keys;
 - scan one keyspace in bytewise key order;
 - return the durable `applied_log_index`.
+- open a consistent, bounded canonical logical-snapshot reader for migration.
 
 Optional extensions cover checkpoint/logical export, predicate pushdown, adjacency pushdown, and change feeds.
 
@@ -20,7 +21,7 @@ Optional extensions cover checkpoint/logical export, predicate pushdown, adjacen
 
 | Backend | Family | Integration | Snapshot form | Current status |
 |---|---|---|---|---|
-| RocksDB | KV | in-process Rust Adapter | physical checkpoint | implemented and contract-tested |
+| RocksDB | KV | in-process Rust Adapter | physical checkpoint + canonical logical export/restore | implemented and contract-tested |
 | PostgreSQL | SQL | Rust Sidecar, parameterized SQL | repeatable logical export / database backup | design pending implementation |
 | Neo4j | property graph | Sidecar over an official supported driver where possible | logical export; Enterprise backup is deployment-specific | design pending implementation |
 | Memgraph | property graph | Rust/Bolt Sidecar | logical export or transactional snapshot | compatibility target, not yet certified |
@@ -46,6 +47,8 @@ Memgraph documents Bolt compatibility and a Rust client path, but storage mode c
 6. durable applied index;
 7. synchronous durable acknowledgement;
 8. physical checkpoint or logical export.
+
+`HotPluggableReplica` adds two independent requirements: canonical logical export and logical restore. A native checkpoint is not considered portable across backend families.
 
 Product labels are not capabilities. For example, a Memgraph analytical instance, PostgreSQL with an unverified asynchronous durability profile, or a graph endpoint without portable export fails startup for a managed production Replica.
 
@@ -75,13 +78,19 @@ TCP v1 is currently appropriate only on a trusted same-host/private test boundar
 
 “Hot plug” does not mean replacing a live database pointer without data movement. The implemented `HotSwapAdapter` protocol is:
 
-1. create the target and restore/export all keyspaces through source index `N`;
-2. verify source and target both durably report `applied_log_index = N`;
-3. enter dual-apply generation `g+1`;
-4. acknowledge each subsequent Raft entry only after source and target both apply it;
-5. retry partial progress using the same idempotent batch;
-6. cut over only with no apply in flight and equal durable indices;
-7. retain the old generation for validation/rollback policy, then retire it explicitly.
+1. open one consistent source snapshot at applied index `N` and stream every Keyspace in strict logical-key order;
+2. validate per-chunk ordinals/digests and the final content manifest while restoring into a hidden target generation;
+3. atomically publish the target only after the complete manifest and its durable applied-index record match;
+4. verify source and target both durably report `applied_log_index = N`;
+5. enter dual-apply generation `g+1`;
+6. acknowledge each subsequent Raft entry only after source and target both apply it;
+7. retry partial progress using the same idempotent batch;
+8. cut over only with no apply in flight and equal durable indices;
+9. retain the old generation for validation/rollback policy, then retire it explicitly.
+
+The implemented logical format binds format version, 128-bit snapshot ID, applied index, strict chunk ordinal, globally ordered `(keyspace, key, value)` entries, per-chunk BLAKE3, entry/chunk totals, and a whole-stream BLAKE3 manifest. Export limits are explicit and capped at 65,536 entries / 16 MiB per chunk. `AdapterRegistry::restore` drives a source reader into a target Factory restore session, then validates the opened target against the selected capability requirement.
+
+The RocksDB target writes synchronous chunks into a non-visible sibling staging directory, defers publication of `applied_log_index` until final verification, syncs the tree, and renames the directory atomically. A failed or corrupt manifest removes the owned staging generation and never creates the target path.
 
 The backend type is immutable within a placement epoch. Cutover is recorded as a control-plane compare-and-swap with a new epoch. Long-term migration additionally needs background snapshot transfer, WAL retention fences, checksum comparison across every keyspace, rollback deadlines, and operator APIs.
 

@@ -27,6 +27,8 @@ fn descriptor() -> AdapterDescriptorV1 {
             durable_applied_index: true,
             durability: Durability::Synchronous,
             snapshot: SnapshotCapability::LogicalExport,
+            logical_export: true,
+            logical_restore: true,
             predicate_pushdown: true,
             adjacency_pushdown: false,
             change_feed: true,
