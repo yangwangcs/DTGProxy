@@ -8,6 +8,7 @@ use crate::{EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, LabelId, Pa
 const IDENTITY_MAGIC: &[u8; 4] = b"DTGI";
 const PROJECTION_MAGIC: &[u8; 4] = b"DTGP";
 const ANCHOR_MAGIC: &[u8; 4] = b"DTGA";
+const DELTA_MAGIC: &[u8; 4] = b"DTGD";
 const FORMAT_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -278,6 +279,143 @@ impl HistoryAnchor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryDelta {
+    commit_ts: TransactionTime,
+    changed_valid: Interval<ValidTime>,
+    replacement: Option<CanonicalElement>,
+}
+
+impl HistoryDelta {
+    #[must_use]
+    pub const fn put(
+        commit_ts: TransactionTime,
+        changed_valid: Interval<ValidTime>,
+        replacement: CanonicalElement,
+    ) -> Self {
+        Self {
+            commit_ts,
+            changed_valid,
+            replacement: Some(replacement),
+        }
+    }
+
+    #[must_use]
+    pub const fn delete(commit_ts: TransactionTime, changed_valid: Interval<ValidTime>) -> Self {
+        Self {
+            commit_ts,
+            changed_valid,
+            replacement: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn commit_ts(&self) -> TransactionTime {
+        self.commit_ts
+    }
+
+    #[must_use]
+    pub const fn changed_valid(&self) -> Interval<ValidTime> {
+        self.changed_valid
+    }
+
+    #[must_use]
+    pub const fn replacement(&self) -> Option<&CanonicalElement> {
+        self.replacement.as_ref()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
+        let mut output = Vec::new();
+        output.extend_from_slice(DELTA_MAGIC);
+        output.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+        encode_transaction_time(&mut output, self.commit_ts);
+        encode_interval(&mut output, self.changed_valid);
+        match &self.replacement {
+            Some(replacement) => {
+                output.push(1);
+                let payload = replacement.encode().map_err(RecordCodecError::Canonical)?;
+                write_len(&mut output, payload.len())?;
+                output.extend_from_slice(&payload);
+            }
+            None => output.push(0),
+        }
+        append_checksum(&mut output);
+        Ok(output)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordCodecError> {
+        let mut decoder = Decoder::new(bytes);
+        decoder.expect_magic(DELTA_MAGIC)?;
+        decoder.expect_version()?;
+        let commit_ts = decoder.read_transaction_time()?;
+        let changed_valid = decoder.read_interval()?;
+        let replacement = match decoder.read_u8()? {
+            0 => None,
+            1 => {
+                let length = decoder.read_u32()? as usize;
+                Some(
+                    CanonicalElement::decode(decoder.take(length)?)
+                        .map_err(RecordCodecError::Canonical)?,
+                )
+            }
+            _ => return Err(RecordCodecError::InvalidHistoryOperation),
+        };
+        decoder.verify_checksum_and_finish()?;
+        Ok(Self {
+            commit_ts,
+            changed_valid,
+            replacement,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryEntry {
+    Anchor(HistoryAnchor),
+    Delta(HistoryDelta),
+}
+
+impl HistoryEntry {
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordCodecError> {
+        let magic = bytes.get(..4).ok_or(RecordCodecError::UnexpectedEnd)?;
+        if magic == ANCHOR_MAGIC {
+            Ok(Self::Anchor(HistoryAnchor::decode(bytes)?))
+        } else if magic == DELTA_MAGIC {
+            Ok(Self::Delta(HistoryDelta::decode(bytes)?))
+        } else {
+            Err(RecordCodecError::InvalidMagic)
+        }
+    }
+
+    #[must_use]
+    pub const fn commit_ts(&self) -> TransactionTime {
+        match self {
+            Self::Anchor(anchor) => anchor.commit_ts(),
+            Self::Delta(delta) => delta.commit_ts(),
+        }
+    }
+
+    #[must_use]
+    pub const fn changed_valid(&self) -> Interval<ValidTime> {
+        match self {
+            Self::Anchor(anchor) => anchor.changed_valid(),
+            Self::Delta(delta) => delta.changed_valid(),
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
+        match self {
+            Self::Anchor(anchor) => anchor.encode(),
+            Self::Delta(delta) => delta.encode(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_anchor(&self) -> bool {
+        matches!(self, Self::Anchor(_))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordCodecError {
     InvalidMagic,
     UnsupportedVersion(u16),
@@ -286,6 +424,7 @@ pub enum RecordCodecError {
     TrailingBytes,
     LengthOverflow,
     InvalidInterval,
+    InvalidHistoryOperation,
     OverlappingOrUnsortedSegments,
     CommitTimestampMismatch,
     ChecksumMismatch,
@@ -305,6 +444,9 @@ impl Display for RecordCodecError {
             Self::LengthOverflow => formatter.write_str("temporal record length exceeds u32"),
             Self::InvalidInterval => {
                 formatter.write_str("temporal record contains an invalid interval")
+            }
+            Self::InvalidHistoryOperation => {
+                formatter.write_str("history delta contains an invalid operation")
             }
             Self::OverlappingOrUnsortedSegments => {
                 formatter.write_str("projection segments overlap or are not ordered")

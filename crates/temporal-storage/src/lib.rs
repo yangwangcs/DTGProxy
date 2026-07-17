@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod diff;
+mod history;
 mod key;
 mod record;
 mod rewrite;
@@ -14,7 +15,8 @@ pub use key::{
     out_adjacency_prefix, vertex_identity_key,
 };
 pub use record::{
-    EdgeIdentity, HistoryAnchor, ProjectionRecord, RecordCodecError, ValidSegment, VertexIdentity,
+    EdgeIdentity, HistoryAnchor, HistoryDelta, HistoryEntry, ProjectionRecord, RecordCodecError,
+    ValidSegment, VertexIdentity,
 };
 pub use store::{
     CommitContext, EdgeMutation, EdgeView, TemporalStore, TemporalStoreError, TemporalStoreFuture,

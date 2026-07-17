@@ -7,9 +7,11 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 
 use adapter_rocksdb::RocksAdapter;
+use storage_api::{KeySpan, Keyspace, StorageAdapter};
 use temporal_storage::{
-    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
-    TemporalStore, VertexMutation,
+    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, HistoryAnchor,
+    LabelId, PartitionId, ProjectionRecord, TemporalStore, ValidSegment, VertexMutation,
+    history_prefix,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -23,18 +25,12 @@ fn main() {
     let vertex = ElementRef::vertex(GraphId::new(1), PartitionId::new(0), ElementId::new(1));
     let label = LabelId::new(1);
 
-    for index in 1..=32_u64 {
+    for index in 1..=1_008_u64 {
         let read = i64::try_from((index - 1) * 100).unwrap();
         let commit = i64::try_from(index * 100).unwrap();
-        let start = if index == 1 {
-            0
-        } else {
-            i64::try_from((index * 7) % 90).unwrap()
-        };
-        let end = if index == 1 { 100 } else { start + 10 };
         block_on(store.commit_vertex(
             context(index, read, commit),
-            VertexMutation::put(vertex, label, interval(start, end), payload(index)).unwrap(),
+            VertexMutation::put(vertex, label, interval(0, 100), payload(index)).unwrap(),
         ))
         .unwrap();
     }
@@ -42,17 +38,49 @@ fn main() {
     measure("current_point_lookup", iterations, || {
         black_box(block_on(store.vertex_current(vertex, valid(50))).unwrap());
     });
-    measure("as_of_latest_depth_1", iterations, || {
-        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(3_200))).unwrap());
+    measure("as_of_replay_depth_1", iterations, || {
+        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(99_300))).unwrap());
     });
-    measure("as_of_oldest_depth_32", iterations, || {
-        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(100))).unwrap());
+    measure("as_of_replay_depth_16", iterations, || {
+        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(100_800))).unwrap());
     });
+    measure("as_of_snapshot_age_1000", iterations, || {
+        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(800))).unwrap());
+    });
+
+    let history = block_on(
+        store
+            .adapter()
+            .scan(&KeySpan::prefix(Keyspace::History, history_prefix(vertex))),
+    )
+    .unwrap();
+    let history_bytes: usize = history.iter().map(|entry| entry.value().len()).sum();
+    println!("history_value_bytes_total={history_bytes}");
+    println!(
+        "history_value_bytes_average={}",
+        history_bytes / history.len()
+    );
+    let hypothetical_full_anchor_bytes: usize = (1..=1_008_u64)
+        .map(|index| {
+            let commit = tx(i64::try_from(index * 100).unwrap());
+            let projection = ProjectionRecord::new(
+                commit,
+                vec![ValidSegment::new(interval(0, 100), payload(index))],
+            )
+            .unwrap();
+            HistoryAnchor::new(commit, interval(0, 100), projection)
+                .unwrap()
+                .encode()
+                .unwrap()
+                .len()
+        })
+        .sum();
+    println!("full_anchor_value_bytes_hypothetical={hypothetical_full_anchor_bytes}");
 
     let correction_start = Instant::now();
     for offset in 1..=8_u64 {
-        let log_index = 32 + offset;
-        let read = i64::try_from(3_100 + offset * 100).unwrap();
+        let log_index = 1_008 + offset;
+        let read = i64::try_from(100_700 + offset * 100).unwrap();
         let commit = read + 100;
         let start = i64::try_from(offset * 9).unwrap();
         block_on(
@@ -74,7 +102,7 @@ fn main() {
     let source = ElementId::new(10);
     let edge_type = EdgeTypeId::new(9);
     for degree in 0..32_u64 {
-        let log_index = 41 + degree;
+        let log_index = 1_017 + degree;
         let edge = ElementRef::edge(
             GraphId::new(1),
             PartitionId::new(0),
@@ -82,7 +110,7 @@ fn main() {
         );
         block_on(
             store.commit_edge(
-                context(log_index, 0, 10_000 + i64::try_from(degree).unwrap()),
+                context(log_index, 0, 200_000 + i64::try_from(degree).unwrap()),
                 EdgeMutation::put(
                     edge,
                     edge_type,

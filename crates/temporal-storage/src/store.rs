@@ -9,9 +9,10 @@ use storage_api::{
 use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
 use crate::diff::{TemporalChange, diff_projections};
+use crate::history::{MAX_CHAIN_ENTRIES, entry_for_commit, reconstruct};
 use crate::rewrite::rewrite_projection;
 use crate::{
-    EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryAnchor,
+    EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryEntry,
     KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError, VertexIdentity,
     current_edge_key, current_vertex_key, decode_graph_key, edge_identity_key, history_anchor_key,
     history_prefix, in_adjacency_key, in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix,
@@ -221,36 +222,32 @@ where
 
             let identity = VertexIdentity::new(mutation.element, mutation.label)?;
             self.validate_vertex_identity(&identity).await?;
-            let anchors = self.load_anchors(mutation.element).await?;
-            let latest = anchors.first();
-            if let Some(latest) = latest {
-                if latest.commit_ts() > context.commit_ts {
-                    return Err(TemporalStoreError::NonMonotonicCommit);
-                }
-                if latest.commit_ts() == context.commit_ts
-                    && context.log_index > self.adapter.applied_log_index()?
-                {
-                    return Err(TemporalStoreError::NonMonotonicCommit);
-                }
-            }
-
-            if anchors.iter().any(|anchor| {
-                anchor.commit_ts() > context.read_ts
-                    && anchor.commit_ts() < context.commit_ts
-                    && anchor.changed_valid().overlaps(&mutation.valid)
-            }) {
-                return Err(TemporalStoreError::WriteConflict);
-            }
-
+            let current = self.load_current_projection(mutation.element).await?;
+            self.validate_commit_frontier(
+                mutation.element,
+                current.as_ref(),
+                context,
+                mutation.valid,
+            )
+            .await?;
+            let recent_entries = self
+                .load_history_chain_at(mutation.element, context.commit_ts)
+                .await?;
             let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-            let base = latest.map_or(&empty, HistoryAnchor::projection);
+            let base = current.as_ref().unwrap_or(&empty);
             let projection = rewrite_projection(
                 base,
                 context.commit_ts,
                 mutation.valid,
-                mutation.replacement,
+                mutation.replacement.clone(),
             )?;
-            let anchor = HistoryAnchor::new(context.commit_ts, mutation.valid, projection.clone())?;
+            let history = entry_for_commit(
+                &recent_entries,
+                context.commit_ts,
+                mutation.valid,
+                mutation.replacement,
+                projection.clone(),
+            )?;
 
             let mutations = vec![
                 Mutation::put(0, vertex_identity_key(mutation.element), identity.encode()),
@@ -262,7 +259,7 @@ where
                 Mutation::put(
                     2,
                     history_anchor_key(mutation.element, context.commit_ts, 0),
-                    anchor.encode()?,
+                    history.encode()?,
                 ),
             ];
 
@@ -295,18 +292,32 @@ where
                 mutation.destination,
             )?;
             self.validate_edge_identity(&identity).await?;
-            let anchors = self.load_anchors(mutation.element).await?;
-            self.validate_commit_frontier(&anchors, context, mutation.valid)?;
-
+            let current = self.load_current_projection(mutation.element).await?;
+            self.validate_commit_frontier(
+                mutation.element,
+                current.as_ref(),
+                context,
+                mutation.valid,
+            )
+            .await?;
+            let recent_entries = self
+                .load_history_chain_at(mutation.element, context.commit_ts)
+                .await?;
             let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-            let base = anchors.first().map_or(&empty, HistoryAnchor::projection);
+            let base = current.as_ref().unwrap_or(&empty);
             let projection = rewrite_projection(
                 base,
                 context.commit_ts,
                 mutation.valid,
-                mutation.replacement,
+                mutation.replacement.clone(),
             )?;
-            let anchor = HistoryAnchor::new(context.commit_ts, mutation.valid, projection.clone())?;
+            let history = entry_for_commit(
+                &recent_entries,
+                context.commit_ts,
+                mutation.valid,
+                mutation.replacement,
+                projection.clone(),
+            )?;
             let projection_bytes = projection.encode()?;
             let out_key = out_adjacency_key(
                 mutation.element.graph(),
@@ -336,7 +347,7 @@ where
                 Mutation::put(
                     2,
                     history_anchor_key(mutation.element, context.commit_ts, 0),
-                    anchor.encode()?,
+                    history.encode()?,
                 ),
             ];
             if projection.segments().is_empty() {
@@ -385,10 +396,10 @@ where
         Box::pin(async move {
             require_vertex(element)?;
             Ok(self
-                .load_anchor_at(element, transaction_time)
+                .load_projection_at(element, transaction_time)
                 .await?
                 .as_ref()
-                .and_then(|anchor| anchor.projection().visible_at(valid_time))
+                .and_then(|projection| projection.visible_at(valid_time))
                 .cloned())
         })
     }
@@ -414,10 +425,10 @@ where
         Box::pin(async move {
             require_edge(element)?;
             Ok(self
-                .load_anchor_at(element, transaction_time)
+                .load_projection_at(element, transaction_time)
                 .await?
                 .as_ref()
-                .and_then(|anchor| anchor.projection().visible_at(valid_time))
+                .and_then(|projection| projection.visible_at(valid_time))
                 .cloned())
         })
     }
@@ -579,67 +590,119 @@ where
         Ok(projection.visible_at(valid_time).cloned())
     }
 
-    fn validate_commit_frontier(
+    async fn validate_commit_frontier(
         &self,
-        anchors: &[HistoryAnchor],
+        element: ElementRef,
+        current: Option<&ProjectionRecord>,
         context: CommitContext,
         changed_valid: Interval<ValidTime>,
     ) -> Result<(), TemporalStoreError> {
-        if let Some(latest) = anchors.first() {
-            if latest.commit_ts() > context.commit_ts {
+        if let Some(current) = current {
+            if current.commit_ts() > context.commit_ts {
                 return Err(TemporalStoreError::NonMonotonicCommit);
             }
-            if latest.commit_ts() == context.commit_ts
+            if current.commit_ts() == context.commit_ts
                 && context.log_index > self.adapter.applied_log_index()?
             {
                 return Err(TemporalStoreError::NonMonotonicCommit);
             }
         }
-        if anchors.iter().any(|anchor| {
-            anchor.commit_ts() > context.read_ts
-                && anchor.commit_ts() < context.commit_ts
-                && anchor.changed_valid().overlaps(&changed_valid)
+        let intervening = self
+            .load_history_between(element, context.read_ts, context.commit_ts)
+            .await?;
+        if intervening.iter().any(|entry| {
+            entry.commit_ts() > context.read_ts
+                && entry.commit_ts() < context.commit_ts
+                && entry.changed_valid().overlaps(&changed_valid)
         }) {
             return Err(TemporalStoreError::WriteConflict);
         }
         Ok(())
     }
 
-    async fn load_anchors(
+    async fn load_current_projection(
         &self,
         element: ElementRef,
-    ) -> Result<Vec<HistoryAnchor>, TemporalStoreError> {
-        let entries = self
-            .adapter
-            .scan(&KeySpan::prefix(
-                storage_api::Keyspace::History,
-                history_prefix(element),
-            ))
-            .await?;
-        entries
+    ) -> Result<Option<ProjectionRecord>, TemporalStoreError> {
+        let key = match element.kind() {
+            ElementKind::Vertex => current_vertex_key(element),
+            ElementKind::Edge => current_edge_key(element),
+        };
+        let mut values = self.adapter.multi_get(&[key]).await?;
+        values
+            .pop()
+            .flatten()
+            .map(|bytes| ProjectionRecord::decode(&bytes).map_err(TemporalStoreError::from))
+            .transpose()
+    }
+
+    async fn load_history_between(
+        &self,
+        element: ElementRef,
+        read_ts: TransactionTime,
+        commit_ts: TransactionTime,
+    ) -> Result<Vec<HistoryEntry>, TemporalStoreError> {
+        let start = history_anchor_key(element, commit_ts, 0)
+            .as_bytes()
+            .to_vec();
+        let end = history_anchor_key(element, read_ts, 0).as_bytes().to_vec();
+        let span = KeySpan::range(Keyspace::History, start, Some(end))
+            .expect("commit timestamp follows read timestamp in reversed key order");
+        self.adapter
+            .scan(&span)
+            .await?
             .into_iter()
-            .map(|entry| HistoryAnchor::decode(entry.value()).map_err(TemporalStoreError::from))
+            .map(|entry| HistoryEntry::decode(entry.value()).map_err(TemporalStoreError::from))
             .collect()
     }
 
-    async fn load_anchor_at(
+    async fn load_history_chain_at(
         &self,
         element: ElementRef,
         transaction_time: TransactionTime,
-    ) -> Result<Option<HistoryAnchor>, TemporalStoreError> {
+    ) -> Result<Vec<HistoryEntry>, TemporalStoreError> {
         let prefix = history_prefix(element);
         let start = history_anchor_key(element, transaction_time, 0)
             .as_bytes()
             .to_vec();
-        let span = KeySpan::prefix_from(Keyspace::History, prefix, start)
+        let first_span = KeySpan::prefix_from(Keyspace::History, prefix.clone(), start.clone())
             .expect("history seek key always starts with its element prefix")
             .with_limit(1)
             .expect("history seek limit is positive");
-        let mut entries = self.adapter.scan(&span).await?;
-        entries
-            .pop()
-            .map(|entry| HistoryAnchor::decode(entry.value()).map_err(TemporalStoreError::from))
-            .transpose()
+        let mut first = self.adapter.scan(&first_span).await?;
+        let Some(first) = first.pop() else {
+            return Ok(Vec::new());
+        };
+        let first = HistoryEntry::decode(first.value())?;
+        if first.is_anchor() {
+            return Ok(vec![first]);
+        }
+
+        let chain_span = KeySpan::prefix_from(Keyspace::History, prefix, start)
+            .expect("history seek key always starts with its element prefix")
+            .with_limit(MAX_CHAIN_ENTRIES)
+            .expect("history chain limit is positive");
+        let mut chain = Vec::new();
+        for entry in self.adapter.scan(&chain_span).await? {
+            let entry = HistoryEntry::decode(entry.value())?;
+            let is_anchor = entry.is_anchor();
+            chain.push(entry);
+            if is_anchor {
+                break;
+            }
+        }
+        Ok(chain)
+    }
+
+    async fn load_projection_at(
+        &self,
+        element: ElementRef,
+        transaction_time: TransactionTime,
+    ) -> Result<Option<ProjectionRecord>, TemporalStoreError> {
+        let entries = self
+            .load_history_chain_at(element, transaction_time)
+            .await?;
+        reconstruct(&entries)
     }
 
     async fn diff_element(
@@ -651,12 +714,9 @@ where
         if from_transaction > to_transaction {
             return Err(TemporalStoreError::InvalidDiffOrder);
         }
-        let before = self.load_anchor_at(element, from_transaction).await?;
-        let after = self.load_anchor_at(element, to_transaction).await?;
-        Ok(diff_projections(
-            before.as_ref().map(HistoryAnchor::projection),
-            after.as_ref().map(HistoryAnchor::projection),
-        ))
+        let before = self.load_projection_at(element, from_transaction).await?;
+        let after = self.load_projection_at(element, to_transaction).await?;
+        Ok(diff_projections(before.as_ref(), after.as_ref()))
     }
 }
 
@@ -668,6 +728,9 @@ pub enum TemporalStoreError {
     IdentityMismatch,
     WrongElementKind,
     UnexpectedAdjacencyKey,
+    UnexpectedHistoryAnchor,
+    MissingHistoryAnchor,
+    HistoryChainTooDeep,
     InvalidDiffOrder,
     Adapter(AdapterError),
     Record(RecordCodecError),
@@ -692,6 +755,15 @@ impl Display for TemporalStoreError {
             }
             Self::UnexpectedAdjacencyKey => {
                 formatter.write_str("adjacency scan returned an unexpected key type")
+            }
+            Self::UnexpectedHistoryAnchor => {
+                formatter.write_str("history delta chain contains an unexpected nested anchor")
+            }
+            Self::MissingHistoryAnchor => {
+                formatter.write_str("history delta chain does not terminate at an anchor")
+            }
+            Self::HistoryChainTooDeep => {
+                formatter.write_str("history delta chain exceeds the configured replay limit")
             }
             Self::InvalidDiffOrder => {
                 formatter.write_str("DIFF start transaction must not follow its end")

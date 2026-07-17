@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use temporal_storage::{
-    EdgeIdentity, EdgeTypeId, ElementId, ElementRef, GraphId, HistoryAnchor, LabelId, PartitionId,
-    ProjectionRecord, RecordCodecError, ValidSegment, VertexIdentity,
+    EdgeIdentity, EdgeTypeId, ElementId, ElementRef, GraphId, HistoryAnchor, HistoryDelta,
+    HistoryEntry, LabelId, PartitionId, ProjectionRecord, RecordCodecError, ValidSegment,
+    VertexIdentity,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -188,5 +189,50 @@ fn identity_constructor_rejects_the_wrong_element_kind() {
             ElementId::new(2),
         ),
         Err(RecordCodecError::WrongElementKind)
+    );
+}
+
+#[test]
+fn history_put_and_delete_deltas_round_trip_with_canonical_types() {
+    let put = HistoryDelta::put(
+        TransactionTime::new(300, 1),
+        interval(4, Some(7)),
+        payload("delta"),
+    );
+    let delete = HistoryDelta::delete(TransactionTime::new(400, 0), interval(8, None));
+
+    let put_bytes = put.encode().unwrap();
+    let delete_bytes = delete.encode().unwrap();
+
+    assert_eq!(&put_bytes[..4], b"DTGD");
+    assert_eq!(HistoryDelta::decode(&put_bytes).unwrap(), put);
+    assert_eq!(HistoryDelta::decode(&delete_bytes).unwrap(), delete);
+    assert_eq!(
+        HistoryEntry::decode(&put_bytes).unwrap(),
+        HistoryEntry::Delta(put)
+    );
+    assert_eq!(
+        HistoryEntry::decode(&delete_bytes).unwrap(),
+        HistoryEntry::Delta(delete)
+    );
+}
+
+#[test]
+fn history_entry_dispatches_anchors_and_rejects_delta_corruption() {
+    let commit = TransactionTime::new(100, 0);
+    let projection = ProjectionRecord::new(commit, Vec::new()).unwrap();
+    let anchor = HistoryAnchor::new(commit, interval(1, None), projection).unwrap();
+    assert_eq!(
+        HistoryEntry::decode(&anchor.encode().unwrap()).unwrap(),
+        HistoryEntry::Anchor(anchor)
+    );
+
+    let delta = HistoryDelta::put(commit, interval(1, None), payload("value"));
+    let mut corrupt = delta.encode().unwrap();
+    let payload_byte = corrupt.len() - 9;
+    corrupt[payload_byte] ^= 1;
+    assert_eq!(
+        HistoryDelta::decode(&corrupt),
+        Err(RecordCodecError::ChecksumMismatch)
     );
 }

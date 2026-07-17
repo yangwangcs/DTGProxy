@@ -241,9 +241,26 @@ fn as_of_seek_decodes_only_the_first_eligible_anchor() {
         VertexMutation::put(vertex(), label, interval(4, Some(7)), payload("new")).unwrap(),
     ))
     .unwrap();
+    for log_index in 3..=18 {
+        let read = i64::try_from((log_index - 1) * 100).unwrap();
+        let commit = i64::try_from(log_index * 100).unwrap();
+        block_on(
+            store.commit_vertex(
+                context(log_index, read, commit),
+                VertexMutation::put(
+                    vertex(),
+                    label,
+                    interval(20, Some(21)),
+                    payload(&format!("filler-{log_index}")),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    }
     block_on(store.adapter().apply_committed(CommittedMutationBatch {
         shard_id: 3,
-        log_index: 3,
+        log_index: 19,
         txn_id: 999,
         mutations: vec![Mutation::put(
             0,
@@ -254,9 +271,9 @@ fn as_of_seek_decodes_only_the_first_eligible_anchor() {
     .unwrap();
 
     assert_eq!(
-        block_on(store.vertex_as_of(vertex(), valid(5), tx(250))).unwrap(),
+        block_on(store.vertex_as_of(vertex(), valid(5), tx(1850))).unwrap(),
         Some(payload("new")),
-        "the latest eligible anchor must be selected without decoding older records"
+        "replay must stop at the nearest anchor without decoding older records"
     );
     assert_eq!(
         block_on(store.vertex_as_of(vertex(), valid(5), tx(150))),

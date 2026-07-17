@@ -15,9 +15,10 @@ The repository is being delivered in independently verifiable phases. The implem
 - `dtgproxy`: executable product entry point.
 
 Phase 0, the Phase 1A durable adapter, and the Phase 1B temporal persistence slice are
-implemented and tested. Bounded Anchor+Delta history, replicated shard runtime, distributed
-transactions, query execution, external database adapters, and analytics integration remain
-active implementation phases described by the design.
+implemented and tested. Bounded Anchor+Delta history is also implemented in Phase 1C. Atomic
+multi-element transactions, the local query frontend, replicated shard runtime, distributed
+transactions, external database adapters, and analytics integration remain active implementation
+phases described by the design.
 
 The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
 `adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column
@@ -50,7 +51,11 @@ Phase 1B intentionally stores a full projection anchor for every changed element
 is the correctness baseline and makes read-back simple and auditable, but write amplification is
 linear in an element's valid-time segment count. Its initial AS OF implementation scanned the
 complete element prefix. Phase 1C now uses a bounded reverse-time seek and decodes exactly one
-eligible full anchor; Anchor+Delta replay and compaction remain the next storage-format step.
+eligible record. History now starts with an Anchor, writes at most 15 bounded Deltas, and forces a
+new Anchor when either that replay count or a 64 KiB encoded-delta budget would be exceeded.
+Readers seek directly to the requested transaction time and replay backward only to the nearest
+Anchor. Missing or over-limit chains fail closed. Phase 1B full-anchor records remain readable and
+can serve as migration anchors for new Deltas.
 
 ## Performance probe
 
@@ -83,6 +88,14 @@ After adding prefix-constrained range seek plus a one-record scan limit, the sam
 98.8% reduction respectively versus the Phase 1B baseline. Current lookup remained 7,697 ns/op,
 degree-32 expansion 29,440 ns/op, and synchronous correction 424,380 ns/op. The next benchmark
 gate is bounded Anchor+Delta replay and write bytes, not further tuning of the full-anchor format.
+
+With 1,008 commits on one element, the Anchor+Delta benchmark measured 5,684 ns/op at replay
+depth 1, 20,457 ns/op at the maximum replay depth 16, and 13,528 ns/op for a snapshot 1,000
+versions behind the current state. Actual History values occupied 100,827 bytes (100 bytes/record)
+versus 148,077 hypothetical bytes if every commit were a full Anchor, a 31.9% reduction for this
+single-segment workload. Current lookup measured 3,095 ns/op, synchronous correction 131,046
+ns/op, and degree-32 expansion 29,456 ns/op. These results are the baseline for multi-segment and
+transaction benchmarks, not production SLOs.
 
 ## Development
 

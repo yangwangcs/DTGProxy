@@ -49,20 +49,26 @@ Current lookup measured 7,697 ns/op, synchronous correction 424,380 ns/op, degre
 
 **Files:** `temporal-storage/src/record.rs`, new `history.rs`, store/rewrite/tests.
 
-- [ ] Write failing codec tests for `HistoryDelta` Put/Delete changes, canonical payloads,
+- [x] Write failing codec tests for `HistoryDelta` Put/Delete changes, canonical payloads,
   corruption, and mixed Anchor/Delta chains.
-- [ ] Introduce `HistoryEntry::{Anchor, Delta}` decoding by magic. A Delta stores `commit_ts`,
+- [x] Introduce `HistoryEntry::{Anchor, Delta}` decoding by magic. A Delta stores `commit_ts`,
   exact changed valid interval, and optional canonical replacement.
-- [ ] Use an explicit policy (initial anchor, then at most 15 deltas) and force an anchor when
+- [x] Use an explicit policy (initial anchor, then at most 15 deltas) and force an anchor when
   replay-count or encoded-byte thresholds are reached.
-- [ ] Reconstruct AS OF by bounded seek, scanning older entries only until the first Anchor,
+- [x] Reconstruct AS OF by bounded seek, scanning older entries only until the first Anchor,
   reversing collected deltas, and applying the shared deterministic interval rewrite.
-- [ ] Use entry metadata for bounded conflict scans over `(read_ts, commit_ts)` rather than
+- [x] Use entry metadata for bounded conflict scans over `(read_ts, commit_ts)` rather than
   decoding all element history.
-- [ ] Add restart/checkpoint, randomized equivalence, corrupt-chain, maximum-depth, and migration
+- [x] Add restart/checkpoint, randomized equivalence, corrupt-chain, maximum-depth, and migration
   tests from Phase 1B full-anchor data.
-- [ ] Benchmark history depths 1/16/1,000 and record bytes per correction; commit as
+- [x] Benchmark history depths 1/16/1,000 and record bytes per correction; commit as
   `feat: add bounded anchor delta history`.
+
+Task 2 benchmark evidence (`DTGPROXY_BENCH_ITERS=200`, 1,008 element commits): replay depth 1
+5,684 ns/op; maximum replay depth 16 20,457 ns/op; snapshot age 1,000 13,528 ns/op; Current
+lookup 3,095 ns/op; synchronous correction 131,046 ns/op; degree-32 expansion 29,456 ns/op.
+History values used 100,827 bytes versus 148,077 hypothetical all-anchor bytes, a 31.9%
+reduction on the single-segment workload.
 
 ### Task 3: Atomic Multi-element Single-node Transactions
 
