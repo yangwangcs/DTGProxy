@@ -422,10 +422,21 @@ git status --short
 
 Expected: formatting, Clippy, and tests exit 0; version output is `DTGProxy 0.1.0`; search has no matches; Git status only contains intentionally uncommitted Task 6 files before the commit.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/dtgproxy README.md docs && git commit -m "feat: deliver DTGProxy phase zero kernel"`
 
-- [ ] **Step 6: Record actual evidence**
+- [x] **Step 6: Record actual evidence**
 
 Update this plan's completed checkboxes only after each command has produced its expected result. Do not mark the overall DTGProxy goal complete: RocksDB persistence, consensus, distributed transactions, query execution, external adapters, analytics, and production operations remain Phase 1–6 work.
+
+## Actual Evidence
+
+Recorded on 2026-07-17 for implementation commit `d500705`:
+
+- `cargo fmt --all -- --check`: exit 0.
+- `cargo clippy --workspace --all-targets -- -D warnings`: exit 0.
+- `cargo test --workspace`: 20 behavioral tests passed, 0 failed.
+- `cargo run -q -p dtgproxy -- --version`: printed `DTGProxy 0.1.0`.
+- Brand and placeholder scan: no matches outside ignored build artifacts.
+- Implementation branch: `feature/dtgproxy-phase0`.
