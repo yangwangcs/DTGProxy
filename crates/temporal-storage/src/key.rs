@@ -247,6 +247,20 @@ pub fn history_anchor_key(
 }
 
 #[must_use]
+pub fn out_adjacency_prefix(graph: GraphId, partition: PartitionId, source: ElementId) -> Vec<u8> {
+    adjacency_prefix(TAG_ADJ_OUT, graph, partition, source)
+}
+
+#[must_use]
+pub fn in_adjacency_prefix(
+    graph: GraphId,
+    partition: PartitionId,
+    destination: ElementId,
+) -> Vec<u8> {
+    adjacency_prefix(TAG_ADJ_IN, graph, partition, destination)
+}
+
+#[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn out_adjacency_key(
     graph: GraphId,
@@ -404,6 +418,15 @@ fn adjacency_key(
     key.extend_from_slice(&second.value().to_be_bytes());
     key.extend_from_slice(&edge.value().to_be_bytes());
     LogicalKey::in_keyspace(keyspace, key)
+}
+
+fn adjacency_prefix(tag: u8, graph: GraphId, partition: PartitionId, first: ElementId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(29);
+    key.push(tag);
+    key.extend_from_slice(&graph.value().to_be_bytes());
+    key.extend_from_slice(&partition.value().to_be_bytes());
+    key.extend_from_slice(&first.value().to_be_bytes());
+    key
 }
 
 fn encode_transaction_time(value: TransactionTime) -> [u8; 12] {

@@ -143,15 +143,15 @@ RocksDB adapters; no unstable/default serializers in the durable format.
 
 **Produces:** edge mutation/read APIs plus `expand_out_current` and `expand_in_current`.
 
-- [ ] Write failing tests for typed edge round-trip, immutable identity, both adjacency
+- [x] Write failing tests for typed edge round-trip, immutable identity, both adjacency
   directions, exact valid-time filtering, partial delete, fully absent Current adjacency removal,
   AS OF edge reads, and atomic rollback on a malformed edge batch.
-- [ ] Implement edge identity records containing immutable source, destination, and edge type.
-- [ ] Atomically write Current edge, History anchor, and both adjacency keys. Adjacency values
+- [x] Implement edge identity records containing immutable source, destination, and edge type.
+- [x] Atomically write Current edge, History anchor, and both adjacency keys. Adjacency values
   point to the canonical Current edge record; delete both keys only when the latest projection
   contains no present valid segment.
-- [ ] Implement ordered prefix expansions and residual exact-time filtering.
-- [ ] Run vertex/edge suites plus both adapter contracts; commit as
+- [x] Implement ordered prefix expansions and residual exact-time filtering.
+- [x] Run vertex/edge suites plus both adapter contracts; commit as
   `feat: persist bitemporal edges and adjacency`.
 
 ### Task 6: Temporal DIFF and RocksDB End-to-End Proof
