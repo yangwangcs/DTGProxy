@@ -1,0 +1,325 @@
+use std::cmp::{max, min};
+
+use storage_api::{Keyspace, LogicalKey, StorageAdapter};
+use temporal_types::TransactionTime;
+
+use crate::ShardRuntimeError;
+
+const META_PREFIX: &[u8] = b"\x01dtg/replica/v1/";
+const POSITION_KEY: &[u8] = b"\x01dtg/replica/v1/position";
+const CLOSED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/closed-ts";
+const RESOLVED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/resolved-ts";
+const ADAPTER_APPLIED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/adapter-applied-ts";
+const ENTRY_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/entry/";
+const META_VERSION: u16 = 1;
+const POSITION_MAGIC: [u8; 4] = *b"DTRP";
+const TIMESTAMP_MAGIC: [u8; 4] = *b"DTTM";
+const ENTRY_DIGEST_MAGIC: [u8; 4] = *b"DTRE";
+const POSITION_VALUE_BYTES: usize = 38;
+const TIMESTAMP_VALUE_BYTES: usize = 22;
+const ENTRY_DIGEST_VALUE_BYTES: usize = 50;
+
+pub const MIN_REPLICA_TIME: TransactionTime = TransactionTime::new(i64::MIN, 0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplicaMetadata {
+    pub shard_id: u32,
+    pub placement_epoch: u64,
+    pub last_term: u64,
+    pub applied_index: u64,
+    pub closed_ts: TransactionTime,
+    pub resolved_ts: TransactionTime,
+    pub adapter_applied_ts: TransactionTime,
+}
+
+impl ReplicaMetadata {
+    pub(crate) const fn initial(shard_id: u32, placement_epoch: u64) -> Self {
+        Self {
+            shard_id,
+            placement_epoch,
+            last_term: 0,
+            applied_index: 0,
+            closed_ts: MIN_REPLICA_TIME,
+            resolved_ts: MIN_REPLICA_TIME,
+            adapter_applied_ts: MIN_REPLICA_TIME,
+        }
+    }
+
+    #[must_use]
+    pub fn safe_ts(&self) -> TransactionTime {
+        min(
+            self.closed_ts,
+            min(self.resolved_ts, self.adapter_applied_ts),
+        )
+    }
+
+    pub(crate) fn after_apply(self, term: u64, index: u64, commit_ts: TransactionTime) -> Self {
+        Self {
+            last_term: term,
+            applied_index: index,
+            adapter_applied_ts: commit_ts,
+            ..self
+        }
+    }
+
+    pub(crate) fn after_tick(self, term: u64, index: u64, closed_ts: TransactionTime) -> Self {
+        Self {
+            last_term: term,
+            applied_index: index,
+            closed_ts,
+            resolved_ts: closed_ts,
+            adapter_applied_ts: max(self.adapter_applied_ts, closed_ts),
+            ..self
+        }
+    }
+}
+
+pub(crate) async fn load_metadata<A: StorageAdapter>(
+    adapter: &A,
+    shard_id: u32,
+    placement_epoch: u64,
+) -> Result<ReplicaMetadata, ShardRuntimeError> {
+    let keys = [
+        position_key(),
+        closed_ts_key(),
+        resolved_ts_key(),
+        adapter_applied_ts_key(),
+    ];
+    let values = adapter.multi_get(&keys).await?;
+    let adapter_index = adapter.applied_log_index()?;
+    let mut values = values.into_iter();
+    let position = values.next().flatten();
+    let closed = values.next().flatten();
+    let resolved = values.next().flatten();
+    let adapter_applied = values.next().flatten();
+    if position.is_none() {
+        if closed.is_some() || resolved.is_some() || adapter_applied.is_some() {
+            return Err(ShardRuntimeError::CorruptMetadata { record: "position" });
+        }
+        if adapter_index != 0 {
+            return Err(ShardRuntimeError::MetadataIndexMismatch {
+                metadata: 0,
+                adapter: adapter_index,
+            });
+        }
+        return Ok(ReplicaMetadata::initial(shard_id, placement_epoch));
+    }
+
+    let (stored_shard, stored_epoch, last_term, applied_index) =
+        decode_position(position.as_deref().expect("position checked as present"))?;
+    if stored_shard != shard_id {
+        return Err(ShardRuntimeError::ShardMismatch {
+            expected: shard_id,
+            actual: stored_shard,
+        });
+    }
+    if stored_epoch != placement_epoch {
+        return Err(ShardRuntimeError::StaleEpoch {
+            expected: stored_epoch,
+            actual: placement_epoch,
+        });
+    }
+    if applied_index != adapter_index {
+        return Err(ShardRuntimeError::MetadataIndexMismatch {
+            metadata: applied_index,
+            adapter: adapter_index,
+        });
+    }
+    Ok(ReplicaMetadata {
+        shard_id,
+        placement_epoch,
+        last_term,
+        applied_index,
+        closed_ts: decode_optional_timestamp(closed, "closed-ts")?,
+        resolved_ts: decode_optional_timestamp(resolved, "resolved-ts")?,
+        adapter_applied_ts: decode_optional_timestamp(adapter_applied, "adapter-applied-ts")?,
+    })
+}
+
+fn decode_optional_timestamp(
+    bytes: Option<Vec<u8>>,
+    record: &'static str,
+) -> Result<TransactionTime, ShardRuntimeError> {
+    bytes
+        .map(|bytes| decode_timestamp(&bytes, record))
+        .transpose()
+        .map(|timestamp| timestamp.unwrap_or(MIN_REPLICA_TIME))
+}
+
+pub(crate) fn is_reserved_metadata_key(key: &LogicalKey) -> bool {
+    key.keyspace() == Keyspace::Meta && key.as_bytes().starts_with(META_PREFIX)
+}
+
+pub(crate) fn position_key() -> LogicalKey {
+    meta_key(POSITION_KEY.to_vec())
+}
+
+pub(crate) fn closed_ts_key() -> LogicalKey {
+    meta_key(CLOSED_TS_KEY.to_vec())
+}
+
+pub(crate) fn resolved_ts_key() -> LogicalKey {
+    meta_key(RESOLVED_TS_KEY.to_vec())
+}
+
+pub(crate) fn adapter_applied_ts_key() -> LogicalKey {
+    meta_key(ADAPTER_APPLIED_TS_KEY.to_vec())
+}
+
+pub(crate) fn entry_digest_key(index: u64) -> LogicalKey {
+    let mut key = Vec::with_capacity(ENTRY_DIGEST_PREFIX.len() + 8);
+    key.extend_from_slice(ENTRY_DIGEST_PREFIX);
+    key.extend_from_slice(&index.to_be_bytes());
+    meta_key(key)
+}
+
+fn meta_key(bytes: Vec<u8>) -> LogicalKey {
+    LogicalKey::in_keyspace(Keyspace::Meta, bytes)
+}
+
+pub(crate) fn encode_position(metadata: ReplicaMetadata) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(POSITION_VALUE_BYTES);
+    bytes.extend_from_slice(&POSITION_MAGIC);
+    bytes.extend_from_slice(&META_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&metadata.shard_id.to_be_bytes());
+    bytes.extend_from_slice(&metadata.placement_epoch.to_be_bytes());
+    bytes.extend_from_slice(&metadata.last_term.to_be_bytes());
+    bytes.extend_from_slice(&metadata.applied_index.to_be_bytes());
+    append_checksum(&mut bytes);
+    bytes
+}
+
+fn decode_position(bytes: &[u8]) -> Result<(u32, u64, u64, u64), ShardRuntimeError> {
+    validate_record(bytes, POSITION_VALUE_BYTES, POSITION_MAGIC, "position")?;
+    Ok((
+        u32::from_be_bytes(bytes[6..10].try_into().expect("fixed position slice")),
+        u64::from_be_bytes(bytes[10..18].try_into().expect("fixed position slice")),
+        u64::from_be_bytes(bytes[18..26].try_into().expect("fixed position slice")),
+        u64::from_be_bytes(bytes[26..34].try_into().expect("fixed position slice")),
+    ))
+}
+
+pub(crate) fn encode_timestamp(timestamp: TransactionTime) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(TIMESTAMP_VALUE_BYTES);
+    bytes.extend_from_slice(&TIMESTAMP_MAGIC);
+    bytes.extend_from_slice(&META_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&timestamp.physical_micros().to_be_bytes());
+    bytes.extend_from_slice(&timestamp.logical().to_be_bytes());
+    append_checksum(&mut bytes);
+    bytes
+}
+
+fn decode_timestamp(
+    bytes: &[u8],
+    record: &'static str,
+) -> Result<TransactionTime, ShardRuntimeError> {
+    validate_record(bytes, TIMESTAMP_VALUE_BYTES, TIMESTAMP_MAGIC, record)?;
+    Ok(TransactionTime::new(
+        i64::from_be_bytes(bytes[6..14].try_into().expect("fixed timestamp slice")),
+        u32::from_be_bytes(bytes[14..18].try_into().expect("fixed timestamp slice")),
+    ))
+}
+
+pub(crate) fn encode_entry_digest(term: u64, digest: [u8; 32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ENTRY_DIGEST_VALUE_BYTES);
+    bytes.extend_from_slice(&ENTRY_DIGEST_MAGIC);
+    bytes.extend_from_slice(&META_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&term.to_be_bytes());
+    bytes.extend_from_slice(&digest);
+    append_checksum(&mut bytes);
+    bytes
+}
+
+pub(crate) fn decode_entry_digest(bytes: &[u8]) -> Result<(u64, [u8; 32]), ShardRuntimeError> {
+    validate_record(
+        bytes,
+        ENTRY_DIGEST_VALUE_BYTES,
+        ENTRY_DIGEST_MAGIC,
+        "entry-digest",
+    )?;
+    Ok((
+        u64::from_be_bytes(bytes[6..14].try_into().expect("fixed entry digest slice")),
+        bytes[14..46]
+            .try_into()
+            .expect("fixed entry digest hash slice"),
+    ))
+}
+
+fn append_checksum(bytes: &mut Vec<u8>) {
+    let checksum = crc32fast::hash(bytes);
+    bytes.extend_from_slice(&checksum.to_be_bytes());
+}
+
+fn validate_record(
+    bytes: &[u8],
+    expected_length: usize,
+    magic: [u8; 4],
+    record: &'static str,
+) -> Result<(), ShardRuntimeError> {
+    if bytes.len() != expected_length || bytes[..4] != magic {
+        return Err(ShardRuntimeError::CorruptMetadata { record });
+    }
+    if u16::from_be_bytes(
+        bytes[4..6]
+            .try_into()
+            .expect("fixed metadata version slice"),
+    ) != META_VERSION
+    {
+        return Err(ShardRuntimeError::CorruptMetadata { record });
+    }
+    let checksum_offset = bytes.len() - 4;
+    let stored = u32::from_be_bytes(
+        bytes[checksum_offset..]
+            .try_into()
+            .expect("fixed metadata checksum slice"),
+    );
+    if crc32fast::hash(&bytes[..checksum_offset]) != stored {
+        return Err(ShardRuntimeError::CorruptMetadata { record });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ENTRY_DIGEST_VALUE_BYTES, ReplicaMetadata, decode_entry_digest, decode_position,
+        decode_timestamp, encode_entry_digest, encode_position, encode_timestamp,
+    };
+    use crate::ShardRuntimeError;
+    use temporal_types::TransactionTime;
+
+    #[test]
+    fn replica_metadata_codecs_round_trip_and_reject_corruption() {
+        let metadata = ReplicaMetadata {
+            shard_id: 7,
+            placement_epoch: 9,
+            last_term: 11,
+            applied_index: 13,
+            closed_ts: TransactionTime::new(17, 1),
+            resolved_ts: TransactionTime::new(17, 1),
+            adapter_applied_ts: TransactionTime::new(19, 2),
+        };
+        assert_eq!(
+            decode_position(&encode_position(metadata)).unwrap(),
+            (7, 9, 11, 13)
+        );
+        assert_eq!(
+            decode_timestamp(&encode_timestamp(metadata.closed_ts), "test").unwrap(),
+            metadata.closed_ts
+        );
+        let digest = [23_u8; 32];
+        assert_eq!(
+            decode_entry_digest(&encode_entry_digest(29, digest)).unwrap(),
+            (29, digest)
+        );
+
+        let mut corrupted = encode_entry_digest(29, digest);
+        corrupted[ENTRY_DIGEST_VALUE_BYTES / 2] ^= 1;
+        assert!(matches!(
+            decode_entry_digest(&corrupted),
+            Err(ShardRuntimeError::CorruptMetadata {
+                record: "entry-digest"
+            })
+        ));
+    }
+}

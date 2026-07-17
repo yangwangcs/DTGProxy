@@ -1,0 +1,21 @@
+[package]
+name = "shard-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = "=1.8.5"
+crc32fast = "=1.5.0"
+raft-command = { path = "../raft-command" }
+storage-api = { path = "../storage-api" }
+temporal-types = { path = "../temporal-types" }
+
+[dev-dependencies]
+adapter-memory = { path = "../adapter-memory" }
+adapter-rocksdb = { path = "../adapter-rocksdb" }
+tempfile = "3"
+
+[lints]
+workspace = true

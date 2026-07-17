@@ -63,15 +63,15 @@ Folly/Thrift/C++ source is copied. Sources: [raft-rs](https://github.com/tikv/ra
 
 **Files:** new `shard-runtime` crate, runtime metadata keys/codecs, Memory/Rocks TCK.
 
-- [ ] Apply a decoded command at a supplied `(term, index)` and reject gaps, shard/epoch mismatch,
+- [x] Apply a decoded command at a supplied `(term, index)` and reject gaps, shard/epoch mismatch,
   non-monotonic commit time, and divergent replay before mutation.
-- [ ] Append deterministic Meta mutations so term/index/epoch/watermarks and business records share
+- [x] Append deterministic Meta mutations so term/index/epoch/watermarks and business records share
   the Adapter's one atomic batch.
-- [ ] Implement replicated Closed-Timestamp Tick and calculate `safe_ts` from durable components.
-- [ ] Recover runtime metadata from Memory/RocksDB restart and prove duplicate Apply is idempotent.
-- [ ] Inject Adapter failure and prove the replica stops serving/advancing safe time until replay
+- [x] Implement replicated Closed-Timestamp Tick and calculate `safe_ts` from durable components.
+- [x] Recover runtime metadata from Memory/RocksDB restart and prove duplicate Apply is idempotent.
+- [x] Inject Adapter failure and prove the replica stops serving/advancing safe time until replay
   catches it up.
-- [ ] Commit as `feat: apply deterministic shard state`.
+- [x] Commit as `feat: apply deterministic shard state`.
 
 ### Task 4: Three-node raft-rs Group with Deterministic Transport
 
