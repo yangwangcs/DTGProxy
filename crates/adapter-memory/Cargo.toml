@@ -1,0 +1,13 @@
+[package]
+name = "adapter-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+storage-api = { path = "../storage-api" }
+
+[lints]
+workspace = true
+
