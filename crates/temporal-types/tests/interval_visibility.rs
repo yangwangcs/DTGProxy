@@ -15,6 +15,7 @@ fn interval_is_half_open_and_rejects_empty_ranges() {
     assert!(interval.contains(valid(10)));
     assert!(interval.contains(valid(19)));
     assert!(!interval.contains(valid(20)));
+    assert_eq!(interval.end(), Some(valid(20)));
     assert!(Interval::new(valid(10), Some(valid(10))).is_err());
 }
 

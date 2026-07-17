@@ -45,6 +45,11 @@ where
     }
 
     #[must_use]
+    pub const fn end(&self) -> Option<T> {
+        self.end
+    }
+
+    #[must_use]
     pub fn contains(&self, value: T) -> bool {
         value >= self.start && self.end.is_none_or(|end| value < end)
     }

@@ -95,17 +95,17 @@ RocksDB adapters; no unstable/default serializers in the durable format.
 **Produces:** `VertexIdentity`, `EdgeIdentity`, `ValidSegment`, `ProjectionRecord`, and
 `HistoryAnchor` codecs.
 
-- [ ] Write failing golden-vector and round-trip tests covering vertices, edges, finite and
+- [x] Write failing golden-vector and round-trip tests covering vertices, edges, finite and
   unbounded valid intervals, empty projections, multiple disjoint segments, every canonical
   graph value type, checksum mismatch, duplicate/overlapping segments, wrong magic/version,
   truncation, and trailing bytes.
-- [ ] Implement versioned values with independent magics for identity, projection, and anchor.
+- [x] Implement versioned values with independent magics for identity, projection, and anchor.
   Embed length-delimited `CanonicalElement::encode()` bytes and a deterministic FNV-1a checksum.
-- [ ] Validate strict increasing/disjoint half-open valid segments during construction and decode.
-- [ ] Make `HistoryAnchor` carry `commit_ts`, the exact changed valid interval, and the complete
+- [x] Validate strict increasing/disjoint half-open valid segments during construction and decode.
+- [x] Make `HistoryAnchor` carry `commit_ts`, the exact changed valid interval, and the complete
   projection at that transaction time. This metadata enables overlap conflict checks without
   comparing entire states.
-- [ ] Run record/codec regressions and commit as `feat: encode temporal projection records`.
+- [x] Run record/codec regressions and commit as `feat: encode temporal projection records`.
 
 ### Task 4: Vertex Rewriter and Current/AS OF Reads
 
