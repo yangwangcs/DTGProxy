@@ -114,14 +114,14 @@ logical rows/fingerprints, and exercise every publication/compaction crash bound
 
 **Files:** shard request API, ReadIndex/lease state, query-executor routing adapter.
 
-- [ ] Define leader-linearizable and follower-snapshot read modes with explicit retryable
+- [x] Define leader-linearizable and follower-snapshot read modes with explicit retryable
   `NotLeader`, `StaleEpoch`, `NotReady`, and `AdapterLagging` errors.
-- [ ] Leader reads wait for ReadIndex apply. Follower reads require `safe_ts >= read_ts`, applied
+- [x] Leader reads wait for ReadIndex apply. Follower reads require `safe_ts >= read_ts`, applied
   ReadIndex/lease proof, matching epoch, and healthy Adapter.
-- [ ] Replicate ticks on idle shards and prove safe time advances without writes but never crosses
+- [x] Replicate ticks on idle shards and prove safe time advances without writes but never crosses
   an unapplied commit.
-- [ ] Execute typed Temporal IR through the shard read API without direct Adapter access.
-- [ ] Commit as `feat: enforce replicated temporal read barriers`.
+- [x] Execute typed Temporal IR through the shard read API without direct Adapter access.
+- [x] Commit as `feat: enforce replicated temporal read barriers`.
 
 ### Task 7: Phase 2 Acceptance
 

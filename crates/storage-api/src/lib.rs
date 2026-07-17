@@ -398,6 +398,34 @@ pub trait StorageAdapter: Send + Sync {
     fn applied_log_index(&self) -> Result<u64, AdapterError>;
 }
 
+impl<T> StorageAdapter for &T
+where
+    T: StorageAdapter + ?Sized,
+{
+    fn capabilities(&self) -> AdapterCapabilities {
+        (**self).capabilities()
+    }
+
+    fn apply_committed<'a>(
+        &'a self,
+        batch: CommittedMutationBatch,
+    ) -> AdapterFuture<'a, ApplyReceipt> {
+        (**self).apply_committed(batch)
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        (**self).multi_get(keys)
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        (**self).scan(span)
+    }
+
+    fn applied_log_index(&self) -> Result<u64, AdapterError> {
+        (**self).applied_log_index()
+    }
+}
+
 fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     for index in (0..end.len()).rev() {

@@ -41,7 +41,7 @@ The durable layout has eight stable RocksDB Column Families: `meta`, `identity`,
 Family is also present because RocksDB requires it, but DTGProxy does not place logical data
 there.
 
-The approved architecture and remaining distributed phases are specified in [the detailed design](docs/superpowers/specs/2026-07-17-dtgproxy-design.md). The durable replicated command layout is specified in [Raft Command V1](docs/raft-command-v1.md), its local apply/recovery contract is described in [the Shard state machine](docs/shard-state-machine.md), the WAL restart rules in [Durable Raft WAL](docs/raft-wal.md), generation-based recovery in [Replica Snapshot](docs/replica-snapshot.md), and the three-replica consensus harness in [the replicated Shard Group](docs/replicated-shard-group.md).
+The approved architecture and remaining distributed phases are specified in [the detailed design](docs/superpowers/specs/2026-07-17-dtgproxy-design.md). The durable replicated command layout is specified in [Raft Command V1](docs/raft-command-v1.md), its local apply/recovery contract is described in [the Shard state machine](docs/shard-state-machine.md), the WAL restart rules in [Durable Raft WAL](docs/raft-wal.md), generation-based recovery in [Replica Snapshot](docs/replica-snapshot.md), the three-replica consensus harness in [the replicated Shard Group](docs/replicated-shard-group.md), and authorized leader/Follower reads in [Consistent Shard Read Barriers](docs/read-barriers.md).
 
 ## Temporal persistence slice
 

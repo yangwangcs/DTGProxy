@@ -573,6 +573,8 @@ version = "0.1.0"
 dependencies = [
  "adapter-memory",
  "adapter-rocksdb",
+ "raft-command",
+ "shard-runtime",
  "storage-api",
  "tempfile",
  "temporal-ir",

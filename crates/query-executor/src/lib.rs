@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod shard_query;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::Write as _;
@@ -16,6 +18,8 @@ use temporal_storage::{
     TemporalStore, TemporalStoreError,
 };
 use temporal_types::{CanonicalElement, CodecError};
+
+pub use shard_query::{ShardQueryError, ShardQueryExecutor};
 
 pub type ExecutorFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ExecutorError>> + Send + 'a>>;

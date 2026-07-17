@@ -1,15 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use adapter_memory::MemoryAdapter;
 use raft::eraftpb::{Entry, EntryType, Message};
 use raft::storage::MemStorage;
-use raft::{Config, RawNode, StateRole};
+use raft::{Config, RawNode, ReadState, StateRole};
 use raft_command::CommandEnvelopeV1;
 use slog::{Logger, o};
+use temporal_types::TransactionTime;
 
-use crate::{DeterministicTransport, ReplicaMetadata, ShardRuntimeError, ShardStateMachine};
+use crate::{
+    DeterministicTransport, FollowerReadProof, ReadBarrierError, ReadPermit, ReadPermitMode,
+    ReplicaMetadata, ShardRuntimeError, ShardStateMachine,
+};
 
 const DEFAULT_MAX_DRIVE_ROUNDS: usize = 1_024;
 
@@ -124,6 +128,14 @@ struct AppliedEvent {
 struct ReadyOutput {
     messages: Vec<Message>,
     events: Vec<AppliedEvent>,
+    read_states: Vec<ReadState>,
+}
+
+#[derive(Clone, Copy)]
+struct CompletedReadState {
+    node_id: u64,
+    term: u64,
+    index: u64,
 }
 
 struct RaftReplica {
@@ -191,6 +203,20 @@ impl RaftReplica {
             .map_err(|error| ReplicationError::Raft(error.to_string()))
     }
 
+    fn request_read_index(&mut self, context: Vec<u8>) -> Result<(), ReplicationError> {
+        self.raw_node
+            .as_mut()
+            .ok_or(ReplicationError::NodeStopped {
+                node_id: self.node_id,
+            })?
+            .read_index(context);
+        Ok(())
+    }
+
+    fn current_term(&self) -> Option<u64> {
+        self.raw_node.as_ref().map(|node| node.raft.term)
+    }
+
     fn step(&mut self, message: Message) -> Result<(), ReplicationError> {
         let Some(raw_node) = self.raw_node.as_mut() else {
             return Ok(());
@@ -221,11 +247,13 @@ impl RaftReplica {
             return Ok(ReadyOutput {
                 messages: Vec::new(),
                 events: Vec::new(),
+                read_states: Vec::new(),
             });
         }
         let applied_by_leader = raw_node.raft.state == StateRole::Leader;
         let mut ready = raw_node.ready();
         let mut messages = ready.take_messages();
+        let read_states = ready.take_read_states();
 
         if !ready.snapshot().is_empty() {
             self.storage
@@ -259,7 +287,11 @@ impl RaftReplica {
             .await?,
         );
         raw_node.advance_apply();
-        Ok(ReadyOutput { messages, events })
+        Ok(ReadyOutput {
+            messages,
+            events,
+            read_states,
+        })
     }
 
     fn stop(&mut self) {
@@ -340,6 +372,10 @@ pub struct InProcessShardGroup {
     pending: BTreeMap<u128, PendingProposal>,
     completed: BTreeMap<u128, CompletedProposal>,
     applied_events: BTreeMap<(u64, u128), (u64, u64)>,
+    completed_read_states: BTreeMap<Vec<u8>, CompletedReadState>,
+    pending_read_contexts: BTreeSet<Vec<u8>>,
+    next_read_sequence: u64,
+    next_internal_request: u64,
 }
 
 impl InProcessShardGroup {
@@ -363,6 +399,10 @@ impl InProcessShardGroup {
             pending: BTreeMap::new(),
             completed: BTreeMap::new(),
             applied_events: BTreeMap::new(),
+            completed_read_states: BTreeMap::new(),
+            pending_read_contexts: BTreeSet::new(),
+            next_read_sequence: 1,
+            next_internal_request: 1,
         })
     }
 
@@ -477,6 +517,261 @@ impl InProcessShardGroup {
         })
     }
 
+    pub async fn leader_read_permit(
+        &mut self,
+        node_id: u64,
+        placement_epoch: u64,
+        max_ticks: usize,
+    ) -> Result<ReadPermit, ReadBarrierError> {
+        self.validate_read_epoch(placement_epoch)?;
+        let leader_id = self.leader_id();
+        if leader_id != Some(node_id) {
+            return Err(ReadBarrierError::NotLeader {
+                node_id,
+                leader_hint: leader_id,
+            });
+        }
+        let proof = self
+            .issue_follower_read_proof(placement_epoch, max_ticks)
+            .await?;
+        if self.leader_id() != Some(node_id) || proof.leader_id != node_id {
+            return Err(ReadBarrierError::NotLeader {
+                node_id,
+                leader_hint: self.leader_id(),
+            });
+        }
+        self.validate_applied_index(node_id, proof.read_index)?;
+        Ok(ReadPermit::new(
+            self.shard_id,
+            self.placement_epoch,
+            node_id,
+            proof.read_index,
+            ReadPermitMode::LeaderLinearizable,
+        ))
+    }
+
+    pub async fn issue_follower_read_proof(
+        &mut self,
+        placement_epoch: u64,
+        max_ticks: usize,
+    ) -> Result<FollowerReadProof, ReadBarrierError> {
+        self.validate_read_epoch(placement_epoch)?;
+        let leader_id = self.leader_id().ok_or(ReadBarrierError::NotReady {
+            node_id: None,
+            reason: "the Shard Group has no leader",
+        })?;
+        let leader_term = self
+            .replicas
+            .get(&leader_id)
+            .and_then(RaftReplica::current_term)
+            .ok_or(ReadBarrierError::NotReady {
+                node_id: Some(leader_id),
+                reason: "the leader Replica is stopped",
+            })?;
+        let context = self.next_read_context()?;
+        self.pending_read_contexts.insert(context.clone());
+        if self
+            .replicas
+            .get_mut(&leader_id)
+            .expect("leader belongs to Replica map")
+            .request_read_index(context.clone())
+            .is_err()
+        {
+            self.finish_read_context(&context);
+            return Err(ReadBarrierError::NotReady {
+                node_id: Some(leader_id),
+                reason: "ReadIndex request could not be submitted",
+            });
+        }
+
+        for tick in 0..=max_ticks {
+            if self.drain(DEFAULT_MAX_DRIVE_ROUNDS).await.is_err() {
+                self.finish_read_context(&context);
+                return Err(ReadBarrierError::NotReady {
+                    node_id: Some(leader_id),
+                    reason: "Raft could not complete the ReadIndex barrier",
+                });
+            }
+            if let Some(completed) = self.completed_read_states.get(&context).copied() {
+                let current_leader = self.leader_id();
+                let current_term = current_leader
+                    .and_then(|id| self.replicas.get(&id))
+                    .and_then(RaftReplica::current_term);
+                if completed.node_id != leader_id
+                    || current_leader != Some(leader_id)
+                    || current_term != Some(leader_term)
+                    || completed.term != leader_term
+                {
+                    self.finish_read_context(&context);
+                    return Err(ReadBarrierError::NotReady {
+                        node_id: Some(leader_id),
+                        reason: "leadership changed while ReadIndex was in flight",
+                    });
+                }
+                if self
+                    .validate_applied_index(leader_id, completed.index)
+                    .is_ok()
+                {
+                    self.finish_read_context(&context);
+                    return Ok(FollowerReadProof {
+                        shard_id: self.shard_id,
+                        placement_epoch: self.placement_epoch,
+                        leader_id,
+                        leader_term,
+                        read_index: completed.index,
+                    });
+                }
+            }
+            if tick == max_ticks {
+                break;
+            }
+            if self.tick().await.is_err() {
+                self.finish_read_context(&context);
+                return Err(ReadBarrierError::NotReady {
+                    node_id: Some(leader_id),
+                    reason: "Raft could not advance the ReadIndex barrier",
+                });
+            }
+        }
+        self.finish_read_context(&context);
+        Err(ReadBarrierError::NotReady {
+            node_id: Some(leader_id),
+            reason: "ReadIndex did not receive quorum confirmation before the deadline",
+        })
+    }
+
+    pub fn follower_read_permit(
+        &self,
+        node_id: u64,
+        placement_epoch: u64,
+        read_ts: TransactionTime,
+        proof: &FollowerReadProof,
+    ) -> Result<ReadPermit, ReadBarrierError> {
+        self.validate_read_epoch(placement_epoch)?;
+        if proof.shard_id != self.shard_id || proof.placement_epoch != self.placement_epoch {
+            return Err(ReadBarrierError::StaleEpoch {
+                expected: self.placement_epoch,
+                actual: proof.placement_epoch,
+            });
+        }
+        let replica = self
+            .replicas
+            .get(&node_id)
+            .ok_or(ReadBarrierError::NodeNotFound { node_id })?;
+        if !replica.is_running() {
+            return Err(ReadBarrierError::NotReady {
+                node_id: Some(node_id),
+                reason: "the follower Replica is stopped",
+            });
+        }
+        if self.leader_id() == Some(node_id) {
+            return Err(ReadBarrierError::NotReady {
+                node_id: Some(node_id),
+                reason: "a follower snapshot permit cannot target the leader",
+            });
+        }
+        let current_leader = self.leader_id();
+        let current_term = current_leader
+            .and_then(|leader| self.replicas.get(&leader))
+            .and_then(RaftReplica::current_term);
+        if current_leader != Some(proof.leader_id) || current_term != Some(proof.leader_term) {
+            return Err(ReadBarrierError::NotReady {
+                node_id: Some(node_id),
+                reason: "the ReadIndex proof belongs to an old leader term",
+            });
+        }
+        self.validate_applied_index(node_id, proof.read_index)?;
+        let safe_ts = replica.state_machine.servable_safe_ts().map_err(|_| {
+            ReadBarrierError::AdapterLagging {
+                node_id,
+                required_index: proof.read_index,
+                applied_index: replica.state_machine.metadata().applied_index,
+            }
+        })?;
+        if safe_ts < read_ts {
+            return Err(ReadBarrierError::NotReady {
+                node_id: Some(node_id),
+                reason: "follower safe time is below the requested transaction time",
+            });
+        }
+        Ok(ReadPermit::new(
+            self.shard_id,
+            self.placement_epoch,
+            node_id,
+            proof.read_index,
+            ReadPermitMode::FollowerSnapshot { read_ts },
+        ))
+    }
+
+    pub async fn advance_closed_timestamp(
+        &mut self,
+        closed_ts: TransactionTime,
+        max_ticks: usize,
+    ) -> Result<ProposalReceipt, ReplicationError> {
+        let request_id = (1_u128 << 127) | u128::from(self.next_internal_request);
+        self.next_internal_request = self.next_internal_request.saturating_add(1);
+        let command = CommandEnvelopeV1::new(
+            self.shard_id,
+            self.placement_epoch,
+            request_id,
+            raft_command::CommandBodyV1::ClosedTimestampTick(closed_ts),
+        )
+        .encode()?;
+        self.propose_and_wait(command, max_ticks).await
+    }
+
+    fn validate_read_epoch(&self, placement_epoch: u64) -> Result<(), ReadBarrierError> {
+        if placement_epoch != self.placement_epoch {
+            return Err(ReadBarrierError::StaleEpoch {
+                expected: self.placement_epoch,
+                actual: placement_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_applied_index(
+        &self,
+        node_id: u64,
+        required_index: u64,
+    ) -> Result<(), ReadBarrierError> {
+        let replica = self
+            .replicas
+            .get(&node_id)
+            .ok_or(ReadBarrierError::NodeNotFound { node_id })?;
+        let applied_index = replica.state_machine.metadata().applied_index;
+        if !replica.state_machine.is_healthy() || applied_index < required_index {
+            return Err(ReadBarrierError::AdapterLagging {
+                node_id,
+                required_index,
+                applied_index,
+            });
+        }
+        Ok(())
+    }
+
+    fn next_read_context(&mut self) -> Result<Vec<u8>, ReadBarrierError> {
+        let sequence = self.next_read_sequence;
+        self.next_read_sequence =
+            self.next_read_sequence
+                .checked_add(1)
+                .ok_or(ReadBarrierError::NotReady {
+                    node_id: self.leader_id(),
+                    reason: "ReadIndex context sequence is exhausted",
+                })?;
+        let mut context = Vec::with_capacity(24);
+        context.extend_from_slice(b"DTRI");
+        context.extend_from_slice(&self.shard_id.to_be_bytes());
+        context.extend_from_slice(&self.placement_epoch.to_be_bytes());
+        context.extend_from_slice(&sequence.to_be_bytes());
+        Ok(context)
+    }
+
+    fn finish_read_context(&mut self, context: &[u8]) {
+        self.pending_read_contexts.remove(context);
+        self.completed_read_states.remove(context);
+    }
+
     pub async fn tick(&mut self) -> Result<(), ReplicationError> {
         for replica in self.replicas.values_mut() {
             replica.tick();
@@ -520,6 +815,7 @@ impl InProcessShardGroup {
                     .await?;
                 self.transport.send_all(output.messages);
                 self.record_events(node_id, output.events);
+                self.record_read_states(node_id, output.read_states);
             }
             self.complete_requests_applied_on_current_leader();
             if !progressed {
@@ -536,6 +832,29 @@ impl InProcessShardGroup {
             if event.applied_by_leader {
                 self.complete_request(node_id, event.request_id, event.term, event.index);
             }
+        }
+    }
+
+    fn record_read_states(&mut self, node_id: u64, read_states: Vec<ReadState>) {
+        let Some(term) = self
+            .replicas
+            .get(&node_id)
+            .and_then(RaftReplica::current_term)
+        else {
+            return;
+        };
+        for state in read_states {
+            if !self.pending_read_contexts.contains(&state.request_ctx) {
+                continue;
+            }
+            self.completed_read_states.insert(
+                state.request_ctx,
+                CompletedReadState {
+                    node_id,
+                    term,
+                    index: state.index,
+                },
+            );
         }
     }
 

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+shard-runtime = { path = "../shard-runtime" }
 storage-api = { path = "../storage-api" }
 temporal-ir = { path = "../temporal-ir" }
 temporal-storage = { path = "../temporal-storage" }
@@ -14,6 +15,7 @@ temporal-types = { path = "../temporal-types" }
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }
 adapter-rocksdb = { path = "../adapter-rocksdb" }
+raft-command = { path = "../raft-command" }
 tempfile = "3"
 
 [lints]
