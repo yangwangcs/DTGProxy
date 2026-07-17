@@ -93,22 +93,22 @@ Folly/Thrift/C++ source is copied. Sources: [raft-rs](https://github.com/tikv/ra
 
 **Files:** Raft log store, checkpoint manifest, restore tests.
 
-**Current progress:** `replica-snapshot` binds a RocksDB checkpoint to shard/epoch/term/index,
-membership, and watermarks with a CRC-protected manifest and deterministic BLAKE3 directory
-digest. `raft-logstore` synchronously persists HardState, entries, membership, and Raft snapshots,
-then reconstructs `RawNode` from WAL plus the Adapter's atomic applied index. A forced crash after
-committed WAL persistence and before Adapter apply is recovered by suffix replay. Full
-temporal-query equivalence, snapshot transfer/install, post-snapshot compaction, and the remaining
-crash-point schedules are still required.
+**Completed:** a CRC-protected manifest and BLAKE3 directory digest bind the Adapter checkpoint to
+shard/epoch/term/index, membership, and watermarks. Hidden staging plus atomic generation
+publication prevents partial visibility. Source WAL snapshot persistence follows bundle durability
+and compacts only its covered prefix. A received Raft snapshot must exactly match the bundle before
+the new follower generation is published. Restart replays the committed suffix from the Adapter's
+atomic applied index. Tests compare Current, AS OF, DIFF, double adjacency, metadata, and all
+logical rows/fingerprints, and exercise every publication/compaction crash boundary.
 
 - [x] Version a manifest binding shard/epoch/term/applied index/watermarks to an Adapter checkpoint
   and checksum.
-- [ ] Create snapshots only after Adapter checkpoint completion at the matching applied index;
+- [x] Create snapshots only after Adapter checkpoint completion at the matching applied index;
   compact logs only after the snapshot is durable.
-- [ ] Install snapshot into an empty/lagging follower, then replay the suffix and compare Current,
+- [x] Install snapshot into an empty/lagging follower, then replay the suffix and compare Current,
   AS OF, DIFF, adjacency, metadata, and command fingerprints.
-- [ ] Test crash points before/after checkpoint, manifest publish, log compact, and snapshot apply.
-- [ ] Commit as `feat: recover replicated shard snapshots`.
+- [x] Test crash points before/after checkpoint, manifest publish, log compact, and snapshot apply.
+- [x] Commit as `feat: recover replicated shard snapshots`.
 
 ### Task 6: Epoch Fencing and Consistent Read Barriers
 

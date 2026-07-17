@@ -45,10 +45,14 @@ The in-memory MemStorage inside `RocksRaftStorage` is a read cache only. A failp
 write but before cache update proves that reopening uses the durable database as the source of
 truth.
 
-## Current boundary
+## Snapshot boundary
 
-The WAL can persist and recover a Raft snapshot payload, while `replica-snapshot` can create and
-verify an Adapter checkpoint. Installing that checkpoint into a running/lagging Replica and
-atomically activating the matching Raft snapshot is the next integration step. Until then,
-`DurableRaftReplica` rejects an incoming non-empty Ready snapshot rather than exposing a Replica
-whose consensus position and temporal data disagree.
+`replica-snapshot` now publishes the Adapter checkpoint before asking the source WAL to persist a
+matching local snapshot. Prefix compaction retains entries above the snapshot index. Followers
+install the checkpoint and Raft snapshot together into a new immutable generation, then reopen
+RawNode with `Config.applied` equal to the installed Adapter index and replay a committed suffix.
+
+Checkpoint bytes travel out of band from the Raft message. Therefore a bare non-empty Ready
+snapshot is still rejected: the node supervisor must pair the message with its verified bundle and
+use the generation installer. This is a fail-closed interface rule, not an unimplemented storage
+operation; transport streaming and old-generation garbage collection remain operational work.

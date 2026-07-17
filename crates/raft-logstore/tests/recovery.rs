@@ -106,6 +106,43 @@ fn durable_snapshot_restores_membership_position_and_payload_before_compaction()
 }
 
 #[test]
+fn local_snapshot_compacts_only_its_prefix_and_preserves_the_log_suffix() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RocksRaftStorage::open(directory.path(), &[1, 2, 3]).unwrap();
+    store
+        .persist_ready(
+            None,
+            &[
+                entry(1, 1, b"one"),
+                entry(2, 1, b"two"),
+                entry(3, 2, b"suffix"),
+            ],
+            Some(&HardState {
+                term: 2,
+                vote: 1,
+                commit: 2,
+            }),
+        )
+        .unwrap();
+    let snapshot = snapshot(2, 1, &[1, 2, 3], b"manifest-v1");
+    store
+        .persist_local_snapshot_preserving_suffix(&snapshot)
+        .unwrap();
+    drop(store);
+
+    let reopened = RocksRaftStorage::open(directory.path(), &[1, 2, 3]).unwrap();
+    assert_eq!(reopened.first_index().unwrap(), 3);
+    assert_eq!(reopened.last_index().unwrap(), 3);
+    assert_eq!(reopened.term(2).unwrap(), 1);
+    assert_eq!(
+        reopened
+            .entries(3, 4, None, GetEntriesContext::empty(false))
+            .unwrap(),
+        vec![entry(3, 2, b"suffix")]
+    );
+}
+
+#[test]
 fn crash_failpoints_prove_before_write_rollback_and_after_write_recovery() {
     let directory = tempfile::tempdir().unwrap();
     let store = RocksRaftStorage::open(directory.path(), &[1, 2, 3]).unwrap();

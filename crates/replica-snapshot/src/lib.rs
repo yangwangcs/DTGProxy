@@ -2,11 +2,15 @@
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs::File;
-use std::io::{self, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use adapter_rocksdb::RocksAdapter;
+use raft::Storage;
+use raft::eraftpb::{ConfState, Snapshot, SnapshotMetadata};
+use raft_logstore::RocksRaftStorage;
 use shard_runtime::ShardStateMachine;
 use storage_api::{AdapterError, StorageAdapter};
 use temporal_types::TransactionTime;
@@ -18,6 +22,31 @@ const DIGEST_BYTES: usize = 32;
 const CHECKSUM_BYTES: usize = 4;
 const MIN_MANIFEST_BYTES: usize = FIXED_PREFIX_BYTES + DIGEST_BYTES + CHECKSUM_BYTES;
 pub const MAX_SNAPSHOT_VOTERS: usize = 64;
+const MANIFEST_FILE: &str = "manifest.dtg";
+const CHECKPOINT_DIRECTORY: &str = "checkpoint";
+const INSTALLED_ADAPTER_DIRECTORY: &str = "adapter";
+const INSTALLED_RAFT_DIRECTORY: &str = "raft";
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotFailpoint {
+    BeforeCheckpoint,
+    AfterCheckpointBeforeManifest,
+    AfterManifestSyncBeforePublish,
+    AfterAdapterCopyBeforeSnapshotPersist,
+    AfterSnapshotPersistBeforePublish,
+    AfterBundlePublishBeforeWalSnapshot,
+    AfterWalSnapshotPersist,
+    AfterPublish,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledSnapshot {
+    pub root: PathBuf,
+    pub adapter_path: PathBuf,
+    pub raft_wal_path: PathBuf,
+    pub manifest: SnapshotManifestV1,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotManifestV1 {
@@ -174,6 +203,378 @@ pub fn open_verified_checkpoint(
     Ok(adapter)
 }
 
+pub fn create_snapshot_bundle(
+    machine: &ShardStateMachine<RocksAdapter>,
+    voters: &[u64],
+    destination: impl AsRef<Path>,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    create_snapshot_bundle_inner(machine, voters, destination.as_ref(), None)
+}
+
+pub fn create_snapshot_bundle_with_failpoint(
+    machine: &ShardStateMachine<RocksAdapter>,
+    voters: &[u64],
+    destination: impl AsRef<Path>,
+    failpoint: SnapshotFailpoint,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    create_snapshot_bundle_inner(machine, voters, destination.as_ref(), Some(failpoint))
+}
+
+fn create_snapshot_bundle_inner(
+    machine: &ShardStateMachine<RocksAdapter>,
+    voters: &[u64],
+    destination: &Path,
+    failpoint: Option<SnapshotFailpoint>,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    let staging = StagedDirectory::new(destination)?;
+    fail_if(failpoint, SnapshotFailpoint::BeforeCheckpoint)?;
+    let checkpoint = staging.path().join(CHECKPOINT_DIRECTORY);
+    let manifest = create_rocks_checkpoint(machine, voters, &checkpoint)?;
+    sync_tree(&checkpoint)?;
+    fail_if(failpoint, SnapshotFailpoint::AfterCheckpointBeforeManifest)?;
+    write_manifest(staging.path(), &manifest)?;
+    fail_if(failpoint, SnapshotFailpoint::AfterManifestSyncBeforePublish)?;
+    staging.publish(destination)?;
+    fail_if(failpoint, SnapshotFailpoint::AfterPublish)?;
+    Ok(manifest)
+}
+
+pub fn open_snapshot_bundle(bundle: impl AsRef<Path>) -> Result<SnapshotManifestV1, SnapshotError> {
+    let bundle = bundle.as_ref();
+    let manifest = read_manifest(bundle)?;
+    let digest = hash_checkpoint(&bundle.join(CHECKPOINT_DIRECTORY))?;
+    if digest != manifest.checkpoint_digest {
+        return Err(SnapshotError::CheckpointDigestMismatch);
+    }
+    Ok(manifest)
+}
+
+pub fn create_and_activate_local_snapshot(
+    machine: &ShardStateMachine<RocksAdapter>,
+    raft_storage: &RocksRaftStorage,
+    voters: &[u64],
+    destination: impl AsRef<Path>,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    create_and_activate_local_snapshot_inner(
+        machine,
+        raft_storage,
+        voters,
+        destination.as_ref(),
+        None,
+    )
+}
+
+pub fn create_and_activate_local_snapshot_with_failpoint(
+    machine: &ShardStateMachine<RocksAdapter>,
+    raft_storage: &RocksRaftStorage,
+    voters: &[u64],
+    destination: impl AsRef<Path>,
+    failpoint: SnapshotFailpoint,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    create_and_activate_local_snapshot_inner(
+        machine,
+        raft_storage,
+        voters,
+        destination.as_ref(),
+        Some(failpoint),
+    )
+}
+
+fn create_and_activate_local_snapshot_inner(
+    machine: &ShardStateMachine<RocksAdapter>,
+    raft_storage: &RocksRaftStorage,
+    voters: &[u64],
+    destination: &Path,
+    failpoint: Option<SnapshotFailpoint>,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    let manifest = match failpoint {
+        Some(
+            point @ (SnapshotFailpoint::BeforeCheckpoint
+            | SnapshotFailpoint::AfterCheckpointBeforeManifest
+            | SnapshotFailpoint::AfterManifestSyncBeforePublish
+            | SnapshotFailpoint::AfterPublish),
+        ) => create_snapshot_bundle_with_failpoint(machine, voters, destination, point)?,
+        _ => create_snapshot_bundle(machine, voters, destination)?,
+    };
+    fail_if(
+        failpoint,
+        SnapshotFailpoint::AfterBundlePublishBeforeWalSnapshot,
+    )?;
+    activate_published_local_snapshot(raft_storage, destination)?;
+    fail_if(failpoint, SnapshotFailpoint::AfterWalSnapshotPersist)?;
+    Ok(manifest)
+}
+
+pub fn activate_published_local_snapshot(
+    raft_storage: &RocksRaftStorage,
+    bundle: impl AsRef<Path>,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    let manifest = open_snapshot_bundle(bundle)?;
+    let raft_state = raft_storage
+        .initial_state()
+        .map_err(raft_logstore::RaftLogStoreError::from)?;
+    let position_matches = raft_state.conf_state.voters == manifest.voters
+        && raft_state.hard_state.commit >= manifest.applied_index
+        && raft_storage
+            .term(manifest.applied_index)
+            .map_err(raft_logstore::RaftLogStoreError::from)?
+            == manifest.term;
+    if !position_matches {
+        return Err(SnapshotError::RaftSnapshotPositionMismatch);
+    }
+    raft_storage.persist_local_snapshot_preserving_suffix(&raft_snapshot(&manifest)?)?;
+    Ok(manifest)
+}
+
+pub async fn install_snapshot_bundle(
+    bundle: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<InstalledSnapshot, SnapshotError> {
+    install_snapshot_bundle_inner(bundle.as_ref(), destination.as_ref(), None, None).await
+}
+
+pub async fn install_snapshot_bundle_with_failpoint(
+    bundle: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    failpoint: SnapshotFailpoint,
+) -> Result<InstalledSnapshot, SnapshotError> {
+    install_snapshot_bundle_inner(bundle.as_ref(), destination.as_ref(), Some(failpoint), None)
+        .await
+}
+
+pub async fn install_received_snapshot_bundle(
+    incoming_snapshot: &Snapshot,
+    bundle: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<InstalledSnapshot, SnapshotError> {
+    install_snapshot_bundle_inner(
+        bundle.as_ref(),
+        destination.as_ref(),
+        None,
+        Some(incoming_snapshot),
+    )
+    .await
+}
+
+async fn install_snapshot_bundle_inner(
+    bundle: &Path,
+    destination: &Path,
+    failpoint: Option<SnapshotFailpoint>,
+    incoming_snapshot: Option<&Snapshot>,
+) -> Result<InstalledSnapshot, SnapshotError> {
+    let manifest = open_snapshot_bundle(bundle)?;
+    let manifest_snapshot = raft_snapshot(&manifest)?;
+    if incoming_snapshot.is_some_and(|incoming| *incoming != manifest_snapshot) {
+        return Err(SnapshotError::IncomingRaftSnapshotMismatch);
+    }
+    let staging = StagedDirectory::new(destination)?;
+    let adapter_path = staging.path().join(INSTALLED_ADAPTER_DIRECTORY);
+    copy_tree(&bundle.join(CHECKPOINT_DIRECTORY), &adapter_path)?;
+    let copied_digest = hash_checkpoint(&adapter_path)?;
+    if copied_digest != manifest.checkpoint_digest {
+        return Err(SnapshotError::CheckpointDigestMismatch);
+    }
+    fail_if(
+        failpoint,
+        SnapshotFailpoint::AfterAdapterCopyBeforeSnapshotPersist,
+    )?;
+
+    let adapter = open_verified_checkpoint(&adapter_path, &manifest)?;
+    let machine = ShardStateMachine::open(adapter, manifest.shard_id, manifest.placement_epoch)
+        .await
+        .map_err(|error| SnapshotError::StateMachine(error.to_string()))?;
+    validate_machine_manifest(&machine, &manifest)?;
+    drop(machine);
+
+    write_manifest(staging.path(), &manifest)?;
+    let raft_wal_path = staging.path().join(INSTALLED_RAFT_DIRECTORY);
+    let raft_storage = RocksRaftStorage::open(&raft_wal_path, &manifest.voters)?;
+    raft_storage.persist_snapshot(&manifest_snapshot)?;
+    drop(raft_storage);
+    sync_tree(staging.path())?;
+    fail_if(
+        failpoint,
+        SnapshotFailpoint::AfterSnapshotPersistBeforePublish,
+    )?;
+    staging.publish(destination)?;
+
+    let installed = InstalledSnapshot {
+        root: destination.to_path_buf(),
+        adapter_path: destination.join(INSTALLED_ADAPTER_DIRECTORY),
+        raft_wal_path: destination.join(INSTALLED_RAFT_DIRECTORY),
+        manifest,
+    };
+    fail_if(failpoint, SnapshotFailpoint::AfterPublish)?;
+    Ok(installed)
+}
+
+pub fn raft_snapshot(manifest: &SnapshotManifestV1) -> Result<Snapshot, SnapshotError> {
+    Ok(Snapshot {
+        data: manifest.encode()?,
+        metadata: Some(SnapshotMetadata {
+            conf_state: Some(ConfState {
+                voters: manifest.voters.clone(),
+                ..Default::default()
+            }),
+            index: manifest.applied_index,
+            term: manifest.term,
+        }),
+    })
+}
+
+fn validate_machine_manifest(
+    machine: &ShardStateMachine<RocksAdapter>,
+    manifest: &SnapshotManifestV1,
+) -> Result<(), SnapshotError> {
+    let metadata = machine.metadata();
+    if metadata.shard_id != manifest.shard_id
+        || metadata.placement_epoch != manifest.placement_epoch
+        || metadata.last_term != manifest.term
+        || metadata.applied_index != manifest.applied_index
+        || metadata.closed_ts != manifest.closed_ts
+        || metadata.resolved_ts != manifest.resolved_ts
+        || metadata.adapter_applied_ts != manifest.adapter_applied_ts
+    {
+        return Err(SnapshotError::ReplicaMetadataMismatch);
+    }
+    Ok(())
+}
+
+fn write_manifest(root: &Path, manifest: &SnapshotManifestV1) -> Result<(), SnapshotError> {
+    let path = root.join(MANIFEST_FILE);
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(&manifest.encode()?)?;
+    file.sync_all()?;
+    sync_directory(root)
+}
+
+fn read_manifest(root: &Path) -> Result<SnapshotManifestV1, SnapshotError> {
+    let mut file = File::open(root.join(MANIFEST_FILE))?;
+    let length = usize::try_from(file.metadata()?.len())
+        .map_err(|_| SnapshotError::ManifestLengthMismatch)?;
+    let maximum = MIN_MANIFEST_BYTES + MAX_SNAPSHOT_VOTERS * 8;
+    if length > maximum {
+        return Err(SnapshotError::ManifestLengthMismatch);
+    }
+    let mut bytes = Vec::with_capacity(length);
+    file.read_to_end(&mut bytes)?;
+    SnapshotManifestV1::decode(&bytes)
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<(), SnapshotError> {
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            std::fs::copy(entry.path(), &target)?;
+            File::open(&target)?.sync_all()?;
+        } else {
+            return Err(SnapshotError::UnsupportedCheckpointEntry);
+        }
+    }
+    sync_directory(destination)
+}
+
+fn sync_tree(root: &Path) -> Result<(), SnapshotError> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            sync_tree(&entry.path())?;
+        } else if file_type.is_file() {
+            File::open(entry.path())?.sync_all()?;
+        } else {
+            return Err(SnapshotError::UnsupportedCheckpointEntry);
+        }
+    }
+    sync_directory(root)
+}
+
+fn sync_directory(directory: &Path) -> Result<(), SnapshotError> {
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn fail_if(
+    configured: Option<SnapshotFailpoint>,
+    current: SnapshotFailpoint,
+) -> Result<(), SnapshotError> {
+    if configured == Some(current) {
+        Err(SnapshotError::InjectedFailure(current))
+    } else {
+        Ok(())
+    }
+}
+
+struct StagedDirectory {
+    path: PathBuf,
+    published: bool,
+}
+
+impl StagedDirectory {
+    fn new(destination: &Path) -> Result<Self, SnapshotError> {
+        if destination.exists() {
+            return Err(SnapshotError::DestinationExists);
+        }
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let name = destination
+            .file_name()
+            .ok_or(SnapshotError::InvalidDestination)?
+            .to_string_lossy();
+        for _ in 0..128 {
+            let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{name}.dtg-stage-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: candidate,
+                        published: false,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(SnapshotError::StagingNameExhausted)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(mut self, destination: &Path) -> Result<(), SnapshotError> {
+        if destination.exists() {
+            return Err(SnapshotError::DestinationExists);
+        }
+        std::fs::rename(&self.path, destination)?;
+        self.published = true;
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_directory(parent)
+    }
+}
+
+impl Drop for StagedDirectory {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ignored = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 fn validate_voters(voters: &[u64]) -> Result<(), SnapshotError> {
     if voters.len() > MAX_SNAPSHOT_VOTERS {
         return Err(SnapshotError::TooManyVoters {
@@ -274,6 +675,15 @@ pub enum SnapshotError {
     InvalidCheckpointPath,
     UnsupportedCheckpointEntry,
     CheckpointTooLarge,
+    RaftLogStore(raft_logstore::RaftLogStoreError),
+    StateMachine(String),
+    ReplicaMetadataMismatch,
+    RaftSnapshotPositionMismatch,
+    IncomingRaftSnapshotMismatch,
+    DestinationExists,
+    InvalidDestination,
+    StagingNameExhausted,
+    InjectedFailure(SnapshotFailpoint),
 }
 
 impl Display for SnapshotError {
@@ -310,6 +720,27 @@ impl Display for SnapshotError {
                 formatter.write_str("checkpoint contains a symlink or unsupported entry")
             }
             Self::CheckpointTooLarge => formatter.write_str("checkpoint size exceeds codec limits"),
+            Self::RaftLogStore(error) => write!(formatter, "Raft snapshot WAL error: {error}"),
+            Self::StateMachine(error) => write!(formatter, "snapshot state-machine error: {error}"),
+            Self::ReplicaMetadataMismatch => {
+                formatter.write_str("checkpoint Replica metadata differs from its manifest")
+            }
+            Self::RaftSnapshotPositionMismatch => formatter.write_str(
+                "Raft WAL membership, term, or commit frontier differs from the snapshot manifest",
+            ),
+            Self::IncomingRaftSnapshotMismatch => formatter.write_str(
+                "incoming Raft snapshot position, membership, or payload differs from its bundle",
+            ),
+            Self::DestinationExists => {
+                formatter.write_str("snapshot publication destination already exists")
+            }
+            Self::InvalidDestination => formatter.write_str("invalid snapshot destination path"),
+            Self::StagingNameExhausted => {
+                formatter.write_str("could not allocate a snapshot staging directory")
+            }
+            Self::InjectedFailure(failpoint) => {
+                write!(formatter, "injected snapshot failure at {failpoint:?}")
+            }
         }
     }
 }
@@ -318,6 +749,7 @@ impl Error for SnapshotError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Adapter(error) => Some(error),
+            Self::RaftLogStore(error) => Some(error),
             _ => None,
         }
     }
@@ -332,5 +764,11 @@ impl From<AdapterError> for SnapshotError {
 impl From<io::Error> for SnapshotError {
     fn from(error: io::Error) -> Self {
         Self::Io(error.to_string())
+    }
+}
+
+impl From<raft_logstore::RaftLogStoreError> for SnapshotError {
+    fn from(error: raft_logstore::RaftLogStoreError) -> Self {
+        Self::RaftLogStore(error)
     }
 }

@@ -164,6 +164,93 @@ impl RocksRaftStorage {
         self.persist_ready(Some(snapshot), &[], None)
     }
 
+    /// Persists a locally generated snapshot and compacts only entries covered
+    /// by it, retaining any uncommitted or unapplied suffix above its index.
+    pub fn persist_local_snapshot_preserving_suffix(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<(), RaftLogStoreError> {
+        let _guard = self
+            .persist_guard
+            .lock()
+            .map_err(|_| RaftLogStoreError::LockPoisoned)?;
+        if *self
+            .latest_snapshot
+            .read()
+            .map_err(|_| RaftLogStoreError::LockPoisoned)?
+            == *snapshot
+        {
+            return Ok(());
+        }
+        let metadata = snapshot
+            .metadata
+            .as_ref()
+            .and_then(|metadata| {
+                metadata
+                    .conf_state
+                    .as_ref()
+                    .map(|conf_state| (metadata, conf_state))
+            })
+            .ok_or(RaftLogStoreError::SnapshotMissingMetadata)?;
+        let (metadata, conf_state) = metadata;
+        validate_voters(&conf_state.voters)?;
+        let raft_state = self.cache.initial_state()?;
+        if metadata.index > raft_state.hard_state.commit {
+            return Err(RaftLogStoreError::SnapshotBeyondCommit {
+                snapshot_index: metadata.index,
+                commit_index: raft_state.hard_state.commit,
+            });
+        }
+        let last_index = self.cache.last_index()?;
+        if metadata.index > last_index {
+            return Err(RaftLogStoreError::SnapshotBeyondLastIndex {
+                snapshot_index: metadata.index,
+                last_index,
+            });
+        }
+        let suffix = if metadata.index < last_index {
+            self.cache.entries(
+                metadata.index.saturating_add(1),
+                last_index.saturating_add(1),
+                None,
+                GetEntriesContext::empty(false),
+            )?
+        } else {
+            Vec::new()
+        };
+        if self.take_failpoint(PersistFailpoint::BeforeWrite)? {
+            return Err(RaftLogStoreError::InjectedFailure(
+                PersistFailpoint::BeforeWrite,
+            ));
+        }
+
+        let mut batch = WriteBatch::default();
+        for key in entry_keys_before(&self.db, metadata.index.saturating_add(1))? {
+            batch.delete(key);
+        }
+        batch.put(SNAPSHOT_KEY, encode_message(SNAPSHOT_MAGIC, snapshot)?);
+        batch.put(
+            CONF_STATE_KEY,
+            encode_message(CONF_STATE_MAGIC, conf_state)?,
+        );
+        write_sync(&self.db, batch)?;
+        if self.take_failpoint(PersistFailpoint::AfterWriteBeforeCache)? {
+            return Err(RaftLogStoreError::InjectedFailure(
+                PersistFailpoint::AfterWriteBeforeCache,
+            ));
+        }
+
+        self.cache.wl().apply_snapshot(snapshot.clone())?;
+        self.cache.wl().append(&suffix)?;
+        self.cache.wl().set_conf_state(conf_state.clone());
+        self.cache.wl().set_hardstate(raft_state.hard_state.clone());
+        *self
+            .latest_snapshot
+            .write()
+            .map_err(|_| RaftLogStoreError::LockPoisoned)? = snapshot.clone();
+        Ok(())
+    }
+
     pub fn persist_light_commit(&self, commit_index: u64) -> Result<(), RaftLogStoreError> {
         let mut hard_state = self.cache.initial_state()?.hard_state;
         hard_state.commit = commit_index;
@@ -470,6 +557,14 @@ pub enum RaftLogStoreError {
         snapshot_index: u64,
         compact_index: u64,
     },
+    SnapshotBeyondCommit {
+        snapshot_index: u64,
+        commit_index: u64,
+    },
+    SnapshotBeyondLastIndex {
+        snapshot_index: u64,
+        last_index: u64,
+    },
     InjectedFailure(PersistFailpoint),
 }
 
@@ -504,6 +599,20 @@ impl Display for RaftLogStoreError {
             } => write!(
                 formatter,
                 "cannot compact to {compact_index} before durable snapshot {snapshot_index}"
+            ),
+            Self::SnapshotBeyondCommit {
+                snapshot_index,
+                commit_index,
+            } => write!(
+                formatter,
+                "local snapshot index {snapshot_index} exceeds commit index {commit_index}"
+            ),
+            Self::SnapshotBeyondLastIndex {
+                snapshot_index,
+                last_index,
+            } => write!(
+                formatter,
+                "local snapshot index {snapshot_index} exceeds last log index {last_index}"
             ),
             Self::InjectedFailure(failpoint) => {
                 write!(formatter, "injected Raft WAL failure at {failpoint:?}")

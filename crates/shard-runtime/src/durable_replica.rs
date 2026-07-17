@@ -90,6 +90,11 @@ impl DurableRaftReplica {
     }
 
     #[must_use]
+    pub const fn state_machine(&self) -> &ShardStateMachine<RocksAdapter> {
+        &self.state_machine
+    }
+
+    #[must_use]
     pub const fn raft_storage(&self) -> &RocksRaftStorage {
         &self.storage
     }
