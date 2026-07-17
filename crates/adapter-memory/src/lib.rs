@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
 use storage_api::{
-    AdapterCapabilities, AdapterError, AdapterFuture, ApplyReceipt, CommittedMutationBatch,
-    KeySpan, KeyValue, LogicalKey, MutationOperation, StorageAdapter,
+    AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, ApplyReceipt,
+    BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, LogicalKey,
+    MutationOperation, SnapshotCapability, StorageAdapter,
 };
 
 #[derive(Default)]
@@ -110,10 +111,27 @@ impl MemoryAdapter {
 }
 
 impl StorageAdapter for MemoryAdapter {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        AdapterDescriptorV1::new(
+            "memory",
+            env!("CARGO_PKG_VERSION"),
+            BackendFamily::Test,
+            self.capabilities(),
+        )
+    }
+
     fn capabilities(&self) -> AdapterCapabilities {
         AdapterCapabilities {
             local_atomic_batch: true,
             idempotent_apply: true,
+            consistent_multi_get: true,
+            ordered_scan: true,
+            durable_applied_index: false,
+            durability: Durability::Volatile,
+            snapshot: SnapshotCapability::None,
+            predicate_pushdown: false,
+            adjacency_pushdown: false,
+            change_feed: false,
         }
     }
 

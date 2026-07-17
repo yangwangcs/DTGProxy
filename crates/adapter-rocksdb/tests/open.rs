@@ -1,5 +1,10 @@
-use adapter_rocksdb::RocksAdapter;
-use storage_api::AdapterError;
+use std::future::Future;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
+use adapter_registry::{AdapterOpenRequest, AdapterRegistry};
+use adapter_rocksdb::{RocksAdapter, RocksAdapterFactory};
+use storage_api::{AdapterError, AdapterRequirement};
 
 #[test]
 fn open_creates_all_required_column_families() {
@@ -35,4 +40,38 @@ fn open_maps_native_failures_to_a_typed_backend_error() {
     };
 
     assert!(matches!(error, AdapterError::Backend(_)));
+}
+
+#[test]
+fn production_registry_hot_plugs_the_rocksdb_factory() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(RocksAdapterFactory)).unwrap();
+    let request = AdapterOpenRequest::new("shard-7").with_parameter(
+        "path",
+        directory.path().to_str().expect("temporary path is UTF-8"),
+    );
+
+    let opened =
+        block_on(registry.open("rocksdb", &request, AdapterRequirement::ManagedReplica)).unwrap();
+    assert_eq!(opened.provider_name(), "rocksdb");
+    assert_eq!(opened.descriptor().implementation(), "rocksdb");
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }

@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Instant;
 
 use raft::eraftpb::Message;
 use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
@@ -47,8 +48,12 @@ fn three_replicas_elect_replicate_and_ack_only_after_leader_apply() {
     assert_eq!(group.leader_id(), Some(1));
 
     let command = apply_command(7, 9, 101, 100, b"v1");
+    let proposal_started = Instant::now();
     let receipt = block_on(group.propose_and_wait(command.clone(), 20)).unwrap();
+    let proposal_elapsed = proposal_started.elapsed();
     assert_eq!(receipt.leader_id, 1);
+    assert!(receipt.commit_to_apply <= proposal_elapsed);
+    assert!(receipt.proposal_to_commit + receipt.commit_to_apply <= proposal_elapsed);
     assert!(
         receipt.index >= 2,
         "leader election must durably apply its no-op"

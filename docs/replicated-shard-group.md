@@ -20,10 +20,12 @@ Leader-election empty entries are not skipped: `apply_noop_entry` atomically adv
 and Replica position without changing graph data. Raft index and Adapter `applied_log_index`
 therefore never diverge because of a leader no-op.
 
-The current harness uses a distinct `MemStorage` per Replica. That store survives deterministic
-stop/restart within one process and proves the Ready contract, but it is not a process-crash durable
-WAL. Task 5 replaces it with the durable log/snapshot manifest while preserving this wrapper and
-ordering.
+The deterministic harness uses a distinct `MemStorage` per Replica to inject precise network and
+leadership schedules. The production-facing `DurableRaftReplica` uses `RocksRaftStorage`, persists
+HardState/ConfState/entries/snapshot records with checksums and synchronous writes, and replays a
+crash window in which Raft commit became durable before Adapter apply. Snapshot bundles install the
+Adapter checkpoint and matching Raft snapshot as a hidden generation before publication, then
+replay a retained committed suffix.
 
 ## Request completion
 
@@ -48,3 +50,8 @@ request replay, and final state convergence.
 `MultiRaftRuntime` maps `(node_id, shard_id)` ownership while keeping one independent Raft Group per
 Shard. Tests run two groups with different Leaders on the same three logical nodes and prove that
 both progress independently.
+
+The replaceable acceptance transport uses versioned, checksummed TCP frames and a real
+three-process restart smoke. It deliberately opens one TCP connection per message and is not the
+final production network. Persistent pooled/multiplexed connections, TLS, admission control, and
+backpressure remain release requirements.

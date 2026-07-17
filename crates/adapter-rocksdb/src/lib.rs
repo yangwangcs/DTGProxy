@@ -4,13 +4,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use adapter_registry::{
+    AdapterFactory, AdapterFactoryError, AdapterFactoryFuture, AdapterOpenRequest,
+};
 use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode,
     MultiThreaded, Options, WriteBatch, WriteOptions,
 };
 use storage_api::{
-    AdapterCapabilities, AdapterError, AdapterFuture, ApplyReceipt, CommittedMutationBatch,
-    KeySpan, KeyValue, Keyspace, LogicalKey, MutationOperation, StorageAdapter,
+    AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, ApplyReceipt,
+    BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
+    MutationOperation, SnapshotCapability, StorageAdapter,
 };
 
 const APPLIED_LOG_INDEX_KEY: &[u8] = b"\x00applied_log_index";
@@ -18,6 +22,25 @@ const LOG_FINGERPRINT_PREFIX: u8 = 0x01;
 const MUTATION_FINGERPRINT_PREFIX: u8 = 0x02;
 
 type RocksDb = DBWithThreadMode<MultiThreaded>;
+
+pub struct RocksAdapterFactory;
+
+impl AdapterFactory for RocksAdapterFactory {
+    fn provider_name(&self) -> &'static str {
+        "rocksdb"
+    }
+
+    fn open<'a>(&'a self, request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a> {
+        Box::pin(async move {
+            let path = request.parameter("path").ok_or_else(|| {
+                AdapterFactoryError::new("RocksDB Adapter requires the public parameter path")
+            })?;
+            let adapter = RocksAdapter::open(path)
+                .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
+            Ok(Arc::new(adapter) as Arc<dyn StorageAdapter>)
+        })
+    }
+}
 
 pub struct RocksAdapter {
     path: PathBuf,
@@ -58,6 +81,14 @@ impl RocksAdapter {
         AdapterCapabilities {
             local_atomic_batch: true,
             idempotent_apply: true,
+            consistent_multi_get: true,
+            ordered_scan: true,
+            durable_applied_index: true,
+            durability: Durability::Synchronous,
+            snapshot: SnapshotCapability::PhysicalCheckpoint,
+            predicate_pushdown: false,
+            adjacency_pushdown: false,
+            change_feed: false,
         }
     }
 
@@ -202,6 +233,15 @@ impl RocksAdapter {
 }
 
 impl StorageAdapter for RocksAdapter {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        AdapterDescriptorV1::new(
+            "rocksdb",
+            env!("CARGO_PKG_VERSION"),
+            BackendFamily::KeyValue,
+            self.capabilities(),
+        )
+    }
+
     fn capabilities(&self) -> AdapterCapabilities {
         self.capabilities()
     }

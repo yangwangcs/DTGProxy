@@ -10,9 +10,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adapter-registry"
+version = "0.1.0"
+dependencies = [
+ "adapter-memory",
+ "storage-api",
+]
+
+[[package]]
 name = "adapter-rocksdb"
 version = "0.1.0"
 dependencies = [
+ "adapter-registry",
  "rocksdb",
  "storage-api",
  "tempfile",
@@ -177,9 +186,18 @@ dependencies = [
 name = "dtgproxy"
 version = "0.1.0"
 dependencies = [
+ "adapter-memory",
  "adapter-rocksdb",
  "query-executor",
+ "raft",
+ "raft-command",
+ "raft-logstore",
+ "raft-transport",
+ "replica-snapshot",
+ "shard-runtime",
+ "storage-api",
  "tempfile",
+ "temporal-ir",
  "temporal-query",
  "temporal-storage",
  "temporal-types",
@@ -642,6 +660,15 @@ dependencies = [
  "prost",
  "protobuf",
  "protobuf-build",
+]
+
+[[package]]
+name = "raft-transport"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "prost",
+ "raft",
 ]
 
 [[package]]

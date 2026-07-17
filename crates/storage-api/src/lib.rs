@@ -5,11 +5,217 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
+pub const ADAPTER_SPI_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendFamily {
+    KeyValue,
+    Sql,
+    PropertyGraph,
+    Test,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Durability {
+    /// Process loss can lose acknowledged data. Never valid for a production Replica.
+    Volatile,
+    /// Durability depends on backend configuration that the Adapter could not verify.
+    BackendConfigured,
+    /// A successful apply acknowledgement includes a synchronous durable commit.
+    Synchronous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotCapability {
+    None,
+    PhysicalCheckpoint,
+    LogicalExport,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdapterCapabilities {
     pub local_atomic_batch: bool,
     pub idempotent_apply: bool,
+    pub consistent_multi_get: bool,
+    pub ordered_scan: bool,
+    pub durable_applied_index: bool,
+    pub durability: Durability,
+    pub snapshot: SnapshotCapability,
+    pub predicate_pushdown: bool,
+    pub adjacency_pushdown: bool,
+    pub change_feed: bool,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterDescriptorV1 {
+    spi_version: u16,
+    implementation: String,
+    implementation_version: String,
+    family: BackendFamily,
+    capabilities: AdapterCapabilities,
+}
+
+impl AdapterDescriptorV1 {
+    #[must_use]
+    pub fn new(
+        implementation: impl Into<String>,
+        implementation_version: impl Into<String>,
+        family: BackendFamily,
+        capabilities: AdapterCapabilities,
+    ) -> Self {
+        Self::with_spi_version(
+            ADAPTER_SPI_VERSION,
+            implementation,
+            implementation_version,
+            family,
+            capabilities,
+        )
+    }
+
+    #[must_use]
+    pub fn with_spi_version(
+        spi_version: u16,
+        implementation: impl Into<String>,
+        implementation_version: impl Into<String>,
+        family: BackendFamily,
+        capabilities: AdapterCapabilities,
+    ) -> Self {
+        Self {
+            spi_version,
+            implementation: implementation.into(),
+            implementation_version: implementation_version.into(),
+            family,
+            capabilities,
+        }
+    }
+
+    #[must_use]
+    pub const fn spi_version(&self) -> u16 {
+        self.spi_version
+    }
+
+    #[must_use]
+    pub fn implementation(&self) -> &str {
+        &self.implementation
+    }
+
+    #[must_use]
+    pub fn implementation_version(&self) -> &str {
+        &self.implementation_version
+    }
+
+    #[must_use]
+    pub const fn family(&self) -> BackendFamily {
+        self.family
+    }
+
+    #[must_use]
+    pub const fn capabilities(&self) -> AdapterCapabilities {
+        self.capabilities
+    }
+
+    pub fn validate(
+        &self,
+        requirement: AdapterRequirement,
+    ) -> Result<(), AdapterCompatibilityError> {
+        if self.spi_version != ADAPTER_SPI_VERSION {
+            return Err(AdapterCompatibilityError::SpiVersionMismatch {
+                expected: ADAPTER_SPI_VERSION,
+                actual: self.spi_version,
+            });
+        }
+        if requirement == AdapterRequirement::Development {
+            return Ok(());
+        }
+        for (available, capability) in [
+            (
+                self.capabilities.local_atomic_batch,
+                RequiredCapability::LocalAtomicBatch,
+            ),
+            (
+                self.capabilities.idempotent_apply,
+                RequiredCapability::IdempotentApply,
+            ),
+            (
+                self.capabilities.consistent_multi_get,
+                RequiredCapability::ConsistentMultiGet,
+            ),
+            (
+                self.capabilities.ordered_scan,
+                RequiredCapability::OrderedScan,
+            ),
+            (
+                self.capabilities.durable_applied_index,
+                RequiredCapability::DurableAppliedIndex,
+            ),
+            (
+                self.capabilities.durability == Durability::Synchronous,
+                RequiredCapability::SynchronousDurability,
+            ),
+            (
+                self.capabilities.snapshot != SnapshotCapability::None,
+                RequiredCapability::PortableSnapshot,
+            ),
+        ] {
+            if !available {
+                return Err(AdapterCompatibilityError::MissingCapability {
+                    adapter: self.implementation.clone(),
+                    capability,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterRequirement {
+    Development,
+    ManagedReplica,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredCapability {
+    LocalAtomicBatch,
+    IdempotentApply,
+    ConsistentMultiGet,
+    OrderedScan,
+    DurableAppliedIndex,
+    SynchronousDurability,
+    PortableSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdapterCompatibilityError {
+    SpiVersionMismatch {
+        expected: u16,
+        actual: u16,
+    },
+    MissingCapability {
+        adapter: String,
+        capability: RequiredCapability,
+    },
+}
+
+impl Display for AdapterCompatibilityError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SpiVersionMismatch { expected, actual } => write!(
+                formatter,
+                "Adapter SPI version {actual} is incompatible with required version {expected}"
+            ),
+            Self::MissingCapability {
+                adapter,
+                capability,
+            } => write!(
+                formatter,
+                "Adapter {adapter} is missing required capability {capability:?}"
+            ),
+        }
+    }
+}
+
+impl Error for AdapterCompatibilityError {}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -384,6 +590,15 @@ impl Error for AdapterError {}
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
 
 pub trait StorageAdapter: Send + Sync {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        AdapterDescriptorV1::new(
+            "test-adapter",
+            "unversioned",
+            BackendFamily::Test,
+            self.capabilities(),
+        )
+    }
+
     fn capabilities(&self) -> AdapterCapabilities;
 
     fn apply_committed<'a>(
@@ -402,6 +617,10 @@ impl<T> StorageAdapter for &T
 where
     T: StorageAdapter + ?Sized,
 {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        (**self).descriptor()
+    }
+
     fn capabilities(&self) -> AdapterCapabilities {
         (**self).capabilities()
     }

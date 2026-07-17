@@ -8,12 +8,25 @@ license.workspace = true
 [dependencies]
 adapter-rocksdb = { path = "../adapter-rocksdb" }
 query-executor = { path = "../query-executor" }
+raft-command = { path = "../raft-command" }
+raft-transport = { path = "../raft-transport" }
+shard-runtime = { path = "../shard-runtime" }
+storage-api = { path = "../storage-api" }
+temporal-ir = { path = "../temporal-ir" }
 temporal-query = { path = "../temporal-query" }
 temporal-storage = { path = "../temporal-storage" }
+temporal-types = { path = "../temporal-types" }
 
 [dev-dependencies]
-temporal-types = { path = "../temporal-types" }
+adapter-memory = { path = "../adapter-memory" }
+raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
+raft-logstore = { path = "../raft-logstore" }
+replica-snapshot = { path = "../replica-snapshot" }
 tempfile = "3"
+
+[[bench]]
+name = "phase2"
+harness = false
 
 [lints]
 workspace = true

@@ -1,0 +1,194 @@
+use std::future::Future;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
+use adapter_memory::MemoryAdapter;
+use adapter_registry::{
+    AdapterFactory, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry, HotSwapAdapter,
+    MigrationError, MigrationStatus, RegistryError, SecretString,
+};
+use storage_api::{
+    AdapterRequirement, CommittedMutationBatch, Keyspace, LogicalKey, Mutation, StorageAdapter,
+};
+
+struct MemoryFactory;
+
+impl AdapterFactory for MemoryFactory {
+    fn provider_name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn open<'a>(&'a self, _request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a> {
+        Box::pin(async {
+            let adapter: Arc<dyn StorageAdapter> = Arc::new(MemoryAdapter::new());
+            Ok(adapter)
+        })
+    }
+}
+
+#[test]
+fn registry_selects_a_provider_and_validates_the_opened_instance() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let request = AdapterOpenRequest::new("shard-7");
+
+    let opened =
+        block_on(registry.open("memory", &request, AdapterRequirement::Development)).unwrap();
+    assert_eq!(opened.provider_name(), "memory");
+    assert_eq!(opened.instance_id(), "shard-7");
+    assert_eq!(opened.descriptor(), &opened.adapter().descriptor());
+}
+
+#[test]
+fn production_open_rejects_a_development_only_adapter() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+
+    assert!(matches!(
+        block_on(registry.open(
+            "memory",
+            &AdapterOpenRequest::new("production-shard"),
+            AdapterRequirement::ManagedReplica,
+        )),
+        Err(RegistryError::Incompatible(_))
+    ));
+}
+
+#[test]
+fn duplicate_invalid_and_unknown_providers_fail_closed() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    assert!(matches!(
+        registry.register(Arc::new(MemoryFactory)),
+        Err(RegistryError::DuplicateProvider { provider }) if provider == "memory"
+    ));
+    assert!(matches!(
+        block_on(registry.open(
+            "missing",
+            &AdapterOpenRequest::new("shard"),
+            AdapterRequirement::Development,
+        )),
+        Err(RegistryError::UnknownProvider { provider }) if provider == "missing"
+    ));
+    assert!(matches!(
+        AdapterRegistry::validate_provider_name("../plugin"),
+        Err(RegistryError::InvalidProviderName { .. })
+    ));
+}
+
+#[test]
+fn secrets_are_never_exposed_by_debug_output() {
+    let secret = SecretString::new("super-secret-password");
+    let request = AdapterOpenRequest::new("postgres-shard")
+        .with_parameter("endpoint", "postgresql://database:5432/dtg")
+        .with_secret("password", secret);
+
+    let output = format!("{request:?}");
+    assert!(output.contains("[REDACTED]"));
+    assert!(!output.contains("super-secret-password"));
+    assert_eq!(
+        request.secret("password").unwrap().expose(),
+        "super-secret-password"
+    );
+}
+
+#[test]
+fn hot_swap_dual_applies_then_cuts_over_without_an_index_gap() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let source = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("source"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let target = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("target"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+
+    block_on(source.adapter().apply_committed(batch(1, b"one"))).unwrap();
+    block_on(target.adapter().apply_committed(batch(1, b"one"))).unwrap();
+    let hot = HotSwapAdapter::new(source);
+    hot.start_migration(target, AdapterRequirement::Development)
+        .unwrap();
+    assert_eq!(
+        hot.migration_status(),
+        MigrationStatus::DualApplying {
+            source_generation: 1,
+            target_generation: 2,
+            synchronized_index: 1,
+        }
+    );
+
+    block_on(hot.apply_committed(batch(2, b"two"))).unwrap();
+    let retired = hot.cutover().unwrap();
+    assert_eq!(hot.generation(), 2);
+    assert_eq!(hot.applied_log_index().unwrap(), 2);
+    assert_eq!(retired.adapter().applied_log_index().unwrap(), 2);
+
+    block_on(hot.apply_committed(batch(3, b"three"))).unwrap();
+    assert_eq!(hot.applied_log_index().unwrap(), 3);
+    assert_eq!(retired.adapter().applied_log_index().unwrap(), 2);
+}
+
+#[test]
+fn hot_swap_refuses_an_unsynchronized_target() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let source = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("source"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let target = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("target"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    block_on(source.adapter().apply_committed(batch(1, b"one"))).unwrap();
+
+    let hot = HotSwapAdapter::new(source);
+    assert!(matches!(
+        hot.start_migration(target, AdapterRequirement::Development),
+        Err(MigrationError::TargetIndexMismatch {
+            source: 1,
+            target: 0
+        })
+    ));
+}
+
+fn batch(log_index: u64, value: &[u8]) -> CommittedMutationBatch {
+    CommittedMutationBatch {
+        shard_id: 7,
+        log_index,
+        txn_id: u128::from(log_index),
+        mutations: vec![Mutation::put(
+            0,
+            LogicalKey::in_keyspace(Keyspace::Current, b"value".to_vec()),
+            value.to_vec(),
+        )],
+    }
+}
+
+struct NoopWake;
+
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}

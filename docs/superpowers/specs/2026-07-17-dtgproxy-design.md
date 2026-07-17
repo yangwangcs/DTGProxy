@@ -16,7 +16,7 @@ DTGProxy 是位于应用和普通 KV/图数据库之间的分布式双时态属�
 系统采用以下核心方案：
 
 - 数据模型：属性图 + 有效时间（valid time）+ 事务时间（transaction time）。
-- 分布方式：Shared-Nothing、多 Shard Group、每组 Raft 复制。
+- 分布方式：同一内核同时提供 PrimaryReplica 与 Shared-Nothing；Shared-Nothing 中每个 Shard Group 仍可用 Raft 主从复制。
 - 事务方式：双时态 MVCC + 全局 Timestamp Oracle + Percolator 风格乐观 2PC。
 - 查询方式：时态图 IR、能力感知下推、分布式分片执行与流式归并。
 - 存储方式：Current Projection + History Projection；历史采用版本目录和 anchor+delta 压缩。
@@ -41,6 +41,8 @@ DTGProxy 是位于应用和普通 KV/图数据库之间的分布式双时态属�
 | D-10 | 首版不实现完整 GQL/Cypher，而实现稳定的 Temporal IR、事务 API 和必要的 Temporal Cypher 子集。 |
 | D-11 | 首版采用中间件管理的 Shard Replica；由底层数据库接管复制属于后续能力。 |
 | D-12 | 所有公开的性能数字都是待验证工程目标，不在实测前作为产品承诺。 |
+| D-13 | 对外提供 PrimaryReplica 和 SharedNothing 两种部署模式；两者复用同一 Shard/Raft/时态状态机。 |
+| D-14 | 首批后端矩阵为 RocksDB、PostgreSQL 和 Neo4j/Memgraph 图后端；后端通过 SPI v1 注册与受控迁移切换，不使用不稳定 Rust 动态库 ABI。 |
 
 ## 3. 目标、非目标与成功条件
 

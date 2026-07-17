@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::time::{Duration, Instant};
 
 use adapter_memory::MemoryAdapter;
 use raft::eraftpb::{Entry, EntryType, Message};
@@ -23,6 +24,14 @@ pub struct ProposalReceipt {
     pub leader_id: u64,
     pub term: u64,
     pub index: u64,
+    /// Local time from proposal submission until this Replica observes the
+    /// entry in Raft's committed-entry stream.
+    pub proposal_to_commit: Duration,
+    /// Local time from observing the committed entry to completing its Adapter apply.
+    ///
+    /// This is intentionally narrower than end-to-end proposal latency and is suitable
+    /// for separating state-machine/Adapter delay from Raft quorum delay.
+    pub commit_to_apply: Duration,
 }
 
 #[derive(Debug)]
@@ -110,6 +119,7 @@ impl From<raft_command::CommandCodecError> for ReplicationError {
 #[derive(Clone)]
 struct PendingProposal {
     command: Vec<u8>,
+    proposed_at: Instant,
 }
 
 #[derive(Clone)]
@@ -123,6 +133,8 @@ struct AppliedEvent {
     term: u64,
     index: u64,
     applied_by_leader: bool,
+    commit_observed_at: Instant,
+    commit_to_apply: Duration,
 }
 
 struct ReadyOutput {
@@ -326,6 +338,7 @@ async fn apply_entries(
             }
             EntryType::EntryNormal => {
                 let command = CommandEnvelopeV1::decode(&entry.data)?;
+                let commit_observed_at = Instant::now();
                 state_machine
                     .apply_entry(entry.term, entry.index, &entry.data)
                     .await?;
@@ -334,6 +347,8 @@ async fn apply_entries(
                     term: entry.term,
                     index: entry.index,
                     applied_by_leader,
+                    commit_observed_at,
+                    commit_to_apply: commit_observed_at.elapsed(),
                 });
             }
             EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
@@ -371,7 +386,7 @@ pub struct InProcessShardGroup {
     transport: DeterministicTransport,
     pending: BTreeMap<u128, PendingProposal>,
     completed: BTreeMap<u128, CompletedProposal>,
-    applied_events: BTreeMap<(u64, u128), (u64, u64)>,
+    applied_events: BTreeMap<(u64, u128), (u64, u64, Instant, Duration)>,
     completed_read_states: BTreeMap<Vec<u8>, CompletedReadState>,
     pending_read_contexts: BTreeSet<Vec<u8>>,
     next_read_sequence: u64,
@@ -497,6 +512,7 @@ impl InProcessShardGroup {
                 request_id,
                 PendingProposal {
                     command: command.clone(),
+                    proposed_at: Instant::now(),
                 },
             );
         }
@@ -827,10 +843,24 @@ impl InProcessShardGroup {
 
     fn record_events(&mut self, node_id: u64, events: Vec<AppliedEvent>) {
         for event in events {
-            self.applied_events
-                .insert((node_id, event.request_id), (event.term, event.index));
+            self.applied_events.insert(
+                (node_id, event.request_id),
+                (
+                    event.term,
+                    event.index,
+                    event.commit_observed_at,
+                    event.commit_to_apply,
+                ),
+            );
             if event.applied_by_leader {
-                self.complete_request(node_id, event.request_id, event.term, event.index);
+                self.complete_request(
+                    node_id,
+                    event.request_id,
+                    event.term,
+                    event.index,
+                    event.commit_observed_at,
+                    event.commit_to_apply,
+                );
             }
         }
     }
@@ -865,16 +895,39 @@ impl InProcessShardGroup {
         let applied: Vec<_> = self
             .applied_events
             .iter()
-            .filter_map(|((node_id, request_id), (term, index))| {
-                (*node_id == leader_id).then_some((*request_id, *term, *index))
-            })
+            .filter_map(
+                |((node_id, request_id), (term, index, commit_observed_at, commit_to_apply))| {
+                    (*node_id == leader_id).then_some((
+                        *request_id,
+                        *term,
+                        *index,
+                        *commit_observed_at,
+                        *commit_to_apply,
+                    ))
+                },
+            )
             .collect();
-        for (request_id, term, index) in applied {
-            self.complete_request(leader_id, request_id, term, index);
+        for (request_id, term, index, commit_observed_at, commit_to_apply) in applied {
+            self.complete_request(
+                leader_id,
+                request_id,
+                term,
+                index,
+                commit_observed_at,
+                commit_to_apply,
+            );
         }
     }
 
-    fn complete_request(&mut self, leader_id: u64, request_id: u128, term: u64, index: u64) {
+    fn complete_request(
+        &mut self,
+        leader_id: u64,
+        request_id: u128,
+        term: u64,
+        index: u64,
+        commit_observed_at: Instant,
+        commit_to_apply: Duration,
+    ) {
         let Some(pending) = self.pending.remove(&request_id) else {
             return;
         };
@@ -887,6 +940,9 @@ impl InProcessShardGroup {
                     leader_id,
                     term,
                     index,
+                    proposal_to_commit: commit_observed_at
+                        .saturating_duration_since(pending.proposed_at),
+                    commit_to_apply,
                 },
             },
         );

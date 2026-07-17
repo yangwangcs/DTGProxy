@@ -1,17 +1,15 @@
 [package]
-name = "adapter-rocksdb"
+name = "adapter-registry"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-adapter-registry = { path = "../adapter-registry" }
-rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "multi-threaded-cf"] }
 storage-api = { path = "../storage-api" }
 
 [dev-dependencies]
-tempfile = "3"
+adapter-memory = { path = "../adapter-memory" }
 
 [lints]
 workspace = true
