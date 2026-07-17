@@ -1,0 +1,13 @@
+[package]
+name = "temporal-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+temporal-storage = { path = "../temporal-storage" }
+temporal-types = { path = "../temporal-types" }
+
+[lints]
+workspace = true

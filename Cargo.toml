@@ -6,6 +6,8 @@ members = [
     "crates/adapter-memory",
     "crates/adapter-rocksdb",
     "crates/temporal-storage",
+    "crates/temporal-ir",
+    "crates/query-executor",
     "crates/dtgproxy",
 ]
 resolver = "3"

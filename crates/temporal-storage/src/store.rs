@@ -18,8 +18,8 @@ use crate::{
     EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryEntry,
     KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError, TemporalTransaction,
     VertexIdentity, current_edge_key, current_vertex_key, decode_graph_key, edge_identity_key,
-    history_anchor_key, history_prefix, in_adjacency_key, in_adjacency_prefix, out_adjacency_key,
-    out_adjacency_prefix, vertex_identity_key,
+    edge_identity_prefix, history_anchor_key, history_prefix, in_adjacency_key,
+    in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix, vertex_identity_key,
 };
 
 pub type TemporalStoreFuture<'a, T> =
@@ -507,6 +507,52 @@ where
         })
     }
 
+    pub fn edge_view_current<'a>(
+        &'a self,
+        element: ElementRef,
+        valid_time: ValidTime,
+    ) -> TemporalStoreFuture<'a, Option<EdgeView>> {
+        Box::pin(async move {
+            require_edge(element)?;
+            let Some(payload) = self
+                .current_value(current_edge_key(element), valid_time)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let identity = self
+                .load_edge_identity(element)
+                .await?
+                .ok_or(TemporalStoreError::MissingEdgeIdentity { edge: element })?;
+            Ok(Some(edge_view(identity, payload)))
+        })
+    }
+
+    pub fn edge_view_as_of<'a>(
+        &'a self,
+        element: ElementRef,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Option<EdgeView>> {
+        Box::pin(async move {
+            require_edge(element)?;
+            let Some(payload) = self
+                .load_projection_at(element, transaction_time)
+                .await?
+                .as_ref()
+                .and_then(|projection| projection.visible_at(valid_time))
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let identity = self
+                .load_edge_identity(element)
+                .await?
+                .ok_or(TemporalStoreError::MissingEdgeIdentity { edge: element })?;
+            Ok(Some(edge_view(identity, payload)))
+        })
+    }
+
     pub fn expand_out_current<'a>(
         &'a self,
         graph: GraphId,
@@ -595,6 +641,35 @@ where
         })
     }
 
+    pub fn expand_out_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        partition: PartitionId,
+        source: ElementId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
+        self.expand_as_of(graph, partition, source, valid_time, transaction_time, true)
+    }
+
+    pub fn expand_in_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        partition: PartitionId,
+        destination: ElementId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
+        self.expand_as_of(
+            graph,
+            partition,
+            destination,
+            valid_time,
+            transaction_time,
+            false,
+        )
+    }
+
     pub fn diff_vertex<'a>(
         &'a self,
         element: ElementRef,
@@ -649,6 +724,69 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn load_edge_identity(
+        &self,
+        element: ElementRef,
+    ) -> Result<Option<EdgeIdentity>, TemporalStoreError> {
+        let mut values = self
+            .adapter
+            .multi_get(&[edge_identity_key(element)])
+            .await?;
+        values
+            .pop()
+            .flatten()
+            .map(|bytes| EdgeIdentity::decode(&bytes).map_err(TemporalStoreError::from))
+            .transpose()
+    }
+
+    fn expand_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        partition: PartitionId,
+        endpoint: ElementId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+        outgoing: bool,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Identity,
+                    edge_identity_prefix(graph, partition),
+                ))
+                .await?;
+            let mut edges = Vec::new();
+            for entry in entries {
+                let GraphKey::EdgeIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedEdgeIdentityKey);
+                };
+                let identity = EdgeIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                let matches_endpoint = if outgoing {
+                    identity.source() == endpoint
+                } else {
+                    identity.destination() == endpoint
+                };
+                if !matches_endpoint {
+                    continue;
+                }
+                if let Some(payload) = self
+                    .load_projection_at(element, transaction_time)
+                    .await?
+                    .as_ref()
+                    .and_then(|projection| projection.visible_at(valid_time))
+                    .cloned()
+                {
+                    edges.push(edge_view(identity, payload));
+                }
+            }
+            Ok(edges)
+        })
     }
 
     async fn validate_incident_edge_coverage(
@@ -864,6 +1002,10 @@ pub enum TemporalStoreError {
         vertex: ElementRef,
         edge: ElementRef,
     },
+    MissingEdgeIdentity {
+        edge: ElementRef,
+    },
+    UnexpectedEdgeIdentityKey,
     UnexpectedAdjacencyKey,
     UnexpectedHistoryAnchor,
     MissingHistoryAnchor,
@@ -912,6 +1054,12 @@ impl Display for TemporalStoreError {
                     "vertex deletion would leave incident edge {edge:?} without endpoint {vertex:?}"
                 )
             }
+            Self::MissingEdgeIdentity { edge } => {
+                write!(formatter, "visible edge has no identity record: {edge:?}")
+            }
+            Self::UnexpectedEdgeIdentityKey => {
+                formatter.write_str("edge identity scan returned an unexpected key type")
+            }
             Self::UnexpectedAdjacencyKey => {
                 formatter.write_str("adjacency scan returned an unexpected key type")
             }
@@ -959,6 +1107,16 @@ fn require_vertex(element: ElementRef) -> Result<(), TemporalStoreError> {
         Ok(())
     } else {
         Err(TemporalStoreError::WrongElementKind)
+    }
+}
+
+fn edge_view(identity: EdgeIdentity, payload: CanonicalElement) -> EdgeView {
+    EdgeView {
+        element: identity.element(),
+        edge_type: identity.edge_type(),
+        source: identity.source(),
+        destination: identity.destination(),
+        payload,
     }
 }
 

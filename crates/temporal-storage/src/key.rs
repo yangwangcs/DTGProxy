@@ -213,6 +213,15 @@ pub fn edge_identity_key(element: ElementRef) -> LogicalKey {
 }
 
 #[must_use]
+pub fn edge_identity_prefix(graph: GraphId, partition: PartitionId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(13);
+    key.push(TAG_EDGE_IDENTITY);
+    key.extend_from_slice(&graph.value().to_be_bytes());
+    key.extend_from_slice(&partition.value().to_be_bytes());
+    key
+}
+
+#[must_use]
 pub fn current_vertex_key(element: ElementRef) -> LogicalKey {
     entity_key(Keyspace::Current, TAG_CURRENT_VERTEX, element)
 }

@@ -12,13 +12,16 @@ The repository is being delivered in independently verifiable phases. The implem
   idempotent replay, restart recovery, snapshot reads, and checkpoints;
 - `temporal-storage`: deterministic graph key/value codecs, Current/History rewriting, typed
   vertex and edge reads, double adjacency, AS OF, and temporal DIFF;
+- `temporal-ir`: versioned, validated backend-neutral plans for point lookup, expansion, AS OF,
+  and DIFF;
+- `query-executor`: deterministic local execution with typed vertex, edge, and change records;
 - `dtgproxy`: executable product entry point.
 
 Phase 0, the Phase 1A durable adapter, and the Phase 1B temporal persistence slice are
-implemented and tested. Bounded Anchor+Delta history and atomic multi-element single-node
-transactions are also implemented in Phase 1C. The local query frontend, replicated shard runtime,
-distributed transactions, external database adapters, and analytics integration remain active
-implementation phases described by the design.
+implemented and tested. Bounded Anchor+Delta history, atomic multi-element single-node
+transactions, typed Temporal IR, and the local executor are also implemented in Phase 1C. The
+text query frontend, replicated shard runtime, distributed transactions, external database
+adapters, and analytics integration remain active implementation phases described by the design.
 
 The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
 `adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column
@@ -66,6 +69,21 @@ new Anchor when either that replay count or a 64 KiB encoded-delta budget would 
 Readers seek directly to the requested transaction time and replay backward only to the nearest
 Anchor. Missing or over-limit chains fail closed. Phase 1B full-anchor records remain readable and
 can serve as migration anchors for new Deltas.
+
+## Temporal IR and local execution
+
+`TemporalPlan` version 1 makes graph/partition scope, point valid time, Current versus transaction
+`AS OF`, result bounds, and DIFF transaction bounds explicit. Required selectors cannot be omitted
+from the typed plan. Validation rejects unknown versions, zero/unbounded limits, and reversed DIFF
+bounds before storage is accessed.
+
+`LocalExecutor` executes only through `TemporalStore` and returns canonical typed vertex, edge, or
+change records. Expansion applies valid-time filtering, de-duplicates `Both` direction self-edges,
+orders by stable element identity, and applies limits after ordering. Historical expansion does not
+reuse Current adjacency: it scans the immutable edge identity directory and reconstructs each
+candidate at the requested transaction time, so fully deleted edges remain visible in older
+snapshots. This is a correctness-first fallback; Phase 2+ can add a versioned adjacency index and
+capability-aware pushdown without changing IR semantics.
 
 ## Performance probe
 

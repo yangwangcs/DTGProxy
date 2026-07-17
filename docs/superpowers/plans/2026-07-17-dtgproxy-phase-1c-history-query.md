@@ -99,15 +99,22 @@ referential integrity.
 
 **Files:** new `temporal-ir` and `query-executor` crates plus TCK.
 
-- [ ] Define versioned typed IR for vertex lookup, edge lookup, expand out/in/both, Current,
+- [x] Define versioned typed IR for vertex lookup, edge lookup, expand out/in/both, Current,
   transaction AS OF, valid-time point selector, and element DIFF.
-- [ ] Validate plans (graph/partition scope, required time selectors, bounded result limits) before
+- [x] Validate plans (graph/partition scope, required time selectors, bounded result limits) before
   execution.
-- [ ] Implement executor operators over `TemporalStore` with deterministic ordering and explicit
+- [x] Implement executor operators over `TemporalStore` with deterministic ordering and explicit
   residual valid-time filtering.
-- [ ] Add typed result records preserving canonical values and edge identities.
-- [ ] Test equivalent Current/AS OF/DIFF plans against direct APIs and checkpoint databases.
-- [ ] Commit as `feat: execute local temporal IR`.
+- [x] Add typed result records preserving canonical values and edge identities.
+- [x] Test equivalent Current/AS OF/DIFF plans against direct APIs and checkpoint databases.
+- [x] Commit as `feat: execute local temporal IR`.
+
+Task 4 evidence: three IR validation tests cover every operator, both transaction selectors,
+version rejection, bounded limits, and DIFF ordering. Four executor tests compare Current, AS OF,
+DIFF, and expansion with direct APIs; prove residual valid-time filtering, stable element ordering,
+post-order limits, and `Both` de-duplication; and execute the same typed plan against a RocksDB
+checkpoint. A storage test proves historical expansion includes an edge absent from Current
+adjacency by reconstructing it through the immutable identity directory.
 
 ### Task 5: Minimal Temporal Query Frontend
 
