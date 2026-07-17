@@ -391,7 +391,9 @@ dependencies = [
 name = "temporal-storage"
 version = "0.1.0"
 dependencies = [
+ "adapter-memory",
  "storage-api",
+ "temporal-model",
  "temporal-types",
 ]
 

@@ -2,6 +2,8 @@
 
 mod key;
 mod record;
+mod rewrite;
+mod store;
 
 pub use key::{
     EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, KeyCodecError, LabelId,
@@ -10,4 +12,7 @@ pub use key::{
 };
 pub use record::{
     EdgeIdentity, HistoryAnchor, ProjectionRecord, RecordCodecError, ValidSegment, VertexIdentity,
+};
+pub use store::{
+    CommitContext, TemporalStore, TemporalStoreError, TemporalStoreFuture, VertexMutation,
 };

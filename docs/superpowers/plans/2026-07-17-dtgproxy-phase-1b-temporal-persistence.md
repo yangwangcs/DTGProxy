@@ -118,20 +118,21 @@ RocksDB adapters; no unstable/default serializers in the durable format.
 **Produces:** `TemporalStore`, `VertexMutation`, `CommitContext`, `put_vertex`, `delete_vertex`,
 `vertex_current`, and `vertex_as_of`.
 
-- [ ] Write failing memory-adapter tests for initial insert, disjoint insert, retroactive
+- [x] Write failing memory-adapter tests for initial insert, disjoint insert, retroactive
   correction with residual splitting, partial delete, transaction-time audit, no-result reads,
   canonical type preservation, deterministic replay, invalid commit order, and stale overlapping
   writer conflict. Compare every view to `temporal-model`.
-- [ ] Implement AS OF anchor selection by ordered History prefix scan. At `read_ts`, load the
+- [x] Implement AS OF anchor selection by ordered History prefix scan. At `read_ts`, load the
   newest anchor not newer than the snapshot; inspect later anchors' changed intervals to reject
   only overlapping stale writes.
-- [ ] Rewrite a valid interval by subtracting it from affected segments, inserting/replacing the
+- [x] Rewrite a valid interval by subtracting it from affected segments, inserting/replacing the
   requested present segment (or leaving a hole for delete), sorting, and coalescing adjacent
   equal payloads.
-- [ ] Emit deterministic mutations in fixed order: identity-if-new, Current projection, immutable
-  History anchor. Use the caller's shard/log/transaction identifiers in one committed batch.
-- [ ] Implement Current fast-path reads and AS OF reconstruction from the selected full anchor.
-- [ ] Run all memory round-trip tests and commit as `feat: persist bitemporal vertices`.
+- [x] Emit deterministic mutations in fixed order: validated identity upsert, Current projection,
+  immutable History anchor. Re-emitting the identity makes retries byte-identical. Use the
+  caller's shard/log/transaction identifiers in one committed batch.
+- [x] Implement Current fast-path reads and AS OF reconstruction from the selected full anchor.
+- [x] Run all memory round-trip tests and commit as `feat: persist bitemporal vertices`.
 
 ### Task 5: Edges and Double Adjacency
 
