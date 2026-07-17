@@ -49,13 +49,13 @@ docs/superpowers/specs/            approved detailed design, renamed DTGProxy
 - Consumes: approved design document.
 - Produces: a buildable workspace containing packages `temporal-types`, `temporal-model`, `storage-api`, `adapter-memory`, and `dtgproxy`.
 
-- [ ] **Step 1: Initialize a feature branch because the directory is not yet a Git repository**
+- [x] **Step 1: Initialize a feature branch because the directory is not yet a Git repository**
 
 Run: `git init -b feature/dtgproxy-phase0`
 
 Expected: a new repository whose current branch is `feature/dtgproxy-phase0`, never `main` or `master`.
 
-- [ ] **Step 2: Add workspace configuration**
+- [x] **Step 2: Add workspace configuration**
 
 ```toml
 [workspace]
@@ -83,23 +83,23 @@ all = "warn"
 
 Each library manifest inherits workspace package fields and lints. `temporal-model` depends on `temporal-types`; `adapter-memory` depends on `storage-api`.
 
-- [ ] **Step 3: Add branding and ignore rules**
+- [x] **Step 3: Add branding and ignore rules**
 
 `.gitignore` contains `/target/`, `.DS_Store`, `.idea/`, and `.vscode/`. `README.md` states that DTGProxy is a distributed bitemporal property-graph middleware, lists the five Phase 0 crates, and documents `cargo test --workspace` and `cargo run -p dtgproxy -- --version`.
 
-- [ ] **Step 4: Rename the design and replace the old working name mechanically**
+- [x] **Step 4: Rename the design and replace the old working name mechanically**
 
 Run: `mv docs/superpowers/specs/2026-07-17-distributed-bitemporal-graph-middleware-design.md docs/superpowers/specs/2026-07-17-dtgproxy-design.md`, then replace every exact occurrence of the old four-letter working name with `DTGProxy`.
 
 Expected: `rg -n '\bD[T]GM\b' .` returns no matches outside `.git`.
 
-- [ ] **Step 5: Verify the empty baseline builds**
+- [x] **Step 5: Verify the empty baseline builds**
 
 Run: `cargo test --workspace`
 
 Expected: exit 0 with zero behavioral tests.
 
-- [ ] **Step 6: Commit the baseline**
+- [x] **Step 6: Commit the baseline**
 
 Run: `git add . && git commit -m "chore: initialize DTGProxy Rust workspace"`
 
@@ -115,7 +115,7 @@ Run: `git add . && git commit -m "chore: initialize DTGProxy Rust workspace"`
 **Interfaces:**
 - Produces: `Interval<T>`, `IntervalError`, `ValidTime`, `TransactionTime`, and `BitemporalVersion<T>`.
 
-- [ ] **Step 1: Write the failing behavior tests**
+- [x] **Step 1: Write the failing behavior tests**
 
 ```rust
 use temporal_types::{BitemporalVersion, Interval, TransactionTime, ValidTime};
@@ -155,17 +155,17 @@ fn subtracting_an_inner_interval_returns_two_residuals() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p temporal-types --test interval_visibility`
 
 Expected: compile failure because the public temporal types do not exist.
 
-- [ ] **Step 3: Implement the minimal types**
+- [x] **Step 3: Implement the minimal types**
 
-`Interval<T>` stores `start: T` and `end: Option<T>`, validates `end > start`, and implements `contains`, `overlaps`, `intersection`, and `subtract`. `ValidTime` is an ordered `i64` microsecond newtype. `TransactionTime` stores `physical_micros: i64` plus `logical: u32` and derives total ordering. `BitemporalVersion<T>` owns its value plus valid and transaction intervals and implements `is_visible_at` as the conjunction of both interval checks.
+`Interval<T>` stores `start: T` and `end: Option<T>`, validates `end > start`, and implements the tested `contains` and `subtract` behavior. `ValidTime` is an ordered `i64` microsecond newtype. `TransactionTime` stores `physical_micros: i64` plus `logical: u32` and derives total ordering. `BitemporalVersion<T>` owns its value plus valid and transaction intervals and implements `is_visible_at` as the conjunction of both interval checks. Additional accessors are introduced only with the model-oracle tests that consume them.
 
-- [ ] **Step 4: Run GREEN and lint**
+- [x] **Step 4: Run GREEN and lint**
 
 Run: `cargo test -p temporal-types --test interval_visibility && cargo clippy -p temporal-types --all-targets -- -D warnings`
 
