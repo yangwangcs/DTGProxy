@@ -40,12 +40,17 @@ where
     }
 
     #[must_use]
+    pub const fn start(&self) -> T {
+        self.start
+    }
+
+    #[must_use]
     pub fn contains(&self, value: T) -> bool {
         value >= self.start && self.end.is_none_or(|end| value < end)
     }
 
     #[must_use]
-    fn overlaps(&self, other: &Self) -> bool {
+    pub fn overlaps(&self, other: &Self) -> bool {
         self.end.is_none_or(|end| other.start < end)
             && other.end.is_none_or(|end| self.start < end)
     }

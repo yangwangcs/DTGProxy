@@ -169,9 +169,9 @@ Expected: compile failure because the public temporal types do not exist.
 
 Run: `cargo test -p temporal-types --test interval_visibility && cargo clippy -p temporal-types --all-targets -- -D warnings`
 
-Expected: 3 tests pass and Clippy exits 0.
+Expected: 4 tests pass and Clippy exits 0.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/temporal-types && git commit -m "feat: add bitemporal primitive types"`
 
@@ -184,9 +184,9 @@ Run: `git add crates/temporal-types && git commit -m "feat: add bitemporal primi
 
 **Interfaces:**
 - Consumes: `Interval<ValidTime>`, `TransactionTime`, `BitemporalVersion<T>`.
-- Produces: `Timeline<T>`, `StoredVersion<T>`, `CorrectionSummary`, and `TimelineError`.
+- Produces: `Timeline<T>`, `CorrectionSummary`, and `TimelineError`.
 
-- [ ] **Step 1: Write the failing correction test**
+- [x] **Step 1: Write the failing correction test**
 
 ```rust
 use temporal_model::Timeline;
@@ -226,17 +226,17 @@ fn stale_writer_conflicts_with_a_later_overlapping_commit() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p temporal-model --test retroactive_correction`
 
 Expected: compile failure because `Timeline` is not implemented.
 
-- [ ] **Step 3: Implement the model**
+- [x] **Step 3: Implement the model**
 
-`Timeline<T: Clone + Eq>` owns monotonically assigned `u64` version IDs. `put_initial` rejects overlap with a version visible at its commit timestamp. `correct` rejects `commit_ts <= read_ts`, detects any overlapping version whose transaction start is in `(read_ts, commit_ts)`, closes every overlapping version visible at `read_ts`, opens residual valid-time segments at `commit_ts`, and opens exactly one replacement segment over the correction interval. `value_at` returns an invariant error if more than one version is visible.
+`Timeline<T: Clone>` owns the versions needed by the semantic oracle. `put_initial` rejects overlap with a version visible at its commit timestamp. `correct` rejects `commit_ts <= read_ts`, detects any overlapping version whose transaction start is in `(read_ts, commit_ts)`, closes every overlapping version visible at `read_ts`, opens residual valid-time segments at `commit_ts`, and opens exactly one replacement segment over the correction interval. `value_at` returns an invariant error if more than one version is visible. Durable version IDs remain the responsibility of the later mutation protocol, so the Phase 0 oracle does not invent an untested ID API.
 
-- [ ] **Step 4: Run GREEN and all temporal tests**
+- [x] **Step 4: Run GREEN and all temporal tests**
 
 Run: `cargo test -p temporal-model && cargo test -p temporal-types`
 
