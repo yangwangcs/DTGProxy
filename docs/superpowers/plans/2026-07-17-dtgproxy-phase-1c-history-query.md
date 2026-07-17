@@ -120,14 +120,20 @@ adjacency by reconstructing it through the immutable identity directory.
 
 **Files:** new `temporal-query` crate, CLI integration, parser/executor tests.
 
-- [ ] Specify a deliberately small syntax for ID lookup/expand plus `FOR VALID TIME`,
+- [x] Specify a deliberately small syntax for ID lookup/expand plus `FOR VALID TIME`,
   `AS OF TRANSACTION TIME`, and `DIFF TRANSACTION TIME` clauses.
-- [ ] Implement a hand-written bounded parser with structured errors and no backend-specific
+- [x] Implement a hand-written bounded parser with structured errors and no backend-specific
   syntax leakage.
-- [ ] Compile syntax to the typed IR; test whitespace, integer bounds, malformed clauses, and
+- [x] Compile syntax to the typed IR; test whitespace, integer bounds, malformed clauses, and
   unsupported Cypher constructs.
-- [ ] Add CLI `query --db <path> --text <query>` and machine-readable canonical output.
-- [ ] Commit as `feat: add temporal query subset`.
+- [x] Add CLI `query --db <path> --text <query>` and machine-readable canonical output.
+- [x] Commit as `feat: add temporal query subset`.
+
+Task 5 evidence: six parser tests cover all statement forms, case/whitespace, every integer width,
+input/token limits, missing/trailing clauses, reversed DIFF, and explicit rejection of `MATCH`.
+Five CLI tests include a real RocksDB query and prove parser failure occurs before backend open.
+One canonical-output test fixes stable JSON field order and lossless DTP1 hex payloads for vertex,
+edge identity, and Changed ranges.
 
 ### Task 6: Phase 1 Acceptance
 

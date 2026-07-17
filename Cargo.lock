@@ -102,6 +102,14 @@ dependencies = [
 [[package]]
 name = "dtgproxy"
 version = "0.1.0"
+dependencies = [
+ "adapter-rocksdb",
+ "query-executor",
+ "tempfile",
+ "temporal-query",
+ "temporal-storage",
+ "temporal-types",
+]
 
 [[package]]
 name = "either"
@@ -405,6 +413,15 @@ dependencies = [
 name = "temporal-model"
 version = "0.1.0"
 dependencies = [
+ "temporal-types",
+]
+
+[[package]]
+name = "temporal-query"
+version = "0.1.0"
+dependencies = [
+ "temporal-ir",
+ "temporal-storage",
  "temporal-types",
 ]
 

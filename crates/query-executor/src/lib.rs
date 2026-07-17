@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fmt::Write as _;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
@@ -11,10 +12,10 @@ use temporal_ir::{
     ExpandDirection, PlanBody, PlanError, PointOperator, TemporalPlan, TemporalSelector,
 };
 use temporal_storage::{
-    EdgeTypeId, EdgeView, ElementId, ElementKind, ElementRef, TemporalChange, TemporalStore,
-    TemporalStoreError,
+    EdgeTypeId, EdgeView, ElementId, ElementKind, ElementRef, TemporalChange, TemporalChangeKind,
+    TemporalStore, TemporalStoreError,
 };
-use temporal_types::CanonicalElement;
+use temporal_types::{CanonicalElement, CodecError};
 
 pub type ExecutorFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ExecutorError>> + Send + 'a>>;
@@ -120,6 +121,104 @@ impl QueryResult {
     pub fn records(&self) -> &[QueryRecord] {
         &self.records
     }
+
+    pub fn to_canonical_json(&self) -> Result<String, CodecError> {
+        let mut output = String::from("{\"version\":1,\"records\":[");
+        for (index, record) in self.records.iter().enumerate() {
+            if index != 0 {
+                output.push(',');
+            }
+            match record {
+                QueryRecord::Vertex(record) => {
+                    output.push_str("{\"type\":\"vertex\",");
+                    push_element_identity(&mut output, record.element);
+                    write!(
+                        output,
+                        ",\"payload_dtp1\":\"{}\"}}",
+                        payload_hex(&record.payload)?
+                    )
+                    .expect("writing to String cannot fail");
+                }
+                QueryRecord::Edge(record) => {
+                    output.push_str("{\"type\":\"edge\",");
+                    push_element_identity(&mut output, record.element);
+                    write!(
+                        output,
+                        ",\"edge_type\":\"{}\",\"source_id\":\"{}\",\"destination_id\":\"{}\",\"payload_dtp1\":\"{}\"}}",
+                        record.edge_type.value(),
+                        record.source.value(),
+                        record.destination.value(),
+                        payload_hex(&record.payload)?
+                    )
+                    .expect("writing to String cannot fail");
+                }
+                QueryRecord::Change(record) => {
+                    output.push_str("{\"type\":\"change\",\"element_kind\":\"");
+                    output.push_str(match record.element.kind() {
+                        ElementKind::Vertex => "vertex",
+                        ElementKind::Edge => "edge",
+                    });
+                    output.push_str("\",");
+                    push_element_identity(&mut output, record.element);
+                    write!(
+                        output,
+                        ",\"valid_start_micros\":\"{}\",\"valid_end_micros\":",
+                        record.change.valid().start().as_micros()
+                    )
+                    .expect("writing to String cannot fail");
+                    if let Some(end) = record.change.valid().end() {
+                        write!(output, "\"{}\"", end.as_micros())
+                            .expect("writing to String cannot fail");
+                    } else {
+                        output.push_str("null");
+                    }
+                    match record.change.kind() {
+                        TemporalChangeKind::Added { after } => write!(
+                            output,
+                            ",\"change\":\"added\",\"after_dtp1\":\"{}\"}}",
+                            payload_hex(after)?
+                        ),
+                        TemporalChangeKind::Removed { before } => write!(
+                            output,
+                            ",\"change\":\"removed\",\"before_dtp1\":\"{}\"}}",
+                            payload_hex(before)?
+                        ),
+                        TemporalChangeKind::Changed { before, after } => write!(
+                            output,
+                            ",\"change\":\"changed\",\"before_dtp1\":\"{}\",\"after_dtp1\":\"{}\"}}",
+                            payload_hex(before)?,
+                            payload_hex(after)?
+                        ),
+                    }
+                    .expect("writing to String cannot fail");
+                }
+            }
+        }
+        output.push_str("]}");
+        Ok(output)
+    }
+}
+
+fn push_element_identity(output: &mut String, element: ElementRef) {
+    write!(
+        output,
+        "\"graph\":\"{}\",\"partition\":\"{}\",\"element_id\":\"{}\"",
+        element.graph().value(),
+        element.partition().value(),
+        element.id().value()
+    )
+    .expect("writing to String cannot fail");
+}
+
+fn payload_hex(payload: &CanonicalElement) -> Result<String, CodecError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = payload.encode()?;
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(output)
 }
 
 pub struct LocalExecutor<A> {

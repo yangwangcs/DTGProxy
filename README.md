@@ -15,13 +15,15 @@ The repository is being delivered in independently verifiable phases. The implem
 - `temporal-ir`: versioned, validated backend-neutral plans for point lookup, expansion, AS OF,
   and DIFF;
 - `query-executor`: deterministic local execution with typed vertex, edge, and change records;
+- `temporal-query`: bounded hand-written parser compiling a small temporal syntax to the IR;
 - `dtgproxy`: executable product entry point.
 
 Phase 0, the Phase 1A durable adapter, and the Phase 1B temporal persistence slice are
 implemented and tested. Bounded Anchor+Delta history, atomic multi-element single-node
-transactions, typed Temporal IR, and the local executor are also implemented in Phase 1C. The
-text query frontend, replicated shard runtime, distributed transactions, external database
-adapters, and analytics integration remain active implementation phases described by the design.
+transactions, typed Temporal IR, the local executor, and the minimal text query frontend are also
+implemented in Phase 1C. The replicated shard runtime, distributed transactions, external
+database adapters, and analytics integration remain active implementation phases described by the
+design.
 
 The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
 `adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column
@@ -84,6 +86,42 @@ reuse Current adjacency: it scans the immutable edge identity directory and reco
 candidate at the requested transaction time, so fully deleted edges remain visible in older
 snapshots. This is a correctness-first fallback; Phase 2+ can add a versioned adjacency index and
 capability-aware pushdown without changing IR semantics.
+
+## Minimal temporal query syntax
+
+The Phase 1C frontend intentionally accepts only fixed-shape ID lookup, one-hop expansion, and
+element DIFF. Keywords are case-insensitive; identifiers and times are decimal integers;
+transaction timestamps are `physical_micros:logical`. The complete forms are:
+
+```text
+VERTEX <id> GRAPH <graph> PARTITION <partition>
+  FOR VALID TIME <micros> CURRENT LIMIT <n>
+
+EDGE <id> GRAPH <graph> PARTITION <partition>
+  FOR VALID TIME <micros> AS OF TRANSACTION TIME <physical>:<logical> LIMIT <n>
+
+EXPAND OUT|IN|BOTH FROM <vertex-id> GRAPH <graph> PARTITION <partition>
+  FOR VALID TIME <micros> CURRENT|AS OF TRANSACTION TIME <physical>:<logical> LIMIT <n>
+
+VERTEX|EDGE <id> GRAPH <graph> PARTITION <partition>
+  DIFF TRANSACTION TIME <from-physical>:<from-logical>
+  TO <to-physical>:<to-logical> LIMIT <n>
+```
+
+Input is capped at 4,096 bytes and 64 tokens. Integer widths, unknown statements, missing clauses,
+trailing tokens, result bounds, and reversed DIFF ranges produce structured errors. Cypher/GQL
+constructs such as `MATCH` are deliberately rejected rather than partially interpreted.
+
+Execute a query against a RocksDB database or checkpoint with:
+
+```bash
+dtgproxy query --db /path/to/db --text \
+  "VERTEX 7 GRAPH 1 PARTITION 0 FOR VALID TIME 5 CURRENT LIMIT 1"
+```
+
+The CLI emits canonical JSON. Graph/element identifiers and times are decimal strings to avoid
+consumer precision loss; canonical property payloads are DTP1 bytes encoded as lowercase hex, so
+all graph value types round-trip without lossy JSON coercion.
 
 ## Performance probe
 

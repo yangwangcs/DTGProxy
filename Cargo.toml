@@ -8,6 +8,7 @@ members = [
     "crates/temporal-storage",
     "crates/temporal-ir",
     "crates/query-executor",
+    "crates/temporal-query",
     "crates/dtgproxy",
 ]
 resolver = "3"

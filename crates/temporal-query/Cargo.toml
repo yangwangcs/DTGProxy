@@ -1,19 +1,14 @@
 [package]
-name = "dtgproxy"
+name = "temporal-query"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-adapter-rocksdb = { path = "../adapter-rocksdb" }
-query-executor = { path = "../query-executor" }
-temporal-query = { path = "../temporal-query" }
+temporal-ir = { path = "../temporal-ir" }
 temporal-storage = { path = "../temporal-storage" }
-
-[dev-dependencies]
 temporal-types = { path = "../temporal-types" }
-tempfile = "3"
 
 [lints]
 workspace = true
