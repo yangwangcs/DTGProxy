@@ -100,6 +100,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "dtgproxy"
 version = "0.1.0"
 dependencies = [
@@ -302,6 +311,15 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "raft-command"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "storage-api",
+ "temporal-types",
+]
 
 [[package]]
 name = "regex"

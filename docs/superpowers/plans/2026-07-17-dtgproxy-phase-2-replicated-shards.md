@@ -50,14 +50,14 @@ Folly/Thrift/C++ source is copied. Sources: [raft-rs](https://github.com/tikv/ra
 
 **Files:** new `raft-command` crate and corruption/golden tests.
 
-- [ ] Define `CommandEnvelopeV1 { shard_id, placement_epoch, request_id, body }` with bodies
+- [x] Define `CommandEnvelopeV1 { shard_id, placement_epoch, request_id, body }` with bodies
   `ApplyPrepared { commit_ts, batch }` and `ClosedTimestampTick { closed_ts }`.
-- [ ] Implement explicit big-endian, length-delimited encoding with magic/version/body tags and
+- [x] Implement explicit big-endian, length-delimited encoding with magic/version/body tags and
   checksum; do not use Rust default serialization for durable commands.
-- [ ] Decode with size/count limits, duplicate mutation-sequence rejection, canonical command
+- [x] Decode with size/count limits, duplicate mutation-sequence rejection, canonical command
   ordering checks, and trailing/corruption rejection.
-- [ ] Add golden bytes, round-trip, arbitrary-byte smoke, and Phase 1 mutation compatibility tests.
-- [ ] Commit as `feat: define replicated shard commands`.
+- [x] Add golden bytes, round-trip, arbitrary-byte smoke, and Phase 1 mutation compatibility tests.
+- [x] Commit as `feat: define replicated shard commands`.
 
 ### Task 3: Durable Deterministic Shard State Machine
 

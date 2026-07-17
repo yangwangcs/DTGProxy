@@ -7,6 +7,7 @@ The repository is being delivered in independently verifiable phases. The implem
 - `temporal-types`: bitemporal primitives and canonical values;
 - `temporal-model`: executable in-memory semantic oracle;
 - `storage-api`: backend-neutral prepared/committed mutation contracts;
+- `raft-command`: bounded, checksummed, versioned deterministic Raft command codec;
 - `adapter-memory`: atomic and idempotent reference adapter;
 - `adapter-rocksdb`: durable RocksDB 0.24.0 adapter with atomic cross-keyspace writes,
   idempotent replay, restart recovery, snapshot reads, and checkpoints;
@@ -32,7 +33,7 @@ The durable layout has eight stable RocksDB Column Families: `meta`, `identity`,
 Family is also present because RocksDB requires it, but DTGProxy does not place logical data
 there.
 
-The approved architecture and remaining distributed phases are specified in [the detailed design](docs/superpowers/specs/2026-07-17-dtgproxy-design.md).
+The approved architecture and remaining distributed phases are specified in [the detailed design](docs/superpowers/specs/2026-07-17-dtgproxy-design.md). The durable replicated command layout is specified in [Raft Command V1](docs/raft-command-v1.md).
 
 ## Temporal persistence slice
 
