@@ -6,7 +6,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use adapter_rocksdb::RocksAdapter;
 use temporal_storage::{
     CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
-    TemporalChangeKind, TemporalStore, VertexMutation,
+    TemporalChangeKind, TemporalStore, TemporalTransaction, VertexMutation,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -80,8 +80,21 @@ fn typed_temporal_graph_survives_rocksdb_restart_and_checkpoint() {
         )
         .unwrap();
         block_on(
+            store.commit_vertex(
+                context(3, 0, 250),
+                VertexMutation::put(
+                    ElementRef::vertex(graph(), partition(), ElementId::new(8)),
+                    label,
+                    interval(1, Some(10)),
+                    payload("vertex-destination"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        block_on(
             store.commit_edge(
-                context(3, 200, 300),
+                context(4, 250, 300),
                 EdgeMutation::put(
                     edge(),
                     EdgeTypeId::new(9),
@@ -96,7 +109,7 @@ fn typed_temporal_graph_survives_rocksdb_restart_and_checkpoint() {
         .unwrap();
         block_on(
             store.commit_edge(
-                context(4, 300, 350),
+                context(5, 300, 350),
                 EdgeMutation::delete(
                     edge(),
                     EdgeTypeId::new(9),
@@ -144,11 +157,19 @@ fn typed_temporal_graph_survives_rocksdb_restart_and_checkpoint() {
     ));
 
     store.adapter().checkpoint(&checkpoint_path).unwrap();
-    block_on(store.commit_vertex(
-        context(5, 300, 400),
-        VertexMutation::delete(vertex(), label, interval(4, Some(7))).unwrap(),
-    ))
-    .unwrap();
+    let coordinated_delete = TemporalTransaction::new()
+        .with_vertex(VertexMutation::delete(vertex(), label, interval(4, Some(7))).unwrap())
+        .with_edge(
+            EdgeMutation::delete(
+                edge(),
+                EdgeTypeId::new(9),
+                ElementId::new(7),
+                ElementId::new(8),
+                interval(4, Some(7)),
+            )
+            .unwrap(),
+        );
+    block_on(store.commit_transaction(context(6, 350, 400), coordinated_delete)).unwrap();
     assert_eq!(
         block_on(store.vertex_current(vertex(), valid(5))).unwrap(),
         None

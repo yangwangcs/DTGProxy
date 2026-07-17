@@ -6,8 +6,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use adapter_memory::MemoryAdapter;
 use storage_api::StorageAdapter;
 use temporal_storage::{
-    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, PartitionId,
-    TemporalStore, TemporalStoreError,
+    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
+    TemporalStore, TemporalStoreError, TemporalTransaction, VertexMutation,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -58,17 +58,41 @@ fn put(valid: Interval<ValidTime>, value: &str) -> EdgeMutation {
     .unwrap()
 }
 
+fn seed_endpoints(store: &TemporalStore<MemoryAdapter>) {
+    let transaction = TemporalTransaction::new()
+        .with_vertex(
+            VertexMutation::put(
+                ElementRef::vertex(graph(), partition(), ElementId::new(10)),
+                LabelId::new(1),
+                interval(i64::MIN, None),
+                payload("source"),
+            )
+            .unwrap(),
+        )
+        .with_vertex(
+            VertexMutation::put(
+                ElementRef::vertex(graph(), partition(), ElementId::new(20)),
+                LabelId::new(1),
+                interval(i64::MIN, None),
+                payload("destination"),
+            )
+            .unwrap(),
+        );
+    block_on(store.commit_transaction(context(1, 0, 100), transaction)).unwrap();
+}
+
 #[test]
 fn edge_round_trips_through_current_history_and_both_adjacency_directions() {
     let store = TemporalStore::new(MemoryAdapter::new());
-    block_on(store.commit_edge(context(1, 0, 100), put(interval(1, Some(10)), "knows"))).unwrap();
+    seed_endpoints(&store);
+    block_on(store.commit_edge(context(2, 100, 200), put(interval(1, Some(10)), "knows"))).unwrap();
 
     assert_eq!(
         block_on(store.edge_current(edge(), valid(5))).unwrap(),
         Some(payload("knows"))
     );
     assert_eq!(
-        block_on(store.edge_as_of(edge(), valid(5), tx(150))).unwrap(),
+        block_on(store.edge_as_of(edge(), valid(5), tx(250))).unwrap(),
         Some(payload("knows"))
     );
 
@@ -91,10 +115,11 @@ fn edge_round_trips_through_current_history_and_both_adjacency_directions() {
 #[test]
 fn adjacency_is_exactly_filtered_and_removed_only_when_projection_is_fully_absent() {
     let store = TemporalStore::new(MemoryAdapter::new());
-    block_on(store.commit_edge(context(1, 0, 100), put(interval(1, Some(10)), "edge"))).unwrap();
+    seed_endpoints(&store);
+    block_on(store.commit_edge(context(2, 100, 200), put(interval(1, Some(10)), "edge"))).unwrap();
     block_on(
         store.commit_edge(
-            context(2, 100, 200),
+            context(3, 200, 300),
             EdgeMutation::delete(
                 edge(),
                 EdgeTypeId::new(9),
@@ -119,17 +144,17 @@ fn adjacency_is_exactly_filtered_and_removed_only_when_projection_is_fully_absen
             .is_empty()
     );
     assert_eq!(
-        block_on(store.edge_as_of(edge(), valid(5), tx(150))).unwrap(),
+        block_on(store.edge_as_of(edge(), valid(5), tx(250))).unwrap(),
         Some(payload("edge"))
     );
     assert_eq!(
-        block_on(store.edge_as_of(edge(), valid(5), tx(250))).unwrap(),
+        block_on(store.edge_as_of(edge(), valid(5), tx(350))).unwrap(),
         None
     );
 
     block_on(
         store.commit_edge(
-            context(3, 200, 300),
+            context(4, 300, 400),
             EdgeMutation::delete(
                 edge(),
                 EdgeTypeId::new(9),
@@ -157,7 +182,8 @@ fn adjacency_is_exactly_filtered_and_removed_only_when_projection_is_fully_absen
 #[test]
 fn edge_identity_is_immutable_and_failure_does_not_advance_the_adapter() {
     let store = TemporalStore::new(MemoryAdapter::new());
-    block_on(store.commit_edge(context(1, 0, 100), put(interval(1, None), "edge"))).unwrap();
+    seed_endpoints(&store);
+    block_on(store.commit_edge(context(2, 100, 200), put(interval(1, None), "edge"))).unwrap();
 
     let changed_endpoint = EdgeMutation::put(
         edge(),
@@ -168,10 +194,10 @@ fn edge_identity_is_immutable_and_failure_does_not_advance_the_adapter() {
         payload("bad"),
     )
     .unwrap();
-    let error = block_on(store.commit_edge(context(2, 100, 200), changed_endpoint)).unwrap_err();
+    let error = block_on(store.commit_edge(context(3, 200, 300), changed_endpoint)).unwrap_err();
 
     assert_eq!(error, TemporalStoreError::IdentityMismatch);
-    assert_eq!(store.adapter().applied_log_index().unwrap(), 1);
+    assert_eq!(store.adapter().applied_log_index().unwrap(), 2);
     assert_eq!(
         block_on(store.edge_current(edge(), valid(2))).unwrap(),
         Some(payload("edge"))

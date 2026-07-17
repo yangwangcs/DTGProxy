@@ -15,10 +15,10 @@ The repository is being delivered in independently verifiable phases. The implem
 - `dtgproxy`: executable product entry point.
 
 Phase 0, the Phase 1A durable adapter, and the Phase 1B temporal persistence slice are
-implemented and tested. Bounded Anchor+Delta history is also implemented in Phase 1C. Atomic
-multi-element transactions, the local query frontend, replicated shard runtime, distributed
-transactions, external database adapters, and analytics integration remain active implementation
-phases described by the design.
+implemented and tested. Bounded Anchor+Delta history and atomic multi-element single-node
+transactions are also implemented in Phase 1C. The local query frontend, replicated shard runtime,
+distributed transactions, external database adapters, and analytics integration remain active
+implementation phases described by the design.
 
 The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
 `adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column
@@ -29,14 +29,16 @@ The approved architecture and remaining distributed phases are specified in [the
 
 ## Temporal persistence slice
 
-`TemporalStore` accepts typed vertex or edge mutations with a valid-time interval plus a
-transaction context. It validates immutable identity and temporal conflicts, rewrites the change
-into disjoint valid-time segments, and sends one deterministic `CommittedMutationBatch` to the
-selected adapter. That batch atomically contains:
+`TemporalStore` accepts a `TemporalTransaction` containing typed vertex and edge mutations with
+valid-time intervals plus one transaction context. It validates immutable identity, interval-level
+write conflicts, and temporal referential integrity; rewrites all changes into disjoint valid-time
+segments; and sends exactly one deterministic `CommittedMutationBatch` to the selected adapter.
+Single-vertex and single-edge methods are wrappers around this transaction API. The batch
+atomically contains:
 
 - the graph-scoped identity record;
 - the latest Current projection;
-- an immutable transaction-time History anchor;
+- immutable transaction-time History Anchor/Delta entries;
 - both source- and destination-oriented adjacency records for edges;
 - adapter replay metadata and the applied log index.
 
@@ -46,6 +48,14 @@ ranges. Durable records have explicit tags, magic, format versions, big-endian f
 fields, length-delimited canonical payloads, and checksums. The randomized TCK drives the same
 fixed-seed corrections through the semantic model, Memory Adapter, and RocksDB after every
 commit.
+
+Operations are normalized by graph, partition, kind, and element before mutation sequence numbers
+are assigned. A transaction may create both endpoints and their edge together. Every edge valid
+interval must be fully covered by both endpoint projections after all staged vertex changes.
+Conversely, deleting part of a vertex lifetime is rejected if an incident edge would become
+dangling, unless that edge is coordinately rewritten in the same transaction. Validation failure,
+log-order failure, or replay mismatch leaves Current, History, both adjacency directions, and the
+applied log index unchanged. Memory and RocksDB execute the same transaction contract tests.
 
 Phase 1B intentionally stores a full projection anchor for every changed element commit. This
 is the correctness baseline and makes read-back simple and auditable, but write amplification is

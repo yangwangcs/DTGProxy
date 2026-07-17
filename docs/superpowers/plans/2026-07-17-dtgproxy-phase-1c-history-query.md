@@ -74,19 +74,26 @@ reduction on the single-segment workload.
 
 **Files:** new `transaction.rs`; refactor store/rewrite; transaction TCK.
 
-- [ ] Write failing tests for two vertices plus an edge in one commit, atomic failure, deterministic
+- [x] Write failing tests for two vertices plus an edge in one commit, atomic failure, deterministic
   retry, overlapping stale-write rejection, non-overlapping stale writes, endpoint existence,
   partial endpoint deletion, and immutable identity.
-- [ ] Define `TemporalTransaction` and typed operation enums. Normalize and sort operations by
+- [x] Define `TemporalTransaction` and typed operation enums. Normalize and sort operations by
   graph/partition/kind/element/valid start before assigning deterministic mutation sequences.
-- [ ] Read all identities/projections at one adapter snapshot, validate the complete write set,
-  and stage Current/History/double-adjacency mutations without applying them.
-- [ ] Validate edge valid intervals are fully covered by both endpoint projections after applying
+- [x] Pin preparation to the next state-machine log index, validate the complete write set against
+  that stable logical snapshot, and stage Current/History/double-adjacency mutations without
+  applying them. Already-applied indices retain deterministic replay behavior.
+- [x] Validate edge valid intervals are fully covered by both endpoint projections after applying
   all staged vertex changes in the same transaction.
-- [ ] Apply exactly one `CommittedMutationBatch`; prove any validation/adapter failure leaves all
+- [x] Apply exactly one `CommittedMutationBatch`; prove any validation/adapter failure leaves all
   elements and adjacency unchanged.
-- [ ] Keep single-element convenience methods as wrappers around the transaction API.
-- [ ] Commit as `feat: add atomic temporal graph transactions`.
+- [x] Keep single-element convenience methods as wrappers around the transaction API.
+- [x] Commit as `feat: add atomic temporal graph transactions`.
+
+Task 3 evidence: seven focused semantic tests cover multi-element atomicity, deterministic replay,
+log gaps, interval conflicts, endpoint coverage, and coordinated endpoint/edge deletion. A shared
+adapter TCK passes against Memory and RocksDB, including rollback without applied-index advance.
+Single-element edge tests now seed and validate real endpoints rather than bypassing graph
+referential integrity.
 
 ### Task 4: Typed Temporal IR and Local Executor
 

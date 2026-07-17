@@ -10,8 +10,8 @@ use adapter_rocksdb::RocksAdapter;
 use storage_api::{KeySpan, Keyspace, StorageAdapter};
 use temporal_storage::{
     CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, HistoryAnchor,
-    LabelId, PartitionId, ProjectionRecord, TemporalStore, ValidSegment, VertexMutation,
-    history_prefix,
+    LabelId, PartitionId, ProjectionRecord, TemporalStore, TemporalTransaction, ValidSegment,
+    VertexMutation, history_prefix,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -101,8 +101,33 @@ fn main() {
 
     let source = ElementId::new(10);
     let edge_type = EdgeTypeId::new(9);
+    let mut endpoints = TemporalTransaction::new().with_vertex(
+        VertexMutation::put(
+            ElementRef::vertex(GraphId::new(1), PartitionId::new(0), source),
+            label,
+            interval(0, 100),
+            payload(10),
+        )
+        .unwrap(),
+    );
     for degree in 0..32_u64 {
-        let log_index = 1_017 + degree;
+        endpoints = endpoints.with_vertex(
+            VertexMutation::put(
+                ElementRef::vertex(
+                    GraphId::new(1),
+                    PartitionId::new(0),
+                    ElementId::new(2_000 + u128::from(degree)),
+                ),
+                label,
+                interval(0, 100),
+                payload(2_000 + degree),
+            )
+            .unwrap(),
+        );
+    }
+    block_on(store.commit_transaction(context(1_017, 0, 150_000), endpoints)).unwrap();
+    for degree in 0..32_u64 {
+        let log_index = 1_018 + degree;
         let edge = ElementRef::edge(
             GraphId::new(1),
             PartitionId::new(0),
@@ -110,7 +135,7 @@ fn main() {
         );
         block_on(
             store.commit_edge(
-                context(log_index, 0, 200_000 + i64::try_from(degree).unwrap()),
+                context(log_index, 150_000, 200_000 + i64::try_from(degree).unwrap()),
                 EdgeMutation::put(
                     edge,
                     edge_type,

@@ -1,22 +1,25 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 
 use storage_api::{
-    AdapterError, ApplyReceipt, CommittedMutationBatch, KeySpan, Keyspace, Mutation, StorageAdapter,
+    AdapterError, ApplyReceipt, CommittedMutationBatch, KeySpan, Keyspace, Mutation,
+    MutationOperation, StorageAdapter,
 };
 use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
 use crate::diff::{TemporalChange, diff_projections};
 use crate::history::{MAX_CHAIN_ENTRIES, entry_for_commit, reconstruct};
 use crate::rewrite::rewrite_projection;
+use crate::transaction::TemporalOperation;
 use crate::{
     EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryEntry,
-    KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError, VertexIdentity,
-    current_edge_key, current_vertex_key, decode_graph_key, edge_identity_key, history_anchor_key,
-    history_prefix, in_adjacency_key, in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix,
-    vertex_identity_key,
+    KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError, TemporalTransaction,
+    VertexIdentity, current_edge_key, current_vertex_key, decode_graph_key, edge_identity_key,
+    history_anchor_key, history_prefix, in_adjacency_key, in_adjacency_prefix, out_adjacency_key,
+    out_adjacency_prefix, vertex_identity_key,
 };
 
 pub type TemporalStoreFuture<'a, T> =
@@ -52,10 +55,10 @@ impl CommitContext {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VertexMutation {
-    element: ElementRef,
-    label: LabelId,
-    valid: Interval<ValidTime>,
-    replacement: Option<CanonicalElement>,
+    pub(crate) element: ElementRef,
+    pub(crate) label: LabelId,
+    pub(crate) valid: Interval<ValidTime>,
+    pub(crate) replacement: Option<CanonicalElement>,
 }
 
 impl VertexMutation {
@@ -96,12 +99,12 @@ impl VertexMutation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeMutation {
-    element: ElementRef,
-    edge_type: EdgeTypeId,
-    source: ElementId,
-    destination: ElementId,
-    valid: Interval<ValidTime>,
-    replacement: Option<CanonicalElement>,
+    pub(crate) element: ElementRef,
+    pub(crate) edge_type: EdgeTypeId,
+    pub(crate) source: ElementId,
+    pub(crate) destination: ElementId,
+    pub(crate) valid: Interval<ValidTime>,
+    pub(crate) replacement: Option<CanonicalElement>,
 }
 
 impl EdgeMutation {
@@ -210,59 +213,209 @@ where
         &self.adapter
     }
 
-    pub fn commit_vertex<'a>(
+    pub fn commit_transaction<'a>(
         &'a self,
         context: CommitContext,
-        mutation: VertexMutation,
+        transaction: TemporalTransaction,
     ) -> TemporalStoreFuture<'a, ApplyReceipt> {
         Box::pin(async move {
             if context.commit_ts <= context.read_ts {
                 return Err(TemporalStoreError::InvalidCommitOrder);
             }
+            let applied_log_index = self.adapter.applied_log_index()?;
+            let expected_log_index = applied_log_index.saturating_add(1);
+            if context.log_index > applied_log_index && context.log_index != expected_log_index {
+                return Err(AdapterError::NonContiguousLogIndex {
+                    expected: expected_log_index,
+                    actual: context.log_index,
+                }
+                .into());
+            }
+            let mut operations = transaction.into_operations();
+            if operations.is_empty() {
+                return Err(TemporalStoreError::EmptyTransaction);
+            }
+            operations.sort_by_key(TemporalOperation::element);
+            for pair in operations.windows(2) {
+                if pair[0].element() == pair[1].element() {
+                    return Err(TemporalStoreError::DuplicateElementOperation {
+                        element: pair[0].element(),
+                    });
+                }
+            }
 
-            let identity = VertexIdentity::new(mutation.element, mutation.label)?;
-            self.validate_vertex_identity(&identity).await?;
-            let current = self.load_current_projection(mutation.element).await?;
-            self.validate_commit_frontier(
-                mutation.element,
-                current.as_ref(),
-                context,
-                mutation.valid,
-            )
-            .await?;
-            let recent_entries = self
-                .load_history_chain_at(mutation.element, context.commit_ts)
-                .await?;
-            let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-            let base = current.as_ref().unwrap_or(&empty);
-            let projection = rewrite_projection(
-                base,
-                context.commit_ts,
-                mutation.valid,
-                mutation.replacement.clone(),
-            )?;
-            let history = entry_for_commit(
-                &recent_entries,
-                context.commit_ts,
-                mutation.valid,
-                mutation.replacement,
-                projection.clone(),
-            )?;
+            let mut staged_vertices = BTreeMap::new();
+            let mut guarded_vertices = BTreeMap::new();
+            let mut staged_edges = BTreeMap::new();
+            let mut writes = Vec::new();
+            for operation in operations {
+                match operation {
+                    TemporalOperation::Vertex(mutation) => {
+                        let removes_valid_time = mutation.replacement.is_none();
+                        let identity = VertexIdentity::new(mutation.element, mutation.label)?;
+                        self.validate_vertex_identity(&identity).await?;
+                        let current = self.load_current_projection(mutation.element).await?;
+                        self.validate_commit_frontier(
+                            mutation.element,
+                            current.as_ref(),
+                            context,
+                            mutation.valid,
+                        )
+                        .await?;
+                        let recent_entries = self
+                            .load_history_chain_at(mutation.element, context.commit_ts)
+                            .await?;
+                        let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
+                        let projection = rewrite_projection(
+                            current.as_ref().unwrap_or(&empty),
+                            context.commit_ts,
+                            mutation.valid,
+                            mutation.replacement.clone(),
+                        )?;
+                        let history = entry_for_commit(
+                            &recent_entries,
+                            context.commit_ts,
+                            mutation.valid,
+                            mutation.replacement,
+                            projection.clone(),
+                        )?;
+                        writes.push(MutationOperation::Put {
+                            key: vertex_identity_key(mutation.element),
+                            value: identity.encode(),
+                        });
+                        writes.push(MutationOperation::Put {
+                            key: current_vertex_key(mutation.element),
+                            value: projection.encode()?,
+                        });
+                        writes.push(MutationOperation::Put {
+                            key: history_anchor_key(mutation.element, context.commit_ts, 0),
+                            value: history.encode()?,
+                        });
+                        if removes_valid_time {
+                            guarded_vertices.insert(mutation.element, projection.clone());
+                        }
+                        staged_vertices.insert(mutation.element, projection);
+                    }
+                    TemporalOperation::Edge(mutation) => {
+                        let identity = EdgeIdentity::new(
+                            mutation.element,
+                            mutation.edge_type,
+                            mutation.source,
+                            mutation.destination,
+                        )?;
+                        self.validate_edge_identity(&identity).await?;
+                        let current = self.load_current_projection(mutation.element).await?;
+                        self.validate_commit_frontier(
+                            mutation.element,
+                            current.as_ref(),
+                            context,
+                            mutation.valid,
+                        )
+                        .await?;
+                        if mutation.replacement.is_some() {
+                            for endpoint_id in [mutation.source, mutation.destination] {
+                                let endpoint = ElementRef::vertex(
+                                    mutation.element.graph(),
+                                    mutation.element.partition(),
+                                    endpoint_id,
+                                );
+                                let endpoint_projection =
+                                    if let Some(projection) = staged_vertices.get(&endpoint) {
+                                        Some(projection.clone())
+                                    } else {
+                                        self.load_current_projection(endpoint).await?
+                                    };
+                                if endpoint_projection.as_ref().is_none_or(|projection| {
+                                    !projection_covers(projection, mutation.valid)
+                                }) {
+                                    return Err(TemporalStoreError::EndpointNotPresent {
+                                        vertex: endpoint,
+                                    });
+                                }
+                            }
+                        }
+                        let recent_entries = self
+                            .load_history_chain_at(mutation.element, context.commit_ts)
+                            .await?;
+                        let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
+                        let projection = rewrite_projection(
+                            current.as_ref().unwrap_or(&empty),
+                            context.commit_ts,
+                            mutation.valid,
+                            mutation.replacement.clone(),
+                        )?;
+                        let history = entry_for_commit(
+                            &recent_entries,
+                            context.commit_ts,
+                            mutation.valid,
+                            mutation.replacement,
+                            projection.clone(),
+                        )?;
+                        let projection_bytes = projection.encode()?;
+                        let out_key = out_adjacency_key(
+                            mutation.element.graph(),
+                            mutation.element.partition(),
+                            mutation.source,
+                            mutation.edge_type,
+                            0,
+                            mutation.destination,
+                            mutation.element.id(),
+                        );
+                        let in_key = in_adjacency_key(
+                            mutation.element.graph(),
+                            mutation.element.partition(),
+                            mutation.destination,
+                            mutation.edge_type,
+                            0,
+                            mutation.source,
+                            mutation.element.id(),
+                        );
+                        writes.push(MutationOperation::Put {
+                            key: edge_identity_key(mutation.element),
+                            value: identity.encode(),
+                        });
+                        writes.push(MutationOperation::Put {
+                            key: current_edge_key(mutation.element),
+                            value: projection_bytes.clone(),
+                        });
+                        writes.push(MutationOperation::Put {
+                            key: history_anchor_key(mutation.element, context.commit_ts, 0),
+                            value: history.encode()?,
+                        });
+                        if projection.segments().is_empty() {
+                            writes.push(MutationOperation::Delete { key: out_key });
+                            writes.push(MutationOperation::Delete { key: in_key });
+                        } else {
+                            writes.push(MutationOperation::Put {
+                                key: out_key,
+                                value: projection_bytes.clone(),
+                            });
+                            writes.push(MutationOperation::Put {
+                                key: in_key,
+                                value: projection_bytes,
+                            });
+                        }
+                        staged_edges.insert(mutation.element, projection);
+                    }
+                }
+            }
 
-            let mutations = vec![
-                Mutation::put(0, vertex_identity_key(mutation.element), identity.encode()),
-                Mutation::put(
-                    1,
-                    current_vertex_key(mutation.element),
-                    projection.encode()?,
-                ),
-                Mutation::put(
-                    2,
-                    history_anchor_key(mutation.element, context.commit_ts, 0),
-                    history.encode()?,
-                ),
-            ];
+            for (vertex, projection) in guarded_vertices {
+                self.validate_incident_edge_coverage(vertex, &projection, &staged_edges)
+                    .await?;
+            }
 
+            let mutations = writes
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, operation)| {
+                    Ok(Mutation {
+                        sequence: u32::try_from(sequence)
+                            .map_err(|_| TemporalStoreError::TooManyMutations)?,
+                        operation,
+                    })
+                })
+                .collect::<Result<Vec<_>, TemporalStoreError>>()?;
             Ok(self
                 .adapter
                 .apply_committed(CommittedMutationBatch {
@@ -275,99 +428,20 @@ where
         })
     }
 
+    pub fn commit_vertex<'a>(
+        &'a self,
+        context: CommitContext,
+        mutation: VertexMutation,
+    ) -> TemporalStoreFuture<'a, ApplyReceipt> {
+        self.commit_transaction(context, TemporalTransaction::new().with_vertex(mutation))
+    }
+
     pub fn commit_edge<'a>(
         &'a self,
         context: CommitContext,
         mutation: EdgeMutation,
     ) -> TemporalStoreFuture<'a, ApplyReceipt> {
-        Box::pin(async move {
-            if context.commit_ts <= context.read_ts {
-                return Err(TemporalStoreError::InvalidCommitOrder);
-            }
-
-            let identity = EdgeIdentity::new(
-                mutation.element,
-                mutation.edge_type,
-                mutation.source,
-                mutation.destination,
-            )?;
-            self.validate_edge_identity(&identity).await?;
-            let current = self.load_current_projection(mutation.element).await?;
-            self.validate_commit_frontier(
-                mutation.element,
-                current.as_ref(),
-                context,
-                mutation.valid,
-            )
-            .await?;
-            let recent_entries = self
-                .load_history_chain_at(mutation.element, context.commit_ts)
-                .await?;
-            let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-            let base = current.as_ref().unwrap_or(&empty);
-            let projection = rewrite_projection(
-                base,
-                context.commit_ts,
-                mutation.valid,
-                mutation.replacement.clone(),
-            )?;
-            let history = entry_for_commit(
-                &recent_entries,
-                context.commit_ts,
-                mutation.valid,
-                mutation.replacement,
-                projection.clone(),
-            )?;
-            let projection_bytes = projection.encode()?;
-            let out_key = out_adjacency_key(
-                mutation.element.graph(),
-                mutation.element.partition(),
-                mutation.source,
-                mutation.edge_type,
-                0,
-                mutation.destination,
-                mutation.element.id(),
-            );
-            let in_key = in_adjacency_key(
-                mutation.element.graph(),
-                mutation.element.partition(),
-                mutation.destination,
-                mutation.edge_type,
-                0,
-                mutation.source,
-                mutation.element.id(),
-            );
-            let mut mutations = vec![
-                Mutation::put(0, edge_identity_key(mutation.element), identity.encode()),
-                Mutation::put(
-                    1,
-                    current_edge_key(mutation.element),
-                    projection_bytes.clone(),
-                ),
-                Mutation::put(
-                    2,
-                    history_anchor_key(mutation.element, context.commit_ts, 0),
-                    history.encode()?,
-                ),
-            ];
-            if projection.segments().is_empty() {
-                mutations.push(Mutation::delete(3, out_key));
-                mutations.push(Mutation::delete(4, in_key));
-            } else {
-                mutations.push(Mutation::put(3, out_key, projection_bytes.clone()));
-                mutations.push(Mutation::put(4, in_key, projection_bytes));
-            }
-
-            Ok(self
-                .adapter
-                .apply_committed(CommittedMutationBatch {
-                    shard_id: context.shard_id,
-                    log_index: context.log_index,
-                    txn_id: context.txn_id,
-                    mutations,
-                })
-                .await?)
-        })
+        self.commit_transaction(context, TemporalTransaction::new().with_edge(mutation))
     }
 
     pub fn vertex_current<'a>(
@@ -577,6 +651,57 @@ where
         Ok(())
     }
 
+    async fn validate_incident_edge_coverage(
+        &self,
+        vertex: ElementRef,
+        endpoint_projection: &ProjectionRecord,
+        staged_edges: &BTreeMap<ElementRef, ProjectionRecord>,
+    ) -> Result<(), TemporalStoreError> {
+        let mut incident_edges = BTreeMap::new();
+        let spans = [
+            KeySpan::prefix(
+                Keyspace::AdjOut,
+                out_adjacency_prefix(vertex.graph(), vertex.partition(), vertex.id()),
+            ),
+            KeySpan::prefix(
+                Keyspace::AdjIn,
+                in_adjacency_prefix(vertex.graph(), vertex.partition(), vertex.id()),
+            ),
+        ];
+        for span in spans {
+            for entry in self.adapter.scan(&span).await? {
+                let edge = match decode_graph_key(entry.key())? {
+                    GraphKey::OutAdjacency {
+                        graph,
+                        partition,
+                        edge,
+                        ..
+                    }
+                    | GraphKey::InAdjacency {
+                        graph,
+                        partition,
+                        edge,
+                        ..
+                    } => ElementRef::edge(graph, partition, edge),
+                    _ => return Err(TemporalStoreError::UnexpectedAdjacencyKey),
+                };
+                incident_edges.insert(edge, ProjectionRecord::decode(entry.value())?);
+            }
+        }
+
+        for (edge, stored_projection) in incident_edges {
+            let effective_projection = staged_edges.get(&edge).unwrap_or(&stored_projection);
+            if effective_projection
+                .segments()
+                .iter()
+                .any(|segment| !projection_covers(endpoint_projection, segment.valid()))
+            {
+                return Err(TemporalStoreError::EndpointStillReferenced { vertex, edge });
+            }
+        }
+        Ok(())
+    }
+
     async fn current_value(
         &self,
         key: storage_api::LogicalKey,
@@ -722,11 +847,23 @@ where
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TemporalStoreError {
+    EmptyTransaction,
+    TooManyMutations,
     InvalidCommitOrder,
     NonMonotonicCommit,
     WriteConflict,
     IdentityMismatch,
     WrongElementKind,
+    DuplicateElementOperation {
+        element: ElementRef,
+    },
+    EndpointNotPresent {
+        vertex: ElementRef,
+    },
+    EndpointStillReferenced {
+        vertex: ElementRef,
+        edge: ElementRef,
+    },
     UnexpectedAdjacencyKey,
     UnexpectedHistoryAnchor,
     MissingHistoryAnchor,
@@ -740,6 +877,10 @@ pub enum TemporalStoreError {
 impl Display for TemporalStoreError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyTransaction => formatter.write_str("temporal transaction has no operations"),
+            Self::TooManyMutations => {
+                formatter.write_str("temporal transaction exceeds the mutation sequence space")
+            }
             Self::InvalidCommitOrder => {
                 formatter.write_str("commit timestamp must follow the read snapshot")
             }
@@ -752,6 +893,24 @@ impl Display for TemporalStoreError {
             Self::IdentityMismatch => formatter.write_str("element identity metadata changed"),
             Self::WrongElementKind => {
                 formatter.write_str("operation received the wrong element kind")
+            }
+            Self::DuplicateElementOperation { element } => {
+                write!(
+                    formatter,
+                    "temporal transaction repeats element {element:?}"
+                )
+            }
+            Self::EndpointNotPresent { vertex } => {
+                write!(
+                    formatter,
+                    "edge endpoint is not present for its full valid interval: {vertex:?}"
+                )
+            }
+            Self::EndpointStillReferenced { vertex, edge } => {
+                write!(
+                    formatter,
+                    "vertex deletion would leave incident edge {edge:?} without endpoint {vertex:?}"
+                )
             }
             Self::UnexpectedAdjacencyKey => {
                 formatter.write_str("adjacency scan returned an unexpected key type")
@@ -809,4 +968,29 @@ fn require_edge(element: ElementRef) -> Result<(), TemporalStoreError> {
     } else {
         Err(TemporalStoreError::WrongElementKind)
     }
+}
+
+fn projection_covers(projection: &ProjectionRecord, required: Interval<ValidTime>) -> bool {
+    let mut cursor = required.start();
+    for segment in projection.segments() {
+        if segment.valid().end().is_some_and(|end| end <= cursor) {
+            continue;
+        }
+        if segment.valid().start() > cursor {
+            return false;
+        }
+        match segment.valid().end() {
+            None => return true,
+            Some(end) => {
+                if required
+                    .end()
+                    .is_some_and(|required_end| required_end <= end)
+                {
+                    return true;
+                }
+                cursor = end;
+            }
+        }
+    }
+    false
 }

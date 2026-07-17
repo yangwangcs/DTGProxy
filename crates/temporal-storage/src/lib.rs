@@ -6,6 +6,7 @@ mod key;
 mod record;
 mod rewrite;
 mod store;
+mod transaction;
 
 pub use diff::{TemporalChange, TemporalChangeKind};
 pub use key::{
@@ -22,3 +23,4 @@ pub use store::{
     CommitContext, EdgeMutation, EdgeView, TemporalStore, TemporalStoreError, TemporalStoreFuture,
     VertexMutation,
 };
+pub use transaction::TemporalTransaction;

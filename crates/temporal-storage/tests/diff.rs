@@ -6,7 +6,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use adapter_memory::MemoryAdapter;
 use temporal_storage::{
     CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
-    TemporalChange, TemporalChangeKind, TemporalStore, TemporalStoreError, VertexMutation,
+    TemporalChange, TemporalChangeKind, TemporalStore, TemporalStoreError, TemporalTransaction,
+    VertexMutation,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -104,9 +105,29 @@ fn diff_rejects_reversed_transaction_snapshots() {
 #[test]
 fn edge_diff_uses_the_same_bitemporal_partitioning() {
     let store = TemporalStore::new(MemoryAdapter::new());
+    let endpoints = TemporalTransaction::new()
+        .with_vertex(
+            VertexMutation::put(
+                ElementRef::vertex(GraphId::new(1), PartitionId::new(0), ElementId::new(10)),
+                LabelId::new(1),
+                interval(i64::MIN, None),
+                payload("source"),
+            )
+            .unwrap(),
+        )
+        .with_vertex(
+            VertexMutation::put(
+                ElementRef::vertex(GraphId::new(1), PartitionId::new(0), ElementId::new(20)),
+                LabelId::new(1),
+                interval(i64::MIN, None),
+                payload("destination"),
+            )
+            .unwrap(),
+        );
+    block_on(store.commit_transaction(context(1, 0, 100), endpoints)).unwrap();
     block_on(
         store.commit_edge(
-            context(1, 0, 100),
+            context(2, 100, 200),
             EdgeMutation::put(
                 edge(),
                 EdgeTypeId::new(9),
@@ -121,7 +142,7 @@ fn edge_diff_uses_the_same_bitemporal_partitioning() {
     .unwrap();
     block_on(
         store.commit_edge(
-            context(2, 100, 200),
+            context(3, 200, 300),
             EdgeMutation::delete(
                 edge(),
                 EdgeTypeId::new(9),
@@ -135,7 +156,7 @@ fn edge_diff_uses_the_same_bitemporal_partitioning() {
     .unwrap();
 
     assert_eq!(
-        block_on(store.diff_edge(edge(), tx(150), tx(250))).unwrap(),
+        block_on(store.diff_edge(edge(), tx(250), tx(350))).unwrap(),
         vec![TemporalChange::new(
             interval(4, Some(7)),
             TemporalChangeKind::Removed {
