@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod diff;
 mod key;
 mod record;
 mod rewrite;
 mod store;
 
+pub use diff::{TemporalChange, TemporalChangeKind};
 pub use key::{
     EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, KeyCodecError, LabelId,
     PartitionId, current_edge_key, current_vertex_key, decode_graph_key, edge_identity_key,

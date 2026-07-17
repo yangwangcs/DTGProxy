@@ -8,6 +8,7 @@ use storage_api::{
 };
 use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
+use crate::diff::{TemporalChange, diff_projections};
 use crate::rewrite::rewrite_projection;
 use crate::{
     EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryAnchor,
@@ -509,6 +510,32 @@ where
         })
     }
 
+    pub fn diff_vertex<'a>(
+        &'a self,
+        element: ElementRef,
+        from_transaction: TransactionTime,
+        to_transaction: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<TemporalChange>> {
+        Box::pin(async move {
+            require_vertex(element)?;
+            self.diff_element(element, from_transaction, to_transaction)
+                .await
+        })
+    }
+
+    pub fn diff_edge<'a>(
+        &'a self,
+        element: ElementRef,
+        from_transaction: TransactionTime,
+        to_transaction: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<TemporalChange>> {
+        Box::pin(async move {
+            require_edge(element)?;
+            self.diff_element(element, from_transaction, to_transaction)
+                .await
+        })
+    }
+
     async fn validate_vertex_identity(
         &self,
         expected: &VertexIdentity,
@@ -594,6 +621,27 @@ where
             .map(|entry| HistoryAnchor::decode(entry.value()).map_err(TemporalStoreError::from))
             .collect()
     }
+
+    async fn diff_element(
+        &self,
+        element: ElementRef,
+        from_transaction: TransactionTime,
+        to_transaction: TransactionTime,
+    ) -> Result<Vec<TemporalChange>, TemporalStoreError> {
+        if from_transaction > to_transaction {
+            return Err(TemporalStoreError::InvalidDiffOrder);
+        }
+        let anchors = self.load_anchors(element).await?;
+        let before = anchors
+            .iter()
+            .find(|anchor| anchor.commit_ts() <= from_transaction)
+            .map(HistoryAnchor::projection);
+        let after = anchors
+            .iter()
+            .find(|anchor| anchor.commit_ts() <= to_transaction)
+            .map(HistoryAnchor::projection);
+        Ok(diff_projections(before, after))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -604,6 +652,7 @@ pub enum TemporalStoreError {
     IdentityMismatch,
     WrongElementKind,
     UnexpectedAdjacencyKey,
+    InvalidDiffOrder,
     Adapter(AdapterError),
     Record(RecordCodecError),
     Key(KeyCodecError),
@@ -627,6 +676,9 @@ impl Display for TemporalStoreError {
             }
             Self::UnexpectedAdjacencyKey => {
                 formatter.write_str("adjacency scan returned an unexpected key type")
+            }
+            Self::InvalidDiffOrder => {
+                formatter.write_str("DIFF start transaction must not follow its end")
             }
             Self::Adapter(error) => Display::fmt(error, formatter),
             Self::Record(error) => Display::fmt(error, formatter),

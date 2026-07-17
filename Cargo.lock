@@ -392,7 +392,9 @@ name = "temporal-storage"
 version = "0.1.0"
 dependencies = [
  "adapter-memory",
+ "adapter-rocksdb",
  "storage-api",
+ "tempfile",
  "temporal-model",
  "temporal-types",
 ]

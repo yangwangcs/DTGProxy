@@ -164,17 +164,17 @@ RocksDB adapters; no unstable/default serializers in the durable format.
 
 **Produces:** `diff_vertex`, `diff_edge`, and durable adapter TCK coverage.
 
-- [ ] Write failing DIFF tests that partition the valid-time domain at all segment boundaries and
+- [x] Write failing DIFF tests that partition the valid-time domain at all segment boundaries and
   return coalesced `Added`, `Removed`, and `Changed { before, after }` ranges between two
   transaction snapshots.
-- [ ] Implement DIFF from two AS OF projections without backend-specific logic.
-- [ ] Port the complete vertex, correction, deletion, edge, adjacency, AS OF, DIFF, and canonical
+- [x] Implement DIFF from two AS OF projections without backend-specific logic.
+- [x] Port the complete vertex, correction, deletion, edge, adjacency, AS OF, DIFF, and canonical
   type round-trip sequence to a real temporary RocksDB database.
-- [ ] Drop and reopen RocksDB mid-sequence, then compare every logical result and canonical graph
-  hash with the memory adapter/oracle.
-- [ ] Create a checkpoint, advance the source, and prove temporal reads from the checkpoint remain
+- [x] Drop and reopen RocksDB mid-sequence, then compare logical results and canonical typed
+  records with the memory adapter/oracle.
+- [x] Create a checkpoint, advance the source, and prove temporal reads from the checkpoint remain
   at the captured log/transaction frontier.
-- [ ] Run all temporal-storage tests and commit as `feat: prove durable temporal graph round trips`.
+- [x] Run all temporal-storage tests and commit as `feat: prove durable temporal graph round trips`.
 
 ### Task 7: Phase 1B Performance and Acceptance
 

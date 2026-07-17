@@ -11,7 +11,9 @@ temporal-types = { path = "../temporal-types" }
 
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }
+adapter-rocksdb = { path = "../adapter-rocksdb" }
 temporal-model = { path = "../temporal-model" }
+tempfile = "3"
 
 [lints]
 workspace = true
