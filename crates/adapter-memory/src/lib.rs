@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use storage_api::{
     AdapterCapabilities, AdapterError, AdapterFuture, ApplyReceipt, CommittedMutationBatch,
-    LogicalKey, Mutation, MutationOperation, StorageAdapter,
+    LogicalKey, MutationOperation, StorageAdapter,
 };
 
 #[derive(Default)]
@@ -33,7 +33,7 @@ impl MemoryAdapter {
 
     fn apply(&self, batch: CommittedMutationBatch) -> Result<ApplyReceipt, AdapterError> {
         let mut state = self.lock_state()?;
-        let batch_fingerprint = fingerprint_batch(&batch);
+        let batch_fingerprint = batch.fingerprint();
 
         if batch.log_index <= state.applied_log_index {
             return match state.log_fingerprints.get(&batch.log_index) {
@@ -65,7 +65,7 @@ impl MemoryAdapter {
                 });
             }
 
-            let fingerprint = fingerprint_mutation(mutation);
+            let fingerprint = mutation.fingerprint();
             if let Some(previous) = state
                 .mutation_fingerprints
                 .get(&(batch.txn_id, mutation.sequence))
@@ -136,68 +136,5 @@ impl StorageAdapter for MemoryAdapter {
 
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         Ok(self.lock_state()?.applied_log_index)
-    }
-}
-
-fn fingerprint_batch(batch: &CommittedMutationBatch) -> u64 {
-    let mut fingerprint = Fnv1a::new();
-    fingerprint.write(&batch.shard_id.to_be_bytes());
-    fingerprint.write(&batch.log_index.to_be_bytes());
-    fingerprint.write(&batch.txn_id.to_be_bytes());
-    fingerprint.write_len(batch.mutations.len());
-    for mutation in &batch.mutations {
-        fingerprint.write(&fingerprint_mutation(mutation).to_be_bytes());
-    }
-    fingerprint.finish()
-}
-
-fn fingerprint_mutation(mutation: &Mutation) -> u64 {
-    let mut fingerprint = Fnv1a::new();
-    fingerprint.write(&mutation.sequence.to_be_bytes());
-    match &mutation.operation {
-        MutationOperation::Put { key, value } => {
-            fingerprint.write(&[1]);
-            fingerprint.write(&[key.keyspace().tag()]);
-            fingerprint.write_length_delimited(key.as_bytes());
-            fingerprint.write_length_delimited(value);
-        }
-        MutationOperation::Delete { key } => {
-            fingerprint.write(&[2]);
-            fingerprint.write(&[key.keyspace().tag()]);
-            fingerprint.write_length_delimited(key.as_bytes());
-        }
-    }
-    fingerprint.finish()
-}
-
-struct Fnv1a(u64);
-
-impl Fnv1a {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    const fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
-
-    fn write_len(&mut self, len: usize) {
-        let len = u64::try_from(len).expect("usize always fits in u64 on supported targets");
-        self.write(&len.to_be_bytes());
-    }
-
-    fn write_length_delimited(&mut self, bytes: &[u8]) {
-        self.write_len(bytes.len());
-        self.write(bytes);
-    }
-
-    const fn finish(&self) -> u64 {
-        self.0
     }
 }

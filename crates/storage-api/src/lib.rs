@@ -112,6 +112,24 @@ impl Mutation {
             operation: MutationOperation::Delete { key },
         }
     }
+
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        let mut fingerprint = Fnv1a::new();
+        fingerprint.write(&self.sequence.to_be_bytes());
+        match &self.operation {
+            MutationOperation::Put { key, value } => {
+                fingerprint.write(&[1, key.keyspace().tag()]);
+                fingerprint.write_length_delimited(key.as_bytes());
+                fingerprint.write_length_delimited(value);
+            }
+            MutationOperation::Delete { key } => {
+                fingerprint.write(&[2, key.keyspace().tag()]);
+                fingerprint.write_length_delimited(key.as_bytes());
+            }
+        }
+        fingerprint.finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,6 +138,21 @@ pub struct CommittedMutationBatch {
     pub log_index: u64,
     pub txn_id: u128,
     pub mutations: Vec<Mutation>,
+}
+
+impl CommittedMutationBatch {
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        let mut fingerprint = Fnv1a::new();
+        fingerprint.write(&self.shard_id.to_be_bytes());
+        fingerprint.write(&self.log_index.to_be_bytes());
+        fingerprint.write(&self.txn_id.to_be_bytes());
+        fingerprint.write_len(self.mutations.len());
+        for mutation in &self.mutations {
+            fingerprint.write(&mutation.fingerprint().to_be_bytes());
+        }
+        fingerprint.finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,4 +219,36 @@ pub trait StorageAdapter: Send + Sync {
     fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>>;
 
     fn applied_log_index(&self) -> Result<u64, AdapterError>;
+}
+
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    const fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn write_len(&mut self, len: usize) {
+        let len = u64::try_from(len).expect("usize always fits in u64 on supported targets");
+        self.write(&len.to_be_bytes());
+    }
+
+    fn write_length_delimited(&mut self, bytes: &[u8]) {
+        self.write_len(bytes.len());
+        self.write(bytes);
+    }
+
+    const fn finish(&self) -> u64 {
+        self.0
+    }
 }

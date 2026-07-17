@@ -131,7 +131,7 @@ Expected: the C++ dependency builds and the open test passes.
 
 Local evidence: macOS 27 Command Line Tools could not resolve the standard C++ header `cstdint`; a direct compiler probe isolated the environment fault. The verified build used `CXX=/opt/homebrew/opt/llvm/bin/clang++` and `LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib`, after which both open tests passed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add Cargo.toml Cargo.lock crates/adapter-rocksdb && git commit -m "feat: bootstrap RocksDB adapter"`
 
@@ -146,17 +146,17 @@ Run: `git add Cargo.toml Cargo.lock crates/adapter-rocksdb && git commit -m "fea
 - Implements: all `StorageAdapter` methods for `RocksAdapter`.
 - Adds: `AdapterError::Backend(String)`.
 
-- [ ] **Step 1: Write failing RocksDB contract tests**
+- [x] **Step 1: Write failing RocksDB contract tests**
 
 Port the six Phase 0 memory-adapter contract behaviors to a temporary RocksDB directory and add a seventh keyspace-isolation case. Every test uses the real database and the standard-library `block_on` helper; no mocks are permitted.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p adapter-rocksdb --test adapter_contract`
 
 Expected: failures because apply, reads, replay metadata, and applied index are not implemented.
 
-- [ ] **Step 3: Implement durable application**
+- [x] **Step 3: Implement durable application**
 
 Reserve these metadata keys:
 
@@ -168,7 +168,7 @@ txn CF:   0x02 | txn_id_be | sequence_be  -> mutation_fingerprint_be
 
 Under an apply mutex, read and validate replay metadata, validate the complete batch, then construct one `WriteBatch` containing every business Put/Delete, new replay fingerprints, and the new applied index. Commit with `WriteOptions::set_sync(true)` and WAL enabled. `multi_get` takes a RocksDB snapshot before reading keys so a single call cannot mix applied states.
 
-- [ ] **Step 4: Run GREEN and cross-adapter tests**
+- [x] **Step 4: Run GREEN and cross-adapter tests**
 
 Run: `cargo test -p adapter-rocksdb && cargo test -p adapter-memory && cargo clippy --workspace --all-targets -- -D warnings`
 
