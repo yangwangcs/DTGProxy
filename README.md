@@ -123,6 +123,27 @@ The CLI emits canonical JSON. Graph/element identifiers and times are decimal st
 consumer precision loss; canonical property payloads are DTP1 bytes encoded as lowercase hex, so
 all graph value types round-trip without lossy JSON coercion.
 
+## Phase 1C isolation and deployment boundary
+
+Phase 1C is a complete single-node semantic/product slice, not yet a distributed deployment. Its
+transaction contract is Temporal Snapshot Isolation for written element/valid-time intervals:
+overlapping intervening writes conflict, while disjoint valid-time corrections may commit. It also
+enforces immutable identities and strict same-partition edge lifetime coverage. It does not yet
+detect arbitrary read/write predicates or provide Temporal Serializable isolation.
+
+`CommitContext` timestamps, transaction IDs, shard IDs, and log indices are supplied by the caller.
+The next-log-index barrier models one ordered state machine and prevents a successful transaction
+from preparing over an unapplied lower log entry. Phase 2 must replace this local ordering
+assumption with replicated Raft proposal/apply and safe-time tracking; Phase 3 must add the global
+timestamp oracle, intents, cross-shard 2PC, epoch checks, recovery, and edge guard locks. Endpoint
+references currently use one graph partition; cross-partition edge projections are therefore not
+claimed by Phase 1C.
+
+Only Memory and RocksDB adapters are implemented. Neo4j and other graph backends remain subject to
+the same capability contract and TCK. Historical expansion is semantically complete but performs a
+partition edge-identity scan; it is not a production complexity target until versioned adjacency
+indexes and capability-aware pushdown are added.
+
 ## Performance probe
 
 Run the release-mode RocksDB microbenchmark with:
@@ -162,6 +183,27 @@ versus 148,077 hypothetical bytes if every commit were a full Anchor, a 31.9% re
 single-segment workload. Current lookup measured 3,095 ns/op, synchronous correction 131,046
 ns/op, and degree-32 expansion 29,456 ns/op. These results are the baseline for multi-segment and
 transaction benchmarks, not production SLOs.
+
+The Phase 1C acceptance run on the same development host and toolchain, after adding local
+transactions and query execution, measured:
+
+| Operation | Acceptance dataset | Nanoseconds/op |
+|---|---:|---:|
+| Current vertex point lookup | 1,016 versions | 2,797 |
+| AS OF replay depth 1 | 1,008-version history | 5,005 |
+| AS OF replay depth 16 | maximum configured chain | 24,360 |
+| AS OF snapshot age 1,000 | old bounded seek | 15,600 |
+| Retroactive correction, sync WAL | 8 commits | 153,562 |
+| Current outgoing expansion | degree 32 | 35,193 |
+| Historical outgoing expansion | 32 edge identities | 163,302 |
+| Atomic two-vertex/one-edge transaction | 11 mutations, sync WAL | 182,671 |
+
+History values remained 100,827 bytes versus 148,077 hypothetical all-anchor bytes. The final
+database occupied 1,164,438 bytes because this acceptance probe additionally persists 200 atomic
+three-element transactions. Historical expansion's 163 µs result quantifies the documented
+identity-scan fallback and is a Phase 2 indexing target. Differences from earlier micro-runs are
+treated as host/run variance unless reproduced by a dedicated benchmark harness; none of these
+numbers are service SLOs.
 
 ## Development
 

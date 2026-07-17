@@ -160,6 +160,74 @@ fn main() {
             .unwrap(),
         );
     });
+    measure("expand_out_as_of_partition_32_edges", iterations, || {
+        black_box(
+            block_on(store.expand_out_as_of(
+                GraphId::new(1),
+                PartitionId::new(0),
+                source,
+                valid(50),
+                tx(210_000),
+            ))
+            .unwrap(),
+        );
+    });
+
+    let transaction_start = Instant::now();
+    for iteration in 0..iterations {
+        let base = 10_000_u128 + u128::from(iteration) * 3;
+        let source = ElementId::new(base);
+        let destination = ElementId::new(base + 1);
+        let edge = ElementRef::edge(
+            GraphId::new(1),
+            PartitionId::new(0),
+            ElementId::new(base + 2),
+        );
+        let transaction = TemporalTransaction::new()
+            .with_vertex(
+                VertexMutation::put(
+                    ElementRef::vertex(GraphId::new(1), PartitionId::new(0), source),
+                    label,
+                    interval(0, 100),
+                    payload(iteration),
+                )
+                .unwrap(),
+            )
+            .with_vertex(
+                VertexMutation::put(
+                    ElementRef::vertex(GraphId::new(1), PartitionId::new(0), destination),
+                    label,
+                    interval(0, 100),
+                    payload(iteration),
+                )
+                .unwrap(),
+            )
+            .with_edge(
+                EdgeMutation::put(
+                    edge,
+                    edge_type,
+                    source,
+                    destination,
+                    interval(0, 100),
+                    payload(iteration),
+                )
+                .unwrap(),
+            );
+        block_on(store.commit_transaction(
+            context(
+                1_050 + iteration,
+                0,
+                300_000 + i64::try_from(iteration).unwrap(),
+            ),
+            transaction,
+        ))
+        .unwrap();
+    }
+    report(
+        "transaction_two_vertices_one_edge_sync",
+        iterations,
+        transaction_start.elapsed(),
+    );
 
     println!("rocksdb_bytes={}", directory_size(directory.path()));
     println!("iterations={iterations}");

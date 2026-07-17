@@ -137,11 +137,32 @@ edge identity, and Changed ranges.
 
 ### Task 6: Phase 1 Acceptance
 
-- [ ] Run deterministic and randomized model/Memory/RocksDB TCKs including restart/checkpoint.
-- [ ] Run format, strict Clippy, full workspace tests, parser/key/value fuzz smoke tests, CLI, and
+- [x] Run deterministic and randomized model/Memory/RocksDB TCKs including restart/checkpoint.
+- [x] Run format, strict Clippy, full workspace tests, parser/key/value fuzz smoke tests, CLI, and
   diff checks.
-- [ ] Run release benchmarks and compare Phase 1B vs Phase 1C history latency/write bytes.
-- [ ] Document compatibility, migration, transaction/isolation limits, IR/query grammar, measured
+- [x] Run release benchmarks and compare Phase 1B vs Phase 1C history latency/write bytes.
+- [x] Document compatibility, migration, transaction/isolation limits, IR/query grammar, measured
   results, and remaining distributed scope.
-- [ ] Record exact evidence and commits. Phase 1 completion must not mark the overall DTGProxy
+- [x] Record exact evidence and commits. Phase 1 completion must not mark the overall DTGProxy
   objective complete; Phase 2–6 remain.
+
+Phase 1C acceptance evidence (2026-07-17, Apple M2, macOS 27.0, Rust 1.93, RocksDB 0.24.0):
+
+- format check and workspace strict Clippy completed with no warnings;
+- 102 behavioral tests passed, including deterministic/randomized model—Memory—RocksDB
+  equivalence, restart/checkpoint, transaction adapter TCK, typed IR/executor, parser, canonical
+  output, and real RocksDB CLI execution;
+- fixed-seed smoke executed 10,000 arbitrary parser inputs, 10,000 canonical DTP1 byte strings,
+  and 10,000 graph key/record byte strings without panic;
+- release benchmark (`DTGPROXY_BENCH_ITERS=200`): Current 2,797 ns/op; AS OF replay depth 1
+  5,005; depth 16 24,360; snapshot age 1,000 15,600; synchronous correction 153,562; Current
+  degree-32 expansion 35,193; historical partition/32-edge expansion 163,302; atomic two-vertex,
+  one-edge transaction 182,671 ns/op;
+- History values were 100,827 bytes versus 148,077 hypothetical all-anchor bytes (31.9% lower);
+  the 1,164,438-byte final database additionally includes 200 benchmark transactions;
+- implementation commits: `5e8e55b` bounded seeks, `8832635` Anchor+Delta, `bb1d638` atomic graph
+  transactions, `621c9f2` Temporal IR/executor, and `a2c10bd` query frontend/CLI.
+
+Phase 1C is therefore accepted as the single-node product slice only. Replication, global
+timestamps, cross-shard transactions, distributed execution, external adapters, and analytics
+remain Phase 2–6 work under the active DTGProxy objective.
