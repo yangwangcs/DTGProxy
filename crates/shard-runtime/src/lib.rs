@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod durable_replica;
 mod metadata;
 mod raft_group;
 mod state_machine;
@@ -8,6 +9,7 @@ mod transport;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+pub use durable_replica::{DurableRaftReplica, DurableReplicaError};
 pub use metadata::{MIN_REPLICA_TIME, ReplicaMetadata};
 pub use raft_group::{InProcessShardGroup, MultiRaftRuntime, ProposalReceipt, ReplicationError};
 pub use state_machine::ShardStateMachine;

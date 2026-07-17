@@ -620,6 +620,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "raft-logstore"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "prost",
+ "raft",
+ "rocksdb",
+ "tempfile",
+]
+
+[[package]]
 name = "raft-proto"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,6 +802,7 @@ dependencies = [
  "crc32fast",
  "raft",
  "raft-command",
+ "raft-logstore",
  "slog",
  "storage-api",
  "tempfile",

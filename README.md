@@ -8,6 +8,8 @@ The repository is being delivered in independently verifiable phases. The implem
 - `temporal-model`: executable in-memory semantic oracle;
 - `storage-api`: backend-neutral prepared/committed mutation contracts;
 - `raft-command`: bounded, checksummed, versioned deterministic Raft command codec;
+- `raft-logstore`: synchronous RocksDB Raft WAL with durable HardState, entries, membership,
+  snapshots, conflict truncation, and restart reconstruction;
 - `shard-runtime`: epoch-fenced durable Replica state machine and safe-time metadata;
 - `replica-snapshot`: checksummed RocksDB checkpoint manifests and verified suffix recovery;
 - `adapter-memory`: atomic and idempotent reference adapter;
@@ -24,11 +26,15 @@ The repository is being delivered in independently verifiable phases. The implem
 Phase 0, the Phase 1A durable adapter, and the Phase 1B temporal persistence slice are
 implemented and tested. Bounded Anchor+Delta history, atomic multi-element single-node
 transactions, typed Temporal IR, the local executor, and the minimal text query frontend are also
-implemented in Phase 1C. The replicated shard runtime, distributed transactions, external
-database adapters, and analytics integration remain active implementation phases described by the
-design. Phase 2 has started with a deterministic prepare/apply boundary: temporal validation and
-graph rewriting produce a log-position-independent `PreparedMutationBatch`, while only committed
-state-machine application assigns the Raft log index and touches the Adapter.
+implemented in Phase 1C. Distributed transactions, external database adapters, and analytics
+integration remain active implementation phases described by the design. Phase 2 now includes the
+deterministic prepare/apply boundary, three-node in-process Raft groups, checkpoint manifests, and
+a process-recoverable single-Replica runtime. Temporal validation and graph rewriting produce a
+log-position-independent `PreparedMutationBatch`; committed state-machine application alone
+assigns the Raft log index and touches the Adapter. The durable runtime persists Raft Ready state
+before Adapter apply and restarts RawNode at the Adapter's atomic `applied_index`, so a crash in
+that window replays committed entries. Snapshot transfer/install, durable three-node orchestration,
+and read barriers remain active work.
 
 The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
 `adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column

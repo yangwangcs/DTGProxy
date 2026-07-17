@@ -93,13 +93,15 @@ Folly/Thrift/C++ source is copied. Sources: [raft-rs](https://github.com/tikv/ra
 
 **Files:** Raft log store, checkpoint manifest, restore tests.
 
-**Current progress:** `replica-snapshot` now binds a RocksDB checkpoint to
-shard/epoch/term/index/membership/watermarks with a CRC-protected manifest and a deterministic
-BLAKE3 directory digest. Verified restore plus suffix replay is covered; Raft WAL durability,
-full temporal-query equivalence, snapshot installation, compaction, and crash-point scheduling
-remain before this task is complete.
+**Current progress:** `replica-snapshot` binds a RocksDB checkpoint to shard/epoch/term/index,
+membership, and watermarks with a CRC-protected manifest and deterministic BLAKE3 directory
+digest. `raft-logstore` synchronously persists HardState, entries, membership, and Raft snapshots,
+then reconstructs `RawNode` from WAL plus the Adapter's atomic applied index. A forced crash after
+committed WAL persistence and before Adapter apply is recovered by suffix replay. Full
+temporal-query equivalence, snapshot transfer/install, post-snapshot compaction, and the remaining
+crash-point schedules are still required.
 
-- [ ] Version a manifest binding shard/epoch/term/applied index/watermarks to an Adapter checkpoint
+- [x] Version a manifest binding shard/epoch/term/applied index/watermarks to an Adapter checkpoint
   and checksum.
 - [ ] Create snapshots only after Adapter checkpoint completion at the matching applied index;
   compact logs only after the snapshot is durable.
