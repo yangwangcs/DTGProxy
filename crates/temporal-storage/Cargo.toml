@@ -1,0 +1,13 @@
+[package]
+name = "temporal-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+storage-api = { path = "../storage-api" }
+temporal-types = { path = "../temporal-types" }
+
+[lints]
+workspace = true

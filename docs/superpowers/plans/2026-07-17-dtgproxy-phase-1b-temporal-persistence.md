@@ -73,17 +73,17 @@ RocksDB adapters; no unstable/default serializers in the durable format.
 
 **Produces:** typed graph IDs and deterministic identity/current/history/adjacency keys.
 
-- [ ] Write failing tests for graph, partition, vertex, and edge key golden bytes; round-trip
+- [x] Write failing tests for graph, partition, vertex, and edge key golden bytes; round-trip
   decoding; keyspace selection; reverse transaction-time ordering; and malformed/trailing data.
-- [ ] Add failing time-component accessor tests rather than exposing tuple fields.
-- [ ] Implement `GraphId(u64)`, `PartitionId(u32)`, `ElementId(u128)`, `LabelId(u32)`,
+- [x] Add failing time-component accessor tests rather than exposing tuple fields.
+- [x] Implement `GraphId(u64)`, `PartitionId(u32)`, `ElementId(u128)`, `LabelId(u32)`,
   `EdgeTypeId(u32)`, `ElementKind`, and `ElementRef`.
-- [ ] Implement explicit key tags: vertex identity `0x01`, edge identity `0x02`, Current vertex
+- [x] Implement explicit key tags: vertex identity `0x01`, edge identity `0x02`, Current vertex
   `0x08`, Current edge `0x09`, out adjacency `0x10`, in adjacency `0x11`, and History anchor
   `0x20`. Include graph and partition in every primary key.
-- [ ] Encode transaction time as signed-micros order-preserving bytes plus logical counter;
+- [x] Encode transaction time as signed-micros order-preserving bytes plus logical counter;
   History uses the bitwise reverse of that ordered representation so newer anchors sort first.
-- [ ] Run codec tests, format, and Clippy; commit as `feat: add temporal graph key codec`.
+- [x] Run codec tests, format, and Clippy; commit as `feat: add temporal graph key codec`.
 
 ### Task 3: Stable Projection Record Codec
 

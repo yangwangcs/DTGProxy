@@ -388,6 +388,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "temporal-storage"
+version = "0.1.0"
+dependencies = [
+ "storage-api",
+ "temporal-types",
+]
+
+[[package]]
 name = "temporal-types"
 version = "0.1.0"
 
