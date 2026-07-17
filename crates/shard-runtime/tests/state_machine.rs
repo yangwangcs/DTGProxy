@@ -140,6 +140,21 @@ fn old_entry_replay_is_idempotent_but_divergent_replay_fails_closed() {
 }
 
 #[test]
+fn raft_leader_noop_entries_advance_the_same_durable_apply_index() {
+    let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
+    block_on(machine.apply_noop_entry(1, 1)).unwrap();
+    block_on(machine.apply_entry(1, 2, &apply_command(9, 101, 100, b"after-noop"))).unwrap();
+
+    let replay = block_on(machine.apply_noop_entry(1, 1)).unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.applied_log_index, 2);
+    assert_eq!(
+        read_current(machine.adapter()),
+        Some(b"after-noop".to_vec())
+    );
+}
+
+#[test]
 fn adapter_failure_fences_serving_until_the_same_entry_replays_successfully() {
     let fail_next = Arc::new(AtomicBool::new(false));
     let adapter = FaultAdapter::new(Arc::clone(&fail_next));

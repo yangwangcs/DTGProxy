@@ -165,6 +165,106 @@ where
         Ok(receipt)
     }
 
+    pub async fn apply_noop_entry(
+        &mut self,
+        term: u64,
+        index: u64,
+    ) -> Result<ApplyReceipt, ShardRuntimeError> {
+        if term == 0 || index == 0 {
+            return Err(ShardRuntimeError::InvalidLogPosition { term, index });
+        }
+        if let Some(failed_index) = self.faulted_at {
+            if failed_index != index {
+                return Err(ShardRuntimeError::ReplicaFaulted { failed_index });
+            }
+            self.metadata = load_metadata(
+                &self.adapter,
+                self.metadata.shard_id,
+                self.metadata.placement_epoch,
+            )
+            .await?;
+        }
+        let adapter_index = match self.adapter.applied_log_index() {
+            Ok(index) => index,
+            Err(error) => {
+                self.faulted_at = Some(index);
+                return Err(ShardRuntimeError::Adapter(error));
+            }
+        };
+        if adapter_index != self.metadata.applied_index {
+            return Err(ShardRuntimeError::MetadataIndexMismatch {
+                metadata: self.metadata.applied_index,
+                adapter: adapter_index,
+            });
+        }
+        let digest = entry_digest(term, index, &[]);
+        if index <= self.metadata.applied_index {
+            if let Err(error) = self.verify_replay(term, index, digest).await {
+                if matches!(error, ShardRuntimeError::Adapter(_)) {
+                    self.faulted_at = Some(index);
+                }
+                return Err(error);
+            }
+            self.faulted_at = None;
+            return Ok(ApplyReceipt {
+                applied_log_index: self.metadata.applied_index,
+                duplicate: true,
+            });
+        }
+        let expected_index = self.metadata.applied_index.saturating_add(1);
+        if index != expected_index {
+            return Err(ShardRuntimeError::NonContiguousIndex {
+                expected: expected_index,
+                actual: index,
+            });
+        }
+        if term < self.metadata.last_term {
+            return Err(ShardRuntimeError::NonMonotonicTerm {
+                current: self.metadata.last_term,
+                proposed: term,
+            });
+        }
+        let next_metadata = ReplicaMetadata {
+            last_term: term,
+            applied_index: index,
+            ..self.metadata
+        };
+        let mut mutations = Vec::new();
+        append_meta_mutation(
+            &mut mutations,
+            entry_digest_key(index),
+            encode_entry_digest(term, digest),
+        )?;
+        append_meta_mutation(
+            &mut mutations,
+            position_key(),
+            encode_position(next_metadata),
+        )?;
+        let batch = CommittedMutationBatch {
+            shard_id: self.metadata.shard_id,
+            log_index: index,
+            txn_id: (u128::from(term) << 64) | u128::from(index),
+            mutations,
+        };
+        let receipt = match self.adapter.apply_committed(batch).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.faulted_at = Some(index);
+                return Err(ShardRuntimeError::Adapter(error));
+            }
+        };
+        if receipt.applied_log_index != index {
+            self.faulted_at = Some(index);
+            return Err(ShardRuntimeError::ApplyReceiptMismatch {
+                expected: index,
+                actual: receipt.applied_log_index,
+            });
+        }
+        self.metadata = next_metadata;
+        self.faulted_at = None;
+        Ok(receipt)
+    }
+
     fn validate_authority(&self, command: &CommandEnvelopeV1) -> Result<(), ShardRuntimeError> {
         if command.shard_id != self.metadata.shard_id {
             return Err(ShardRuntimeError::ShardMismatch {

@@ -1,15 +1,19 @@
 #![forbid(unsafe_code)]
 
 mod metadata;
+mod raft_group;
 mod state_machine;
+mod transport;
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 pub use metadata::{MIN_REPLICA_TIME, ReplicaMetadata};
+pub use raft_group::{InProcessShardGroup, MultiRaftRuntime, ProposalReceipt, ReplicationError};
 pub use state_machine::ShardStateMachine;
 use storage_api::AdapterError;
 use temporal_types::TransactionTime;
+pub use transport::DeterministicTransport;
 
 #[derive(Debug)]
 pub enum ShardRuntimeError {

@@ -77,17 +77,17 @@ Folly/Thrift/C++ source is copied. Sources: [raft-rs](https://github.com/tikv/ra
 
 **Files:** `shard-runtime` Raft node/group/transport modules and fault harness.
 
-- [ ] Integrate `raft-rs` `RawNode` using a narrow wrapper; persist HardState, entries, and snapshot
+- [x] Integrate `raft-rs` `RawNode` using a narrow wrapper; persist HardState, entries, and snapshot
   before sending persistence-dependent messages, following the official Ready/LightReady order.
-- [ ] Implement an in-process transport supporting drop, delay, isolate, heal, reorder, and node
+- [x] Implement an in-process transport supporting drop, delay, isolate, heal, reorder, and node
   stop/restart without shared replica state.
-- [ ] Correlate proposals by request ID and acknowledge only after majority commit plus leader state
+- [x] Correlate proposals by request ID and acknowledge only after majority commit plus leader state
   apply; retry/replay must return the same outcome.
-- [ ] Test election, 3/3 replication, one follower loss, leader loss/re-election, minority refusal,
+- [x] Test election, 3/3 replication, one follower loss, leader loss/re-election, minority refusal,
   partition heal, duplicate delivery, and log convergence.
-- [ ] Add `MultiRaftRuntime` ownership mapping `(node_id, shard_id) -> replica` and prove two groups
+- [x] Add `MultiRaftRuntime` ownership mapping `(node_id, shard_id) -> replica` and prove two groups
   progress independently on the same node.
-- [ ] Commit as `feat: replicate temporal shard groups`.
+- [x] Commit as `feat: replicate temporal shard groups`.
 
 ### Task 5: Snapshot, Restart, and Log Catch-up
 
