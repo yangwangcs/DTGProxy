@@ -205,6 +205,16 @@ impl RaftReplica {
             .map_err(|error| ReplicationError::Raft(error.to_string()))
     }
 
+    fn transfer_leader(&mut self, transferee: u64) -> Result<(), ReplicationError> {
+        self.raw_node
+            .as_mut()
+            .ok_or(ReplicationError::NodeStopped {
+                node_id: self.node_id,
+            })?
+            .transfer_leader(transferee);
+        Ok(())
+    }
+
     fn propose(&mut self, request_id: u128, command: Vec<u8>) -> Result<(), ReplicationError> {
         self.raw_node
             .as_mut()
@@ -451,8 +461,14 @@ impl InProcessShardGroup {
             if self.leader_id() == Some(node_id) {
                 return Ok(());
             }
+            if let Some(leader_id) = self.leader_id() {
+                self.replicas
+                    .get_mut(&leader_id)
+                    .expect("leader id came from Replica map")
+                    .transfer_leader(node_id)?;
+            }
             self.tick().await?;
-            if tick % 10 == 9 {
+            if self.leader_id().is_none() && tick % 10 == 9 {
                 self.replicas
                     .get_mut(&node_id)
                     .expect("candidate was validated before election")
@@ -1039,5 +1055,69 @@ impl MultiRaftRuntime {
 impl Default for MultiRaftRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use super::InProcessShardGroup;
+
+    #[test]
+    fn elect_transfers_an_intervening_leader_to_the_requested_node() {
+        let mut group = block_on(InProcessShardGroup::new(7, 9, &[1, 2, 3])).unwrap();
+        block_on(group.elect(1)).unwrap();
+        group.stop_node(1).unwrap();
+
+        group
+            .replicas
+            .get_mut(&2)
+            .unwrap()
+            .raw_node
+            .as_mut()
+            .unwrap()
+            .raft
+            .set_randomized_election_timeout(19);
+        group
+            .replicas
+            .get_mut(&3)
+            .unwrap()
+            .raw_node
+            .as_mut()
+            .unwrap()
+            .raft
+            .set_randomized_election_timeout(10);
+        block_on(group.drive_ticks(10)).unwrap();
+        assert_eq!(group.leader_id(), Some(3));
+
+        block_on(group.elect(2)).unwrap();
+        assert_eq!(group.leader_id(), Some(2));
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct ThreadWaker(std::thread::Thread);
+
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
+            }
+        }
     }
 }
