@@ -184,18 +184,18 @@ RocksDB adapters; no unstable/default serializers in the durable format.
 - Modify: `README.md`
 - Modify: this plan with actual evidence
 
-- [ ] Add reproducible benchmarks for Current point lookup, AS OF anchor lookup at several history
+- [x] Add reproducible benchmarks for Current point lookup, AS OF anchor lookup at several history
   depths, retroactive correction at several segment counts, and one-hop expansion at several
   degrees. Report throughput/latency and bytes written; do not encode unmeasured targets as
   claims.
-- [ ] Add a deterministic randomized TCK sequence that applies the same operations to the model,
+- [x] Add a deterministic randomized TCK sequence that applies the same operations to the model,
   memory-backed store, and RocksDB-backed store, checking Current/AS OF equivalence after every
   commit.
-- [ ] Document the Phase 1B API, durable layout, correctness boundaries, benchmark invocation,
+- [x] Document the Phase 1B API, durable layout, correctness boundaries, benchmark invocation,
   and the anchor-only write-amplification tradeoff that Phase 1C will remove.
-- [ ] Run `cargo fmt --all -- --check`, strict workspace Clippy, full workspace tests, release
+- [x] Run `cargo fmt --all -- --check`, strict workspace Clippy, full workspace tests, release
   benchmarks, CLI version, and `git diff --check` with the verified LLVM environment.
-- [ ] Record exact counts/results and commits, then commit as
+- [x] Record exact counts/results and commits, then commit as
   `docs: record temporal persistence verification`.
 
 ## Exit boundary
@@ -205,3 +205,30 @@ Phase 1B is accepted only when a vertex-and-edge temporal graph survives
 decoded typed graph matches the memory semantic oracle. Phase 1B deliberately leaves bounded
 Anchor+Delta compaction and Temporal Cypher to Phase 1C; it does not advance the overall goal to
 complete.
+
+## Acceptance Evidence
+
+Verified on 2026-07-17 with Apple M2, macOS 27.0, Rust 1.93, and RocksDB 0.24.0:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed with Homebrew LLVM.
+- `cargo test --workspace`: 64 behavioral tests passed, 0 failed, plus empty unit/doc targets.
+- Fixed-seed TCK: 32 commits matched the model, Memory Adapter, and RocksDB after every commit.
+- Real RocksDB TCK: restart and checkpoint preserved typed Current, AS OF, adjacency, and DIFF.
+- `cargo run -q -p dtgproxy -- --version`: printed `DTGProxy 0.1.0`.
+- `git diff --check`: passed.
+- Ordered scans: `0b4d534`.
+- Stable graph key codec: `d9cce3a`.
+- Stable projection records: `007c6c9`.
+- Bitemporal vertices: `63fdeee`.
+- Bitemporal edges and adjacency: `bb83b4d`.
+- Durable round-trip and DIFF proof: `2650a0e`.
+
+Release benchmark (`DTGPROXY_BENCH_ITERS=200`): Current lookup 7,785 ns/op; AS OF latest
+222,166 ns/op; AS OF oldest at depth 32 230,516 ns/op; synchronous retroactive commit 480,421
+ns/op; degree-32 out expansion 29,541 ns/op; database size 290,152 bytes. The AS OF result is a
+measured optimization trigger: the anchor-only reader scans the complete element history, so
+Phase 1C must introduce bounded reverse-time seek and bounded Anchor+Delta replay.
+
+Phase 1B is accepted. The overall DTGProxy objective remains active; Phase 1C and distributed
+Phases 2–6 are not implemented by this acceptance.
