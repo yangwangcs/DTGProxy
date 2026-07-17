@@ -87,8 +87,10 @@ impl LogicalKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeySpan {
     keyspace: Keyspace,
-    prefix: Vec<u8>,
+    start: Vec<u8>,
     end: Option<Vec<u8>>,
+    required_prefix: Option<Vec<u8>>,
+    limit: Option<usize>,
 }
 
 impl KeySpan {
@@ -97,9 +99,53 @@ impl KeySpan {
         let end = prefix_successor(&prefix);
         Self {
             keyspace,
-            prefix,
+            start: prefix.clone(),
             end,
+            required_prefix: Some(prefix),
+            limit: None,
         }
+    }
+
+    pub fn prefix_from(
+        keyspace: Keyspace,
+        prefix: Vec<u8>,
+        start: Vec<u8>,
+    ) -> Result<Self, KeySpanError> {
+        if !start.starts_with(&prefix) {
+            return Err(KeySpanError::StartOutsidePrefix);
+        }
+        Ok(Self {
+            keyspace,
+            start,
+            end: prefix_successor(&prefix),
+            required_prefix: Some(prefix),
+            limit: None,
+        })
+    }
+
+    pub fn range(
+        keyspace: Keyspace,
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+    ) -> Result<Self, KeySpanError> {
+        if end.as_ref().is_some_and(|end| end <= &start) {
+            return Err(KeySpanError::EmptyOrReversed);
+        }
+        Ok(Self {
+            keyspace,
+            start,
+            end,
+            required_prefix: None,
+            limit: None,
+        })
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Result<Self, KeySpanError> {
+        if limit == 0 {
+            return Err(KeySpanError::ZeroLimit);
+        }
+        self.limit = Some(limit);
+        Ok(self)
     }
 
     #[must_use]
@@ -109,7 +155,7 @@ impl KeySpan {
 
     #[must_use]
     pub fn start(&self) -> &[u8] {
-        &self.prefix
+        &self.start
     }
 
     #[must_use]
@@ -119,9 +165,40 @@ impl KeySpan {
 
     #[must_use]
     pub fn contains(&self, key: &[u8]) -> bool {
-        key.starts_with(&self.prefix)
+        key >= self.start.as_slice()
+            && self.end.as_deref().is_none_or(|end| key < end)
+            && self
+                .required_prefix
+                .as_deref()
+                .is_none_or(|prefix| key.starts_with(prefix))
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> Option<usize> {
+        self.limit
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeySpanError {
+    EmptyOrReversed,
+    StartOutsidePrefix,
+    ZeroLimit,
+}
+
+impl Display for KeySpanError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyOrReversed => formatter.write_str("key span end must follow its start"),
+            Self::StartOutsidePrefix => {
+                formatter.write_str("key span seek start is outside the required prefix")
+            }
+            Self::ZeroLimit => formatter.write_str("key span limit must be positive"),
+        }
+    }
+}
+
+impl Error for KeySpanError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyValue {

@@ -214,6 +214,22 @@ fn prefix_scan_is_ordered_and_isolated_to_one_keyspace() {
     assert_eq!(values[0].value(), b"one");
     assert_eq!(values[1].key().as_bytes(), b"edge:2");
     assert_eq!(values[1].value(), b"two");
+
+    let bounded = block_on(
+        adapter.scan(
+            &KeySpan::range(
+                Keyspace::Current,
+                b"edge:1".to_vec(),
+                Some(b"edge:3".to_vec()),
+            )
+            .unwrap()
+            .with_limit(1)
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(bounded.len(), 1);
+    assert_eq!(bounded[0].key().as_bytes(), b"edge:1");
 }
 
 struct NoopWake;

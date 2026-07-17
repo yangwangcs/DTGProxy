@@ -249,6 +249,9 @@ impl StorageAdapter for RocksAdapter {
                     LogicalKey::in_keyspace(span.keyspace(), key.into_vec()),
                     value.into_vec(),
                 ));
+                if values.len() == span.limit().unwrap_or(usize::MAX) {
+                    break;
+                }
             }
             Ok(values)
         })

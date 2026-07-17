@@ -28,17 +28,22 @@ first stabilizes the state-machine format and query boundary that Phase 2 will r
 
 **Files:** `storage-api`, both adapters, `temporal-storage` key/store/tests/benchmark.
 
-- [ ] Add failing tests for bounded ranges, prefix-constrained seek, exclusive ends, and scan
+- [x] Add failing tests for bounded ranges, prefix-constrained seek, exclusive ends, and scan
   limits in Memory and RocksDB.
-- [ ] Extend `KeySpan` without changing existing prefix behavior; adapters must stop at the bound
+- [x] Extend `KeySpan` without changing existing prefix behavior; adapters must stop at the bound
   or limit while retaining snapshot consistency.
-- [ ] Add a History seek span that starts at `reverse(requested_tx)` and is bounded by the element
+- [x] Add a History seek span that starts at `reverse(requested_tx)` and is bounded by the element
   prefix, so entries newer than the requested snapshot are never decoded.
-- [ ] Make Current AS OF point reads request only the first eligible full anchor in the Phase 1B
+- [x] Make Current AS OF point reads request only the first eligible full anchor in the Phase 1B
   format; retain full scans only for conflict validation until Task 2.
-- [ ] Add scan-count instrumentation in tests and re-run the release benchmark. Require latest
-  and oldest lookup to decode one Phase 1B anchor, independent of history depth.
-- [ ] Commit as `perf: bound temporal history seeks`.
+- [x] Add a single-decode guard that corrupts an older anchor and re-run the release benchmark.
+  Latest and oldest lookup decode one Phase 1B anchor, independent of history depth.
+- [x] Commit as `perf: bound temporal history seeks`.
+
+Task 1 benchmark evidence (`DTGPROXY_BENCH_ITERS=200`): AS OF latest improved from 222,166 to
+11,462 ns/op (94.8%); AS OF oldest at depth 32 improved from 230,516 to 2,828 ns/op (98.8%).
+Current lookup measured 7,697 ns/op, synchronous correction 424,380 ns/op, degree-32 expansion
+29,440 ns/op, and the database occupied 290,151 bytes.
 
 ### Task 2: Anchor+Delta Durable Format and Reconstruction
 

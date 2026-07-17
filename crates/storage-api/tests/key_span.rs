@@ -1,4 +1,4 @@
-use storage_api::{KeySpan, Keyspace};
+use storage_api::{KeySpan, KeySpanError, Keyspace};
 
 #[test]
 fn prefix_span_has_an_exclusive_lexicographic_upper_bound() {
@@ -22,4 +22,39 @@ fn empty_and_all_ff_prefixes_have_an_unbounded_upper_end() {
     assert_eq!(terminal.end(), None);
     assert!(terminal.contains(&[0xff, 0xff, 0x01]));
     assert!(!terminal.contains(&[0xff, 0xfe, 0xff]));
+}
+
+#[test]
+fn bounded_range_and_prefix_seek_have_stable_inclusive_exclusive_semantics() {
+    let range = KeySpan::range(Keyspace::History, b"b".to_vec(), Some(b"d".to_vec())).unwrap();
+    assert!(range.contains(b"b"));
+    assert!(range.contains(b"c"));
+    assert!(!range.contains(b"a"));
+    assert!(!range.contains(b"d"));
+
+    let seek = KeySpan::prefix_from(Keyspace::History, b"edge:".to_vec(), b"edge:2".to_vec())
+        .unwrap()
+        .with_limit(2)
+        .unwrap();
+    assert_eq!(seek.start(), b"edge:2");
+    assert_eq!(seek.limit(), Some(2));
+    assert!(seek.contains(b"edge:2"));
+    assert!(seek.contains(b"edge:9"));
+    assert!(!seek.contains(b"other"));
+}
+
+#[test]
+fn invalid_ranges_seeks_and_limits_are_rejected() {
+    assert_eq!(
+        KeySpan::range(Keyspace::Current, b"z".to_vec(), Some(b"a".to_vec())),
+        Err(KeySpanError::EmptyOrReversed)
+    );
+    assert_eq!(
+        KeySpan::prefix_from(Keyspace::Current, b"edge:".to_vec(), b"vertex:".to_vec()),
+        Err(KeySpanError::StartOutsidePrefix)
+    );
+    assert_eq!(
+        KeySpan::prefix(Keyspace::Current, Vec::new()).with_limit(0),
+        Err(KeySpanError::ZeroLimit)
+    );
 }

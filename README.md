@@ -48,10 +48,9 @@ commit.
 
 Phase 1B intentionally stores a full projection anchor for every changed element commit. This
 is the correctness baseline and makes read-back simple and auditable, but write amplification is
-linear in an element's valid-time segment count. Current AS OF lookup also scans and decodes the
-element's anchor prefix before selecting a snapshot. Phase 1C must replace that path with a
-bounded reverse-time seek plus Anchor+Delta replay and compaction; benchmark results below make
-that optimization need visible rather than hiding it.
+linear in an element's valid-time segment count. Its initial AS OF implementation scanned the
+complete element prefix. Phase 1C now uses a bounded reverse-time seek and decodes exactly one
+eligible full anchor; Anchor+Delta replay and compaction remain the next storage-format step.
 
 ## Performance probe
 
@@ -76,9 +75,14 @@ Warm-cache measurements on 2026-07-17 using Apple M2, macOS 27.0, Rust 1.93, and
 | Current outgoing expansion | degree 32 | 29,541 |
 
 The benchmark database occupied 290,152 bytes. These are development-host microbenchmarks, not
-service SLOs. In particular, the nearly identical depth-1/depth-32 AS OF cost confirms that the
-anchor-only reader currently scans the full element history; the next history implementation
-must measure bounded-seek and bounded-delta replay separately.
+service SLOs. The nearly identical depth-1/depth-32 AS OF cost exposed the original full-prefix
+scan.
+
+After adding prefix-constrained range seek plus a one-record scan limit, the same command measured
+11,462 ns/op for the latest snapshot and 2,828 ns/op for the oldest snapshot. That is a 94.8% and
+98.8% reduction respectively versus the Phase 1B baseline. Current lookup remained 7,697 ns/op,
+degree-32 expansion 29,440 ns/op, and synchronous correction 424,380 ns/op. The next benchmark
+gate is bounded Anchor+Delta replay and write bytes, not further tuning of the full-anchor format.
 
 ## Development
 

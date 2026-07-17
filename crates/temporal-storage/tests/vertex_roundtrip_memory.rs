@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
-use storage_api::StorageAdapter;
+use storage_api::{CommittedMutationBatch, Mutation, StorageAdapter};
 use temporal_model::Timeline;
 use temporal_storage::{
-    CommitContext, ElementId, ElementRef, GraphId, LabelId, PartitionId, TemporalStore,
-    TemporalStoreError, VertexMutation,
+    CommitContext, ElementId, ElementRef, GraphId, LabelId, PartitionId, RecordCodecError,
+    TemporalStore, TemporalStoreError, VertexMutation, history_anchor_key,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -224,6 +224,43 @@ fn stale_writer_on_a_disjoint_valid_interval_can_commit() {
     assert_eq!(
         block_on(store.vertex_current(vertex(), valid(9))).unwrap(),
         Some(payload("c"))
+    );
+}
+
+#[test]
+fn as_of_seek_decodes_only_the_first_eligible_anchor() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let label = LabelId::new(11);
+    block_on(store.commit_vertex(
+        context(1, 0, 100),
+        VertexMutation::put(vertex(), label, interval(1, None), payload("old")).unwrap(),
+    ))
+    .unwrap();
+    block_on(store.commit_vertex(
+        context(2, 100, 200),
+        VertexMutation::put(vertex(), label, interval(4, Some(7)), payload("new")).unwrap(),
+    ))
+    .unwrap();
+    block_on(store.adapter().apply_committed(CommittedMutationBatch {
+        shard_id: 3,
+        log_index: 3,
+        txn_id: 999,
+        mutations: vec![Mutation::put(
+            0,
+            history_anchor_key(vertex(), tx(100), 0),
+            b"corrupt-old-anchor".to_vec(),
+        )],
+    }))
+    .unwrap();
+
+    assert_eq!(
+        block_on(store.vertex_as_of(vertex(), valid(5), tx(250))).unwrap(),
+        Some(payload("new")),
+        "the latest eligible anchor must be selected without decoding older records"
+    );
+    assert_eq!(
+        block_on(store.vertex_as_of(vertex(), valid(5), tx(150))),
+        Err(TemporalStoreError::Record(RecordCodecError::InvalidMagic))
     );
 }
 

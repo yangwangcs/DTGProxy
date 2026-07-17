@@ -144,6 +144,7 @@ impl StorageAdapter for MemoryAdapter {
                 .take_while(|(key, _)| {
                     key.keyspace() == span.keyspace() && span.contains(key.as_bytes())
                 })
+                .take(span.limit().unwrap_or(usize::MAX))
                 .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
                 .collect())
         })

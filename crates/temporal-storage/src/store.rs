@@ -384,10 +384,10 @@ where
     ) -> TemporalStoreFuture<'a, Option<CanonicalElement>> {
         Box::pin(async move {
             require_vertex(element)?;
-            let anchors = self.load_anchors(element).await?;
-            Ok(anchors
-                .iter()
-                .find(|anchor| anchor.commit_ts() <= transaction_time)
+            Ok(self
+                .load_anchor_at(element, transaction_time)
+                .await?
+                .as_ref()
                 .and_then(|anchor| anchor.projection().visible_at(valid_time))
                 .cloned())
         })
@@ -413,10 +413,10 @@ where
     ) -> TemporalStoreFuture<'a, Option<CanonicalElement>> {
         Box::pin(async move {
             require_edge(element)?;
-            let anchors = self.load_anchors(element).await?;
-            Ok(anchors
-                .iter()
-                .find(|anchor| anchor.commit_ts() <= transaction_time)
+            Ok(self
+                .load_anchor_at(element, transaction_time)
+                .await?
+                .as_ref()
                 .and_then(|anchor| anchor.projection().visible_at(valid_time))
                 .cloned())
         })
@@ -622,6 +622,26 @@ where
             .collect()
     }
 
+    async fn load_anchor_at(
+        &self,
+        element: ElementRef,
+        transaction_time: TransactionTime,
+    ) -> Result<Option<HistoryAnchor>, TemporalStoreError> {
+        let prefix = history_prefix(element);
+        let start = history_anchor_key(element, transaction_time, 0)
+            .as_bytes()
+            .to_vec();
+        let span = KeySpan::prefix_from(Keyspace::History, prefix, start)
+            .expect("history seek key always starts with its element prefix")
+            .with_limit(1)
+            .expect("history seek limit is positive");
+        let mut entries = self.adapter.scan(&span).await?;
+        entries
+            .pop()
+            .map(|entry| HistoryAnchor::decode(entry.value()).map_err(TemporalStoreError::from))
+            .transpose()
+    }
+
     async fn diff_element(
         &self,
         element: ElementRef,
@@ -631,16 +651,12 @@ where
         if from_transaction > to_transaction {
             return Err(TemporalStoreError::InvalidDiffOrder);
         }
-        let anchors = self.load_anchors(element).await?;
-        let before = anchors
-            .iter()
-            .find(|anchor| anchor.commit_ts() <= from_transaction)
-            .map(HistoryAnchor::projection);
-        let after = anchors
-            .iter()
-            .find(|anchor| anchor.commit_ts() <= to_transaction)
-            .map(HistoryAnchor::projection);
-        Ok(diff_projections(before, after))
+        let before = self.load_anchor_at(element, from_transaction).await?;
+        let after = self.load_anchor_at(element, to_transaction).await?;
+        Ok(diff_projections(
+            before.as_ref().map(HistoryAnchor::projection),
+            after.as_ref().map(HistoryAnchor::projection),
+        ))
     }
 }
 
