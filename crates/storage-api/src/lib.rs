@@ -25,6 +25,17 @@ pub enum Keyspace {
 }
 
 impl Keyspace {
+    pub const ALL: [Self; 8] = [
+        Self::Meta,
+        Self::Identity,
+        Self::Current,
+        Self::AdjOut,
+        Self::AdjIn,
+        Self::History,
+        Self::TemporalIndex,
+        Self::Txn,
+    ];
+
     #[must_use]
     pub const fn tag(self) -> u8 {
         self as u8
@@ -123,6 +134,7 @@ pub enum AdapterError {
     CommittedLogReplayMismatch { log_index: u64 },
     DuplicateMutationSequence { txn_id: u128, sequence: u32 },
     MutationReplayMismatch { txn_id: u128, sequence: u32 },
+    Backend(String),
     LockPoisoned,
 }
 
@@ -153,6 +165,7 @@ impl Display for AdapterError {
                     "transaction {txn_id} mutation sequence {sequence} changed during replay"
                 )
             }
+            Self::Backend(message) => write!(formatter, "storage backend error: {message}"),
             Self::LockPoisoned => formatter.write_str("adapter state lock is poisoned"),
         }
     }

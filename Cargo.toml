@@ -4,6 +4,7 @@ members = [
     "crates/temporal-model",
     "crates/storage-api",
     "crates/adapter-memory",
+    "crates/adapter-rocksdb",
     "crates/dtgproxy",
 ]
 resolver = "3"
@@ -19,4 +20,3 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
-

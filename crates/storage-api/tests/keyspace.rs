@@ -21,4 +21,3 @@ fn logical_key_defaults_to_current_and_can_select_history() {
     assert_eq!(history.keyspace(), Keyspace::History);
     assert_ne!(current, history);
 }
-

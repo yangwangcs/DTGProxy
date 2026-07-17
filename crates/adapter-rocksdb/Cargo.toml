@@ -1,0 +1,17 @@
+[package]
+name = "adapter-rocksdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "multi-threaded-cf"] }
+storage-api = { path = "../storage-api" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+

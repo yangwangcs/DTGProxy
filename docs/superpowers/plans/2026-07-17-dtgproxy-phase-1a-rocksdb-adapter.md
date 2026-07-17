@@ -77,7 +77,7 @@ Expected: compile failure because `Keyspace` and the new constructors do not exi
 
 Run: `cargo test -p storage-api && cargo test -p adapter-memory && cargo clippy --workspace --all-targets -- -D warnings`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/storage-api crates/adapter-memory && git commit -m "feat: add stable storage keyspaces"`
 
@@ -93,7 +93,7 @@ Run: `git add crates/storage-api crates/adapter-memory && git commit -m "feat: a
 - Consumes: `StorageAdapter`, `Keyspace`.
 - Produces: `RocksAdapter::open(path)` and `RocksAdapter::path()`.
 
-- [ ] **Step 1: Write the failing open test**
+- [x] **Step 1: Write the failing open test**
 
 ```rust
 use adapter_rocksdb::RocksAdapter;
@@ -113,21 +113,23 @@ fn open_creates_all_required_column_families() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p adapter-rocksdb --test open`
 
 Expected: package or import failure because the adapter crate does not exist.
 
-- [ ] **Step 3: Add the crate and minimal open implementation**
+- [x] **Step 3: Add the crate and minimal open implementation**
 
 Use `DBWithThreadMode<MultiThreaded>`, `Options::create_if_missing(true)`, `create_missing_column_families(true)`, and one `ColumnFamilyDescriptor` per DTGProxy keyspace. Map all RocksDB errors to `AdapterError::Backend(String)` without inspecting English strings for retry policy.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `cargo test -p adapter-rocksdb --test open`
 
 Expected: the C++ dependency builds and the open test passes.
+
+Local evidence: macOS 27 Command Line Tools could not resolve the standard C++ header `cstdint`; a direct compiler probe isolated the environment fault. The verified build used `CXX=/opt/homebrew/opt/llvm/bin/clang++` and `LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib`, after which both open tests passed.
 
 - [ ] **Step 5: Commit**
 
