@@ -4,7 +4,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
 use storage_api::{
-    AdapterError, CommittedMutationBatch, Keyspace, LogicalKey, Mutation, StorageAdapter,
+    AdapterError, CommittedMutationBatch, KeySpan, Keyspace, LogicalKey, Mutation, StorageAdapter,
 };
 
 fn key(value: &str) -> LogicalKey {
@@ -183,6 +183,35 @@ fn identical_bytes_in_current_and_history_are_isolated() {
         block_on(adapter.multi_get(&[current, history])).unwrap(),
         vec![Some(b"current".to_vec()), Some(b"history".to_vec())]
     );
+}
+
+#[test]
+fn prefix_scan_is_ordered_and_isolated_to_one_keyspace() {
+    let adapter = MemoryAdapter::new();
+    block_on(adapter.apply_committed(batch(
+        1,
+        15,
+        vec![
+            Mutation::put(0, LogicalKey::new(b"edge:2".to_vec()), b"two".to_vec()),
+            Mutation::put(1, LogicalKey::new(b"edge:1".to_vec()), b"one".to_vec()),
+            Mutation::put(2, LogicalKey::new(b"other".to_vec()), b"skip".to_vec()),
+            Mutation::put(
+                3,
+                LogicalKey::in_keyspace(Keyspace::History, b"edge:0".to_vec()),
+                b"history".to_vec(),
+            ),
+        ],
+    )))
+    .unwrap();
+
+    let values =
+        block_on(adapter.scan(&KeySpan::prefix(Keyspace::Current, b"edge:".to_vec()))).unwrap();
+
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].key().as_bytes(), b"edge:1");
+    assert_eq!(values[0].value(), b"one");
+    assert_eq!(values[1].key().as_bytes(), b"edge:2");
+    assert_eq!(values[1].value(), b"two");
 }
 
 struct NoopWake;

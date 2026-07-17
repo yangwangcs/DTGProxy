@@ -85,6 +85,73 @@ impl LogicalKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeySpan {
+    keyspace: Keyspace,
+    prefix: Vec<u8>,
+    end: Option<Vec<u8>>,
+}
+
+impl KeySpan {
+    #[must_use]
+    pub fn prefix(keyspace: Keyspace, prefix: Vec<u8>) -> Self {
+        let end = prefix_successor(&prefix);
+        Self {
+            keyspace,
+            prefix,
+            end,
+        }
+    }
+
+    #[must_use]
+    pub const fn keyspace(&self) -> Keyspace {
+        self.keyspace
+    }
+
+    #[must_use]
+    pub fn start(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    #[must_use]
+    pub fn end(&self) -> Option<&[u8]> {
+        self.end.as_deref()
+    }
+
+    #[must_use]
+    pub fn contains(&self, key: &[u8]) -> bool {
+        key.starts_with(&self.prefix)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyValue {
+    key: LogicalKey,
+    value: Vec<u8>,
+}
+
+impl KeyValue {
+    #[must_use]
+    pub const fn new(key: LogicalKey, value: Vec<u8>) -> Self {
+        Self { key, value }
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> &LogicalKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (LogicalKey, Vec<u8>) {
+        (self.key, self.value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MutationOperation {
     Put { key: LogicalKey, value: Vec<u8> },
     Delete { key: LogicalKey },
@@ -218,7 +285,21 @@ pub trait StorageAdapter: Send + Sync {
 
     fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>>;
 
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>>;
+
     fn applied_log_index(&self) -> Result<u64, AdapterError>;
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] += 1;
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 struct Fnv1a(u64);

@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rocksdb::{
-    BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options,
-    WriteBatch, WriteOptions,
+    BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, Direction, IteratorMode,
+    MultiThreaded, Options, WriteBatch, WriteOptions,
 };
 use storage_api::{
     AdapterCapabilities, AdapterError, AdapterFuture, ApplyReceipt, CommittedMutationBatch,
-    Keyspace, LogicalKey, MutationOperation, StorageAdapter,
+    KeySpan, KeyValue, Keyspace, LogicalKey, MutationOperation, StorageAdapter,
 };
 
 const APPLIED_LOG_INDEX_KEY: &[u8] = b"\x00applied_log_index";
@@ -230,6 +230,27 @@ impl StorageAdapter for RocksAdapter {
                 .into_iter()
                 .map(|result| result.map_err(backend_error))
                 .collect()
+        })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move {
+            let cf = self.cf(span.keyspace())?;
+            let snapshot = self.db.snapshot();
+            let iterator =
+                snapshot.iterator_cf(&cf, IteratorMode::From(span.start(), Direction::Forward));
+            let mut values = Vec::new();
+            for item in iterator {
+                let (key, value) = item.map_err(backend_error)?;
+                if !span.contains(&key) {
+                    break;
+                }
+                values.push(KeyValue::new(
+                    LogicalKey::in_keyspace(span.keyspace(), key.into_vec()),
+                    value.into_vec(),
+                ));
+            }
+            Ok(values)
         })
     }
 

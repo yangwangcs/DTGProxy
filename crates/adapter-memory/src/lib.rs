@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use storage_api::{
     AdapterCapabilities, AdapterError, AdapterFuture, ApplyReceipt, CommittedMutationBatch,
-    LogicalKey, MutationOperation, StorageAdapter,
+    KeySpan, KeyValue, LogicalKey, MutationOperation, StorageAdapter,
 };
 
 #[derive(Default)]
@@ -130,6 +130,21 @@ impl StorageAdapter for MemoryAdapter {
             Ok(keys
                 .iter()
                 .map(|key| state.data.get(key).cloned())
+                .collect())
+        })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move {
+            let state = self.lock_state()?;
+            let start = LogicalKey::in_keyspace(span.keyspace(), span.start().to_vec());
+            Ok(state
+                .data
+                .range(start..)
+                .take_while(|(key, _)| {
+                    key.keyspace() == span.keyspace() && span.contains(key.as_bytes())
+                })
+                .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
                 .collect())
         })
     }

@@ -51,15 +51,15 @@ RocksDB adapters; no unstable/default serializers in the durable format.
 
 **Produces:** `KeySpan::prefix`, `StorageAdapter::scan`, and ordered `KeyValue` results.
 
-- [ ] Write failing contract tests for an empty prefix, exact keyspace isolation, bytewise order,
+- [x] Write failing contract tests for an empty prefix, exact keyspace isolation, bytewise order,
   exclusive upper-bound construction (including an all-`0xff` prefix), and snapshot-consistent
   scan results.
-- [ ] Run the storage and memory tests to capture RED.
-- [ ] Implement stable prefix-bound calculation and the object-safe boxed-future SPI method.
-- [ ] Implement memory scan using `BTreeMap::range` and RocksDB scan using one DB snapshot plus a
+- [x] Run the storage and memory tests to capture RED.
+- [x] Implement stable prefix-bound calculation and the object-safe boxed-future SPI method.
+- [x] Implement memory scan using `BTreeMap::range` and RocksDB scan using one DB snapshot plus a
   bounded iterator in the selected Column Family.
-- [ ] Run both adapters' complete contract suites and strict workspace Clippy.
-- [ ] Commit as `feat: add ordered storage scans`.
+- [x] Run both adapters' complete contract suites and strict workspace Clippy.
+- [x] Commit as `feat: add ordered storage scans`.
 
 ### Task 2: Stable Graph Key Codec
 
