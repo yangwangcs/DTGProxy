@@ -203,7 +203,7 @@ Construct `rocksdb::checkpoint::Checkpoint` from the live DB and call `create_ch
 
 Run: `cargo test -p adapter-rocksdb --test recovery`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/adapter-rocksdb && git commit -m "feat: add RocksDB recovery checkpoints"`
 
@@ -213,11 +213,11 @@ Run: `git add crates/adapter-rocksdb && git commit -m "feat: add RocksDB recover
 - Modify: `README.md`
 - Modify: this plan with actual evidence.
 
-- [ ] **Step 1: Document the durable adapter and native build requirement**
+- [x] **Step 1: Document the durable adapter and native build requirement**
 
 README names RocksDB 0.24.0, explains the eight CFs, states that clang/libclang are required, and gives the exact adapter test command.
 
-- [ ] **Step 2: Run complete verification**
+- [x] **Step 2: Run complete verification**
 
 ```bash
 cargo fmt --all -- --check
@@ -227,8 +227,27 @@ cargo run -q -p dtgproxy -- --version
 git diff --check
 ```
 
-- [ ] **Step 3: Commit and record evidence**
+- [x] **Step 3: Commit and record evidence**
 
 Run: `git add README.md docs && git commit -m "docs: record RocksDB adapter verification"`.
 
 Record exact test counts, tool results, implementation commit hashes, and the remaining Phase 1B–6 scope. Do not mark the overall DTGProxy goal complete.
+
+## Acceptance Evidence
+
+Verified on 2026-07-17 with Rust 1.93 and RocksDB 0.24.0:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed with Homebrew LLVM.
+- `cargo test --workspace`: 34 behavioral tests passed, 0 failed, plus empty unit/doc-test targets.
+- `cargo run -q -p dtgproxy -- --version`: printed `DTGProxy 0.1.0`.
+- `git diff --check`: passed.
+- Keyspace contract: `90f498f`.
+- RocksDB bootstrap: `67377ff`.
+- Atomic apply and snapshot reads: `4c955b7`.
+- Restart recovery and checkpoints: `7759a04`.
+
+Phase 1A is accepted. The overall product goal remains active: Phase 1B must materialize and
+read bitemporal graph state on the durable keyspaces; Phase 2 adds replicated shards; Phase 3
+adds distributed bitemporal transactions; Phase 4 adds query execution; Phase 5 adds external
+backend adapters; and Phase 6 adds analytics integration, hardening, and performance proof.
