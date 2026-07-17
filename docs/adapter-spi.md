@@ -1,6 +1,6 @@
 # DTGProxy Storage Adapter SPI v1
 
-Status: SPI v1, capability gate, registry, RocksDB factory, and index-fenced hot-swap state machine are implemented. PostgreSQL and property-graph Sidecars are planned work and are not yet claimed as supported.
+Status: SPI v1, capability gate, registry, RocksDB factory, index-fenced hot-swap state machine, and the bounded Sidecar v1 protocol/runtime are implemented. PostgreSQL and property-graph Adapter implementations remain planned work and are not yet claimed as supported.
 
 ## Objective
 
@@ -59,7 +59,17 @@ Rust has no stable native plugin ABI, so DTGProxy does not `dlopen` arbitrary Ru
 - Public parameters and secrets are separate; debug output always redacts secret values.
 - The opened instance—not only its configuration—is described and validated before it can serve a Shard.
 
-The Sidecar boundary must add request checksums, bounded frames, request IDs, deadlines, mTLS or same-host authenticated transport, health/readiness, backpressure, and structured retry classification. This wire protocol is the next SPI task.
+## Sidecar v1 boundary
+
+`adapter-sidecar` implements a canonical Protobuf payload inside a fixed `DTAS` binary frame. The frame has an explicit wire version, request/response kind, 128-bit request identifier, bounded 16 MiB payload length, and CRC32. Unknown versions, flags, message variants, enum values, non-canonical encodings, length mismatches, and checksum failures fail closed.
+
+The deliberately small remote surface is `Describe`, `Apply`, `MultiGet`, `Scan`, `AppliedLogIndex`, and `Health`. The client checks the actual descriptor and readiness at connect time, caches the durable applied index, and rejects write acknowledgements behind the required index, index regression, wrong multi-get cardinality, out-of-range/unordered scans, unexpected response types, and remote structured errors.
+
+The TCP implementation provides a fixed-size persistent connection pool, positive connect/read/write timeouts, `TCP_NODELAY`, request/response ID matching, and one reconnect retry with the original request ID. The bounded server uses a fixed worker count and finite pending-connection queue; it does not create a thread per connection and has explicit shutdown that interrupts active connections. A full queue sheds new connections and lets the client timeout/retry.
+
+The Sidecar frame request ID is transport correlation, not the storage idempotency key. A response can be lost after an apply, so a retry may execute twice. Correctness therefore depends on the mandatory Adapter rule that the same committed `(shard_id, log_index, txn_id, mutation fingerprint)` is idempotent and a different replay at the same log index fails.
+
+TCP v1 is currently appropriate only on a trusted same-host/private test boundary. Unix-domain peer authentication or mTLS, authorization, per-tenant admission, protocol fuzzing, metrics/traces, and certificate rotation remain release gates before a network-exposed Sidecar is production-supported.
 
 ## Index-fenced backend migration
 

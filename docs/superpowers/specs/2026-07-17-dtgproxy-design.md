@@ -527,9 +527,9 @@ pub trait StorageAdapter: Send + Sync {
 
 ### 10.4 Sidecar 协议
 
-- gRPC + Protobuf，Sidecar 与 Shard Runtime 优先使用 Unix Domain Socket。
-- 每个调用包含 `shard_id`、`raft_term`、`log_index`、`txn_id` 和 Deadline。
-- Sidecar 必须拒绝旧 Term/Epoch 的写入。
+- v1 使用有版本、有界、带 CRC 的二进制帧承载 Protobuf；高阶管理面可使用 gRPC。Sidecar 与 Shard Runtime 生产部署优先使用带对端认证的 Unix Domain Socket，跨主机时必须 mTLS。
+- Apply 调用包含 `shard_id`、`log_index`、`txn_id` 和确定性 Mutation；Term/Epoch 在进入 Adapter 前由 Shard State Machine 围栏。后续的跨进程租约使 Sidecar 只接受当前 Replica 世代的单写者。
+- Sidecar 帧 request ID 只用于请求/响应关联和断线重试，不取代 Adapter 对 `(shard_id, log_index, txn_id, fingerprint)` 的幂等检查。
 - Sidecar 崩溃后从后端 `applied_log_index+1` 请求重放。
 - Sidecar 版本升级通过 Capability Version 和滚动兼容窗口进行。
 
@@ -1227,7 +1227,7 @@ adapters/
 ### 22.2 推荐依赖
 
 - Tokio：异步运行时。
-- gRPC/Protobuf：节点与 Sidecar 协议。
+- gRPC/Protobuf：节点和管理面协议；固定帧 + Protobuf：Sidecar 数据面。
 - `tikv/raft-rs`：共识核心，通过自有 `ConsensusEngine` 隔离。
 - RocksDB：参考本地存储。
 - Apache Arrow Rust/Flight：列式交换。

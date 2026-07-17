@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package dtg.adapter.v1;
+
+// Canonical source document for the hand-derived Rust prost messages. Keeping the
+// generated shape in source avoids requiring protoc in end-user builds.
+message LogicalKey { uint32 keyspace = 1; bytes key = 2; }
+message Mutation { uint32 sequence = 1; uint32 operation = 2; LogicalKey key = 3; bytes value = 4; }
+message ApplyRequest { uint32 shard_id = 1; uint64 log_index = 2; bytes txn_id = 3; repeated Mutation mutations = 4; }
+message MultiGetRequest { repeated LogicalKey keys = 1; }
+message ScanRequest {
+  uint32 keyspace = 1;
+  bytes start = 2;
+  bool has_end = 3;
+  bytes end = 4;
+  bool has_required_prefix = 5;
+  bytes required_prefix = 6;
+  bool has_limit = 7;
+  uint64 limit = 8;
+}
+message RequestEnvelope {
+  uint32 spi_version = 1;
+  oneof body {
+    bool describe = 2;
+    ApplyRequest apply = 3;
+    MultiGetRequest multi_get = 4;
+    ScanRequest scan = 5;
+    bool applied_log_index = 6;
+    bool health = 7;
+  }
+}
+
+message Capabilities {
+  bool local_atomic_batch = 1;
+  bool idempotent_apply = 2;
+  bool consistent_multi_get = 3;
+  bool ordered_scan = 4;
+  bool durable_applied_index = 5;
+  uint32 durability = 6;
+  uint32 snapshot = 7;
+  bool predicate_pushdown = 8;
+  bool adjacency_pushdown = 9;
+  bool change_feed = 10;
+}
+message DescriptorResponse {
+  uint32 spi_version = 1;
+  string implementation = 2;
+  string implementation_version = 3;
+  uint32 family = 4;
+  Capabilities capabilities = 5;
+}
+message ApplyResponse { uint64 applied_log_index = 1; bool duplicate = 2; }
+message OptionalBytes { bool present = 1; bytes value = 2; }
+message MultiGetResponse { repeated OptionalBytes values = 1; }
+message KeyValue { LogicalKey key = 1; bytes value = 2; }
+message ScanResponse { repeated KeyValue values = 1; }
+message HealthResponse { bool ready = 1; string detail = 2; }
+message ErrorResponse { uint32 code = 1; string message = 2; bool retryable = 3; }
+message ResponseEnvelope {
+  uint32 spi_version = 1;
+  oneof body {
+    DescriptorResponse descriptor = 2;
+    ApplyResponse apply = 3;
+    MultiGetResponse multi_get = 4;
+    ScanResponse scan = 5;
+    uint64 applied_log_index = 6;
+    HealthResponse health = 7;
+    ErrorResponse error = 8;
+  }
+}

@@ -21,7 +21,8 @@ Date: 2026-07-17. This is a single-machine engineering baseline, not a distribut
 - full Current/AS OF/DIFF, edge, and both adjacency semantic equality after snapshot recovery;
 - leader/follower ReadIndex, term, epoch, applied-index, and safe-time fences;
 - PrimaryReplica and SharedNothing routing with logical partition/physical Shard separation;
-- SPI capability rejection, registry selection, secret redaction, and index-fenced backend cutover.
+- SPI capability rejection, registry selection, secret redaction, and index-fenced backend cutover;
+- all Sidecar request/response codecs, corrupt/oversize frame rejection, client response invariant checks, persistent TCP, bounded server shutdown, and same-request-ID reconnect retry.
 
 Exact commands:
 
@@ -67,7 +68,7 @@ The in-process Raft harness has no kernel network or disk WAL on each proposal, 
 
 ## Unmet release gates
 
-- persistent pooled async network transport with TLS and load shedding;
+- authenticated Sidecar transport (Unix-domain peer credentials or mTLS), protocol fuzzing, and load-shedding/latency benchmarks;
 - multi-host chaos, disk-full/corruption, clock skew, packet loss, and long-duration tests;
 - Meta/TSO/Balancer and complete cross-Shard transaction recovery;
 - PostgreSQL and graph Sidecars plus their live backend conformance matrices;

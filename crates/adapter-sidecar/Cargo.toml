@@ -1,0 +1,17 @@
+[package]
+name = "adapter-sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32fast = "=1.5.0"
+prost = "=0.11.9"
+storage-api = { path = "../storage-api" }
+
+[dev-dependencies]
+adapter-memory = { path = "../adapter-memory" }
+
+[lints]
+workspace = true

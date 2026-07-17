@@ -17,9 +17,11 @@ The Adapter commits these records and its own `applied_log_index` in one local a
 process crash therefore cannot expose a new graph value with an old Replica watermark, or the
 opposite. Reserved Replica Meta keys cannot be supplied by a business mutation.
 
-The Adapter uses the envelope `request_id` as its idempotency namespace. The prepared batch
-`txn_id` remains the graph/distributed-transaction identity and is preserved in the durable Raft
-command. Request IDs must be globally unique across client and internal proposals.
+The durable Raft command envelope `request_id` is the client/internal-proposal deduplication
+namespace. The prepared batch `txn_id` remains the graph/distributed-transaction identity. A
+Sidecar frame also has a request ID, but that value is transport correlation only: an ambiguous
+network retry may execute the same call twice. The Adapter independently makes the committed
+`(shard_id, log_index, txn_id, mutation fingerprint)` idempotent and rejects divergent replay.
 
 ## Replay and fencing
 

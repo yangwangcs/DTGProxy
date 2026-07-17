@@ -383,6 +383,11 @@ impl KeySpan {
     pub const fn limit(&self) -> Option<usize> {
         self.limit
     }
+
+    #[must_use]
+    pub fn required_prefix(&self) -> Option<&[u8]> {
+        self.required_prefix.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

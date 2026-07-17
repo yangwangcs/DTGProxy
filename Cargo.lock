@@ -28,6 +28,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "adapter-sidecar"
+version = "0.1.0"
+dependencies = [
+ "adapter-memory",
+ "crc32fast",
+ "prost",
+ "storage-api",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
