@@ -124,10 +124,7 @@ impl StorageAdapter for MemoryAdapter {
         Box::pin(async move { self.apply(batch) })
     }
 
-    fn multi_get<'a>(
-        &'a self,
-        keys: &'a [LogicalKey],
-    ) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
         Box::pin(async move {
             let state = self.lock_state()?;
             Ok(keys
@@ -202,4 +199,3 @@ impl Fnv1a {
         self.0
     }
 }
-

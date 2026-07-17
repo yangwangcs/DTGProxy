@@ -3,4 +3,3 @@
 mod timeline;
 
 pub use timeline::{CorrectionSummary, Timeline, TimelineError};
-

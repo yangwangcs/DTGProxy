@@ -113,8 +113,7 @@ impl Display for AdapterError {
 
 impl Error for AdapterError {}
 
-pub type AdapterFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
+pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
 
 pub trait StorageAdapter: Send + Sync {
     fn capabilities(&self) -> AdapterCapabilities;
@@ -124,11 +123,7 @@ pub trait StorageAdapter: Send + Sync {
         batch: CommittedMutationBatch,
     ) -> AdapterFuture<'a, ApplyReceipt>;
 
-    fn multi_get<'a>(
-        &'a self,
-        keys: &'a [LogicalKey],
-    ) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>>;
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>>;
 
     fn applied_log_index(&self) -> Result<u64, AdapterError>;
 }
-

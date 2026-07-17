@@ -129,11 +129,7 @@ fn write_len(output: &mut Vec<u8>, len: usize) -> Result<(), CodecError> {
     Ok(())
 }
 
-fn encode_value(
-    value: &GraphValue,
-    depth: u8,
-    output: &mut Vec<u8>,
-) -> Result<(), CodecError> {
+fn encode_value(value: &GraphValue, depth: u8, output: &mut Vec<u8>) -> Result<(), CodecError> {
     if depth > MAX_NESTING {
         return Err(CodecError::NestingLimitExceeded);
     }
@@ -284,4 +280,3 @@ impl<'a> Decoder<'a> {
         }
     }
 }
-

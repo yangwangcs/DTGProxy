@@ -6,7 +6,6 @@ impl ValidTime {
     pub const fn from_micros(micros: i64) -> Self {
         Self(micros)
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -23,5 +22,4 @@ impl TransactionTime {
             logical,
         }
     }
-
 }

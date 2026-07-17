@@ -367,7 +367,7 @@ Run: `cargo test -p adapter-memory && cargo test --workspace && cargo clippy --w
 
 Expected: all tests pass without warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/storage-api crates/adapter-memory && git commit -m "feat: add storage adapter contract"`
 
@@ -381,7 +381,7 @@ Run: `git add crates/storage-api crates/adapter-memory && git commit -m "feat: a
 **Interfaces:**
 - Produces: executable `dtgproxy --version` behavior.
 
-- [ ] **Step 1: Write the failing CLI test**
+- [x] **Step 1: Write the failing CLI test**
 
 ```rust
 use std::process::Command;
@@ -397,17 +397,17 @@ fn version_reports_product_name_and_workspace_version() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p dtgproxy --test cli`
 
 Expected: failure because the binary does not yet return the required identity.
 
-- [ ] **Step 3: Implement the minimal CLI**
+- [x] **Step 3: Implement the minimal CLI**
 
 `--version` and `-V` print `DTGProxy {CARGO_PKG_VERSION}` to stdout and exit 0. No arguments print a concise Phase 0 status plus usage. Unknown arguments print an error plus usage to stderr and exit 2.
 
-- [ ] **Step 4: Run acceptance verification**
+- [x] **Step 4: Run acceptance verification**
 
 Run:
 

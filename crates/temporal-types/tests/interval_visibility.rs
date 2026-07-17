@@ -53,4 +53,3 @@ fn unbounded_interval_contains_all_later_values() {
     assert!(interval.contains(valid(10)));
     assert!(interval.contains(valid(i64::MAX)));
 }
-

@@ -51,8 +51,7 @@ where
 
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        self.end.is_none_or(|end| other.start < end)
-            && other.end.is_none_or(|end| self.start < end)
+        self.end.is_none_or(|end| other.start < end) && other.end.is_none_or(|end| self.start < end)
     }
 
     #[must_use]

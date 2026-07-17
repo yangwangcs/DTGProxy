@@ -3,19 +3,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
-use storage_api::{
-    AdapterError, CommittedMutationBatch, LogicalKey, Mutation, StorageAdapter,
-};
+use storage_api::{AdapterError, CommittedMutationBatch, LogicalKey, Mutation, StorageAdapter};
 
 fn key(value: &str) -> LogicalKey {
     LogicalKey::new(value.as_bytes().to_vec())
 }
 
-fn batch(
-    log_index: u64,
-    txn_id: u128,
-    mutations: Vec<Mutation>,
-) -> CommittedMutationBatch {
+fn batch(log_index: u64, txn_id: u128, mutations: Vec<Mutation>) -> CommittedMutationBatch {
     CommittedMutationBatch {
         shard_id: 3,
         log_index,
@@ -27,7 +21,11 @@ fn batch(
 #[test]
 fn committed_batch_is_visible_and_identical_log_replay_is_idempotent() {
     let adapter = MemoryAdapter::new();
-    let committed = batch(1, 7, vec![Mutation::put(0, key("account:1"), b"A".to_vec())]);
+    let committed = batch(
+        1,
+        7,
+        vec![Mutation::put(0, key("account:1"), b"A".to_vec())],
+    );
 
     let first = block_on(adapter.apply_committed(committed.clone())).unwrap();
     let duplicate = block_on(adapter.apply_committed(committed)).unwrap();
@@ -127,12 +125,7 @@ fn delete_mutation_removes_a_committed_key() {
     )))
     .unwrap();
 
-    block_on(adapter.apply_committed(batch(
-        2,
-        12,
-        vec![Mutation::delete(0, key("a"))],
-    )))
-    .unwrap();
+    block_on(adapter.apply_committed(batch(2, 12, vec![Mutation::delete(0, key("a"))]))).unwrap();
 
     assert_eq!(
         block_on(adapter.multi_get(&[key("a")])).unwrap(),

@@ -89,4 +89,3 @@ fn commit_timestamp_must_follow_the_read_snapshot() {
         "commit timestamp must follow transaction snapshot"
     );
 }
-

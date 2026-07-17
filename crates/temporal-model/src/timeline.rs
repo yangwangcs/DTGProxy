@@ -23,9 +23,7 @@ impl Display for TimelineError {
             Self::InvalidCommitOrder => {
                 formatter.write_str("commit timestamp must follow transaction snapshot")
             }
-            Self::WriteConflict => {
-                formatter.write_str("write conflict after transaction snapshot")
-            }
+            Self::WriteConflict => formatter.write_str("write conflict after transaction snapshot"),
             Self::OverlappingVersion => {
                 formatter.write_str("a visible version already overlaps the valid interval")
             }
@@ -164,11 +162,7 @@ where
         let mut visible = self
             .versions
             .iter()
-            .filter(|stored| {
-                stored
-                    .version
-                    .is_visible_at(valid_time, transaction_time)
-            })
+            .filter(|stored| stored.version.is_visible_at(valid_time, transaction_time))
             .map(|stored| stored.version.value());
 
         let value = visible.next();
