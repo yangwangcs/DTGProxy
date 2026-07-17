@@ -172,7 +172,7 @@ Under an apply mutex, read and validate replay metadata, validate the complete b
 
 Run: `cargo test -p adapter-rocksdb && cargo test -p adapter-memory && cargo clippy --workspace --all-targets -- -D warnings`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/storage-api crates/adapter-rocksdb && git commit -m "feat: apply committed batches to RocksDB"`
 
@@ -185,21 +185,21 @@ Run: `git add crates/storage-api crates/adapter-rocksdb && git commit -m "feat: 
 **Interfaces:**
 - Produces: `RocksAdapter::checkpoint(destination)`.
 
-- [ ] **Step 1: Write failing recovery tests**
+- [x] **Step 1: Write failing recovery tests**
 
 Test A applies Current and History values, drops the adapter, reopens the same path, and verifies both values plus `applied_log_index`. Test B creates a checkpoint after log index 1, applies log index 2 to the source, opens the checkpoint as a separate adapter, and proves the checkpoint sees index 1 but not index 2.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p adapter-rocksdb --test recovery`
 
 Expected: restart may pass, while checkpoint compilation fails because the method is absent.
 
-- [ ] **Step 3: Implement checkpoint creation**
+- [x] **Step 3: Implement checkpoint creation**
 
 Construct `rocksdb::checkpoint::Checkpoint` from the live DB and call `create_checkpoint(destination)`. Reject an existing destination through the typed backend error. Do not disable WAL or use a non-zero flush threshold.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run: `cargo test -p adapter-rocksdb --test recovery`
 

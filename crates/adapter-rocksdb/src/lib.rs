@@ -67,6 +67,13 @@ impl RocksAdapter {
         Ok(names)
     }
 
+    pub fn checkpoint(&self, destination: impl AsRef<Path>) -> Result<(), AdapterError> {
+        let checkpoint = rocksdb::checkpoint::Checkpoint::new(&self.db).map_err(backend_error)?;
+        checkpoint
+            .create_checkpoint(destination)
+            .map_err(backend_error)
+    }
+
     fn cf(&self, keyspace: Keyspace) -> Result<Arc<BoundColumnFamily<'_>>, AdapterError> {
         self.db.cf_handle(keyspace.column_family()).ok_or_else(|| {
             AdapterError::Backend(format!(
