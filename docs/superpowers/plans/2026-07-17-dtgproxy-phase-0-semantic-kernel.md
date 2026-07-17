@@ -315,7 +315,7 @@ Run: `cargo test -p temporal-types && cargo clippy -p temporal-types --all-targe
 
 Expected: all temporal-type tests pass without warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/temporal-types && git commit -m "feat: add canonical graph value codec"`
 
@@ -330,7 +330,7 @@ Run: `git add crates/temporal-types && git commit -m "feat: add canonical graph 
 - Produces from `storage-api`: `AdapterCapabilities`, `LogicalKey`, `Mutation`, `CommittedMutationBatch`, `ApplyReceipt`, `AdapterError`, `AdapterFuture`, and `StorageAdapter`.
 - Produces from `adapter-memory`: `MemoryAdapter`.
 
-- [ ] **Step 1: Define the contract types and write failing adapter tests**
+- [x] **Step 1: Define the contract types and write failing adapter tests**
 
 The trait is object-safe and has these exact operations:
 
@@ -351,17 +351,17 @@ pub trait StorageAdapter: Send + Sync {
 
 Tests create a `MemoryAdapter`, apply log index 1 containing a Put, verify the value and applied index, replay the identical batch and require `duplicate == true`, reject the same `(txn_id, mutation_sequence)` with different bytes without changing data or index, and reject a log-index gap.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `cargo test -p adapter-memory --test adapter_contract`
 
 Expected: compile failure because `MemoryAdapter` and the contract implementation do not exist.
 
-- [ ] **Step 3: Implement atomic and idempotent application**
+- [x] **Step 3: Implement atomic and idempotent application**
 
 `MemoryAdapter` stores a `Mutex<State>` containing the key-value map, current applied log index, per-log-index batch fingerprints, and per-`(txn_id, sequence)` mutation fingerprints. It validates a complete batch before cloning and mutating the map, swaps the new state only after every mutation succeeds, returns a duplicate receipt for an identical committed-log replay, and returns typed errors for mismatched replay, non-contiguous index, duplicate mutation sequence, or poisoned lock. Fingerprints use an explicit FNV-1a implementation over tagged length-delimited bytes; `DefaultHasher` is forbidden.
 
-- [ ] **Step 4: Run GREEN and workspace regression**
+- [x] **Step 4: Run GREEN and workspace regression**
 
 Run: `cargo test -p adapter-memory && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`
 
