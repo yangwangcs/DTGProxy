@@ -1,14 +1,18 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
 use adapter_registry::{
-    AdapterFactory, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry, HotSwapAdapter,
+    AdapterFactory, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry,
+    AdapterRestoreFuture, AdapterRestoreSession, AdapterRestoreSessionFuture, HotSwapAdapter,
     MigrationError, MigrationStatus, RegistryError, SecretString,
 };
 use storage_api::{
-    AdapterRequirement, CommittedMutationBatch, Keyspace, LogicalKey, Mutation, StorageAdapter,
+    AdapterDescriptorV1, AdapterFuture, AdapterRequirement, CommittedMutationBatch, Keyspace,
+    LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1,
+    LogicalSnapshotManifestV1, LogicalSnapshotReader, Mutation, StorageAdapter,
 };
 
 struct MemoryFactory;
@@ -52,6 +56,33 @@ fn production_open_rejects_a_development_only_adapter() {
         )),
         Err(RegistryError::Incompatible(_))
     ));
+}
+
+#[test]
+fn restore_validates_capabilities_before_publishing_the_target() {
+    let finished = Arc::new(AtomicBool::new(false));
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register(Arc::new(DevelopmentRestoreFactory {
+            finished: Arc::clone(&finished),
+        }))
+        .unwrap();
+    let header = LogicalSnapshotHeaderV1::new(17, 0);
+    let reader: Box<dyn LogicalSnapshotReader> = Box::new(EmptySnapshotReader {
+        accumulator: LogicalSnapshotAccumulator::new(header.clone()),
+        header,
+    });
+
+    assert!(matches!(
+        block_on(registry.restore(
+            "development-restore",
+            &AdapterOpenRequest::new("target"),
+            AdapterRequirement::HotPluggableReplica,
+            reader,
+        )),
+        Err(RegistryError::Incompatible(_))
+    ));
+    assert!(!finished.load(Ordering::Acquire));
 }
 
 #[test]
@@ -160,6 +191,84 @@ fn hot_swap_refuses_an_unsynchronized_target() {
             target: 0
         })
     ));
+}
+
+struct DevelopmentRestoreFactory {
+    finished: Arc<AtomicBool>,
+}
+
+impl AdapterFactory for DevelopmentRestoreFactory {
+    fn provider_name(&self) -> &'static str {
+        "development-restore"
+    }
+
+    fn open<'a>(&'a self, _request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a> {
+        Box::pin(async { Ok(Arc::new(MemoryAdapter::new()) as Arc<dyn StorageAdapter>) })
+    }
+
+    fn begin_restore<'a>(
+        &'a self,
+        _request: &'a AdapterOpenRequest,
+        _header: LogicalSnapshotHeaderV1,
+    ) -> AdapterRestoreSessionFuture<'a> {
+        let finished = Arc::clone(&self.finished);
+        Box::pin(async move {
+            Ok(Box::new(DevelopmentRestoreSession { finished })
+                as Box<dyn AdapterRestoreSession + 'a>)
+        })
+    }
+}
+
+struct DevelopmentRestoreSession {
+    finished: Arc<AtomicBool>,
+}
+
+impl AdapterRestoreSession for DevelopmentRestoreSession {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        MemoryAdapter::new().descriptor()
+    }
+
+    fn write_chunk<'a>(
+        &'a mut self,
+        _chunk: LogicalSnapshotChunkV1,
+    ) -> AdapterRestoreFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn finish<'a>(
+        self: Box<Self>,
+        _manifest: LogicalSnapshotManifestV1,
+    ) -> AdapterRestoreFuture<'a, Arc<dyn StorageAdapter>>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            self.finished.store(true, Ordering::Release);
+            Ok(Arc::new(MemoryAdapter::new()) as Arc<dyn StorageAdapter>)
+        })
+    }
+}
+
+struct EmptySnapshotReader {
+    header: LogicalSnapshotHeaderV1,
+    accumulator: LogicalSnapshotAccumulator,
+}
+
+impl LogicalSnapshotReader for EmptySnapshotReader {
+    fn header(&self) -> &LogicalSnapshotHeaderV1 {
+        &self.header
+    }
+
+    fn next_chunk<'a>(&'a mut self) -> AdapterFuture<'a, Option<LogicalSnapshotChunkV1>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn finish<'a>(self: Box<Self>) -> AdapterFuture<'a, LogicalSnapshotManifestV1>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move { Ok(self.accumulator.complete()) })
+    }
 }
 
 fn batch(log_index: u64, value: &[u8]) -> CommittedMutationBatch {

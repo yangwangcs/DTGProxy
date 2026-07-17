@@ -3,9 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use adapter_registry::{
     AdapterFactory, AdapterFactoryError, AdapterFactoryFuture, AdapterOpenRequest,
@@ -16,17 +14,14 @@ use rocksdb::{
     MultiThreaded, Options, SnapshotWithThreadMode, WriteBatch, WriteOptions,
 };
 use storage_api::{
-    AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, ApplyReceipt,
-    BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
-    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
-    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
-    LogicalSnapshotReader, MutationOperation, SnapshotCapability, StorageAdapter,
+    ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
+    AdapterFuture, ApplyReceipt, BackendFamily, CommittedMutationBatch, Durability, KeySpan,
+    KeyValue, Keyspace, LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1,
+    LogicalSnapshotError, LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1,
+    LogicalSnapshotManifestV1, LogicalSnapshotReader, MutationOperation, SnapshotCapability,
+    StorageAdapter, adapter_log_fingerprint_key, adapter_mutation_fingerprint_key,
+    new_logical_snapshot_id,
 };
-
-const APPLIED_LOG_INDEX_KEY: &[u8] = b"\x00applied_log_index";
-const LOG_FINGERPRINT_PREFIX: u8 = 0x01;
-const MUTATION_FINGERPRINT_PREFIX: u8 = 0x02;
-static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 type RocksDb = DBWithThreadMode<MultiThreaded>;
 
@@ -94,6 +89,7 @@ impl AdapterFactory for RocksAdapterFactory {
                 accumulator: LogicalSnapshotAccumulator::new(header.clone()),
                 header,
                 saw_applied_index_record: false,
+                last_chunk: None,
             }) as Box<dyn AdapterRestoreSession + 'a>)
         })
     }
@@ -190,7 +186,7 @@ impl RocksAdapter {
 
     fn current_applied_log_index(&self) -> Result<u64, AdapterError> {
         Ok(self
-            .read_u64(Keyspace::Meta, APPLIED_LOG_INDEX_KEY)?
+            .read_u64(Keyspace::Meta, ADAPTER_META_APPLIED_LOG_INDEX_KEY)?
             .unwrap_or(0))
     }
 
@@ -203,7 +199,8 @@ impl RocksAdapter {
         let batch_fingerprint = batch.fingerprint();
 
         if batch.log_index <= applied_log_index {
-            let stored = self.read_u64(Keyspace::Txn, &log_fingerprint_key(batch.log_index))?;
+            let stored =
+                self.read_u64(Keyspace::Txn, &adapter_log_fingerprint_key(batch.log_index))?;
             return match stored {
                 Some(fingerprint) if fingerprint == batch_fingerprint => Ok(ApplyReceipt {
                     applied_log_index,
@@ -234,7 +231,7 @@ impl RocksAdapter {
             }
 
             let fingerprint = mutation.fingerprint();
-            let metadata_key = mutation_fingerprint_key(batch.txn_id, mutation.sequence);
+            let metadata_key = adapter_mutation_fingerprint_key(batch.txn_id, mutation.sequence);
             if let Some(previous) = self.read_u64(Keyspace::Txn, &metadata_key)?
                 && previous != fingerprint
             {
@@ -266,14 +263,14 @@ impl RocksAdapter {
         }
         write_batch.put_cf(
             &txn_cf,
-            log_fingerprint_key(batch.log_index),
+            adapter_log_fingerprint_key(batch.log_index),
             batch_fingerprint.to_be_bytes(),
         );
 
         let meta_cf = self.cf(Keyspace::Meta)?;
         write_batch.put_cf(
             &meta_cf,
-            APPLIED_LOG_INDEX_KEY,
+            ADAPTER_META_APPLIED_LOG_INDEX_KEY,
             batch.log_index.to_be_bytes(),
         );
 
@@ -309,7 +306,7 @@ impl RocksAdapter {
         let mut saw_applied_index = false;
         for entry in entries {
             if entry.key().keyspace() == Keyspace::Meta
-                && entry.key().as_bytes() == APPLIED_LOG_INDEX_KEY
+                && entry.key().as_bytes() == ADAPTER_META_APPLIED_LOG_INDEX_KEY
             {
                 if entry.value() != expected_applied_index.to_be_bytes() {
                     return Err(AdapterError::Backend(
@@ -341,7 +338,7 @@ impl RocksAdapter {
         let meta_cf = self.cf(Keyspace::Meta)?;
         write_batch.put_cf(
             &meta_cf,
-            APPLIED_LOG_INDEX_KEY,
+            ADAPTER_META_APPLIED_LOG_INDEX_KEY,
             applied_log_index.to_be_bytes(),
         );
         self.write_sync(write_batch)
@@ -364,14 +361,25 @@ struct RocksRestoreSession {
     header: LogicalSnapshotHeaderV1,
     accumulator: LogicalSnapshotAccumulator,
     saw_applied_index_record: bool,
+    last_chunk: Option<(u64, [u8; 32])>,
 }
 
 impl AdapterRestoreSession for RocksRestoreSession {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        self.adapter
+            .as_ref()
+            .expect("restore Adapter exists before finish")
+            .descriptor()
+    }
+
     fn write_chunk<'a>(
         &'a mut self,
         chunk: LogicalSnapshotChunkV1,
     ) -> AdapterRestoreFuture<'a, ()> {
         Box::pin(async move {
+            if self.last_chunk == Some((chunk.ordinal(), chunk.digest())) {
+                return Ok(());
+            }
             let mut next_accumulator = self.accumulator.clone();
             next_accumulator
                 .observe(&chunk)
@@ -383,6 +391,7 @@ impl AdapterRestoreSession for RocksRestoreSession {
                 .restore_logical_entries(chunk.entries(), self.header.applied_log_index())
                 .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
             self.saw_applied_index_record |= saw_applied_index;
+            self.last_chunk = Some((chunk.ordinal(), chunk.digest()));
             self.accumulator = next_accumulator;
             Ok(())
         })
@@ -554,7 +563,7 @@ impl StorageAdapter for RocksAdapter {
             let applied_log_index = self.current_applied_log_index()?;
             let snapshot = self.db.snapshot();
             drop(apply_guard);
-            let header = LogicalSnapshotHeaderV1::new(snapshot_id(), applied_log_index);
+            let header = LogicalSnapshotHeaderV1::new(new_logical_snapshot_id(), applied_log_index);
             Ok(Box::new(RocksLogicalSnapshotReader {
                 adapter: self,
                 snapshot,
@@ -672,30 +681,6 @@ fn snapshot_entry_bytes(key: &[u8], value: &[u8]) -> usize {
         .saturating_add(key.len())
         .saturating_add(8)
         .saturating_add(value.len())
-}
-
-fn snapshot_id() -> u128 {
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let process_and_time = (time as u64) ^ (u64::from(std::process::id()) << 32);
-    let sequence = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
-    (u128::from(sequence) << 64) | u128::from(process_and_time)
-}
-
-fn log_fingerprint_key(log_index: u64) -> [u8; 9] {
-    let mut key = [0; 9];
-    key[0] = LOG_FINGERPRINT_PREFIX;
-    key[1..].copy_from_slice(&log_index.to_be_bytes());
-    key
-}
-
-fn mutation_fingerprint_key(txn_id: u128, sequence: u32) -> [u8; 21] {
-    let mut key = [0; 21];
-    key[0] = MUTATION_FINGERPRINT_PREFIX;
-    key[1..17].copy_from_slice(&txn_id.to_be_bytes());
-    key[17..].copy_from_slice(&sequence.to_be_bytes());
-    key
 }
 
 fn backend_error(error: rocksdb::Error) -> AdapterError {

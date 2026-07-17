@@ -4,11 +4,44 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ADAPTER_SPI_VERSION: u16 = 1;
 pub const LOGICAL_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 pub const MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES: usize = 65_536;
 pub const MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub const ADAPTER_META_APPLIED_LOG_INDEX_KEY: &[u8] = b"\x00applied_log_index";
+const ADAPTER_LOG_FINGERPRINT_PREFIX: u8 = 0x01;
+const ADAPTER_MUTATION_FINGERPRINT_PREFIX: u8 = 0x02;
+static NEXT_LOGICAL_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[must_use]
+pub fn new_logical_snapshot_id() -> u128 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let process_and_time = (time as u64) ^ (u64::from(std::process::id()) << 32);
+    let sequence = NEXT_LOGICAL_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
+    (u128::from(sequence) << 64) | u128::from(process_and_time)
+}
+
+#[must_use]
+pub fn adapter_log_fingerprint_key(log_index: u64) -> [u8; 9] {
+    let mut key = [0; 9];
+    key[0] = ADAPTER_LOG_FINGERPRINT_PREFIX;
+    key[1..].copy_from_slice(&log_index.to_be_bytes());
+    key
+}
+
+#[must_use]
+pub fn adapter_mutation_fingerprint_key(txn_id: u128, sequence: u32) -> [u8; 21] {
+    let mut key = [0; 21];
+    key[0] = ADAPTER_MUTATION_FINGERPRINT_PREFIX;
+    key[1..17].copy_from_slice(&txn_id.to_be_bytes());
+    key[17..].copy_from_slice(&sequence.to_be_bytes());
+    key
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendFamily {

@@ -1,0 +1,20 @@
+[package]
+name = "adapter-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+adapter-registry = { path = "../adapter-registry" }
+adapter-sidecar = { path = "../adapter-sidecar" }
+fallible-iterator = "=0.2.0"
+postgres = "=0.19.14"
+storage-api = { path = "../storage-api" }
+
+[dev-dependencies]
+adapter-rocksdb = { path = "../adapter-rocksdb" }
+tempfile = "3"
+
+[lints]
+workspace = true

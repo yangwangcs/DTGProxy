@@ -22,7 +22,7 @@ Optional extensions cover checkpoint/logical export, predicate pushdown, adjacen
 | Backend | Family | Integration | Snapshot form | Current status |
 |---|---|---|---|---|
 | RocksDB | KV | in-process Rust Adapter | physical checkpoint + canonical logical export/restore | implemented and contract-tested |
-| PostgreSQL | SQL | Rust Sidecar, parameterized SQL | repeatable logical export / database backup | design pending implementation |
+| PostgreSQL | SQL | Rust Sidecar, parameterized SQL | repeatable logical export / logical restore | implemented; live and remote-migration certification pending |
 | Neo4j | property graph | Sidecar over an official supported driver where possible | logical export; Enterprise backup is deployment-specific | design pending implementation |
 | Memgraph | property graph | Rust/Bolt Sidecar | logical export or transactional snapshot | compatibility target, not yet certified |
 | Memory | test | in-process | none | development only; production gate rejects it |
@@ -30,6 +30,8 @@ Optional extensions cover checkpoint/logical export, predicate pushdown, adjacen
 RocksDB documents atomic `WriteBatch`, including cross-column-family operations; DTGProxy additionally uses synchronous WAL writes and places business mutations, replay fingerprints, and `applied_log_index` in the same batch. [RocksDB overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview) [RocksDB atomic updates](https://github.com/facebook/rocksdb/wiki/Basic-Operations)
 
 PostgreSQL `REPEATABLE READ` provides one transaction snapshot across statements, and `SERIALIZABLE` can reject non-serializable executions. DTGProxy will still own transaction timestamps and cross-Shard decisions; PostgreSQL isolation protects one Adapter transaction. [PostgreSQL SET TRANSACTION](https://www.postgresql.org/docs/current/sql-set-transaction.html) Synchronous commit behavior is an explicit deployment capability, not assumed from the product name. [PostgreSQL WAL settings](https://www.postgresql.org/docs/current/runtime-config-wal.html)
+
+The implemented PostgreSQL Adapter uses only parameterized values in a static reserved schema, a bounded synchronous connection pool, a session advisory writer lease, global schema-version fencing, `SERIALIZABLE` applies with `synchronous_commit=on`, and `REPEATABLE READ` reads/exports. Its live and cross-backend tests are present but remain ignored until a disposable server is available; see [PostgreSQL Adapter evidence](postgresql-adapter.md).
 
 Neo4j documents ACID transactions and a write-ahead transaction log. Online backup and differential backup are edition/deployment capabilities, so an Adapter must report what the connected instance actually supports. [Neo4j transactional behavior](https://neo4j.com/docs/operations-manual/current/database-internals/) [Neo4j backup](https://neo4j.com/docs/operations-manual/current/backup-restore/online-backup/)
 

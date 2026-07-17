@@ -130,6 +130,7 @@ fn restore_does_not_publish_a_generation_with_a_bad_final_manifest() {
     let factory = RocksAdapterFactory;
     let mut restore = block_on(factory.begin_restore(&request, header)).unwrap();
     for chunk in chunks {
+        block_on(restore.write_chunk(chunk.clone())).unwrap();
         block_on(restore.write_chunk(chunk)).unwrap();
         assert!(!target_path.exists());
     }

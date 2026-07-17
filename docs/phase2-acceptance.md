@@ -72,5 +72,5 @@ The in-process Raft harness has no kernel network or disk WAL on each proposal, 
 - authenticated Sidecar transport (Unix-domain peer credentials or mTLS), protocol fuzzing, and load-shedding/latency benchmarks;
 - multi-host chaos, disk-full/corruption, clock skew, packet loss, and long-duration tests;
 - Meta/TSO/Balancer and complete cross-Shard transaction recovery;
-- PostgreSQL and graph Sidecars plus their live backend conformance matrices;
+- PostgreSQL live/cross-backend certification, Sidecar snapshot-session wire, and graph Sidecars with live backend conformance matrices;
 - security review, dependency/SBOM audit, upgrade compatibility, backup/restore drills, and capacity envelopes.

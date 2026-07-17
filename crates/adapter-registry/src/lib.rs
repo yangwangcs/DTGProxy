@@ -30,6 +30,12 @@ pub type AdapterRestoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, AdapterFactoryError>> + Send + 'a>>;
 
 pub trait AdapterRestoreSession: Send {
+    /// Describes the Adapter that `finish` will publish and return.
+    ///
+    /// Implementations must keep this descriptor stable for the lifetime of the session so the
+    /// Registry can reject an incompatible target before any restore data becomes visible.
+    fn descriptor(&self) -> AdapterDescriptorV1;
+
     fn write_chunk<'a>(&'a mut self, chunk: LogicalSnapshotChunkV1)
     -> AdapterRestoreFuture<'a, ()>;
 
@@ -282,13 +288,13 @@ impl AdapterRegistry {
         let mut restore = factory
             .begin_restore(request, reader.header().clone())
             .await?;
+        let descriptor = restore.descriptor();
+        descriptor.validate(requirement)?;
         while let Some(chunk) = reader.next_chunk().await? {
             restore.write_chunk(chunk).await?;
         }
         let manifest = reader.finish().await?;
         let adapter = restore.finish(manifest).await?;
-        let descriptor = adapter.descriptor();
-        descriptor.validate(requirement)?;
         Ok(OpenedAdapter {
             provider_name: provider.to_owned(),
             instance_id: request.instance_id.clone(),
