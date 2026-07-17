@@ -9,6 +9,7 @@ The repository is being delivered in independently verifiable phases. The implem
 - `storage-api`: backend-neutral prepared/committed mutation contracts;
 - `raft-command`: bounded, checksummed, versioned deterministic Raft command codec;
 - `shard-runtime`: epoch-fenced durable Replica state machine and safe-time metadata;
+- `replica-snapshot`: checksummed RocksDB checkpoint manifests and verified suffix recovery;
 - `adapter-memory`: atomic and idempotent reference adapter;
 - `adapter-rocksdb`: durable RocksDB 0.24.0 adapter with atomic cross-keyspace writes,
   idempotent replay, restart recovery, snapshot reads, and checkpoints;

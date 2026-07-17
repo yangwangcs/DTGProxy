@@ -5,6 +5,7 @@ members = [
     "crates/storage-api",
     "crates/raft-command",
     "crates/shard-runtime",
+    "crates/replica-snapshot",
     "crates/adapter-memory",
     "crates/adapter-rocksdb",
     "crates/temporal-storage",

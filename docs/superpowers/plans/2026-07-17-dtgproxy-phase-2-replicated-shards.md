@@ -93,6 +93,12 @@ Folly/Thrift/C++ source is copied. Sources: [raft-rs](https://github.com/tikv/ra
 
 **Files:** Raft log store, checkpoint manifest, restore tests.
 
+**Current progress:** `replica-snapshot` now binds a RocksDB checkpoint to
+shard/epoch/term/index/membership/watermarks with a CRC-protected manifest and a deterministic
+BLAKE3 directory digest. Verified restore plus suffix replay is covered; Raft WAL durability,
+full temporal-query equivalence, snapshot installation, compaction, and crash-point scheduling
+remain before this task is complete.
+
 - [ ] Version a manifest binding shard/epoch/term/applied index/watermarks to an Adapter checkpoint
   and checksum.
 - [ ] Create snapshots only after Adapter checkpoint completion at the matching applied index;
