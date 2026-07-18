@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 adapter-rocksdb = { path = "../adapter-rocksdb" }
+blake3 = "=1.8.5"
 query-executor = { path = "../query-executor" }
 raft-command = { path = "../raft-command" }
 raft-transport = { path = "../raft-transport" }
@@ -16,6 +17,8 @@ temporal-ir = { path = "../temporal-ir" }
 temporal-query = { path = "../temporal-query" }
 temporal-storage = { path = "../temporal-storage" }
 temporal-types = { path = "../temporal-types" }
+timestamp-oracle = { path = "../timestamp-oracle" }
+txn-protocol = { path = "../txn-protocol" }
 
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }

@@ -7,6 +7,13 @@
 //! be a replicated Raft group; the two modes therefore share the same consensus,
 //! temporal state-machine, and read-barrier implementation.
 
+mod transaction;
+
+pub use transaction::{
+    PreparedShardTransaction, ScopedTemporalTransaction, TransactionContext,
+    TransactionCoordinator, TransactionCoordinatorError, TransactionReceipt, TransactionStatus,
+};
+
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -295,6 +302,26 @@ impl InProcessDeploymentRuntime {
             .group_mut(shard_id)?
             .propose_and_wait(command, max_ticks)
             .await
+    }
+
+    pub async fn propose_shard(
+        &mut self,
+        shard_id: u32,
+        command: Vec<u8>,
+        max_ticks: usize,
+    ) -> Result<ProposalReceipt, ReplicationError> {
+        self.raft
+            .group_mut(shard_id)?
+            .propose_and_wait(command, max_ticks)
+            .await
+    }
+
+    pub async fn propose_shards(
+        &mut self,
+        commands: Vec<(u32, Vec<u8>)>,
+        max_ticks: usize,
+    ) -> Result<Vec<(u32, Result<ProposalReceipt, ReplicationError>)>, ReplicationError> {
+        self.raft.propose_many(commands, max_ticks).await
     }
 
     pub async fn advance_closed_timestamp(

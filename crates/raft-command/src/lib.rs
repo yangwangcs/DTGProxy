@@ -18,6 +18,7 @@ const PREWRITE_TAG: u8 = 3;
 const RECORD_DECISION_TAG: u8 = 4;
 const FINALIZE_TAG: u8 = 5;
 const ABORT_INTENT_TAG: u8 = 6;
+const ONE_PHASE_COMMIT_TAG: u8 = 7;
 const PUT_TAG: u8 = 1;
 const DELETE_TAG: u8 = 2;
 const HEADER_BYTES: usize = 40;
@@ -210,6 +211,19 @@ impl CommandEnvelopeV1 {
                 validate_participant(shard_id, placement_epoch, abort.participant)?;
                 CommandBodyV1::AbortIntent(abort)
             }
+            ONE_PHASE_COMMIT_TAG => {
+                let request =
+                    PrewriteRequest::decode(body_reader.length_delimited(MAX_VALUE_BYTES)?)
+                        .map_err(transaction_protocol_error)?;
+                let expected_proof = decode_proof(&mut body_reader)?;
+                let one_phase = OnePhaseCommitV1 {
+                    request,
+                    expected_proof,
+                    commit_ts: decode_transaction_time(&mut body_reader)?,
+                };
+                validate_one_phase(shard_id, placement_epoch, &one_phase)?;
+                CommandBodyV1::OnePhaseCommit(one_phase)
+            }
             tag => return Err(CommandCodecError::UnknownBodyTag { tag }),
         };
         body_reader.finish()?;
@@ -305,6 +319,18 @@ impl CommandEnvelopeV1 {
                 body.extend_from_slice(&abort.intent_digest);
                 Ok((ABORT_INTENT_TAG, body))
             }
+            CommandBodyV1::OnePhaseCommit(one_phase) => {
+                validate_one_phase(self.shard_id, self.placement_epoch, one_phase)?;
+                let request = one_phase
+                    .request
+                    .encode()
+                    .map_err(transaction_protocol_error)?;
+                let mut body = Vec::with_capacity(request.len() + 72);
+                write_length_delimited(&mut body, &request)?;
+                encode_proof(&mut body, &one_phase.expected_proof);
+                encode_transaction_time(&mut body, one_phase.commit_ts);
+                Ok((ONE_PHASE_COMMIT_TAG, body))
+            }
         }
     }
 }
@@ -317,6 +343,7 @@ pub enum CommandBodyV1 {
     RecordDecision(RecordDecisionV1),
     Finalize(FinalizeV1),
     AbortIntent(AbortIntentV1),
+    OnePhaseCommit(OnePhaseCommitV1),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -352,15 +379,36 @@ pub struct AbortIntentV1 {
     pub intent_digest: [u8; 32],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnePhaseCommitV1 {
+    pub request: PrewriteRequest,
+    pub expected_proof: ParticipantProof,
+    pub commit_ts: TransactionTime,
+}
+
 fn validate_prewrite(
     shard_id: u32,
     placement_epoch: u64,
     prewrite: &PrewriteV1,
 ) -> Result<(), CommandCodecError> {
-    validate_participant(shard_id, placement_epoch, prewrite.request.participant())?;
-    if prewrite.expected_proof.participant() != prewrite.request.participant()
-        || prewrite.expected_proof.intent_digest() != prewrite.request.intent_digest()
-        || prewrite.expected_proof.min_commit_ts() <= prewrite.request.start_ts()
+    validate_prewrite_parts(
+        shard_id,
+        placement_epoch,
+        &prewrite.request,
+        &prewrite.expected_proof,
+    )
+}
+
+fn validate_prewrite_parts(
+    shard_id: u32,
+    placement_epoch: u64,
+    request: &PrewriteRequest,
+    expected_proof: &ParticipantProof,
+) -> Result<(), CommandCodecError> {
+    validate_participant(shard_id, placement_epoch, request.participant())?;
+    if expected_proof.participant() != request.participant()
+        || expected_proof.intent_digest() != request.intent_digest()
+        || expected_proof.min_commit_ts() <= request.start_ts()
     {
         return Err(CommandCodecError::InvalidParticipantProof);
     }
@@ -375,6 +423,25 @@ fn validate_record_decision(
     validate_participant(shard_id, placement_epoch, record.home)?;
     HomeDecisionEngine::record(record.home, &record.decision, None)
         .map_err(transaction_protocol_error)?;
+    Ok(())
+}
+
+fn validate_one_phase(
+    shard_id: u32,
+    placement_epoch: u64,
+    one_phase: &OnePhaseCommitV1,
+) -> Result<(), CommandCodecError> {
+    validate_prewrite_parts(
+        shard_id,
+        placement_epoch,
+        &one_phase.request,
+        &one_phase.expected_proof,
+    )?;
+    if one_phase.request.participants().len() != 1
+        || one_phase.commit_ts <= one_phase.expected_proof.min_commit_ts()
+    {
+        return Err(CommandCodecError::InvalidOnePhaseCommit);
+    }
     Ok(())
 }
 
@@ -674,6 +741,7 @@ pub enum CommandCodecError {
     PlacementEpochMismatch { envelope: u64, participant: u64 },
     InvalidParticipantProof,
     InvalidTransactionId,
+    InvalidOnePhaseCommit,
     TransactionProtocol(String),
     TrailingBodyBytes { remaining: usize },
 }
@@ -739,6 +807,9 @@ impl Display for CommandCodecError {
                 formatter.write_str("invalid participant proof in Prewrite command")
             }
             Self::InvalidTransactionId => formatter.write_str("transaction ID must be nonzero"),
+            Self::InvalidOnePhaseCommit => formatter.write_str(
+                "one-phase commit requires one participant and a commit timestamp after its minimum",
+            ),
             Self::TransactionProtocol(error) => write!(formatter, "transaction protocol: {error}"),
             Self::TrailingBodyBytes { remaining } => {
                 write!(formatter, "command body has {remaining} trailing bytes")

@@ -487,6 +487,43 @@ where
                     unresolved_change: change,
                 })
             }
+            CommandBodyV1::OnePhaseCommit(one_phase) => {
+                let keys = ParticipantEngine::prewrite_inspection_keys(&one_phase.request)?;
+                let values = self.adapter.multi_get(&keys).await?;
+                let outcome = ParticipantEngine::one_phase_commit(
+                    &one_phase.request,
+                    one_phase.commit_ts,
+                    &values,
+                )?;
+                if one_phase.expected_proof.participant() != one_phase.request.participant()
+                    || one_phase.expected_proof.intent_digest() != one_phase.request.intent_digest()
+                    || one_phase.expected_proof.min_commit_ts()
+                        != timestamp_successor(one_phase.request.start_ts())?
+                {
+                    return Err(ShardRuntimeError::ParticipantProofMismatch);
+                }
+                if !outcome.duplicate() && one_phase.request.start_ts() <= self.metadata.closed_ts {
+                    return Err(ShardRuntimeError::IntentAtOrBeforeClosed {
+                        closed: self.metadata.closed_ts,
+                        start: one_phase.request.start_ts(),
+                    });
+                }
+                let mutations = outcome.mutations().to_vec();
+                validate_business_mutations(&mutations)?;
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        adapter_applied_ts: max(
+                            self.metadata.adapter_applied_ts,
+                            one_phase.commit_ts,
+                        ),
+                        ..self.metadata
+                    },
+                    mutations,
+                    unresolved_change: UnresolvedChange::None,
+                })
+            }
         }
     }
 
@@ -686,6 +723,22 @@ fn timestamp_predecessor(timestamp: TransactionTime) -> TransactionTime {
         .map_or(TransactionTime::new(i64::MIN, 0), |physical_micros| {
             TransactionTime::new(physical_micros, u32::MAX)
         })
+}
+
+fn timestamp_successor(timestamp: TransactionTime) -> Result<TransactionTime, ShardRuntimeError> {
+    if timestamp.logical() < u32::MAX {
+        return Ok(TransactionTime::new(
+            timestamp.physical_micros(),
+            timestamp.logical() + 1,
+        ));
+    }
+    Ok(TransactionTime::new(
+        timestamp
+            .physical_micros()
+            .checked_add(1)
+            .ok_or(txn_protocol::TxnProtocolError::TimestampExhausted)?,
+        0,
+    ))
 }
 
 fn append_unresolved_change(

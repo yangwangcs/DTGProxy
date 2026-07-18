@@ -1,6 +1,6 @@
 use raft_command::{
     AbortIntentV1, ApplyPreparedV1, CommandBodyV1, CommandCodecError, CommandEnvelopeV1,
-    FinalizeV1, MAX_COMMAND_BYTES, PrewriteV1, RecordDecisionV1,
+    FinalizeV1, MAX_COMMAND_BYTES, OnePhaseCommitV1, PrewriteV1, RecordDecisionV1,
 };
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use temporal_types::TransactionTime;
@@ -113,6 +113,20 @@ fn every_distributed_transaction_phase_round_trips_canonically() {
             7,
             11,
             1004,
+            CommandBodyV1::OnePhaseCommit(OnePhaseCommitV1 {
+                request: request.clone(),
+                expected_proof: ParticipantProof::new(
+                    request.participant(),
+                    TransactionTime::new(100, 1),
+                    request.intent_digest(),
+                ),
+                commit_ts: TransactionTime::new(101, 0),
+            }),
+        ),
+        CommandEnvelopeV1::new(
+            7,
+            11,
+            1005,
             CommandBodyV1::AbortIntent(AbortIntentV1 {
                 participant: participant(7),
                 transaction_id: request.transaction_id(),

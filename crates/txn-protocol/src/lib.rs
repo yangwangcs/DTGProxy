@@ -10,4 +10,6 @@ pub use model::{
     HomeTransactionRecord, IsolationLevel, ParticipantProof, PrewriteRequest, RecoveryAction,
     ShardEpoch, TransactionId, TransactionState, TxnProtocolError, recovery_action,
 };
-pub use participant::{AbortOutcome, FinalizeOutcome, ParticipantEngine, PrewriteOutcome};
+pub use participant::{
+    AbortOutcome, FinalizeOutcome, ParticipantEngine, ParticipantRecordStatus, PrewriteOutcome,
+};

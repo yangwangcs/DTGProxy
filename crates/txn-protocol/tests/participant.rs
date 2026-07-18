@@ -156,6 +156,43 @@ fn abort_releases_locks_and_is_idempotent_but_cannot_reverse_commit() {
 }
 
 #[test]
+fn one_phase_commit_materializes_without_exposing_an_intent_and_replays_durably() {
+    let request = request();
+    let keys = ParticipantEngine::prewrite_inspection_keys(&request).unwrap();
+    let outcome = ParticipantEngine::one_phase_commit(
+        &request,
+        TransactionTime::new(101, 0),
+        &vec![None; keys.len()],
+    )
+    .unwrap();
+    assert!(!outcome.duplicate());
+    let mut state = BTreeMap::new();
+    apply_to_map(&mut state, outcome.mutations());
+    assert_eq!(
+        state.get(&LogicalKey::in_keyspace(
+            Keyspace::Current,
+            b"vertex/77".to_vec()
+        )),
+        Some(&b"value".to_vec())
+    );
+    assert!(
+        keys.iter()
+            .skip(1)
+            .step_by(2)
+            .all(|key| !state.contains_key(key))
+    );
+
+    let replay = ParticipantEngine::one_phase_commit(
+        &request,
+        TransactionTime::new(101, 0),
+        &values_for(&state, &keys),
+    )
+    .unwrap();
+    assert!(replay.duplicate());
+    assert!(replay.mutations().is_empty());
+}
+
+#[test]
 fn recovery_uses_the_home_decision_and_only_times_out_undecided_intents() {
     let request = request();
     let proofs = request

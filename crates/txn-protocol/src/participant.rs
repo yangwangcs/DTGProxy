@@ -62,6 +62,30 @@ pub struct AbortOutcome {
     duplicate: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParticipantRecordStatus {
+    state: TransactionState,
+    commit_ts: Option<TransactionTime>,
+    expires_at: TransactionTime,
+}
+
+impl ParticipantRecordStatus {
+    #[must_use]
+    pub const fn state(self) -> TransactionState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn commit_ts(self) -> Option<TransactionTime> {
+        self.commit_ts
+    }
+
+    #[must_use]
+    pub const fn expires_at(self) -> TransactionTime {
+        self.expires_at
+    }
+}
+
 impl AbortOutcome {
     #[must_use]
     pub fn mutations(&self) -> &[Mutation] {
@@ -106,6 +130,17 @@ impl ParticipantEngine {
             return Err(TxnProtocolError::RequestReplayMismatch);
         }
         Ok(record.request)
+    }
+
+    pub fn participant_record_status(
+        bytes: &[u8],
+    ) -> Result<ParticipantRecordStatus, TxnProtocolError> {
+        let record = decode_participant_record(bytes)?;
+        Ok(ParticipantRecordStatus {
+            state: record.state,
+            commit_ts: record.commit_ts,
+            expires_at: record.request.expires_at(),
+        })
     }
 
     pub fn prewrite_inspection_keys(
@@ -217,6 +252,32 @@ impl ParticipantEngine {
             mutations: mutations_from_operations(operations)?,
             duplicate: false,
         })
+    }
+
+    pub fn one_phase_commit(
+        request: &PrewriteRequest,
+        commit_ts: TransactionTime,
+        inspected_values: &[Option<Vec<u8>>],
+    ) -> Result<FinalizeOutcome, TxnProtocolError> {
+        let prewrite_keys = Self::prewrite_inspection_keys(request)?;
+        validate_inspection_count(&prewrite_keys, inspected_values)?;
+        let prewrite = Self::prewrite(request, inspected_values)?;
+        let finalize_values = if prewrite.duplicate() {
+            let mut values = Vec::with_capacity(request.batch().mutations.len() + 1);
+            values.push(inspected_values[0].clone());
+            values.extend(inspected_values.iter().skip(1).step_by(2).cloned());
+            values
+        } else {
+            let mut values = Vec::with_capacity(request.batch().mutations.len() + 1);
+            for mutation in prewrite.mutations() {
+                let MutationOperation::Put { value, .. } = &mutation.operation else {
+                    return Err(TxnProtocolError::CorruptParticipantState);
+                };
+                values.push(Some(value.clone()));
+            }
+            values
+        };
+        Self::finalize(request, commit_ts, &finalize_values)
     }
 
     pub fn finalize_inspection_keys(

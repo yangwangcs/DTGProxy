@@ -5,7 +5,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use adapter_memory::MemoryAdapter;
 use adapter_rocksdb::RocksAdapter;
 use raft_command::{
-    AbortIntentV1, CommandBodyV1, CommandEnvelopeV1, FinalizeV1, PrewriteV1, RecordDecisionV1,
+    AbortIntentV1, CommandBodyV1, CommandEnvelopeV1, FinalizeV1, OnePhaseCommitV1, PrewriteV1,
+    RecordDecisionV1,
 };
 use shard_runtime::ShardStateMachine;
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter};
@@ -260,6 +261,56 @@ fn rocksdb_restart_restores_the_unresolved_intent_frontier() {
     assert!(recovered.metadata().resolved_ts < request.start_ts());
     let keys = ParticipantEngine::prewrite_inspection_keys(&request).unwrap();
     assert!(read(recovered.adapter(), &keys[1]).is_some());
+}
+
+#[test]
+fn one_phase_commit_retry_after_state_machine_reopen_is_durably_idempotent() {
+    let participant = ShardEpoch::new(7, 9).unwrap();
+    let request = PrewriteRequest::new(
+        TransactionId::new(500),
+        TransactionTime::new(100, 0),
+        3,
+        participant,
+        participant,
+        vec![participant],
+        IsolationLevel::TemporalSnapshot,
+        TransactionTime::new(200, 0),
+        PreparedMutationBatch {
+            shard_id: 7,
+            txn_id: 500,
+            mutations: vec![Mutation::put(
+                0,
+                LogicalKey::in_keyspace(Keyspace::Current, b"one-phase".to_vec()),
+                b"durable".to_vec(),
+            )],
+        },
+    )
+    .unwrap();
+    let command = command(
+        5001,
+        CommandBodyV1::OnePhaseCommit(OnePhaseCommitV1 {
+            expected_proof: ParticipantProof::new(
+                participant,
+                TransactionTime::new(100, 1),
+                request.intent_digest(),
+            ),
+            request,
+            commit_ts: TransactionTime::new(101, 0),
+        }),
+    );
+    let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
+    block_on(machine.apply_entry(1, 1, &command)).unwrap();
+    let mut recovered = block_on(ShardStateMachine::open(machine.into_adapter(), 7, 9)).unwrap();
+    block_on(recovered.apply_entry(1, 2, &command)).unwrap();
+
+    assert_eq!(recovered.metadata().applied_index, 2);
+    assert_eq!(
+        read(
+            recovered.adapter(),
+            &LogicalKey::in_keyspace(Keyspace::Current, b"one-phase".to_vec())
+        ),
+        Some(b"durable".to_vec())
+    );
 }
 
 fn read_current<A: StorageAdapter>(adapter: &A) -> Option<Vec<u8>> {

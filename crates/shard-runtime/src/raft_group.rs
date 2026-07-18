@@ -50,6 +50,7 @@ pub enum ReplicationError {
     UnsupportedEntryType,
     GroupAlreadyExists { shard_id: u32 },
     GroupNotFound { shard_id: u32 },
+    DuplicateShardCommand { shard_id: u32 },
 }
 
 impl Display for ReplicationError {
@@ -89,6 +90,12 @@ impl Display for ReplicationError {
             }
             Self::GroupNotFound { shard_id } => {
                 write!(formatter, "Shard Group {shard_id} not found")
+            }
+            Self::DuplicateShardCommand { shard_id } => {
+                write!(
+                    formatter,
+                    "Shard {shard_id} received two commands in one fan-out"
+                )
             }
         }
     }
@@ -1049,6 +1056,35 @@ impl MultiRaftRuntime {
     #[must_use]
     pub fn group(&self, shard_id: u32) -> Option<&InProcessShardGroup> {
         self.groups.get(&shard_id)
+    }
+
+    pub async fn propose_many(
+        &mut self,
+        commands: Vec<(u32, Vec<u8>)>,
+        max_ticks: usize,
+    ) -> Result<Vec<(u32, Result<ProposalReceipt, ReplicationError>)>, ReplicationError> {
+        let mut command_map = BTreeMap::new();
+        for (shard_id, command) in commands {
+            if command_map.insert(shard_id, command).is_some() {
+                return Err(ReplicationError::DuplicateShardCommand { shard_id });
+            }
+        }
+        if command_map.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(shard_id) = command_map
+            .keys()
+            .find(|shard_id| !self.groups.contains_key(shard_id))
+            .copied()
+        {
+            return Err(ReplicationError::GroupNotFound { shard_id });
+        }
+        let proposals = self.groups.iter_mut().filter_map(|(shard_id, group)| {
+            command_map.remove(shard_id).map(|command| async move {
+                (*shard_id, group.propose_and_wait(command, max_ticks).await)
+            })
+        });
+        Ok(futures_util::future::join_all(proposals).await)
     }
 }
 
