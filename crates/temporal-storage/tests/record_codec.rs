@@ -70,6 +70,21 @@ fn vertex_and_edge_identity_records_round_trip() {
 }
 
 #[test]
+fn cross_partition_edge_identity_round_trips_endpoint_partitions() {
+    let source = vertex_ref();
+    let destination = ElementRef::vertex(source.graph(), PartitionId::new(9), ElementId::new(4));
+    let edge =
+        EdgeIdentity::new_between(edge_ref(), EdgeTypeId::new(8), source, destination).unwrap();
+
+    let bytes = edge.encode();
+    assert_eq!(&bytes[..4], b"DTGI");
+    assert_eq!(&bytes[4..6], 2_u16.to_be_bytes());
+    assert_eq!(EdgeIdentity::decode(&bytes).unwrap(), edge);
+    assert_eq!(edge.source_ref(), source);
+    assert_eq!(edge.destination_ref(), destination);
+}
+
+#[test]
 fn projection_round_trips_disjoint_finite_and_unbounded_segments_without_type_loss() {
     let projection = ProjectionRecord::new(
         TransactionTime::new(100, 2),

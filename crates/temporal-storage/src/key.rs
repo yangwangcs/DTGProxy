@@ -10,6 +10,8 @@ const TAG_CURRENT_VERTEX: u8 = 0x08;
 const TAG_CURRENT_EDGE: u8 = 0x09;
 const TAG_ADJ_OUT: u8 = 0x10;
 const TAG_ADJ_IN: u8 = 0x11;
+const TAG_CROSS_ADJ_OUT: u8 = 0x12;
+const TAG_CROSS_ADJ_IN: u8 = 0x13;
 const TAG_HISTORY_ANCHOR: u8 = 0x20;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -168,6 +170,28 @@ pub enum GraphKey {
         source: ElementId,
         edge: ElementId,
     },
+    CrossOutAdjacency {
+        graph: GraphId,
+        partition: PartitionId,
+        source: ElementId,
+        edge_type: EdgeTypeId,
+        bucket: u16,
+        destination_partition: PartitionId,
+        destination: ElementId,
+        edge_partition: PartitionId,
+        edge: ElementId,
+    },
+    CrossInAdjacency {
+        graph: GraphId,
+        partition: PartitionId,
+        destination: ElementId,
+        edge_type: EdgeTypeId,
+        bucket: u16,
+        source_partition: PartitionId,
+        source: ElementId,
+        edge_partition: PartitionId,
+        edge: ElementId,
+    },
     HistoryAnchor {
         element: ElementRef,
         transaction_time: TransactionTime,
@@ -270,6 +294,24 @@ pub fn in_adjacency_prefix(
 }
 
 #[must_use]
+pub fn cross_out_adjacency_prefix(
+    graph: GraphId,
+    partition: PartitionId,
+    source: ElementId,
+) -> Vec<u8> {
+    adjacency_prefix(TAG_CROSS_ADJ_OUT, graph, partition, source)
+}
+
+#[must_use]
+pub fn cross_in_adjacency_prefix(
+    graph: GraphId,
+    partition: PartitionId,
+    destination: ElementId,
+) -> Vec<u8> {
+    adjacency_prefix(TAG_CROSS_ADJ_IN, graph, partition, destination)
+}
+
+#[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn out_adjacency_key(
     graph: GraphId,
@@ -313,6 +355,62 @@ pub fn in_adjacency_key(
         edge_type,
         bucket,
         source,
+        edge,
+    )
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn cross_out_adjacency_key(
+    graph: GraphId,
+    source_partition: PartitionId,
+    source: ElementId,
+    edge_type: EdgeTypeId,
+    bucket: u16,
+    destination_partition: PartitionId,
+    destination: ElementId,
+    edge_partition: PartitionId,
+    edge: ElementId,
+) -> LogicalKey {
+    cross_adjacency_key(
+        Keyspace::AdjOut,
+        TAG_CROSS_ADJ_OUT,
+        graph,
+        source_partition,
+        source,
+        edge_type,
+        bucket,
+        destination_partition,
+        destination,
+        edge_partition,
+        edge,
+    )
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn cross_in_adjacency_key(
+    graph: GraphId,
+    destination_partition: PartitionId,
+    destination: ElementId,
+    edge_type: EdgeTypeId,
+    bucket: u16,
+    source_partition: PartitionId,
+    source: ElementId,
+    edge_partition: PartitionId,
+    edge: ElementId,
+) -> LogicalKey {
+    cross_adjacency_key(
+        Keyspace::AdjIn,
+        TAG_CROSS_ADJ_IN,
+        graph,
+        destination_partition,
+        destination,
+        edge_type,
+        bucket,
+        source_partition,
+        source,
+        edge_partition,
         edge,
     )
 }
@@ -365,6 +463,56 @@ pub fn decode_graph_key(key: &LogicalKey) -> Result<GraphKey, KeyCodecError> {
                 edge,
             }
         }
+        TAG_CROSS_ADJ_OUT => {
+            require_keyspace(key, Keyspace::AdjOut)?;
+            let (
+                graph,
+                partition,
+                first,
+                edge_type,
+                bucket,
+                remote_partition,
+                second,
+                edge_partition,
+                edge,
+            ) = decoder.read_cross_adjacency()?;
+            GraphKey::CrossOutAdjacency {
+                graph,
+                partition,
+                source: first,
+                edge_type,
+                bucket,
+                destination_partition: remote_partition,
+                destination: second,
+                edge_partition,
+                edge,
+            }
+        }
+        TAG_CROSS_ADJ_IN => {
+            require_keyspace(key, Keyspace::AdjIn)?;
+            let (
+                graph,
+                partition,
+                first,
+                edge_type,
+                bucket,
+                remote_partition,
+                second,
+                edge_partition,
+                edge,
+            ) = decoder.read_cross_adjacency()?;
+            GraphKey::CrossInAdjacency {
+                graph,
+                partition,
+                destination: first,
+                edge_type,
+                bucket,
+                source_partition: remote_partition,
+                source: second,
+                edge_partition,
+                edge,
+            }
+        }
         TAG_HISTORY_ANCHOR => {
             require_keyspace(key, Keyspace::History)?;
             let element = decoder.read_element_ref(ElementKind::Vertex, true)?;
@@ -386,6 +534,29 @@ pub fn decode_graph_key(key: &LogicalKey) -> Result<GraphKey, KeyCodecError> {
         Ok(decoded)
     } else {
         Err(KeyCodecError::TrailingBytes)
+    }
+}
+
+#[must_use]
+pub const fn graph_key_scope(key: GraphKey) -> (GraphId, PartitionId) {
+    match key {
+        GraphKey::VertexIdentity(element)
+        | GraphKey::EdgeIdentity(element)
+        | GraphKey::CurrentVertex(element)
+        | GraphKey::CurrentEdge(element)
+        | GraphKey::HistoryAnchor { element, .. } => (element.graph(), element.partition()),
+        GraphKey::OutAdjacency {
+            graph, partition, ..
+        }
+        | GraphKey::InAdjacency {
+            graph, partition, ..
+        }
+        | GraphKey::CrossOutAdjacency {
+            graph, partition, ..
+        }
+        | GraphKey::CrossInAdjacency {
+            graph, partition, ..
+        } => (graph, partition),
     }
 }
 
@@ -429,6 +600,34 @@ fn adjacency_key(
     LogicalKey::in_keyspace(keyspace, key)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cross_adjacency_key(
+    keyspace: Keyspace,
+    tag: u8,
+    graph: GraphId,
+    local_partition: PartitionId,
+    local_endpoint: ElementId,
+    edge_type: EdgeTypeId,
+    bucket: u16,
+    remote_partition: PartitionId,
+    remote_endpoint: ElementId,
+    edge_partition: PartitionId,
+    edge: ElementId,
+) -> LogicalKey {
+    let mut key = Vec::with_capacity(75);
+    key.push(tag);
+    key.extend_from_slice(&graph.value().to_be_bytes());
+    key.extend_from_slice(&local_partition.value().to_be_bytes());
+    key.extend_from_slice(&local_endpoint.value().to_be_bytes());
+    key.extend_from_slice(&edge_type.value().to_be_bytes());
+    key.extend_from_slice(&bucket.to_be_bytes());
+    key.extend_from_slice(&remote_partition.value().to_be_bytes());
+    key.extend_from_slice(&remote_endpoint.value().to_be_bytes());
+    key.extend_from_slice(&edge_partition.value().to_be_bytes());
+    key.extend_from_slice(&edge.value().to_be_bytes());
+    LogicalKey::in_keyspace(keyspace, key)
+}
+
 fn adjacency_prefix(tag: u8, graph: GraphId, partition: PartitionId, first: ElementId) -> Vec<u8> {
     let mut key = Vec::with_capacity(29);
     key.push(tag);
@@ -468,6 +667,18 @@ type AdjacencyParts = (
     EdgeTypeId,
     u16,
     ElementId,
+    ElementId,
+);
+
+type CrossAdjacencyParts = (
+    GraphId,
+    PartitionId,
+    ElementId,
+    EdgeTypeId,
+    u16,
+    PartitionId,
+    ElementId,
+    PartitionId,
     ElementId,
 );
 
@@ -557,6 +768,20 @@ impl<'a> Decoder<'a> {
             EdgeTypeId::new(self.read_u32()?),
             self.read_u16()?,
             ElementId::new(self.read_u128()?),
+            ElementId::new(self.read_u128()?),
+        ))
+    }
+
+    fn read_cross_adjacency(&mut self) -> Result<CrossAdjacencyParts, KeyCodecError> {
+        Ok((
+            GraphId::new(self.read_u64()?),
+            PartitionId::new(self.read_u32()?),
+            ElementId::new(self.read_u128()?),
+            EdgeTypeId::new(self.read_u32()?),
+            self.read_u16()?,
+            PartitionId::new(self.read_u32()?),
+            ElementId::new(self.read_u128()?),
+            PartitionId::new(self.read_u32()?),
             ElementId::new(self.read_u128()?),
         ))
     }

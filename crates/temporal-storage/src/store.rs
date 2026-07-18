@@ -17,8 +17,9 @@ use crate::transaction::TemporalOperation;
 use crate::{
     EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryEntry,
     KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError, TemporalTransaction,
-    VertexIdentity, current_edge_key, current_vertex_key, decode_graph_key, edge_identity_key,
-    edge_identity_prefix, history_anchor_key, history_prefix, in_adjacency_key,
+    VertexIdentity, cross_in_adjacency_key, cross_in_adjacency_prefix, cross_out_adjacency_key,
+    cross_out_adjacency_prefix, current_edge_key, current_vertex_key, decode_graph_key,
+    edge_identity_key, edge_identity_prefix, history_anchor_key, history_prefix, in_adjacency_key,
     in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix, vertex_identity_key,
 };
 
@@ -137,8 +138,8 @@ impl VertexMutation {
 pub struct EdgeMutation {
     pub(crate) element: ElementRef,
     pub(crate) edge_type: EdgeTypeId,
-    pub(crate) source: ElementId,
-    pub(crate) destination: ElementId,
+    pub(crate) source: ElementRef,
+    pub(crate) destination: ElementRef,
     pub(crate) valid: Interval<ValidTime>,
     pub(crate) replacement: Option<CanonicalElement>,
 }
@@ -150,6 +151,25 @@ impl EdgeMutation {
         edge_type: EdgeTypeId,
         source: ElementId,
         destination: ElementId,
+        valid: Interval<ValidTime>,
+        payload: CanonicalElement,
+    ) -> Result<Self, TemporalStoreError> {
+        Self::put_between(
+            element,
+            edge_type,
+            ElementRef::vertex(element.graph(), element.partition(), source),
+            ElementRef::vertex(element.graph(), element.partition(), destination),
+            valid,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_between(
+        element: ElementRef,
+        edge_type: EdgeTypeId,
+        source: ElementRef,
+        destination: ElementRef,
         valid: Interval<ValidTime>,
         payload: CanonicalElement,
     ) -> Result<Self, TemporalStoreError> {
@@ -170,19 +190,44 @@ impl EdgeMutation {
         destination: ElementId,
         valid: Interval<ValidTime>,
     ) -> Result<Self, TemporalStoreError> {
+        Self::delete_between(
+            element,
+            edge_type,
+            ElementRef::vertex(element.graph(), element.partition(), source),
+            ElementRef::vertex(element.graph(), element.partition(), destination),
+            valid,
+        )
+    }
+
+    pub fn delete_between(
+        element: ElementRef,
+        edge_type: EdgeTypeId,
+        source: ElementRef,
+        destination: ElementRef,
+        valid: Interval<ValidTime>,
+    ) -> Result<Self, TemporalStoreError> {
         Self::new(element, edge_type, source, destination, valid, None)
     }
 
     fn new(
         element: ElementRef,
         edge_type: EdgeTypeId,
-        source: ElementId,
-        destination: ElementId,
+        source: ElementRef,
+        destination: ElementRef,
         valid: Interval<ValidTime>,
         replacement: Option<CanonicalElement>,
     ) -> Result<Self, TemporalStoreError> {
-        if element.kind() != ElementKind::Edge {
+        if element.kind() != ElementKind::Edge
+            || source.kind() != ElementKind::Vertex
+            || destination.kind() != ElementKind::Vertex
+        {
             return Err(TemporalStoreError::WrongElementKind);
+        }
+        if source.graph() != element.graph()
+            || destination.graph() != element.graph()
+            || source.partition() != element.partition()
+        {
+            return Err(TemporalStoreError::InvalidEdgeEndpoints);
         }
         Ok(Self {
             element,
@@ -199,8 +244,8 @@ impl EdgeMutation {
 pub struct EdgeView {
     element: ElementRef,
     edge_type: EdgeTypeId,
-    source: ElementId,
-    destination: ElementId,
+    source: ElementRef,
+    destination: ElementRef,
     payload: CanonicalElement,
 }
 
@@ -217,11 +262,21 @@ impl EdgeView {
 
     #[must_use]
     pub const fn source(&self) -> ElementId {
-        self.source
+        self.source.id()
     }
 
     #[must_use]
     pub const fn destination(&self) -> ElementId {
+        self.destination.id()
+    }
+
+    #[must_use]
+    pub const fn source_ref(&self) -> ElementRef {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn destination_ref(&self) -> ElementRef {
         self.destination
     }
 
@@ -288,6 +343,31 @@ where
         })
     }
 
+    pub fn prepare_endpoint_guard<'a>(
+        &'a self,
+        read_ts: TransactionTime,
+        vertex: ElementRef,
+        required: Interval<ValidTime>,
+    ) -> TemporalStoreFuture<'a, MutationOperation> {
+        Box::pin(async move {
+            require_vertex(vertex)?;
+            let projection = self
+                .load_current_projection(vertex)
+                .await?
+                .ok_or(TemporalStoreError::EndpointNotPresent { vertex })?;
+            if projection.commit_ts() > read_ts {
+                return Err(TemporalStoreError::WriteConflict);
+            }
+            if !projection_covers(&projection, required) {
+                return Err(TemporalStoreError::EndpointNotPresent { vertex });
+            }
+            Ok(MutationOperation::Put {
+                key: current_vertex_key(vertex),
+                value: projection.encode()?,
+            })
+        })
+    }
+
     async fn prepare_transaction_inner(
         &self,
         context: PrepareContext,
@@ -312,6 +392,7 @@ where
 
         let mut staged_vertices = BTreeMap::new();
         let mut guarded_vertices = BTreeMap::new();
+        let mut endpoint_guards = BTreeMap::new();
         let mut staged_edges = BTreeMap::new();
         let mut writes = Vec::new();
         for operation in operations {
@@ -364,7 +445,7 @@ where
                     staged_vertices.insert(mutation.element, projection);
                 }
                 TemporalOperation::Edge(mutation) => {
-                    let identity = EdgeIdentity::new(
+                    let identity = EdgeIdentity::new_between(
                         mutation.element,
                         mutation.edge_type,
                         mutation.source,
@@ -381,24 +462,30 @@ where
                     )
                     .await?;
                     if mutation.replacement.is_some() {
-                        for endpoint_id in [mutation.source, mutation.destination] {
-                            let endpoint = ElementRef::vertex(
-                                mutation.element.graph(),
-                                mutation.element.partition(),
-                                endpoint_id,
-                            );
-                            let endpoint_projection =
-                                if let Some(projection) = staged_vertices.get(&endpoint) {
-                                    Some(projection.clone())
-                                } else {
-                                    self.load_current_projection(endpoint).await?
-                                };
+                        for endpoint in [mutation.source, mutation.destination]
+                            .into_iter()
+                            .filter(|endpoint| endpoint.partition() == mutation.element.partition())
+                        {
+                            let staged = staged_vertices.get(&endpoint);
+                            let endpoint_projection = if let Some(projection) = staged {
+                                Some(projection.clone())
+                            } else {
+                                self.load_current_projection(endpoint).await?
+                            };
                             if endpoint_projection.as_ref().is_none_or(|projection| {
                                 !projection_covers(projection, mutation.valid)
                             }) {
                                 return Err(TemporalStoreError::EndpointNotPresent {
                                     vertex: endpoint,
                                 });
+                            }
+                            if staged.is_none() {
+                                let projection = endpoint_projection
+                                    .expect("validated existing endpoint has a projection");
+                                if projection.commit_ts() > context.read_ts {
+                                    return Err(TemporalStoreError::WriteConflict);
+                                }
+                                endpoint_guards.entry(endpoint).or_insert(projection);
                             }
                         }
                     }
@@ -420,24 +507,55 @@ where
                         projection.clone(),
                     )?;
                     let projection_bytes = projection.encode()?;
-                    let out_key = out_adjacency_key(
-                        mutation.element.graph(),
-                        mutation.element.partition(),
-                        mutation.source,
-                        mutation.edge_type,
-                        0,
-                        mutation.destination,
-                        mutation.element.id(),
-                    );
-                    let in_key = in_adjacency_key(
-                        mutation.element.graph(),
-                        mutation.element.partition(),
-                        mutation.destination,
-                        mutation.edge_type,
-                        0,
-                        mutation.source,
-                        mutation.element.id(),
-                    );
+                    let cross_partition =
+                        mutation.source.partition() != mutation.destination.partition();
+                    let (out_key, in_key) = if cross_partition {
+                        (
+                            cross_out_adjacency_key(
+                                mutation.element.graph(),
+                                mutation.source.partition(),
+                                mutation.source.id(),
+                                mutation.edge_type,
+                                0,
+                                mutation.destination.partition(),
+                                mutation.destination.id(),
+                                mutation.element.partition(),
+                                mutation.element.id(),
+                            ),
+                            cross_in_adjacency_key(
+                                mutation.element.graph(),
+                                mutation.destination.partition(),
+                                mutation.destination.id(),
+                                mutation.edge_type,
+                                0,
+                                mutation.source.partition(),
+                                mutation.source.id(),
+                                mutation.element.partition(),
+                                mutation.element.id(),
+                            ),
+                        )
+                    } else {
+                        (
+                            out_adjacency_key(
+                                mutation.element.graph(),
+                                mutation.element.partition(),
+                                mutation.source.id(),
+                                mutation.edge_type,
+                                0,
+                                mutation.destination.id(),
+                                mutation.element.id(),
+                            ),
+                            in_adjacency_key(
+                                mutation.element.graph(),
+                                mutation.element.partition(),
+                                mutation.destination.id(),
+                                mutation.edge_type,
+                                0,
+                                mutation.source.id(),
+                                mutation.element.id(),
+                            ),
+                        )
+                    };
                     writes.push(MutationOperation::Put {
                         key: edge_identity_key(mutation.element),
                         value: identity.encode(),
@@ -471,6 +589,12 @@ where
         for (vertex, projection) in guarded_vertices {
             self.validate_incident_edge_coverage(vertex, &projection, &staged_edges)
                 .await?;
+        }
+        for (vertex, projection) in endpoint_guards {
+            writes.push(MutationOperation::Put {
+                key: current_vertex_key(vertex),
+                value: projection.encode()?,
+            });
         }
 
         let mutations = writes
@@ -624,36 +748,63 @@ where
         valid_time: ValidTime,
     ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
         Box::pin(async move {
-            let entries = self
-                .adapter
-                .scan(&KeySpan::prefix(
+            let spans = [
+                KeySpan::prefix(
                     Keyspace::AdjOut,
                     out_adjacency_prefix(graph, partition, source),
-                ))
-                .await?;
+                ),
+                KeySpan::prefix(
+                    Keyspace::AdjOut,
+                    cross_out_adjacency_prefix(graph, partition, source),
+                ),
+            ];
             let mut edges = Vec::new();
-            for entry in entries {
-                let GraphKey::OutAdjacency {
-                    graph,
-                    partition,
-                    source,
-                    edge_type,
-                    destination,
-                    edge,
-                    ..
-                } = decode_graph_key(entry.key())?
-                else {
-                    return Err(TemporalStoreError::UnexpectedAdjacencyKey);
-                };
-                let projection = ProjectionRecord::decode(entry.value())?;
-                if let Some(payload) = projection.visible_at(valid_time) {
-                    edges.push(EdgeView {
-                        element: ElementRef::edge(graph, partition, edge),
-                        edge_type,
-                        source,
-                        destination,
-                        payload: payload.clone(),
-                    });
+            for span in spans {
+                for entry in self.adapter.scan(&span).await? {
+                    let (element, edge_type, source, destination) =
+                        match decode_graph_key(entry.key())? {
+                            GraphKey::OutAdjacency {
+                                graph,
+                                partition,
+                                source,
+                                edge_type,
+                                destination,
+                                edge,
+                                ..
+                            } => (
+                                ElementRef::edge(graph, partition, edge),
+                                edge_type,
+                                ElementRef::vertex(graph, partition, source),
+                                ElementRef::vertex(graph, partition, destination),
+                            ),
+                            GraphKey::CrossOutAdjacency {
+                                graph,
+                                partition,
+                                source,
+                                edge_type,
+                                destination_partition,
+                                destination,
+                                edge_partition,
+                                edge,
+                                ..
+                            } => (
+                                ElementRef::edge(graph, edge_partition, edge),
+                                edge_type,
+                                ElementRef::vertex(graph, partition, source),
+                                ElementRef::vertex(graph, destination_partition, destination),
+                            ),
+                            _ => return Err(TemporalStoreError::UnexpectedAdjacencyKey),
+                        };
+                    let projection = ProjectionRecord::decode(entry.value())?;
+                    if let Some(payload) = projection.visible_at(valid_time) {
+                        edges.push(EdgeView {
+                            element,
+                            edge_type,
+                            source,
+                            destination,
+                            payload: payload.clone(),
+                        });
+                    }
                 }
             }
             Ok(edges)
@@ -668,36 +819,63 @@ where
         valid_time: ValidTime,
     ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
         Box::pin(async move {
-            let entries = self
-                .adapter
-                .scan(&KeySpan::prefix(
+            let spans = [
+                KeySpan::prefix(
                     Keyspace::AdjIn,
                     in_adjacency_prefix(graph, partition, destination),
-                ))
-                .await?;
+                ),
+                KeySpan::prefix(
+                    Keyspace::AdjIn,
+                    cross_in_adjacency_prefix(graph, partition, destination),
+                ),
+            ];
             let mut edges = Vec::new();
-            for entry in entries {
-                let GraphKey::InAdjacency {
-                    graph,
-                    partition,
-                    destination,
-                    edge_type,
-                    source,
-                    edge,
-                    ..
-                } = decode_graph_key(entry.key())?
-                else {
-                    return Err(TemporalStoreError::UnexpectedAdjacencyKey);
-                };
-                let projection = ProjectionRecord::decode(entry.value())?;
-                if let Some(payload) = projection.visible_at(valid_time) {
-                    edges.push(EdgeView {
-                        element: ElementRef::edge(graph, partition, edge),
-                        edge_type,
-                        source,
-                        destination,
-                        payload: payload.clone(),
-                    });
+            for span in spans {
+                for entry in self.adapter.scan(&span).await? {
+                    let (element, edge_type, source, destination) =
+                        match decode_graph_key(entry.key())? {
+                            GraphKey::InAdjacency {
+                                graph,
+                                partition,
+                                destination,
+                                edge_type,
+                                source,
+                                edge,
+                                ..
+                            } => (
+                                ElementRef::edge(graph, partition, edge),
+                                edge_type,
+                                ElementRef::vertex(graph, partition, source),
+                                ElementRef::vertex(graph, partition, destination),
+                            ),
+                            GraphKey::CrossInAdjacency {
+                                graph,
+                                partition,
+                                destination,
+                                edge_type,
+                                source_partition,
+                                source,
+                                edge_partition,
+                                edge,
+                                ..
+                            } => (
+                                ElementRef::edge(graph, edge_partition, edge),
+                                edge_type,
+                                ElementRef::vertex(graph, source_partition, source),
+                                ElementRef::vertex(graph, partition, destination),
+                            ),
+                            _ => return Err(TemporalStoreError::UnexpectedAdjacencyKey),
+                        };
+                    let projection = ProjectionRecord::decode(entry.value())?;
+                    if let Some(payload) = projection.visible_at(valid_time) {
+                        edges.push(EdgeView {
+                            element,
+                            edge_type,
+                            source,
+                            destination,
+                            payload: payload.clone(),
+                        });
+                    }
                 }
             }
             Ok(edges)
@@ -868,6 +1046,14 @@ where
                 Keyspace::AdjIn,
                 in_adjacency_prefix(vertex.graph(), vertex.partition(), vertex.id()),
             ),
+            KeySpan::prefix(
+                Keyspace::AdjOut,
+                cross_out_adjacency_prefix(vertex.graph(), vertex.partition(), vertex.id()),
+            ),
+            KeySpan::prefix(
+                Keyspace::AdjIn,
+                cross_in_adjacency_prefix(vertex.graph(), vertex.partition(), vertex.id()),
+            ),
         ];
         for span in spans {
             for entry in self.adapter.scan(&span).await? {
@@ -884,6 +1070,18 @@ where
                         edge,
                         ..
                     } => ElementRef::edge(graph, partition, edge),
+                    GraphKey::CrossOutAdjacency {
+                        graph,
+                        edge_partition,
+                        edge,
+                        ..
+                    }
+                    | GraphKey::CrossInAdjacency {
+                        graph,
+                        edge_partition,
+                        edge,
+                        ..
+                    } => ElementRef::edge(graph, edge_partition, edge),
                     _ => return Err(TemporalStoreError::UnexpectedAdjacencyKey),
                 };
                 incident_edges.insert(edge, ProjectionRecord::decode(entry.value())?);
@@ -1060,6 +1258,7 @@ pub enum TemporalStoreError {
     WriteConflict,
     IdentityMismatch,
     WrongElementKind,
+    InvalidEdgeEndpoints,
     DuplicateElementOperation {
         element: ElementRef,
     },
@@ -1104,6 +1303,9 @@ impl Display for TemporalStoreError {
             Self::WrongElementKind => {
                 formatter.write_str("operation received the wrong element kind")
             }
+            Self::InvalidEdgeEndpoints => formatter.write_str(
+                "edge endpoints must be vertices in the edge graph and the edge must be owned by its source partition",
+            ),
             Self::DuplicateElementOperation { element } => {
                 write!(
                     formatter,
@@ -1182,8 +1384,8 @@ fn edge_view(identity: EdgeIdentity, payload: CanonicalElement) -> EdgeView {
     EdgeView {
         element: identity.element(),
         edge_type: identity.edge_type(),
-        source: identity.source(),
-        destination: identity.destination(),
+        source: identity.source_ref(),
+        destination: identity.destination_ref(),
         payload,
     }
 }

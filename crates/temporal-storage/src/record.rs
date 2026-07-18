@@ -10,6 +10,7 @@ const PROJECTION_MAGIC: &[u8; 4] = b"DTGP";
 const ANCHOR_MAGIC: &[u8; 4] = b"DTGA";
 const DELTA_MAGIC: &[u8; 4] = b"DTGD";
 const FORMAT_VERSION: u16 = 1;
+const CROSS_PARTITION_EDGE_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VertexIdentity {
@@ -55,8 +56,8 @@ impl VertexIdentity {
 pub struct EdgeIdentity {
     element: ElementRef,
     edge_type: EdgeTypeId,
-    source: ElementId,
-    destination: ElementId,
+    source: ElementRef,
+    destination: ElementRef,
 }
 
 impl EdgeIdentity {
@@ -66,8 +67,31 @@ impl EdgeIdentity {
         source: ElementId,
         destination: ElementId,
     ) -> Result<Self, RecordCodecError> {
-        if element.kind() != ElementKind::Edge {
+        Self::new_between(
+            element,
+            edge_type,
+            ElementRef::vertex(element.graph(), element.partition(), source),
+            ElementRef::vertex(element.graph(), element.partition(), destination),
+        )
+    }
+
+    pub fn new_between(
+        element: ElementRef,
+        edge_type: EdgeTypeId,
+        source: ElementRef,
+        destination: ElementRef,
+    ) -> Result<Self, RecordCodecError> {
+        if element.kind() != ElementKind::Edge
+            || source.kind() != ElementKind::Vertex
+            || destination.kind() != ElementKind::Vertex
+        {
             return Err(RecordCodecError::WrongElementKind);
+        }
+        if source.graph() != element.graph()
+            || destination.graph() != element.graph()
+            || source.partition() != element.partition()
+        {
+            return Err(RecordCodecError::InvalidEdgeEndpoints);
         }
         Ok(Self {
             element,
@@ -89,20 +113,42 @@ impl EdgeIdentity {
 
     #[must_use]
     pub const fn source(&self) -> ElementId {
-        self.source
+        self.source.id()
     }
 
     #[must_use]
     pub const fn destination(&self) -> ElementId {
+        self.destination.id()
+    }
+
+    #[must_use]
+    pub const fn source_ref(&self) -> ElementRef {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn destination_ref(&self) -> ElementRef {
         self.destination
     }
 
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut output = identity_header(ElementKind::Edge, self.element);
+        let cross_partition = self.source.partition() != self.destination.partition();
+        let version = if cross_partition {
+            CROSS_PARTITION_EDGE_VERSION
+        } else {
+            FORMAT_VERSION
+        };
+        let mut output = identity_header_version(ElementKind::Edge, self.element, version);
         output.extend_from_slice(&self.edge_type.value().to_be_bytes());
-        output.extend_from_slice(&self.source.value().to_be_bytes());
-        output.extend_from_slice(&self.destination.value().to_be_bytes());
+        if cross_partition {
+            output.extend_from_slice(&self.source.partition().value().to_be_bytes());
+        }
+        output.extend_from_slice(&self.source.id().value().to_be_bytes());
+        if cross_partition {
+            output.extend_from_slice(&self.destination.partition().value().to_be_bytes());
+        }
+        output.extend_from_slice(&self.destination.id().value().to_be_bytes());
         append_checksum(&mut output);
         output
     }
@@ -110,10 +156,28 @@ impl EdgeIdentity {
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordCodecError> {
         let mut decoder = IdentityDecoder::new(bytes, ElementKind::Edge)?;
         let edge_type = EdgeTypeId::new(decoder.decoder.read_u32()?);
-        let source = ElementId::new(decoder.decoder.read_u128()?);
-        let destination = ElementId::new(decoder.decoder.read_u128()?);
+        let source_partition = if decoder.version == CROSS_PARTITION_EDGE_VERSION {
+            PartitionId::new(decoder.decoder.read_u32()?)
+        } else {
+            decoder.element.partition()
+        };
+        let source = ElementRef::vertex(
+            decoder.element.graph(),
+            source_partition,
+            ElementId::new(decoder.decoder.read_u128()?),
+        );
+        let destination_partition = if decoder.version == CROSS_PARTITION_EDGE_VERSION {
+            PartitionId::new(decoder.decoder.read_u32()?)
+        } else {
+            decoder.element.partition()
+        };
+        let destination = ElementRef::vertex(
+            decoder.element.graph(),
+            destination_partition,
+            ElementId::new(decoder.decoder.read_u128()?),
+        );
         decoder.finish()?;
-        Self::new(decoder.element, edge_type, source, destination)
+        Self::new_between(decoder.element, edge_type, source, destination)
     }
 }
 
@@ -420,6 +484,7 @@ pub enum RecordCodecError {
     InvalidMagic,
     UnsupportedVersion(u16),
     WrongElementKind,
+    InvalidEdgeEndpoints,
     UnexpectedEnd,
     TrailingBytes,
     LengthOverflow,
@@ -439,6 +504,9 @@ impl Display for RecordCodecError {
                 write!(formatter, "unsupported temporal record version {version}")
             }
             Self::WrongElementKind => formatter.write_str("identity has the wrong element kind"),
+            Self::InvalidEdgeEndpoints => {
+                formatter.write_str("edge endpoints must be vertices in the edge graph and the edge must be owned by its source partition")
+            }
             Self::UnexpectedEnd => formatter.write_str("temporal record ended unexpectedly"),
             Self::TrailingBytes => formatter.write_str("temporal record has trailing bytes"),
             Self::LengthOverflow => formatter.write_str("temporal record length exceeds u32"),
@@ -463,9 +531,13 @@ impl Display for RecordCodecError {
 impl Error for RecordCodecError {}
 
 fn identity_header(kind: ElementKind, element: ElementRef) -> Vec<u8> {
+    identity_header_version(kind, element, FORMAT_VERSION)
+}
+
+fn identity_header_version(kind: ElementKind, element: ElementRef, version: u16) -> Vec<u8> {
     let mut output = Vec::new();
     output.extend_from_slice(IDENTITY_MAGIC);
-    output.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    output.extend_from_slice(&version.to_be_bytes());
     output.push(kind as u8);
     output.extend_from_slice(&element.graph().value().to_be_bytes());
     output.extend_from_slice(&element.partition().value().to_be_bytes());
@@ -522,13 +594,14 @@ fn checksum(bytes: &[u8]) -> u64 {
 struct IdentityDecoder<'a> {
     decoder: Decoder<'a>,
     element: ElementRef,
+    version: u16,
 }
 
 impl<'a> IdentityDecoder<'a> {
     fn new(bytes: &'a [u8], expected_kind: ElementKind) -> Result<Self, RecordCodecError> {
         let mut decoder = Decoder::new(bytes);
         decoder.expect_magic(IDENTITY_MAGIC)?;
-        decoder.expect_version()?;
+        let version = decoder.read_u16()?;
         let kind = match decoder.read_u8()? {
             1 => ElementKind::Vertex,
             2 => ElementKind::Edge,
@@ -537,6 +610,11 @@ impl<'a> IdentityDecoder<'a> {
         if kind != expected_kind {
             return Err(RecordCodecError::WrongElementKind);
         }
+        let supported = version == FORMAT_VERSION
+            || (kind == ElementKind::Edge && version == CROSS_PARTITION_EDGE_VERSION);
+        if !supported {
+            return Err(RecordCodecError::UnsupportedVersion(version));
+        }
         let graph = GraphId::new(decoder.read_u64()?);
         let partition = PartitionId::new(decoder.read_u32()?);
         let id = ElementId::new(decoder.read_u128()?);
@@ -544,7 +622,11 @@ impl<'a> IdentityDecoder<'a> {
             ElementKind::Vertex => ElementRef::vertex(graph, partition, id),
             ElementKind::Edge => ElementRef::edge(graph, partition, id),
         };
-        Ok(Self { decoder, element })
+        Ok(Self {
+            decoder,
+            element,
+            version,
+        })
     }
 
     fn finish(&mut self) -> Result<(), RecordCodecError> {

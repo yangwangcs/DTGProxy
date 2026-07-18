@@ -10,8 +10,8 @@ use dtgproxy::{
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter};
 use temporal_ir::GraphScope;
 use temporal_storage::{
-    ElementId, ElementRef, GraphId, LabelId, PartitionId, TemporalStore, TemporalTransaction,
-    VertexMutation,
+    EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId, TemporalStore,
+    TemporalTransaction, VertexMutation,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, ValidTime};
 use timestamp_oracle::{ManualClock, MemoryTimestampStore, TimestampOracle};
@@ -196,6 +196,123 @@ fn temporal_graph_input_is_rewritten_distributed_committed_and_read_back_tempora
 }
 
 #[test]
+fn cross_partition_edge_is_split_between_source_and_destination_shards() {
+    let config = DeploymentConfig::shared_nothing(31, vec![placement(10), placement(20)]).unwrap();
+    let scopes = (0..1_000)
+        .map(|partition| {
+            let scope = GraphScope::new(GraphId::new(12), PartitionId::new(partition));
+            (config.route_scope(scope).shard_id(), scope)
+        })
+        .fold(BTreeMap::new(), |mut scopes, (shard, scope)| {
+            scopes.entry(shard).or_insert(scope);
+            scopes
+        });
+    let source_scope = scopes[&10];
+    let destination_scope = scopes[&20];
+    let source = source_scope.element(temporal_storage::ElementKind::Vertex, ElementId::new(1));
+    let destination =
+        destination_scope.element(temporal_storage::ElementKind::Vertex, ElementId::new(2));
+    let edge = source_scope.element(temporal_storage::ElementKind::Edge, ElementId::new(100));
+    let valid = Interval::new(ValidTime::from_micros(0), None).unwrap();
+
+    let mut runtime = block_on(InProcessDeploymentRuntime::new(config)).unwrap();
+    block_on(runtime.elect(10, 10)).unwrap();
+    block_on(runtime.elect(20, 20)).unwrap();
+    let oracle = TimestampOracle::open(
+        Arc::new(MemoryTimestampStore::new()),
+        Arc::new(ManualClock::new(3_500)),
+        16,
+    )
+    .unwrap();
+    let coordinator = TransactionCoordinator::new(&oracle, 20);
+
+    block_on(coordinator.commit_temporal(
+        &mut runtime,
+        1,
+        IsolationLevel::TemporalSnapshot,
+        10_000,
+        vec![
+            ScopedTemporalTransaction::new(
+                source_scope,
+                TemporalTransaction::new().with_vertex(
+                    VertexMutation::put(source, LabelId::new(1), valid, payload("source"))
+                        .unwrap(),
+                ),
+            ),
+            ScopedTemporalTransaction::new(
+                destination_scope,
+                TemporalTransaction::new().with_vertex(
+                    VertexMutation::put(
+                        destination,
+                        LabelId::new(1),
+                        valid,
+                        payload("destination"),
+                    )
+                    .unwrap(),
+                ),
+            ),
+        ],
+    ))
+    .unwrap();
+
+    let receipt = block_on(coordinator.commit_temporal(
+        &mut runtime,
+        1,
+        IsolationLevel::TemporalSnapshot,
+        10_000,
+        vec![ScopedTemporalTransaction::new(
+            source_scope,
+            TemporalTransaction::new().with_edge(
+                EdgeMutation::put_between(
+                    edge,
+                    EdgeTypeId::new(7),
+                    source,
+                    destination,
+                    valid,
+                    payload("cross-partition"),
+                )
+                .unwrap(),
+            ),
+        )],
+    ))
+    .unwrap();
+
+    assert_eq!(receipt.participants().len(), 2);
+    let outgoing = expand_out(&runtime, 10, source);
+    let incoming = expand_in(&runtime, 20, destination);
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(incoming.len(), 1);
+    for view in outgoing.iter().chain(&incoming) {
+        assert_eq!(view.element(), edge);
+        assert_eq!(view.source_ref(), source);
+        assert_eq!(view.destination_ref(), destination);
+    }
+
+    block_on(coordinator.commit_temporal(
+        &mut runtime,
+        1,
+        IsolationLevel::TemporalSnapshot,
+        10_000,
+        vec![ScopedTemporalTransaction::new(
+            source_scope,
+            TemporalTransaction::new().with_edge(
+                EdgeMutation::delete_between(
+                    edge,
+                    EdgeTypeId::new(7),
+                    source,
+                    destination,
+                    valid,
+                )
+                .unwrap(),
+            ),
+        )],
+    ))
+    .unwrap();
+    assert!(expand_out(&runtime, 10, source).is_empty());
+    assert!(expand_in(&runtime, 20, destination).is_empty());
+}
+
+#[test]
 fn failed_prewrite_records_abort_and_cleans_every_known_prepared_participant() {
     let config = DeploymentConfig::shared_nothing(21, vec![placement(10), placement(20)]).unwrap();
     let mut runtime = block_on(InProcessDeploymentRuntime::new(config)).unwrap();
@@ -286,6 +403,42 @@ fn read_vertex(
     block_on(
         TemporalStore::new(group.replica_adapter(leader).unwrap())
             .vertex_current(vertex, ValidTime::from_micros(1)),
+    )
+    .unwrap()
+}
+
+fn expand_out(
+    runtime: &InProcessDeploymentRuntime,
+    shard_id: u32,
+    vertex: ElementRef,
+) -> Vec<temporal_storage::EdgeView> {
+    let group = runtime.raft().group(shard_id).unwrap();
+    let leader = group.leader_id().unwrap();
+    block_on(
+        TemporalStore::new(group.replica_adapter(leader).unwrap()).expand_out_current(
+            vertex.graph(),
+            vertex.partition(),
+            vertex.id(),
+            ValidTime::from_micros(1),
+        ),
+    )
+    .unwrap()
+}
+
+fn expand_in(
+    runtime: &InProcessDeploymentRuntime,
+    shard_id: u32,
+    vertex: ElementRef,
+) -> Vec<temporal_storage::EdgeView> {
+    let group = runtime.raft().group(shard_id).unwrap();
+    let leader = group.leader_id().unwrap();
+    block_on(
+        TemporalStore::new(group.replica_adapter(leader).unwrap()).expand_in_current(
+            vertex.graph(),
+            vertex.partition(),
+            vertex.id(),
+            ValidTime::from_micros(1),
+        ),
     )
     .unwrap()
 }

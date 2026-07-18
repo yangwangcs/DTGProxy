@@ -1,13 +1,82 @@
 use storage_api::Keyspace;
 use temporal_storage::{
     EdgeTypeId, ElementId, ElementRef, GraphId, GraphKey, KeyCodecError, LabelId, PartitionId,
-    current_vertex_key, decode_graph_key, history_anchor_key, history_prefix, in_adjacency_key,
-    out_adjacency_key, vertex_identity_key,
+    cross_in_adjacency_key, cross_out_adjacency_key, current_vertex_key, decode_graph_key,
+    graph_key_scope, history_anchor_key, history_prefix, in_adjacency_key, out_adjacency_key,
+    vertex_identity_key,
 };
 use temporal_types::TransactionTime;
 
 fn vertex() -> ElementRef {
     ElementRef::vertex(GraphId::new(1), PartitionId::new(2), ElementId::new(3))
+}
+
+#[test]
+fn cross_partition_adjacency_preserves_remote_and_edge_ownership() {
+    let graph = GraphId::new(9);
+    let source_partition = PartitionId::new(4);
+    let destination_partition = PartitionId::new(8);
+    let source = ElementId::new(10);
+    let destination = ElementId::new(20);
+    let edge = ElementId::new(30);
+    let edge_type = EdgeTypeId::new(7);
+    let out = cross_out_adjacency_key(
+        graph,
+        source_partition,
+        source,
+        edge_type,
+        5,
+        destination_partition,
+        destination,
+        source_partition,
+        edge,
+    );
+    let incoming = cross_in_adjacency_key(
+        graph,
+        destination_partition,
+        destination,
+        edge_type,
+        5,
+        source_partition,
+        source,
+        source_partition,
+        edge,
+    );
+
+    assert_eq!(out.as_bytes()[0], 0x12);
+    assert_eq!(incoming.as_bytes()[0], 0x13);
+    let decoded_out = decode_graph_key(&out).unwrap();
+    let decoded_in = decode_graph_key(&incoming).unwrap();
+    assert_eq!(
+        decoded_out,
+        GraphKey::CrossOutAdjacency {
+            graph,
+            partition: source_partition,
+            source,
+            edge_type,
+            bucket: 5,
+            destination_partition,
+            destination,
+            edge_partition: source_partition,
+            edge,
+        }
+    );
+    assert_eq!(
+        decoded_in,
+        GraphKey::CrossInAdjacency {
+            graph,
+            partition: destination_partition,
+            destination,
+            edge_type,
+            bucket: 5,
+            source_partition,
+            source,
+            edge_partition: source_partition,
+            edge,
+        }
+    );
+    assert_eq!(graph_key_scope(decoded_out), (graph, source_partition));
+    assert_eq!(graph_key_scope(decoded_in), (graph, destination_partition));
 }
 
 #[test]

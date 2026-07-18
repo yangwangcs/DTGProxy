@@ -1,4 +1,23 @@
 use crate::{EdgeMutation, ElementRef, GraphId, PartitionId, VertexMutation};
+use temporal_types::{Interval, ValidTime};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndpointGuard {
+    vertex: ElementRef,
+    valid: Interval<ValidTime>,
+}
+
+impl EndpointGuard {
+    #[must_use]
+    pub const fn vertex(self) -> ElementRef {
+        self.vertex
+    }
+
+    #[must_use]
+    pub const fn valid(self) -> Interval<ValidTime> {
+        self.valid
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TemporalTransaction {
@@ -35,6 +54,24 @@ impl TemporalTransaction {
 
     pub fn extend(&mut self, other: Self) {
         self.operations.extend(other.operations);
+    }
+
+    #[must_use]
+    pub fn remote_endpoint_guards(&self) -> Vec<EndpointGuard> {
+        self.operations
+            .iter()
+            .filter_map(|operation| match operation {
+                TemporalOperation::Edge(mutation)
+                    if mutation.destination.partition() != mutation.element.partition() =>
+                {
+                    Some(EndpointGuard {
+                        vertex: mutation.destination,
+                        valid: mutation.valid,
+                    })
+                }
+                TemporalOperation::Vertex(_) | TemporalOperation::Edge(_) => None,
+            })
+            .collect()
     }
 
     pub(crate) fn into_operations(self) -> Vec<TemporalOperation> {

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -7,9 +8,14 @@ use raft_command::{
 };
 use shard_runtime::ReadBarrierError;
 use shard_runtime::ReplicationError;
-use storage_api::{AdapterError, PreparedMutationBatch, StorageAdapter};
+use storage_api::{
+    AdapterError, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch, StorageAdapter,
+};
 use temporal_ir::GraphScope;
-use temporal_storage::{PrepareContext, TemporalStore, TemporalStoreError, TemporalTransaction};
+use temporal_storage::{
+    PrepareContext, TemporalStore, TemporalStoreError, TemporalTransaction, decode_graph_key,
+    graph_key_scope,
+};
 use temporal_types::TransactionTime;
 use timestamp_oracle::{TimestampOracle, TimestampOracleError};
 use txn_protocol::{
@@ -471,6 +477,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         }
         let context = self.begin(schema_version, isolation, ttl_micros)?;
         let mut grouped = BTreeMap::<ShardEpoch, TemporalTransaction>::new();
+        let mut endpoint_guards = Vec::new();
         for scoped in transactions {
             if !scoped
                 .transaction
@@ -480,13 +487,14 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             }
             let placement = runtime.config().route_scope(scoped.scope);
             let participant = ShardEpoch::new(placement.shard_id(), placement.placement_epoch())?;
+            endpoint_guards.extend(scoped.transaction.remote_endpoint_guards());
             grouped
                 .entry(participant)
                 .or_default()
                 .extend(scoped.transaction);
         }
 
-        let mut writes = Vec::with_capacity(grouped.len());
+        let mut routed = BTreeMap::<ShardEpoch, BTreeMap<LogicalKey, MutationOperation>>::new();
         for (participant, transaction) in grouped {
             let group = runtime.raft_mut().group_mut(participant.shard_id())?;
             let leader_id = group
@@ -513,8 +521,62 @@ impl<'oracle> TransactionCoordinator<'oracle> {
                     transaction,
                 )
                 .await?;
-            writes.push(PreparedShardTransaction { participant, batch });
+            for mutation in batch.mutations {
+                let destination = route_operation(runtime, &mutation.operation)?;
+                insert_routed_operation(&mut routed, destination, mutation.operation)?;
+            }
         }
+        for guard in endpoint_guards {
+            let scope = GraphScope::new(guard.vertex().graph(), guard.vertex().partition());
+            let placement = runtime.config().route_scope(scope);
+            let participant = ShardEpoch::new(placement.shard_id(), placement.placement_epoch())?;
+            let group = runtime.raft_mut().group_mut(participant.shard_id())?;
+            let leader_id = group
+                .leader_id()
+                .ok_or(TransactionCoordinatorError::NoLeader {
+                    shard_id: participant.shard_id(),
+                })?;
+            let permit = group
+                .leader_read_permit(leader_id, participant.placement_epoch(), self.max_ticks)
+                .await?;
+            let adapter = group.replica_adapter(permit.node_id()).ok_or(
+                TransactionCoordinatorError::NoLeader {
+                    shard_id: participant.shard_id(),
+                },
+            )?;
+            let operation = TemporalStore::new(adapter)
+                .prepare_endpoint_guard(context.start_ts, guard.vertex(), guard.valid())
+                .await?;
+            insert_routed_operation(&mut routed, participant, operation)?;
+        }
+
+        let writes = routed
+            .into_iter()
+            .map(|(participant, operations)| {
+                let mutations = operations
+                    .into_values()
+                    .enumerate()
+                    .map(|(sequence, operation)| {
+                        let sequence = u32::try_from(sequence)
+                            .map_err(|_| TransactionCoordinatorError::TooManyRoutedMutations)?;
+                        Ok(match operation {
+                            MutationOperation::Put { key, value } => {
+                                Mutation::put(sequence, key, value)
+                            }
+                            MutationOperation::Delete { key } => Mutation::delete(sequence, key),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
+                Ok(PreparedShardTransaction {
+                    participant,
+                    batch: PreparedMutationBatch {
+                        shard_id: participant.shard_id(),
+                        txn_id: context.transaction_id.value(),
+                        mutations,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
         self.commit(runtime, context, writes).await
     }
 
@@ -697,6 +759,46 @@ fn receipt(
     }
 }
 
+fn route_operation(
+    runtime: &InProcessDeploymentRuntime,
+    operation: &MutationOperation,
+) -> Result<ShardEpoch, TransactionCoordinatorError> {
+    let key = operation_key(operation);
+    let graph_key = decode_graph_key(key).map_err(TemporalStoreError::from)?;
+    let (graph, partition) = graph_key_scope(graph_key);
+    let placement = runtime
+        .config()
+        .route_scope(GraphScope::new(graph, partition));
+    Ok(ShardEpoch::new(
+        placement.shard_id(),
+        placement.placement_epoch(),
+    )?)
+}
+
+fn insert_routed_operation(
+    routed: &mut BTreeMap<ShardEpoch, BTreeMap<LogicalKey, MutationOperation>>,
+    participant: ShardEpoch,
+    operation: MutationOperation,
+) -> Result<(), TransactionCoordinatorError> {
+    let key = operation_key(&operation).clone();
+    match routed.entry(participant).or_default().entry(key.clone()) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(operation);
+            Ok(())
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &operation => Ok(()),
+        std::collections::btree_map::Entry::Occupied(_) => {
+            Err(TransactionCoordinatorError::ConflictingRoutedMutation { key })
+        }
+    }
+}
+
+fn operation_key(operation: &MutationOperation) -> &LogicalKey {
+    match operation {
+        MutationOperation::Put { key, .. } | MutationOperation::Delete { key } => key,
+    }
+}
+
 fn transaction_id_from_time(timestamp: TransactionTime) -> TransactionId {
     let physical_offset = u128::from(
         u64::try_from(i128::from(timestamp.physical_micros()) - i128::from(i64::MIN))
@@ -772,6 +874,10 @@ pub enum TransactionCoordinatorError {
         batch: u32,
     },
     BatchTransactionMismatch,
+    TooManyRoutedMutations,
+    ConflictingRoutedMutation {
+        key: LogicalKey,
+    },
     CommitTimestampTooEarly,
     Replication {
         phase: &'static str,
@@ -838,6 +944,12 @@ impl Display for TransactionCoordinatorError {
             ),
             Self::BatchTransactionMismatch => formatter
                 .write_str("prepared batch transaction ID differs from coordinator context"),
+            Self::TooManyRoutedMutations => formatter
+                .write_str("routed temporal transaction exceeds the mutation sequence space"),
+            Self::ConflictingRoutedMutation { key } => write!(
+                formatter,
+                "temporal transaction routes conflicting operations to {key:?}"
+            ),
             Self::CommitTimestampTooEarly => {
                 formatter.write_str("commit timestamp does not exceed every participant minimum")
             }
@@ -944,4 +1056,3 @@ impl From<ReplicationError> for TransactionCoordinatorError {
         Self::Runtime(error)
     }
 }
-use std::collections::BTreeMap;
