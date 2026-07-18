@@ -7,6 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 use adapter_neo4j::Neo4jAdapterFactory;
 use adapter_postgres::PostgresAdapterFactory;
@@ -40,6 +41,7 @@ use crate::{
 
 pub const GATEWAY_API_VERSION: u16 = 1;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const GATEWAY_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn initialize_node(
     config_path: impl AsRef<Path>,
@@ -217,6 +219,9 @@ impl GatewayService {
             config.root().join("timestamp-oracle.state"),
             config.timestamp_reservation(),
         )?;
+        TransactionCoordinator::new(&oracle, config.max_raft_ticks())
+            .recover_pending(&mut runtime)
+            .await?;
         Ok(Self {
             config,
             catalog,
@@ -487,6 +492,20 @@ impl GatewayService {
                 ttl_micros,
                 mutations,
             } => {
+                let expected_schema_version = self
+                    .catalog
+                    .state()
+                    .graph(self.config.graph_id())
+                    .ok_or(GatewayError::UnknownGraph {
+                        graph_id: self.config.graph_id(),
+                    })?
+                    .schema_version();
+                if schema_version != expected_schema_version {
+                    return Err(GatewayError::SchemaVersionMismatch {
+                        expected: expected_schema_version,
+                        actual: schema_version,
+                    });
+                }
                 let scoped = mutations
                     .into_iter()
                     .map(|mutation| mutation.into_scoped(self.config.graph_id()))
@@ -539,10 +558,20 @@ pub fn serve(
             return Ok(());
         }
         let (mut stream, _) = listener.accept().map_err(io_error)?;
-        let request = read_frame(&mut stream)?;
+        if stream
+            .set_read_timeout(Some(GATEWAY_CONNECTION_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(GATEWAY_CONNECTION_TIMEOUT)))
+            .is_err()
+        {
+            continue;
+        }
+        let request = match read_frame(&mut stream) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
         let response = block_on(gateway.execute_json(&request));
-        write_frame(&mut stream, &response)?;
         served = served.saturating_add(1);
+        let _ = write_frame(&mut stream, &response);
     }
 }
 
@@ -1022,6 +1051,7 @@ pub enum GatewayError {
     InvalidRequestId,
     UnknownGraph { graph_id: u64 },
     GraphMismatch { expected: u64, actual: u64 },
+    SchemaVersionMismatch { expected: u64, actual: u64 },
     AlreadyInitialized,
     InvalidMutation(String),
     Query(String),
@@ -1054,6 +1084,10 @@ impl Display for GatewayError {
             Self::GraphMismatch { expected, actual } => write!(
                 formatter,
                 "request graph {actual} differs from configured graph {expected}"
+            ),
+            Self::SchemaVersionMismatch { expected, actual } => write!(
+                formatter,
+                "request schema version {actual} differs from catalog schema version {expected}"
             ),
             Self::AlreadyInitialized => formatter.write_str("DTGProxy root is already initialized"),
             Self::InvalidMutation(message) => {
@@ -1092,6 +1126,7 @@ impl Error for GatewayError {
             | Self::InvalidRequestId
             | Self::UnknownGraph { .. }
             | Self::GraphMismatch { .. }
+            | Self::SchemaVersionMismatch { .. }
             | Self::AlreadyInitialized
             | Self::InvalidMutation(_)
             | Self::Query(_)

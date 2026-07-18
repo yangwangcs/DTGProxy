@@ -14,7 +14,8 @@ mod transaction;
 pub use control_plane;
 pub use transaction::{
     PreparedShardTransaction, ScopedTemporalTransaction, TransactionContext,
-    TransactionCoordinator, TransactionCoordinatorError, TransactionReceipt, TransactionStatus,
+    TransactionCoordinator, TransactionCoordinatorError, TransactionReceipt,
+    TransactionRecoveryReceipt, TransactionStatus,
 };
 
 use std::collections::BTreeMap;

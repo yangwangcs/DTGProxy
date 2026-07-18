@@ -7,6 +7,7 @@ use adapter_memory::MemoryAdapter;
 use adapter_registry::{AdapterOpenRequest, AdapterRegistry};
 use adapter_rocksdb::{RocksAdapter, RocksAdapterFactory};
 use adapter_sidecar::{
+    BeginExportRequest, MAX_ACTIVE_SNAPSHOT_SESSIONS, RemoteErrorCode, Request, Response,
     SidecarRestoreBackend, SidecarService, TcpSidecarAdapterFactory, TcpSidecarServerConfig,
     spawn_stateful_tcp_sidecar_server,
 };
@@ -14,6 +15,95 @@ use storage_api::{
     AdapterRequirement, CommittedMutationBatch, Keyspace, LogicalKey, LogicalSnapshotExportRequest,
     Mutation, StorageAdapter,
 };
+
+#[test]
+fn snapshot_sessions_are_capacity_bounded_and_release_slots_on_abort() {
+    let temporary = tempfile::tempdir().unwrap();
+    let backend = Arc::new(RocksAdapter::open(temporary.path().join("bounded-source")).unwrap());
+    let service = SidecarService::new(backend, None);
+    let mut sessions = Vec::new();
+    for _ in 0..MAX_ACTIVE_SNAPSHOT_SESSIONS {
+        match block_on(service.dispatch(Request::BeginExport(BeginExportRequest {
+            limits: LogicalSnapshotExportRequest::default(),
+            expected_applied_log_index: Some(0),
+        }))) {
+            Response::ExportStarted(started) => sessions.push(started.session_id),
+            response => panic!("expected export session, got {response:?}"),
+        }
+    }
+    match block_on(service.dispatch(Request::BeginExport(BeginExportRequest {
+        limits: LogicalSnapshotExportRequest::default(),
+        expected_applied_log_index: Some(0),
+    }))) {
+        Response::Error(error) => assert_eq!(error.code, RemoteErrorCode::ResourceExhausted as u32),
+        response => panic!("capacity overflow was accepted: {response:?}"),
+    }
+    assert!(matches!(
+        block_on(service.dispatch(Request::AbortSession {
+            session_id: sessions[0]
+        })),
+        Response::SessionAborted { .. }
+    ));
+    assert!(matches!(
+        block_on(service.dispatch(Request::BeginExport(BeginExportRequest {
+            limits: LogicalSnapshotExportRequest::default(),
+            expected_applied_log_index: Some(0),
+        }))),
+        Response::ExportStarted(_)
+    ));
+}
+
+#[test]
+fn sidecar_factory_rejects_zero_transport_timeouts() {
+    let service = Arc::new(SidecarService::new(Arc::new(MemoryAdapter::new()), None));
+    let server = spawn_stateful_tcp_sidecar_server(
+        TcpSidecarServerConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        service,
+    )
+    .unwrap();
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register(Arc::new(TcpSidecarAdapterFactory))
+        .unwrap();
+    let request = AdapterOpenRequest::new("invalid-timeout")
+        .with_parameter("endpoint", server.local_addr().to_string())
+        .with_parameter("connect_timeout_ms", "0");
+    let error = match block_on(registry.open("sidecar", &request, AdapterRequirement::Development))
+    {
+        Ok(_) => panic!("zero timeout was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("timeout"));
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn stateful_server_reuses_connection_capacity_after_clients_disconnect() {
+    let service = Arc::new(SidecarService::new(Arc::new(MemoryAdapter::new()), None));
+    let server = spawn_stateful_tcp_sidecar_server(
+        TcpSidecarServerConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_capacity(1, 1)
+            .unwrap(),
+        service,
+    )
+    .unwrap();
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register(Arc::new(TcpSidecarAdapterFactory))
+        .unwrap();
+
+    for attempt in 0..3 {
+        let request = AdapterOpenRequest::new(format!("client-{attempt}"))
+            .with_parameter("endpoint", server.local_addr().to_string())
+            .with_parameter("pool_size", "1");
+        let opened =
+            block_on(registry.open("sidecar", &request, AdapterRequirement::Development)).unwrap();
+        assert_eq!(opened.adapter().applied_log_index().unwrap(), 0);
+        drop(opened);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    server.shutdown().unwrap();
+}
 
 #[test]
 fn stateful_sidecars_export_restore_and_publish_a_remote_adapter() {

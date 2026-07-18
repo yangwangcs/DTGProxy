@@ -1,4 +1,4 @@
-use storage_api::{Keyspace, LogicalKey, Mutation, MutationOperation};
+use storage_api::{KeySpan, Keyspace, LogicalKey, Mutation, MutationOperation};
 use temporal_types::TransactionTime;
 
 use crate::codec::{
@@ -69,6 +69,36 @@ pub struct ParticipantRecordStatus {
     expires_at: TransactionTime,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantRecoveryRecord {
+    request: PrewriteRequest,
+    proof: ParticipantProof,
+    state: TransactionState,
+    commit_ts: Option<TransactionTime>,
+}
+
+impl ParticipantRecoveryRecord {
+    #[must_use]
+    pub const fn request(&self) -> &PrewriteRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub const fn proof(&self) -> &ParticipantProof {
+        &self.proof
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> TransactionState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn commit_ts(&self) -> Option<TransactionTime> {
+        self.commit_ts
+    }
+}
+
 impl ParticipantRecordStatus {
     #[must_use]
     pub const fn state(self) -> TransactionState {
@@ -101,6 +131,24 @@ impl AbortOutcome {
 pub struct ParticipantEngine;
 
 impl ParticipantEngine {
+    #[must_use]
+    pub fn recovery_span(participant: crate::ShardEpoch) -> KeySpan {
+        let mut prefix = Vec::with_capacity(PARTICIPANT_PREFIX.len() + 4);
+        prefix.extend_from_slice(PARTICIPANT_PREFIX);
+        prefix.extend_from_slice(&participant.shard_id().to_be_bytes());
+        KeySpan::prefix(Keyspace::Txn, prefix)
+    }
+
+    pub fn recovery_record(bytes: &[u8]) -> Result<ParticipantRecoveryRecord, TxnProtocolError> {
+        let record = decode_participant_record(bytes)?;
+        Ok(ParticipantRecoveryRecord {
+            request: record.request,
+            proof: record.proof,
+            state: record.state,
+            commit_ts: record.commit_ts,
+        })
+    }
+
     pub fn participant_record_key(
         participant: crate::ShardEpoch,
         transaction_id: crate::TransactionId,

@@ -28,6 +28,7 @@ there.
 
 Start with the [1.0 quickstart](docs/dtgproxy-v1-quickstart.md), its
 [main-path acceptance record](docs/dtgproxy-v1-acceptance.md), and the
+[final prototype boundary audit](docs/dtgproxy-v1-boundary-audit.md), plus the
 [detailed design](docs/superpowers/specs/2026-07-17-dtgproxy-design.md). Protocol specifications
 for Raft commands, state-machine recovery, snapshots, transactions, control-plane state, Adapter
 SPI, and Sidecar transport are under [`docs/`](docs/).

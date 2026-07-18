@@ -2,6 +2,9 @@
 
 DTGProxy exposes one temporal graph contract over RocksDB, PostgreSQL, Neo4j, or a remote Sidecar. The runnable prototype supports `PrimaryReplica` and `SharedNothing`, durable bitemporal transactions, graph point/adjacency queries, global scans, backend verification, and logical hot migration.
 
+Read the [final boundary audit](dtgproxy-v1-boundary-audit.md) before exposing the prototype outside
+a trusted development network.
+
 ## Build and run
 
 The minimum local path uses RocksDB and requires a C++17 toolchain. On Homebrew macOS:

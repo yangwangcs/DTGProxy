@@ -7,6 +7,7 @@ use dtgproxy::{
     ScopedTemporalTransaction, ShardPlacement, TransactionCoordinator, TransactionCoordinatorError,
     TransactionStatus,
 };
+use raft_command::{CommandBodyV1, CommandEnvelopeV1, PrewriteV1, RecordDecisionV1};
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use temporal_ir::GraphScope;
 use temporal_storage::{
@@ -16,7 +17,10 @@ use temporal_storage::{
 use temporal_types::{CanonicalElement, GraphValue, Interval, ValidTime};
 use timestamp_oracle::{ManualClock, MemoryTimestampStore, TimestampOracle};
 use txn_protocol::TransactionState;
-use txn_protocol::{HomeDecisionEngine, HomeTransactionRecord, IsolationLevel};
+use txn_protocol::{
+    HomeDecisionEngine, HomeTransactionRecord, IsolationLevel, ParticipantProof, PrewriteRequest,
+    ShardEpoch,
+};
 
 fn placement(shard_id: u32) -> ShardPlacement {
     ShardPlacement::new(shard_id, 7, vec![u64::from(shard_id)]).unwrap()
@@ -86,6 +90,123 @@ fn cross_shard_commit_records_home_decision_and_applies_every_participant() {
             commit_ts: receipt.commit_ts()
         }
     );
+}
+
+#[test]
+fn recovery_scans_prepared_intents_and_rolls_forward_a_durable_home_commit() {
+    let config = DeploymentConfig::shared_nothing(9, vec![placement(10), placement(20)]).unwrap();
+    let mut runtime = block_on(InProcessDeploymentRuntime::new(config)).unwrap();
+    block_on(runtime.elect(10, 10)).unwrap();
+    block_on(runtime.elect(20, 20)).unwrap();
+    let oracle = TimestampOracle::open(
+        Arc::new(MemoryTimestampStore::new()),
+        Arc::new(ManualClock::new(1_500)),
+        16,
+    )
+    .unwrap();
+    let coordinator = TransactionCoordinator::new(&oracle, 20);
+    let context = coordinator
+        .begin(3, IsolationLevel::TemporalSnapshot, 10_000)
+        .unwrap();
+    let participants = vec![
+        ShardEpoch::new(10, 7).unwrap(),
+        ShardEpoch::new(20, 7).unwrap(),
+    ];
+    let requests = participants
+        .iter()
+        .map(|participant| {
+            PrewriteRequest::new(
+                context.transaction_id(),
+                context.start_ts(),
+                3,
+                *participant,
+                participants[0],
+                participants.clone(),
+                IsolationLevel::TemporalSnapshot,
+                context.expires_at(),
+                batch(
+                    participant.shard_id(),
+                    context.transaction_id().value(),
+                    format!("v/{}", participant.shard_id()).as_bytes(),
+                    format!("value-{}", participant.shard_id()).as_bytes(),
+                )
+                .batch()
+                .clone(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let proofs = requests
+        .iter()
+        .map(|request| {
+            ParticipantProof::new(
+                request.participant(),
+                temporal_types::TransactionTime::new(
+                    context.start_ts().physical_micros(),
+                    context.start_ts().logical() + 1,
+                ),
+                request.intent_digest(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let prewrites = requests
+        .iter()
+        .zip(&proofs)
+        .enumerate()
+        .map(|(index, (request, proof))| {
+            (
+                request.participant().shard_id(),
+                CommandEnvelopeV1::new(
+                    request.participant().shard_id(),
+                    request.participant().placement_epoch(),
+                    100 + index as u128,
+                    CommandBodyV1::Prewrite(PrewriteV1 {
+                        request: request.clone(),
+                        expected_proof: proof.clone(),
+                    }),
+                )
+                .encode()
+                .unwrap(),
+            )
+        })
+        .collect();
+    let prewritten = block_on(runtime.propose_shards(prewrites, 20)).unwrap();
+    assert!(prewritten.iter().all(|(_, result)| result.is_ok()));
+
+    let decision = HomeTransactionRecord::new(
+        context.transaction_id(),
+        context.start_ts(),
+        TransactionState::Committed,
+        Some(context.commit_ts()),
+        participants.clone(),
+        proofs,
+    )
+    .unwrap();
+    let home_command = CommandEnvelopeV1::new(
+        participants[0].shard_id(),
+        participants[0].placement_epoch(),
+        200,
+        CommandBodyV1::RecordDecision(RecordDecisionV1 {
+            home: participants[0],
+            decision,
+        }),
+    )
+    .encode()
+    .unwrap();
+    block_on(runtime.propose_shard(participants[0].shard_id(), home_command, 20)).unwrap();
+    assert_eq!(read(&runtime, 10, b"v/10"), None);
+    assert_eq!(read(&runtime, 20, b"v/20"), None);
+
+    let recovered = block_on(coordinator.recover_pending(&mut runtime)).unwrap();
+    assert_eq!(recovered.scanned_records(), 2);
+    assert_eq!(recovered.finalized(), 2);
+    assert_eq!(recovered.aborted(), 0);
+    assert_eq!(read(&runtime, 10, b"v/10"), Some(b"value-10".to_vec()));
+    assert_eq!(read(&runtime, 20, b"v/20"), Some(b"value-20".to_vec()));
+
+    let replay = block_on(coordinator.recover_pending(&mut runtime)).unwrap();
+    assert_eq!(replay.finalized(), 0);
+    assert_eq!(replay.aborted(), 0);
 }
 
 #[test]

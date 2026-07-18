@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::io::Write;
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -167,6 +168,47 @@ fn gateway_transaction_accepts_temporal_input_and_query_reads_it_back() {
 }
 
 #[test]
+fn gateway_rejects_a_transaction_for_a_stale_or_future_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("node.json");
+    let config = NodeConfig::new(
+        directory.path().join("data"),
+        7,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        20,
+        16,
+    )
+    .unwrap();
+    initialize_node(&config_path, &config, graph(DeploymentMode::PrimaryReplica)).unwrap();
+    let mut gateway = block_on(GatewayService::open(config)).unwrap();
+    let payload = CanonicalElement::new(1, BTreeMap::new());
+    let response = block_on(gateway.execute_request(GatewayRequest {
+        version: GATEWAY_API_VERSION,
+        request_id: "wrong-schema".into(),
+        operation: GatewayOperation::Transaction {
+            schema_version: 2,
+            ttl_micros: 10_000,
+            mutations: vec![ApiMutation::PutVertex {
+                partition: 0,
+                vertex_id: "9".into(),
+                label_id: 1,
+                valid_from_micros: 0,
+                valid_to_micros: None,
+                payload_dtp1: hex(&payload.encode().unwrap()),
+            }],
+        },
+    }));
+    let response = serde_json::to_value(response).unwrap();
+    assert_eq!(response["ok"], false);
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("schema version")
+    );
+}
+
+#[test]
 fn online_backend_migration_snapshots_cuts_over_and_publishes_catalog_generation() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("node.json");
@@ -268,6 +310,41 @@ fn bounded_tcp_gateway_serves_a_canonical_status_frame() {
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["graph_name"], "graph-7");
     server.join().unwrap();
+}
+
+#[test]
+fn malformed_client_frame_does_not_terminate_the_gateway_listener() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("node.json");
+    let config = NodeConfig::new(
+        directory.path().join("data"),
+        7,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        20,
+        16,
+    )
+    .unwrap();
+    initialize_node(&config_path, &config, graph(DeploymentMode::PrimaryReplica)).unwrap();
+    let gateway = block_on(GatewayService::open(config)).unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || serve(gateway, listener, Some(1)));
+
+    let mut malformed = TcpStream::connect(address).unwrap();
+    malformed.write_all(&0_u32.to_be_bytes()).unwrap();
+    malformed.shutdown(Shutdown::Both).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let mut valid = TcpStream::connect(address).unwrap();
+    write_frame(
+        &mut valid,
+        br#"{"version":1,"request_id":"after-malformed","operation":"status"}"#,
+    )
+    .unwrap();
+    let response: serde_json::Value =
+        serde_json::from_slice(&read_frame(&mut valid).unwrap()).unwrap();
+    assert_eq!(response["ok"], true);
+    server.join().unwrap().unwrap();
 }
 
 fn graph(mode: DeploymentMode) -> GraphDefinition {

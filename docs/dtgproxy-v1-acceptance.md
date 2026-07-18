@@ -1,6 +1,7 @@
 # DTGProxy 1.0 main-path acceptance
 
-This document records the implemented prototype boundary before the separate final hardening audit.
+This document records the implemented prototype main path. The separate
+[final boundary audit](dtgproxy-v1-boundary-audit.md) records fixes and remaining production gates.
 
 | Capability | Executable evidence |
 |---|---|
@@ -33,6 +34,10 @@ Ignored live tests require disposable services:
 - `DTGPROXY_POSTGRES_URL` for PostgreSQL.
 - `DTGPROXY_NEO4J_ENDPOINT`, `DTGPROXY_NEO4J_PASSWORD`, and optionally `DTGPROXY_NEO4J_USERNAME`/`DTGPROXY_NEO4J_DATABASE` for Neo4j.
 
-## Deliberately deferred to the final boundary audit
+## Boundary status
 
-Malformed Sidecar frames, session reaping/resource exhaustion, crash injection through every migration cutover window, disk-full/corruption, network packet-loss matrices, secret-redaction/SBOM review, and throughput/capacity characterization are audited only after the main code path is complete. They are not claimed by this acceptance record.
+Malformed Gateway isolation, Sidecar connection reuse/session bounds, schema fencing, timeout
+handling, and startup transaction recovery were closed by the final audit. Durable migration
+cutover orchestration, external-service matrices, untrusted-network security, streaming
+backpressure, disk-full testing, SBOM review, and service capacity qualification remain production
+gates and are not claimed by this acceptance record.

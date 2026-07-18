@@ -26,8 +26,8 @@ use storage_api::{
 
 mod service;
 pub use service::{
-    SidecarRestoreBackend, SidecarService, TcpSidecarAdapterFactory,
-    spawn_stateful_tcp_sidecar_server,
+    MAX_ACTIVE_SNAPSHOT_SESSIONS, SNAPSHOT_SESSION_IDLE_TIMEOUT, SidecarRestoreBackend,
+    SidecarService, TcpSidecarAdapterFactory, spawn_stateful_tcp_sidecar_server,
 };
 
 const MAGIC: [u8; 4] = *b"DTAS";

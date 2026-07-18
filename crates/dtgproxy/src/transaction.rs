@@ -18,7 +18,8 @@ use temporal_types::TransactionTime;
 use timestamp_oracle::{TimestampOracle, TimestampOracleError};
 use txn_protocol::{
     HomeDecisionEngine, HomeTransactionRecord, IsolationLevel, ParticipantEngine, ParticipantProof,
-    PrewriteRequest, ShardEpoch, TransactionId, TransactionState, TxnProtocolError,
+    ParticipantRecoveryRecord, PrewriteRequest, RecoveryAction, ShardEpoch, TransactionId,
+    TransactionState, TxnProtocolError, recovery_action,
 };
 
 use crate::InProcessDeploymentRuntime;
@@ -146,6 +147,36 @@ pub enum TransactionStatus {
     Preparing,
     Committed { commit_ts: TransactionTime },
     Aborted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransactionRecoveryReceipt {
+    scanned_records: usize,
+    waiting: usize,
+    finalized: usize,
+    aborted: usize,
+}
+
+impl TransactionRecoveryReceipt {
+    #[must_use]
+    pub const fn scanned_records(self) -> usize {
+        self.scanned_records
+    }
+
+    #[must_use]
+    pub const fn waiting(self) -> usize {
+        self.waiting
+    }
+
+    #[must_use]
+    pub const fn finalized(self) -> usize {
+        self.finalized
+    }
+
+    #[must_use]
+    pub const fn aborted(self) -> usize {
+        self.aborted
+    }
 }
 
 impl TransactionReceipt {
@@ -636,6 +667,128 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         Ok(TransactionStatus::Unknown)
     }
 
+    pub async fn recover_pending(
+        &self,
+        runtime: &mut InProcessDeploymentRuntime,
+    ) -> Result<TransactionRecoveryReceipt, TransactionCoordinatorError> {
+        let observed_at = self.oracle.next()?;
+        let placements = runtime.config().all_shards().to_vec();
+        let mut records = Vec::new();
+        let mut receipt = TransactionRecoveryReceipt::default();
+        for placement in placements {
+            let participant = ShardEpoch::new(placement.shard_id(), placement.placement_epoch())?;
+            let rows = {
+                let group = runtime.raft_mut().group_mut(participant.shard_id())?;
+                let leader_id = group
+                    .leader_id()
+                    .ok_or(TransactionCoordinatorError::NoLeader {
+                        shard_id: participant.shard_id(),
+                    })?;
+                let permit = group
+                    .leader_read_permit(leader_id, participant.placement_epoch(), self.max_ticks)
+                    .await?;
+                group
+                    .replica_adapter(permit.node_id())
+                    .ok_or(TransactionCoordinatorError::NoLeader {
+                        shard_id: participant.shard_id(),
+                    })?
+                    .scan(&ParticipantEngine::recovery_span(participant))
+                    .await?
+            };
+            receipt.scanned_records = receipt.scanned_records.saturating_add(rows.len());
+            for row in rows {
+                let record = ParticipantEngine::recovery_record(row.value())?;
+                if record.request().participant() != participant {
+                    return Err(TransactionCoordinatorError::StalePlacementEpoch {
+                        shard_id: participant.shard_id(),
+                        expected: participant.placement_epoch(),
+                        actual: record.request().participant().placement_epoch(),
+                    });
+                }
+                if record.state() == TransactionState::Preparing {
+                    records.push(record);
+                }
+            }
+        }
+
+        for record in records {
+            let request = record.request();
+            let home_key =
+                HomeDecisionEngine::inspection_key(request.home(), request.transaction_id())?;
+            let home_bytes = {
+                let group = runtime.raft_mut().group_mut(request.home().shard_id())?;
+                let leader_id = group
+                    .leader_id()
+                    .ok_or(TransactionCoordinatorError::NoLeader {
+                        shard_id: request.home().shard_id(),
+                    })?;
+                let permit = group
+                    .leader_read_permit(leader_id, request.home().placement_epoch(), self.max_ticks)
+                    .await?;
+                group
+                    .replica_adapter(permit.node_id())
+                    .ok_or(TransactionCoordinatorError::NoLeader {
+                        shard_id: request.home().shard_id(),
+                    })?
+                    .multi_get(std::slice::from_ref(&home_key))
+                    .await?
+                    .pop()
+                    .flatten()
+            };
+            let home = home_bytes
+                .as_deref()
+                .map(HomeTransactionRecord::decode)
+                .transpose()?;
+            match recovery_action(home.as_ref(), request.expires_at(), observed_at) {
+                RecoveryAction::Wait => {
+                    receipt.waiting = receipt.waiting.saturating_add(1);
+                }
+                RecoveryAction::RollForward { commit_ts } => {
+                    let command = recovery_finalize_command(&record, commit_ts)?;
+                    runtime
+                        .propose_shard(request.participant().shard_id(), command, self.max_ticks)
+                        .await?;
+                    receipt.finalized = receipt.finalized.saturating_add(1);
+                }
+                RecoveryAction::Rollback => {
+                    if home.is_none() {
+                        let decision = HomeTransactionRecord::new(
+                            request.transaction_id(),
+                            request.start_ts(),
+                            TransactionState::Aborted,
+                            None,
+                            request.participants().to_vec(),
+                            vec![record.proof().clone()],
+                        )?;
+                        let command = CommandEnvelopeV1::new(
+                            request.home().shard_id(),
+                            request.home().placement_epoch(),
+                            phase_request_id(
+                                request.transaction_id(),
+                                ABORT_DECISION_PHASE,
+                                request.home(),
+                            ),
+                            CommandBodyV1::RecordDecision(RecordDecisionV1 {
+                                home: request.home(),
+                                decision,
+                            }),
+                        )
+                        .encode()?;
+                        runtime
+                            .propose_shard(request.home().shard_id(), command, self.max_ticks)
+                            .await?;
+                    }
+                    let command = recovery_abort_command(&record)?;
+                    runtime
+                        .propose_shard(request.participant().shard_id(), command, self.max_ticks)
+                        .await?;
+                    receipt.aborted = receipt.aborted.saturating_add(1);
+                }
+            }
+        }
+        Ok(receipt)
+    }
+
     fn validate_write(
         &self,
         runtime: &InProcessDeploymentRuntime,
@@ -822,6 +975,50 @@ fn timestamp_successor(
             .ok_or(TransactionCoordinatorError::TimestampExhausted)?,
         0,
     ))
+}
+
+fn recovery_finalize_command(
+    record: &ParticipantRecoveryRecord,
+    commit_ts: TransactionTime,
+) -> Result<Vec<u8>, TransactionCoordinatorError> {
+    let request = record.request();
+    Ok(CommandEnvelopeV1::new(
+        request.participant().shard_id(),
+        request.participant().placement_epoch(),
+        phase_request_id(
+            request.transaction_id(),
+            FINALIZE_PHASE,
+            request.participant(),
+        ),
+        CommandBodyV1::Finalize(FinalizeV1 {
+            participant: request.participant(),
+            transaction_id: request.transaction_id(),
+            intent_digest: request.intent_digest(),
+            commit_ts,
+        }),
+    )
+    .encode()?)
+}
+
+fn recovery_abort_command(
+    record: &ParticipantRecoveryRecord,
+) -> Result<Vec<u8>, TransactionCoordinatorError> {
+    let request = record.request();
+    Ok(CommandEnvelopeV1::new(
+        request.participant().shard_id(),
+        request.participant().placement_epoch(),
+        phase_request_id(
+            request.transaction_id(),
+            ABORT_INTENT_PHASE,
+            request.participant(),
+        ),
+        CommandBodyV1::AbortIntent(AbortIntentV1 {
+            participant: request.participant(),
+            transaction_id: request.transaction_id(),
+            intent_digest: request.intent_digest(),
+        }),
+    )
+    .encode()?)
 }
 
 fn phase_request_id(transaction_id: TransactionId, phase: u8, participant: ShardEpoch) -> u128 {

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use adapter_registry::{
     AdapterFactory, AdapterFactoryError, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry,
@@ -64,18 +66,44 @@ impl SidecarRestoreBackend {
     }
 }
 
+pub const MAX_ACTIVE_SNAPSHOT_SESSIONS: usize = 64;
+pub const SNAPSHOT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 enum SnapshotSession {
+    Reserved {
+        last_activity: Instant,
+    },
     Export {
+        last_activity: Instant,
         started: ExportStarted,
         chunks: VecDeque<LogicalSnapshotChunkV1>,
         manifest: LogicalSnapshotManifestV1,
     },
     Restore {
+        last_activity: Instant,
         request: BeginRestoreRequest,
         chunks: Vec<LogicalSnapshotChunkV1>,
         accumulator: Box<LogicalSnapshotAccumulator>,
         last_chunk: Option<(u64, [u8; 32])>,
     },
+}
+
+impl SnapshotSession {
+    fn last_activity(&self) -> Instant {
+        match self {
+            Self::Reserved { last_activity }
+            | Self::Export { last_activity, .. }
+            | Self::Restore { last_activity, .. } => *last_activity,
+        }
+    }
+
+    fn touch(&mut self, now: Instant) {
+        match self {
+            Self::Reserved { last_activity }
+            | Self::Export { last_activity, .. }
+            | Self::Restore { last_activity, .. } => *last_activity = now,
+        }
+    }
 }
 
 pub struct SidecarService {
@@ -127,6 +155,31 @@ impl SidecarService {
 
     fn session_id(&self) -> u128 {
         u128::from(self.next_session.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn reserve_session(&self) -> Result<u128, RemoteError> {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
+        })?;
+        sessions.retain(|_, session| {
+            now.saturating_duration_since(session.last_activity()) < SNAPSHOT_SESSION_IDLE_TIMEOUT
+        });
+        if sessions.len() >= MAX_ACTIVE_SNAPSHOT_SESSIONS {
+            return Err(remote_error(
+                RemoteErrorCode::ResourceExhausted,
+                "active snapshot-session capacity is exhausted",
+            ));
+        }
+        let session_id = self.session_id();
+        sessions.insert(session_id, SnapshotSession::Reserved { last_activity: now });
+        Ok(session_id)
+    }
+
+    fn discard_session(&self, session_id: u128) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.remove(&session_id);
+        }
     }
 
     pub async fn dispatch(&self, request: Request) -> Response {
@@ -183,27 +236,38 @@ impl SidecarService {
         &self,
         request: super::BeginExportRequest,
     ) -> Result<Response, RemoteError> {
-        let active = self.active_adapter()?;
-        let mut reader = active
-            .begin_logical_export(request.limits)
-            .await
-            .map_err(adapter_remote_error)?;
-        if request
-            .expected_applied_log_index
-            .is_some_and(|expected| expected != reader.header().applied_log_index())
-        {
-            return Err(remote_error(
-                RemoteErrorCode::RequestReplayMismatch,
-                "export applied-index fence does not match the Adapter",
-            ));
+        let session_id = self.reserve_session()?;
+        let prepared = async {
+            let active = self.active_adapter()?;
+            let mut reader = active
+                .begin_logical_export(request.limits)
+                .await
+                .map_err(adapter_remote_error)?;
+            if request
+                .expected_applied_log_index
+                .is_some_and(|expected| expected != reader.header().applied_log_index())
+            {
+                return Err(remote_error(
+                    RemoteErrorCode::RequestReplayMismatch,
+                    "export applied-index fence does not match the Adapter",
+                ));
+            }
+            let header = reader.header().clone();
+            let mut chunks = VecDeque::new();
+            while let Some(chunk) = reader.next_chunk().await.map_err(adapter_remote_error)? {
+                chunks.push_back(chunk);
+            }
+            let manifest = reader.finish().await.map_err(adapter_remote_error)?;
+            Ok((header, chunks, manifest))
         }
-        let header = reader.header().clone();
-        let mut chunks = VecDeque::new();
-        while let Some(chunk) = reader.next_chunk().await.map_err(adapter_remote_error)? {
-            chunks.push_back(chunk);
-        }
-        let manifest = reader.finish().await.map_err(adapter_remote_error)?;
-        let session_id = self.session_id();
+        .await;
+        let (header, chunks, manifest) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.discard_session(session_id);
+                return Err(error);
+            }
+        };
         let started = ExportStarted {
             session_id,
             header,
@@ -215,6 +279,7 @@ impl SidecarService {
             .insert(
                 session_id,
                 SnapshotSession::Export {
+                    last_activity: Instant::now(),
                     started: started.clone(),
                     chunks,
                     manifest,
@@ -231,13 +296,25 @@ impl SidecarService {
         let mut sessions = self.sessions.lock().map_err(|_| {
             remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
         })?;
+        let now = Instant::now();
+        if sessions.get(&session_id).is_some_and(|session| {
+            now.saturating_duration_since(session.last_activity()) >= SNAPSHOT_SESSION_IDLE_TIMEOUT
+        }) {
+            sessions.remove(&session_id);
+            return Err(remote_error(
+                RemoteErrorCode::SessionExpired,
+                "export session expired",
+            ));
+        }
         let session = sessions.get_mut(&session_id).ok_or_else(|| {
             remote_error(RemoteErrorCode::SessionUnknown, "unknown export session")
         })?;
+        session.touch(now);
         let SnapshotSession::Export {
             started,
             chunks,
             manifest,
+            ..
         } = session
         else {
             return Err(remote_error(
@@ -280,13 +357,14 @@ impl SidecarService {
                 "restore is not configured on this Sidecar",
             )
         })?;
-        let session_id = self.session_id();
+        let session_id = self.reserve_session()?;
         self.sessions
             .lock()
             .map_err(|_| remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned"))?
             .insert(
                 session_id,
                 SnapshotSession::Restore {
+                    last_activity: Instant::now(),
                     accumulator: Box::new(LogicalSnapshotAccumulator::new(request.header.clone())),
                     request,
                     chunks: Vec::new(),
@@ -311,14 +389,26 @@ impl SidecarService {
         let mut sessions = self.sessions.lock().map_err(|_| {
             remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
         })?;
+        let now = Instant::now();
+        if sessions.get(&session_id).is_some_and(|session| {
+            now.saturating_duration_since(session.last_activity()) >= SNAPSHOT_SESSION_IDLE_TIMEOUT
+        }) {
+            sessions.remove(&session_id);
+            return Err(remote_error(
+                RemoteErrorCode::SessionExpired,
+                "restore session expired",
+            ));
+        }
+        let session = sessions.get_mut(&session_id).ok_or_else(|| {
+            remote_error(RemoteErrorCode::SessionUnknown, "unknown restore session")
+        })?;
+        session.touch(now);
         let SnapshotSession::Restore {
             chunks,
             accumulator,
             last_chunk,
             ..
-        } = sessions.get_mut(&session_id).ok_or_else(|| {
-            remote_error(RemoteErrorCode::SessionUnknown, "unknown restore session")
-        })?
+        } = session
         else {
             return Err(remote_error(
                 RemoteErrorCode::SessionKindMismatch,
@@ -350,14 +440,25 @@ impl SidecarService {
         session_id: u128,
         manifest: LogicalSnapshotManifestV1,
     ) -> Result<Response, RemoteError> {
-        let session = self
-            .sessions
-            .lock()
-            .map_err(|_| remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned"))?
-            .remove(&session_id)
-            .ok_or_else(|| {
+        let (session, expired) = {
+            let mut sessions = self.sessions.lock().map_err(|_| {
+                remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
+            })?;
+            let expired = sessions.get(&session_id).is_some_and(|session| {
+                Instant::now().saturating_duration_since(session.last_activity())
+                    >= SNAPSHOT_SESSION_IDLE_TIMEOUT
+            });
+            let session = sessions.remove(&session_id).ok_or_else(|| {
                 remote_error(RemoteErrorCode::SessionUnknown, "unknown restore session")
             })?;
+            (session, expired)
+        };
+        if expired {
+            return Err(remote_error(
+                RemoteErrorCode::SessionExpired,
+                "restore session expired",
+            ));
+        }
         let SnapshotSession::Restore {
             request,
             chunks,
@@ -412,11 +513,20 @@ impl SidecarService {
     }
 
     fn abort_session(&self, session_id: u128) -> Result<Response, RemoteError> {
-        self.sessions
+        let session = self
+            .sessions
             .lock()
             .map_err(|_| remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned"))?
             .remove(&session_id)
             .ok_or_else(|| remote_error(RemoteErrorCode::SessionUnknown, "unknown session"))?;
+        if Instant::now().saturating_duration_since(session.last_activity())
+            >= SNAPSHOT_SESSION_IDLE_TIMEOUT
+        {
+            return Err(remote_error(
+                RemoteErrorCode::SessionExpired,
+                "snapshot session expired",
+            ));
+        }
         Ok(Response::SessionAborted { session_id })
     }
 }
@@ -497,58 +607,13 @@ pub fn spawn_stateful_tcp_sidecar_server(
     let server_thread = std::thread::Builder::new()
         .name("dtg-stateful-sidecar-accept".into())
         .spawn(move || {
-            let mut workers = Vec::new();
-            while !thread_shutdown.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream
-                            .set_nonblocking(false)
-                            .map_err(|error| super::SidecarServerError::Io(error.to_string()))?;
-                        if workers.len() >= config.worker_threads {
-                            let _ = stream.shutdown(Shutdown::Both);
-                            continue;
-                        }
-                        let connection_id =
-                            super::NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                        let control = stream
-                            .try_clone()
-                            .map_err(|error| super::SidecarServerError::Io(error.to_string()))?;
-                        thread_connections
-                            .lock()
-                            .map_err(|_| super::SidecarServerError::StatePoisoned)?
-                            .insert(connection_id, control);
-                        let worker_service = Arc::clone(&service);
-                        let worker_connections = Arc::clone(&thread_connections);
-                        workers.push(std::thread::spawn(move || {
-                            let result = serve_stateful_connection(stream, &worker_service);
-                            if let Ok(mut connections) = worker_connections.lock() {
-                                connections.remove(&connection_id);
-                            }
-                            result
-                        }));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(config.accept_poll_interval);
-                    }
-                    Err(error) => {
-                        return Err(super::SidecarServerError::Io(error.to_string()));
-                    }
-                }
-            }
-            for stream in thread_connections
-                .lock()
-                .map_err(|_| super::SidecarServerError::StatePoisoned)?
-                .values()
-            {
-                let _ = stream.shutdown(Shutdown::Both);
-            }
-            for worker in workers {
-                worker
-                    .join()
-                    .map_err(|_| super::SidecarServerError::WorkerPanicked)?
-                    .map_err(|error| super::SidecarServerError::Io(error.to_string()))?;
-            }
-            Ok(())
+            run_stateful_tcp_sidecar_server(
+                listener,
+                config,
+                service,
+                thread_shutdown,
+                thread_connections,
+            )
         })
         .map_err(|error| super::SidecarServerError::Io(error.to_string()))?;
     Ok(TcpSidecarServerHandle {
@@ -557,6 +622,112 @@ pub fn spawn_stateful_tcp_sidecar_server(
         active_connections,
         server_thread: Some(server_thread),
     })
+}
+
+fn run_stateful_tcp_sidecar_server(
+    listener: TcpListener,
+    config: TcpSidecarServerConfig,
+    service: Arc<SidecarService>,
+    shutdown: Arc<AtomicBool>,
+    active_connections: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
+) -> Result<(), super::SidecarServerError> {
+    let (sender, receiver) = mpsc::sync_channel(config.pending_connections);
+    let receiver = Arc::new(Mutex::new(receiver));
+    let mut workers = Vec::with_capacity(config.worker_threads);
+    for worker_id in 0..config.worker_threads {
+        let worker_service = Arc::clone(&service);
+        let worker_receiver = Arc::clone(&receiver);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_connections = Arc::clone(&active_connections);
+        workers.push(
+            std::thread::Builder::new()
+                .name(format!("dtg-stateful-sidecar-worker-{worker_id}"))
+                .spawn(move || {
+                    stateful_sidecar_worker_loop(
+                        worker_service,
+                        worker_receiver,
+                        worker_shutdown,
+                        worker_connections,
+                        config.accept_poll_interval,
+                    )
+                })
+                .map_err(|error| super::SidecarServerError::Io(error.to_string()))?,
+        );
+    }
+
+    let accept_result = loop {
+        if shutdown.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Err(error) = stream
+                    .set_nonblocking(false)
+                    .and_then(|()| stream.set_nodelay(true))
+                {
+                    break Err(super::SidecarServerError::Io(error.to_string()));
+                }
+                match sender.try_send(stream) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => break Ok(()),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(config.accept_poll_interval);
+            }
+            Err(error) => break Err(super::SidecarServerError::Io(error.to_string())),
+        }
+    };
+    shutdown.store(true, Ordering::Release);
+    drop(sender);
+    super::close_active_connections(&active_connections)?;
+    for worker in workers {
+        worker
+            .join()
+            .map_err(|_| super::SidecarServerError::WorkerPanicked)??;
+    }
+    accept_result
+}
+
+fn stateful_sidecar_worker_loop(
+    service: Arc<SidecarService>,
+    receiver: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
+    shutdown: Arc<AtomicBool>,
+    active_connections: Arc<Mutex<BTreeMap<u64, TcpStream>>>,
+    poll_interval: std::time::Duration,
+) -> Result<(), super::SidecarServerError> {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let received = receiver
+            .lock()
+            .map_err(|_| super::SidecarServerError::StatePoisoned)?
+            .recv_timeout(poll_interval);
+        let stream = match received {
+            Ok(stream) => stream,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let connection_id = super::NEXT_SERVER_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let control = stream
+            .try_clone()
+            .map_err(|error| super::SidecarServerError::Io(error.to_string()))?;
+        active_connections
+            .lock()
+            .map_err(|_| super::SidecarServerError::StatePoisoned)?
+            .insert(connection_id, control);
+        if shutdown.load(Ordering::Acquire) {
+            let _ = stream.shutdown(Shutdown::Both);
+        } else {
+            let _ = serve_stateful_connection(stream, &service);
+        }
+        active_connections
+            .lock()
+            .map_err(|_| super::SidecarServerError::StatePoisoned)?
+            .remove(&connection_id);
+    }
 }
 
 fn serve_stateful_connection(
@@ -763,10 +934,31 @@ fn transport_from_request(
         .unwrap_or("2")
         .parse::<usize>()
         .map_err(|_| AdapterFactoryError::new("invalid Sidecar pool_size"))?;
+    let connect_timeout = timeout_parameter(request, "connect_timeout_ms", 3_000)?;
+    let read_timeout = timeout_parameter(request, "read_timeout_ms", 10_000)?;
+    let write_timeout = timeout_parameter(request, "write_timeout_ms", 10_000)?;
     let config = TcpSidecarConfig::new(endpoint)
         .with_pool_size(pool_size)
+        .and_then(|config| config.with_timeouts(connect_timeout, read_timeout, write_timeout))
         .map_err(factory_error)?;
     TcpSidecarTransport::connect(config).map_err(factory_error)
+}
+
+fn timeout_parameter(
+    request: &AdapterOpenRequest,
+    name: &str,
+    default_millis: u64,
+) -> Result<Duration, AdapterFactoryError> {
+    let millis = request
+        .parameter(name)
+        .map_or(Ok(default_millis), str::parse::<u64>)
+        .map_err(|_| AdapterFactoryError::new(format!("invalid Sidecar {name}")))?;
+    if millis == 0 {
+        return Err(AdapterFactoryError::new(format!(
+            "Sidecar {name} must be positive"
+        )));
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 fn is_transport_parameter(name: &str) -> bool {

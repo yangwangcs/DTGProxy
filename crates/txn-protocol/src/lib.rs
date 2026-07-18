@@ -11,5 +11,6 @@ pub use model::{
     ShardEpoch, TransactionId, TransactionState, TxnProtocolError, recovery_action,
 };
 pub use participant::{
-    AbortOutcome, FinalizeOutcome, ParticipantEngine, ParticipantRecordStatus, PrewriteOutcome,
+    AbortOutcome, FinalizeOutcome, ParticipantEngine, ParticipantRecordStatus,
+    ParticipantRecoveryRecord, PrewriteOutcome,
 };
