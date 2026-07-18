@@ -182,6 +182,37 @@ async fn stale_epoch_is_rejected_before_a_command_reaches_raft() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn proposal_outcome_reports_durable_request_replay() {
+    let temporary = tempdir().unwrap();
+    let node_config = config(temporary.path());
+    let host = DataNodeHost::open(node_config.clone(), 8).await.unwrap();
+    host.ensure_replica(spec(11)).await.unwrap();
+    host.campaign(key(11)).await.unwrap();
+    let bytes = command(11, 101, 100, b"once");
+
+    let first = host
+        .propose_with_outcome(key(11), 3, 101, bytes.clone())
+        .await
+        .unwrap();
+    assert!(!first.duplicate());
+    let replay = host
+        .propose_with_outcome(key(11), 3, 101, bytes.clone())
+        .await
+        .unwrap();
+    assert!(replay.duplicate());
+    host.shutdown().await.unwrap();
+
+    let reopened = DataNodeHost::open(node_config, 8).await.unwrap();
+    reopened.campaign(key(11)).await.unwrap();
+    let after_restart = reopened
+        .propose_with_outcome(key(11), 3, 101, bytes)
+        .await
+        .unwrap();
+    assert!(after_restart.duplicate());
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn routed_raft_messages_are_validated_before_replica_dispatch() {
     let temporary = tempdir().unwrap();
     let host = DataNodeHost::open(config(temporary.path()), 8)

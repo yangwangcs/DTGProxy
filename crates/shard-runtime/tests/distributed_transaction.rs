@@ -186,7 +186,7 @@ fn replicated_abort_releases_intent_without_materializing_business_data() {
 }
 
 #[test]
-fn a_client_retry_in_a_new_log_entry_does_not_collide_with_adapter_fingerprints() {
+fn a_client_retry_in_a_new_log_entry_advances_raft_without_reapplying_business_state() {
     let request = request(99, 100);
     let proof = ParticipantProof::new(
         participant(),
@@ -207,7 +207,7 @@ fn a_client_retry_in_a_new_log_entry_does_not_collide_with_adapter_fingerprints(
             .duplicate
     );
     assert!(
-        !block_on(machine.apply_entry(1, 2, &prewrite))
+        block_on(machine.apply_entry(1, 2, &prewrite))
             .unwrap()
             .duplicate
     );

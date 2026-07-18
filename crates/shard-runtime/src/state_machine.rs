@@ -11,9 +11,10 @@ use temporal_types::TransactionTime;
 use crate::ShardRuntimeError;
 use crate::metadata::{
     ReplicaMetadata, adapter_applied_ts_key, closed_ts_key, decode_entry_digest,
-    encode_entry_digest, encode_position, encode_timestamp, encode_unresolved_intent,
-    entry_digest_key, is_reserved_metadata_key, load_metadata, load_unresolved_intents,
-    position_key, resolved_ts_key, unresolved_intent_key,
+    decode_request_digest, encode_entry_digest, encode_position, encode_request_digest,
+    encode_timestamp, encode_unresolved_intent, entry_digest_key, is_reserved_metadata_key,
+    load_metadata, load_unresolved_intents, position_key, request_digest_key, resolved_ts_key,
+    unresolved_intent_key,
 };
 use txn_protocol::{HomeDecisionEngine, ParticipantEngine, TransactionId};
 
@@ -142,10 +143,32 @@ where
             });
         }
 
-        let prepared = self.prepare_apply(term, index, command.body).await?;
+        let request_id = command.request_id;
+        let request_digest = command_digest(command_bytes);
+        let request_duplicate = self.request_disposition(request_id, request_digest).await?;
+        let prepared = if request_duplicate {
+            PreparedApply {
+                metadata: ReplicaMetadata {
+                    last_term: term,
+                    applied_index: index,
+                    ..self.metadata
+                },
+                mutations: Vec::new(),
+                unresolved_change: UnresolvedChange::None,
+            }
+        } else {
+            self.prepare_apply(term, index, command.body).await?
+        };
         let next_metadata = prepared.metadata;
         let mut mutations = prepared.mutations;
         append_unresolved_change(&mut mutations, prepared.unresolved_change)?;
+        if !request_duplicate {
+            append_meta_mutation(
+                &mut mutations,
+                request_digest_key(request_id),
+                encode_request_digest(request_digest),
+            )?;
+        }
         append_meta_mutation(
             &mut mutations,
             entry_digest_key(index),
@@ -180,7 +203,10 @@ where
         self.metadata = next_metadata;
         self.unresolved.apply(prepared.unresolved_change)?;
         self.faulted_at = None;
-        Ok(receipt)
+        Ok(ApplyReceipt {
+            applied_log_index: receipt.applied_log_index,
+            duplicate: request_duplicate || receipt.duplicate,
+        })
     }
 
     pub async fn apply_noop_entry(
@@ -571,6 +597,43 @@ where
         }
         Ok(())
     }
+
+    pub async fn request_replay(
+        &self,
+        request_id: u128,
+        command_bytes: &[u8],
+    ) -> Result<bool, ShardRuntimeError> {
+        let command = CommandEnvelopeV1::decode(command_bytes)?;
+        self.validate_authority(&command)?;
+        if command.request_id != request_id {
+            return Err(ShardRuntimeError::RequestEnvelopeMismatch {
+                expected: request_id,
+                actual: command.request_id,
+            });
+        }
+        self.request_disposition(request_id, command_digest(command_bytes))
+            .await
+    }
+
+    async fn request_disposition(
+        &self,
+        request_id: u128,
+        expected_digest: [u8; 32],
+    ) -> Result<bool, ShardRuntimeError> {
+        let value = self
+            .adapter
+            .multi_get(&[request_digest_key(request_id)])
+            .await?
+            .pop()
+            .flatten();
+        let Some(value) = value else {
+            return Ok(false);
+        };
+        if decode_request_digest(&value)? != expected_digest {
+            return Err(ShardRuntimeError::RequestMismatch { request_id });
+        }
+        Ok(true)
+    }
 }
 
 struct PreparedApply {
@@ -831,4 +894,8 @@ fn entry_digest(term: u64, index: u64, command_bytes: &[u8]) -> [u8; 32] {
     );
     hasher.update(command_bytes);
     *hasher.finalize().as_bytes()
+}
+
+fn command_digest(command_bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(command_bytes).as_bytes()
 }

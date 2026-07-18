@@ -12,15 +12,18 @@ const CLOSED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/closed-ts";
 const RESOLVED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/resolved-ts";
 const ADAPTER_APPLIED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/adapter-applied-ts";
 const ENTRY_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/entry/";
+const REQUEST_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/request/";
 const UNRESOLVED_INTENT_PREFIX: &[u8] = b"\x01dtg/replica/v1/unresolved/";
 const META_VERSION: u16 = 1;
 const POSITION_MAGIC: [u8; 4] = *b"DTRP";
 const TIMESTAMP_MAGIC: [u8; 4] = *b"DTTM";
 const ENTRY_DIGEST_MAGIC: [u8; 4] = *b"DTRE";
+const REQUEST_DIGEST_MAGIC: [u8; 4] = *b"DTRQ";
 const UNRESOLVED_INTENT_MAGIC: [u8; 4] = *b"DTRU";
 const POSITION_VALUE_BYTES: usize = 38;
 const TIMESTAMP_VALUE_BYTES: usize = 22;
 const ENTRY_DIGEST_VALUE_BYTES: usize = 50;
+const REQUEST_DIGEST_VALUE_BYTES: usize = 42;
 
 pub const MIN_REPLICA_TIME: TransactionTime = TransactionTime::new(i64::MIN, 0);
 
@@ -203,6 +206,13 @@ pub(crate) fn entry_digest_key(index: u64) -> LogicalKey {
     meta_key(key)
 }
 
+pub(crate) fn request_digest_key(request_id: u128) -> LogicalKey {
+    let mut key = Vec::with_capacity(REQUEST_DIGEST_PREFIX.len() + 16);
+    key.extend_from_slice(REQUEST_DIGEST_PREFIX);
+    key.extend_from_slice(&request_id.to_be_bytes());
+    meta_key(key)
+}
+
 pub(crate) fn unresolved_intent_key(transaction_id: u128) -> LogicalKey {
     let mut key = Vec::with_capacity(UNRESOLVED_INTENT_PREFIX.len() + 16);
     key.extend_from_slice(UNRESOLVED_INTENT_PREFIX);
@@ -305,6 +315,27 @@ pub(crate) fn decode_entry_digest(bytes: &[u8]) -> Result<(u64, [u8; 32]), Shard
     ))
 }
 
+pub(crate) fn encode_request_digest(digest: [u8; 32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(REQUEST_DIGEST_VALUE_BYTES);
+    bytes.extend_from_slice(&REQUEST_DIGEST_MAGIC);
+    bytes.extend_from_slice(&META_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&digest);
+    append_checksum(&mut bytes);
+    bytes
+}
+
+pub(crate) fn decode_request_digest(bytes: &[u8]) -> Result<[u8; 32], ShardRuntimeError> {
+    validate_record(
+        bytes,
+        REQUEST_DIGEST_VALUE_BYTES,
+        REQUEST_DIGEST_MAGIC,
+        "request-digest",
+    )?;
+    Ok(bytes[6..38]
+        .try_into()
+        .expect("fixed request digest hash slice"))
+}
+
 fn append_checksum(bytes: &mut Vec<u8>) {
     let checksum = crc32fast::hash(bytes);
     bytes.extend_from_slice(&checksum.to_be_bytes());
@@ -343,7 +374,8 @@ fn validate_record(
 mod tests {
     use super::{
         ENTRY_DIGEST_VALUE_BYTES, ReplicaMetadata, decode_entry_digest, decode_position,
-        decode_timestamp, encode_entry_digest, encode_position, encode_timestamp,
+        decode_request_digest, decode_timestamp, encode_entry_digest, encode_position,
+        encode_request_digest, encode_timestamp,
     };
     use crate::ShardRuntimeError;
     use temporal_types::TransactionTime;
@@ -371,6 +403,10 @@ mod tests {
         assert_eq!(
             decode_entry_digest(&encode_entry_digest(29, digest)).unwrap(),
             (29, digest)
+        );
+        assert_eq!(
+            decode_request_digest(&encode_request_digest(digest)).unwrap(),
+            digest
         );
 
         let mut corrupted = encode_entry_digest(29, digest);

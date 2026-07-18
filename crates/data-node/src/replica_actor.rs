@@ -7,7 +7,7 @@ use storage_api::{LogicalKey, StorageAdapter};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::{HostError, ReplicaSpec, ReplicaStatus};
+use crate::{HostError, ProposalOutcome, ReplicaSpec, ReplicaStatus};
 
 const MAX_READY_ROUNDS: usize = 256;
 
@@ -110,7 +110,7 @@ pub(crate) enum ActorCommand {
     Propose {
         request_id: u128,
         command: Vec<u8>,
-        response: oneshot::Sender<Result<ReplicaStatus, HostError>>,
+        response: oneshot::Sender<Result<ProposalOutcome, HostError>>,
     },
     Step {
         message: Box<Message>,
@@ -147,11 +147,18 @@ async fn run_actor(
                 command,
                 response,
             } => {
-                let result = match replica.propose(request_id, command) {
-                    Ok(()) => drive_ready(&mut replica, &outbound)
-                        .await
-                        .map(|()| status(&replica, &spec)),
-                    Err(error) => Err(HostError::from_durable(error)),
+                let result = match replica
+                    .state_machine()
+                    .request_replay(request_id, &command)
+                    .await
+                {
+                    Ok(duplicate) => match replica.propose(request_id, command) {
+                        Ok(()) => drive_ready(&mut replica, &outbound)
+                            .await
+                            .map(|()| ProposalOutcome::new(status(&replica, &spec), duplicate)),
+                        Err(error) => Err(HostError::from_durable(error)),
+                    },
+                    Err(error) => Err(HostError::from_runtime(error)),
                 };
                 let _ = response.send(result);
             }
@@ -219,6 +226,8 @@ fn status(replica: &DurableRaftReplica, spec: &ReplicaSpec) -> ReplicaStatus {
         replica.node_id(),
         replica.is_leader(),
         replica.leader_id(),
+        replica.current_term(),
+        replica.commit_index(),
         replica.metadata().applied_index,
         spec.role(),
         spec.schema_version(),

@@ -1,19 +1,27 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod file_config;
 mod host;
 mod identity;
 mod manifest;
 mod raft_network;
 mod replica_actor;
+mod service;
 
 pub use config::{ConfigError, NodeConfig, TlsFiles, TransportSecurity};
+pub use file_config::{DataNodeRuntimeConfig, FileConfigError};
 pub use host::{
-    DataNodeHost, EnsureReplicaOutcome, HostError, ReplicaKey, ReplicaSpec, ReplicaStatus,
+    DataNodeHost, EnsureReplicaOutcome, HostError, ProposalOutcome, ReplicaKey, ReplicaSpec,
+    ReplicaStatus,
 };
 pub use identity::{NodeIdentity, NodeIdentityStore};
 pub use manifest::{ReplicaEntry, ReplicaManifest, ReplicaManifestStore, ReplicaRole};
 pub use raft_network::{RaftDelivery, RaftNetworkError, SharedRaftTransport};
+pub use service::{
+    DataNodeGrpcService, DataOperation, ReadCodecError, ReplicaProfileError, RequestAuthorizer,
+    decode_key_read_result, encode_key_read_plan, encode_rocks_replica_profile,
+};
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};

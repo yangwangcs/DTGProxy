@@ -140,6 +140,29 @@ fn old_entry_replay_is_idempotent_but_divergent_replay_fails_closed() {
 }
 
 #[test]
+fn request_id_replay_at_a_new_log_index_is_durable_and_payload_bound() {
+    let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
+    let original = apply_command(9, 101, 100, b"v1");
+    assert!(
+        !block_on(machine.apply_entry(1, 1, &original))
+            .unwrap()
+            .duplicate
+    );
+
+    let replay = block_on(machine.apply_entry(1, 2, &original)).unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.applied_log_index, 2);
+    assert_eq!(read_current(machine.adapter()), Some(b"v1".to_vec()));
+
+    assert!(matches!(
+        block_on(machine.apply_entry(1, 3, &apply_command(9, 101, 200, b"different"))),
+        Err(ShardRuntimeError::RequestMismatch { request_id: 101 })
+    ));
+    assert_eq!(machine.metadata().applied_index, 2);
+    assert_eq!(read_current(machine.adapter()), Some(b"v1".to_vec()));
+}
+
+#[test]
 fn raft_leader_noop_entries_advance_the_same_durable_apply_index() {
     let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
     block_on(machine.apply_noop_entry(1, 1)).unwrap();

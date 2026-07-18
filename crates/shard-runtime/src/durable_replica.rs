@@ -75,6 +75,16 @@ impl DurableRaftReplica {
     }
 
     #[must_use]
+    pub fn current_term(&self) -> u64 {
+        self.raw_node.raft.term
+    }
+
+    #[must_use]
+    pub fn commit_index(&self) -> u64 {
+        self.raw_node.raft.raft_log.committed
+    }
+
+    #[must_use]
     pub fn has_ready(&self) -> bool {
         self.raw_node.has_ready()
     }

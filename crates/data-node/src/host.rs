@@ -135,6 +135,8 @@ pub struct ReplicaStatus {
     node_id: u64,
     leader: bool,
     leader_id: Option<u64>,
+    term: u64,
+    commit_index: u64,
     applied_index: u64,
     role: ReplicaRole,
     schema_version: u64,
@@ -150,6 +152,8 @@ impl ReplicaStatus {
         node_id: u64,
         leader: bool,
         leader_id: Option<u64>,
+        term: u64,
+        commit_index: u64,
         applied_index: u64,
         role: ReplicaRole,
         schema_version: u64,
@@ -162,6 +166,8 @@ impl ReplicaStatus {
             node_id,
             leader,
             leader_id,
+            term,
+            commit_index,
             applied_index,
             role,
             schema_version,
@@ -205,6 +211,16 @@ impl ReplicaStatus {
     }
 
     #[must_use]
+    pub const fn term(self) -> u64 {
+        self.term
+    }
+
+    #[must_use]
+    pub const fn commit_index(self) -> u64 {
+        self.commit_index
+    }
+
+    #[must_use]
     pub const fn role(self) -> ReplicaRole {
         self.role
     }
@@ -226,6 +242,28 @@ pub enum EnsureReplicaOutcome {
     Existing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProposalOutcome {
+    status: ReplicaStatus,
+    duplicate: bool,
+}
+
+impl ProposalOutcome {
+    pub(crate) const fn new(status: ReplicaStatus, duplicate: bool) -> Self {
+        Self { status, duplicate }
+    }
+
+    #[must_use]
+    pub const fn status(self) -> ReplicaStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn duplicate(self) -> bool {
+        self.duplicate
+    }
+}
+
 pub struct DataNodeHost {
     config: NodeConfig,
     _identity_store: NodeIdentityStore,
@@ -236,6 +274,11 @@ pub struct DataNodeHost {
 }
 
 impl DataNodeHost {
+    #[must_use]
+    pub const fn identity(&self) -> &crate::NodeIdentity {
+        self.config.identity()
+    }
+
     pub async fn open(config: NodeConfig, queue_capacity: usize) -> Result<Self, HostError> {
         if queue_capacity == 0 || queue_capacity > MAX_QUEUE_CAPACITY {
             return Err(HostError::InvalidQueueCapacity);
@@ -337,6 +380,18 @@ impl DataNodeHost {
         request_id: u128,
         command: Vec<u8>,
     ) -> Result<ReplicaStatus, HostError> {
+        self.propose_with_outcome(key, placement_epoch, request_id, command)
+            .await
+            .map(ProposalOutcome::status)
+    }
+
+    pub async fn propose_with_outcome(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        request_id: u128,
+        command: Vec<u8>,
+    ) -> Result<ProposalOutcome, HostError> {
         let (sender, expected_epoch) = self.sender_and_epoch(key)?;
         if placement_epoch != expected_epoch {
             return Err(HostError::StaleEpoch {
@@ -508,6 +563,8 @@ pub enum HostError {
     LearnerNotYetSupported,
     WrongCluster,
     WrongTarget { expected: u64, actual: u64 },
+    RequestEnvelopeMismatch { expected: u128, actual: u128 },
+    RequestMismatch { request_id: u128 },
     StaleEpoch { expected: u64, actual: u64 },
     Overloaded { graph_id: u64, shard_id: u32 },
     OutboundOverloaded,
@@ -524,6 +581,18 @@ impl HostError {
 
     pub(crate) fn from_durable(error: shard_runtime::DurableReplicaError) -> Self {
         Self::DurableReplica(error.to_string())
+    }
+
+    pub(crate) fn from_runtime(error: shard_runtime::ShardRuntimeError) -> Self {
+        match error {
+            shard_runtime::ShardRuntimeError::RequestEnvelopeMismatch { expected, actual } => {
+                Self::RequestEnvelopeMismatch { expected, actual }
+            }
+            shard_runtime::ShardRuntimeError::RequestMismatch { request_id } => {
+                Self::RequestMismatch { request_id }
+            }
+            other => Self::DurableReplica(other.to_string()),
+        }
     }
 }
 
@@ -553,6 +622,14 @@ impl Display for HostError {
             Self::WrongTarget { expected, actual } => write!(
                 formatter,
                 "routed Raft message targets node {actual}; expected {expected}"
+            ),
+            Self::RequestEnvelopeMismatch { expected, actual } => write!(
+                formatter,
+                "proposal request ID {expected} differs from command request ID {actual}"
+            ),
+            Self::RequestMismatch { request_id } => write!(
+                formatter,
+                "request {request_id} was retried with different command bytes"
             ),
             Self::StaleEpoch { expected, actual } => write!(
                 formatter,

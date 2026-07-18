@@ -79,6 +79,13 @@ pub enum ShardRuntimeError {
         expected: u64,
         actual: u64,
     },
+    RequestEnvelopeMismatch {
+        expected: u128,
+        actual: u128,
+    },
+    RequestMismatch {
+        request_id: u128,
+    },
     TooManyMutations,
 }
 
@@ -151,6 +158,14 @@ impl Display for ShardRuntimeError {
             Self::ApplyReceiptMismatch { expected, actual } => write!(
                 formatter,
                 "Adapter receipt index {actual} differs from applied entry {expected}"
+            ),
+            Self::RequestEnvelopeMismatch { expected, actual } => write!(
+                formatter,
+                "Raft proposal request ID {expected} differs from command request ID {actual}"
+            ),
+            Self::RequestMismatch { request_id } => write!(
+                formatter,
+                "request {request_id} was retried with different command bytes"
             ),
             Self::TooManyMutations => {
                 formatter.write_str("Replica metadata exceeds mutation sequence space")

@@ -1,0 +1,109 @@
+use std::error::Error;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use cluster_protocol::MAX_COMMAND_BYTES;
+use cluster_protocol::proto::node_admin_service_server::NodeAdminServiceServer;
+use cluster_protocol::proto::shard_service_server::ShardServiceServer;
+use data_node::{DataNodeGrpcService, DataNodeHost, DataNodeRuntimeConfig, TransportSecurity};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+
+const GRPC_ENVELOPE_ALLOWANCE: usize = 64 * 1024;
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("dtgproxy-data: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
+    let config_path = config_path_from_args()?;
+    let runtime = DataNodeRuntimeConfig::load(config_path)?;
+    let listen_address = runtime.node().listen_address();
+    let security = runtime.node().transport_security().clone();
+    let queue_capacity = runtime.actor_queue_capacity();
+    let shutdown_grace = runtime.shutdown_grace();
+    let host = Arc::new(DataNodeHost::open(runtime.into_node(), queue_capacity).await?);
+    let service = DataNodeGrpcService::new(Arc::clone(&host));
+    let listener = tokio::net::TcpListener::bind(listen_address).await?;
+
+    let mut builder = Server::builder();
+    if let TransportSecurity::MutualTls(files) = security {
+        let ca = std::fs::read(files.ca_certificate())?;
+        let certificate = std::fs::read(files.node_certificate())?;
+        let private_key = std::fs::read(files.private_key())?;
+        builder = builder.tls_config(
+            ServerTlsConfig::new()
+                .identity(Identity::from_pem(certificate, private_key))
+                .client_ca_root(Certificate::from_pem(ca)),
+        )?;
+    }
+
+    let maximum_message = MAX_COMMAND_BYTES + GRPC_ENVELOPE_ALLOWANCE;
+    let shard_service = ShardServiceServer::new(service.clone())
+        .max_decoding_message_size(maximum_message)
+        .max_encoding_message_size(maximum_message);
+    let admin_service = NodeAdminServiceServer::new(service)
+        .max_decoding_message_size(maximum_message)
+        .max_encoding_message_size(maximum_message);
+    println!(
+        "DTGPROXY_DATA_READY node={} address={}",
+        host.identity().node_id(),
+        listener.local_addr()?
+    );
+    std::io::stdout().flush()?;
+
+    builder
+        .add_service(shard_service)
+        .add_service(admin_service)
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal())
+        .await?;
+
+    let host = Arc::try_unwrap(host)
+        .map_err(|_| "Data node service retained a host reference after shutdown")?;
+    tokio::time::timeout(shutdown_grace, host.shutdown())
+        .await
+        .map_err(|_| "Data node graceful shutdown exceeded its deadline")??;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn config_path_from_args() -> Result<PathBuf, Box<dyn Error>> {
+    let mut arguments = std::env::args_os().skip(1);
+    let flag = arguments
+        .next()
+        .ok_or("usage: dtgproxy-data --config PATH")?;
+    let path = arguments
+        .next()
+        .ok_or("usage: dtgproxy-data --config PATH")?;
+    if flag != "--config" || arguments.next().is_some() {
+        return Err("usage: dtgproxy-data --config PATH".into());
+    }
+    Ok(path.into())
+}
