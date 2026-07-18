@@ -1470,6 +1470,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "txn-protocol"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crc32fast",
+ "prost",
+ "storage-api",
+ "temporal-types",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
