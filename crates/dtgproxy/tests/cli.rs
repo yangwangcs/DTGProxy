@@ -23,7 +23,7 @@ fn version_reports_product_name_and_workspace_version() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "DTGProxy 0.1.0\n"
+        "DTGProxy 1.0.0\n"
     );
     assert!(output.stderr.is_empty());
 }
