@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+adapter-registry = { path = "../adapter-registry" }
 adapter-memory = { path = "../adapter-memory" }
 adapter-rocksdb = { path = "../adapter-rocksdb" }
 blake3 = "=1.8.5"

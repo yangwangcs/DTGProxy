@@ -7,7 +7,7 @@ use storage_api::{KeySpan, KeyValue, LogicalKey, StorageAdapter};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::{HostError, ProposalOutcome, ReplicaSpec, ReplicaStatus};
+use crate::{BackendManager, HostError, ProposalOutcome, ReplicaSpec, ReplicaStatus};
 
 const MAX_READY_ROUNDS: usize = 256;
 
@@ -22,18 +22,23 @@ impl ReplicaActorHandle {
     pub(crate) async fn open(
         node_id: u64,
         data_directory: &Path,
+        backend_manager: &BackendManager,
         spec: ReplicaSpec,
         queue_capacity: usize,
     ) -> Result<Self, HostError> {
         let replica_directory = data_directory.join(spec.relative_directory());
         std::fs::create_dir_all(&replica_directory).map_err(HostError::from_io)?;
-        let replica = DurableRaftReplica::open(
+        let backend_slot = backend_manager
+            .open_slot(&replica_directory, spec.backend_slot())
+            .await
+            .map_err(|error| HostError::Adapter(error.to_string()))?;
+        let replica = DurableRaftReplica::open_with_adapter_slot(
             node_id,
             spec.voters(),
             spec.shard_id(),
             spec.placement_epoch(),
             replica_directory.join("raft"),
-            replica_directory.join("adapter"),
+            backend_slot,
         )
         .await
         .map_err(HostError::from_durable)?;

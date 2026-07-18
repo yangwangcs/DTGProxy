@@ -7,13 +7,18 @@ use crate::StorageError;
 
 const RECORD_MAGIC: [u8; 4] = *b"DTRP";
 const LEGACY_MANIFEST_VERSION: u16 = 2;
-const MANIFEST_VERSION: u16 = 3;
+const SNAPSHOT_MANIFEST_VERSION: u16 = 3;
+const MANIFEST_VERSION: u16 = 4;
 const RECORD_HEADER_BYTES: usize = 10;
 const CHECKSUM_BYTES: usize = 4;
 const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REPLICAS: usize = 65_536;
 const MAX_VOTERS: usize = 1_024;
 const MAX_DIRECTORY_BYTES: usize = 240;
+const MAX_BACKEND_NAME_BYTES: usize = 64;
+const MAX_BACKEND_INSTANCE_BYTES: usize = 240;
+const MAX_BACKEND_FIELD_BYTES: usize = 4_096;
+const MAX_BACKEND_FIELDS: usize = 128;
 const MANIFEST_FILE: &str = "replicas.manifest.log";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +45,140 @@ impl ReplicaRole {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendProfile {
+    provider: String,
+    instance_id: String,
+    public_parameters: BTreeMap<String, String>,
+    credential_refs: BTreeMap<String, String>,
+    digest: [u8; 32],
+}
+
+impl BackendProfile {
+    pub fn new(
+        provider: impl Into<String>,
+        instance_id: impl Into<String>,
+        public_parameters: BTreeMap<String, String>,
+        credential_refs: BTreeMap<String, String>,
+    ) -> Result<Self, StorageError> {
+        let provider = provider.into();
+        let instance_id = instance_id.into();
+        validate_backend_name(&provider)?;
+        validate_backend_instance(&instance_id)?;
+        validate_backend_fields(&public_parameters, true)?;
+        validate_backend_fields(&credential_refs, false)?;
+        let digest = backend_profile_digest(
+            &provider,
+            &instance_id,
+            &public_parameters,
+            &credential_refs,
+        );
+        Ok(Self {
+            provider,
+            instance_id,
+            public_parameters,
+            credential_refs,
+            digest,
+        })
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    #[must_use]
+    pub const fn public_parameters(&self) -> &BTreeMap<String, String> {
+        &self.public_parameters
+    }
+
+    #[must_use]
+    pub const fn credential_refs(&self) -> &BTreeMap<String, String> {
+        &self.credential_refs
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendSlotState {
+    Active {
+        generation: u64,
+        profile: BackendProfile,
+    },
+    DualApplying {
+        source_generation: u64,
+        source: BackendProfile,
+        target_generation: u64,
+        target: BackendProfile,
+        fence_index: u64,
+        synchronized_index: u64,
+    },
+}
+
+impl BackendSlotState {
+    pub fn active(generation: u64, profile: BackendProfile) -> Result<Self, StorageError> {
+        if generation == 0 {
+            return Err(StorageError::InvalidReplicaGeneration);
+        }
+        Ok(Self::Active {
+            generation,
+            profile,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dual_applying(
+        source_generation: u64,
+        source: BackendProfile,
+        target_generation: u64,
+        target: BackendProfile,
+        fence_index: u64,
+        synchronized_index: u64,
+    ) -> Result<Self, StorageError> {
+        if source_generation == 0
+            || target_generation != source_generation.checked_add(1).unwrap_or(0)
+            || synchronized_index != fence_index
+        {
+            return Err(StorageError::InvalidBackendTransition);
+        }
+        Ok(Self::DualApplying {
+            source_generation,
+            source,
+            target_generation,
+            target,
+            fence_index,
+            synchronized_index,
+        })
+    }
+
+    #[must_use]
+    pub const fn active_generation(&self) -> u64 {
+        match self {
+            Self::Active { generation, .. } => *generation,
+            Self::DualApplying {
+                source_generation, ..
+            } => *source_generation,
+        }
+    }
+
+    #[must_use]
+    pub const fn active_profile(&self) -> &BackendProfile {
+        match self {
+            Self::Active { profile, .. } => profile,
+            Self::DualApplying { source, .. } => source,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaEntry {
     graph_id: u64,
     shard_id: u32,
@@ -48,6 +187,7 @@ pub struct ReplicaEntry {
     role: ReplicaRole,
     schema_version: u64,
     backend_generation: u64,
+    backend_slot: BackendSlotState,
     snapshot_index: u64,
     relative_directory: String,
 }
@@ -77,6 +217,49 @@ impl ReplicaEntry {
         if voters.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(StorageError::InvalidReplicaVoters);
         }
+        let default_profile = BackendProfile::new(
+            "rocksdb",
+            format!("graph-{graph_id}-shard-{shard_id}-generation-{backend_generation}"),
+            BTreeMap::from([("path".to_owned(), "adapter".to_owned())]),
+            BTreeMap::new(),
+        )?;
+        Self::new_with_backend(
+            graph_id,
+            shard_id,
+            placement_epoch,
+            voters,
+            role,
+            schema_version,
+            BackendSlotState::active(backend_generation, default_profile)?,
+            relative_directory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_backend(
+        graph_id: u64,
+        shard_id: u32,
+        placement_epoch: u64,
+        mut voters: Vec<u64>,
+        role: ReplicaRole,
+        schema_version: u64,
+        backend_slot: BackendSlotState,
+        relative_directory: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        if graph_id == 0 || shard_id == 0 {
+            return Err(StorageError::InvalidReplicaIdentity);
+        }
+        if placement_epoch == 0 {
+            return Err(StorageError::InvalidReplicaEpoch);
+        }
+        if voters.is_empty() || voters.len() > MAX_VOTERS || voters.contains(&0) {
+            return Err(StorageError::InvalidReplicaVoters);
+        }
+        voters.sort_unstable();
+        if voters.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StorageError::InvalidReplicaVoters);
+        }
+        let backend_generation = backend_slot.active_generation();
         if schema_version == 0 || backend_generation == 0 {
             return Err(StorageError::InvalidReplicaGeneration);
         }
@@ -90,6 +273,7 @@ impl ReplicaEntry {
             role,
             schema_version,
             backend_generation,
+            backend_slot,
             snapshot_index: 0,
             relative_directory,
         })
@@ -128,6 +312,11 @@ impl ReplicaEntry {
     #[must_use]
     pub const fn backend_generation(&self) -> u64 {
         self.backend_generation
+    }
+
+    #[must_use]
+    pub const fn backend_slot(&self) -> &BackendSlotState {
+        &self.backend_slot
     }
 
     #[must_use]
@@ -228,6 +417,7 @@ impl ReplicaManifest {
             || existing.role != entry.role
             || existing.schema_version != entry.schema_version
             || existing.backend_generation != entry.backend_generation
+            || existing.backend_slot != entry.backend_slot
             || existing.relative_directory != entry.relative_directory
         {
             return Err(StorageError::ReplicaIdentityConflict {
@@ -256,6 +446,7 @@ impl ReplicaManifest {
             || entry.role != ReplicaRole::Voter
             || entry.schema_version != current.schema_version
             || entry.backend_generation != current.backend_generation
+            || entry.backend_slot != current.backend_slot
             || entry.relative_directory != current.relative_directory
         {
             return Err(StorageError::ReplicaIdentityConflict {
@@ -341,7 +532,10 @@ fn replay_and_repair_tail(file: &mut File) -> Result<ReplicaManifest, StorageErr
                 .try_into()
                 .expect("fixed version"),
         );
-        if !matches!(version, LEGACY_MANIFEST_VERSION | MANIFEST_VERSION) {
+        if !matches!(
+            version,
+            LEGACY_MANIFEST_VERSION | SNAPSHOT_MANIFEST_VERSION | MANIFEST_VERSION
+        ) {
             return Err(StorageError::UnsupportedManifestVersion { actual: version });
         }
         let payload_length = u32::from_be_bytes(
@@ -402,6 +596,7 @@ fn encode_manifest(manifest: &ReplicaManifest) -> Result<Vec<u8>, StorageError> 
         encoded.extend_from_slice(&entry.backend_generation.to_be_bytes());
         encoded.extend_from_slice(&entry.snapshot_index.to_be_bytes());
         write_string(&mut encoded, &entry.relative_directory)?;
+        encode_backend_slot(&mut encoded, &entry.backend_slot)?;
     }
     if encoded.len() > MAX_MANIFEST_BYTES {
         return Err(StorageError::ManifestTooLarge);
@@ -432,7 +627,7 @@ fn decode_manifest(encoded: &[u8], version: u16) -> Result<ReplicaManifest, Stor
         let role = ReplicaRole::from_tag(decoder.read_u8()?)?;
         let schema_version = decoder.read_u64()?;
         let backend_generation = decoder.read_u64()?;
-        let snapshot_index = if version >= MANIFEST_VERSION {
+        let snapshot_index = if version >= SNAPSHOT_MANIFEST_VERSION {
             decoder.read_u64()?
         } else {
             0
@@ -441,14 +636,29 @@ fn decode_manifest(encoded: &[u8], version: u16) -> Result<ReplicaManifest, Stor
         if !directories.insert(directory.clone()) {
             return Err(StorageError::ReplicaDirectoryConflict { directory });
         }
-        let entry = ReplicaEntry::new(
+        let backend_slot = if version >= MANIFEST_VERSION {
+            let decoded = decode_backend_slot(&mut decoder)?;
+            if decoded.active_generation() != backend_generation {
+                return Err(StorageError::InvalidBackendTransition);
+            }
+            decoded
+        } else {
+            let profile = BackendProfile::new(
+                "rocksdb",
+                format!("graph-{graph_id}-shard-{shard_id}-generation-{backend_generation}"),
+                BTreeMap::from([("path".to_owned(), "adapter".to_owned())]),
+                BTreeMap::new(),
+            )?;
+            BackendSlotState::active(backend_generation, profile)?
+        };
+        let entry = ReplicaEntry::new_with_backend(
             graph_id,
             shard_id,
             placement_epoch,
             voters,
             role,
             schema_version,
-            backend_generation,
+            backend_slot,
             directory,
         )?;
         let entry = if snapshot_index == 0 {
@@ -488,7 +698,213 @@ fn validate_relative_directory(directory: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn validate_backend_name(value: &str) -> Result<(), StorageError> {
+    let valid = (1..=MAX_BACKEND_NAME_BYTES).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidBackendProfile)
+    }
+}
+
+fn validate_backend_instance(value: &str) -> Result<(), StorageError> {
+    if value.is_empty()
+        || value.len() > MAX_BACKEND_INSTANCE_BYTES
+        || value.chars().any(char::is_control)
+    {
+        Err(StorageError::InvalidBackendProfile)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_backend_fields(
+    fields: &BTreeMap<String, String>,
+    public: bool,
+) -> Result<(), StorageError> {
+    if fields.len() > MAX_BACKEND_FIELDS {
+        return Err(StorageError::InvalidBackendProfile);
+    }
+    for (name, value) in fields {
+        validate_backend_name(name)?;
+        if value.is_empty()
+            || value.len() > MAX_BACKEND_FIELD_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(StorageError::InvalidBackendProfile);
+        }
+        if public && is_secret_parameter(name) {
+            return Err(StorageError::EmbeddedBackendSecret { name: name.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn is_secret_parameter(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "private_key",
+    ]
+    .iter()
+    .any(|secret| lower == *secret || lower.ends_with(&format!("_{secret}")))
+}
+
+fn backend_profile_digest(
+    provider: &str,
+    instance_id: &str,
+    parameters: &BTreeMap<String, String>,
+    credential_refs: &BTreeMap<String, String>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for value in [provider, instance_id] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    for fields in [parameters, credential_refs] {
+        hasher.update(&(fields.len() as u64).to_be_bytes());
+        for (name, value) in fields {
+            hasher.update(&(name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn encode_backend_slot(encoded: &mut Vec<u8>, slot: &BackendSlotState) -> Result<(), StorageError> {
+    match slot {
+        BackendSlotState::Active {
+            generation,
+            profile,
+        } => {
+            encoded.push(1);
+            encoded.extend_from_slice(&generation.to_be_bytes());
+            encode_backend_profile(encoded, profile)?;
+        }
+        BackendSlotState::DualApplying {
+            source_generation,
+            source,
+            target_generation,
+            target,
+            fence_index,
+            synchronized_index,
+        } => {
+            encoded.push(2);
+            encoded.extend_from_slice(&source_generation.to_be_bytes());
+            encode_backend_profile(encoded, source)?;
+            encoded.extend_from_slice(&target_generation.to_be_bytes());
+            encode_backend_profile(encoded, target)?;
+            encoded.extend_from_slice(&fence_index.to_be_bytes());
+            encoded.extend_from_slice(&synchronized_index.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn encode_backend_profile(
+    encoded: &mut Vec<u8>,
+    profile: &BackendProfile,
+) -> Result<(), StorageError> {
+    write_bounded_string(encoded, &profile.provider, MAX_BACKEND_NAME_BYTES)?;
+    write_bounded_string(encoded, &profile.instance_id, MAX_BACKEND_INSTANCE_BYTES)?;
+    encode_backend_fields(encoded, &profile.public_parameters)?;
+    encode_backend_fields(encoded, &profile.credential_refs)?;
+    encoded.extend_from_slice(&profile.digest);
+    Ok(())
+}
+
+fn encode_backend_fields(
+    encoded: &mut Vec<u8>,
+    fields: &BTreeMap<String, String>,
+) -> Result<(), StorageError> {
+    let count = u16::try_from(fields.len()).map_err(|_| StorageError::InvalidBackendProfile)?;
+    encoded.extend_from_slice(&count.to_be_bytes());
+    for (name, value) in fields {
+        write_bounded_string(encoded, name, MAX_BACKEND_NAME_BYTES)?;
+        write_bounded_string(encoded, value, MAX_BACKEND_FIELD_BYTES)?;
+    }
+    Ok(())
+}
+
+fn decode_backend_slot(decoder: &mut Decoder<'_>) -> Result<BackendSlotState, StorageError> {
+    match decoder.read_u8()? {
+        1 => BackendSlotState::active(decoder.read_u64()?, decode_backend_profile(decoder)?),
+        2 => {
+            let source_generation = decoder.read_u64()?;
+            let source = decode_backend_profile(decoder)?;
+            let target_generation = decoder.read_u64()?;
+            let target = decode_backend_profile(decoder)?;
+            let fence_index = decoder.read_u64()?;
+            let synchronized_index = decoder.read_u64()?;
+            BackendSlotState::dual_applying(
+                source_generation,
+                source,
+                target_generation,
+                target,
+                fence_index,
+                synchronized_index,
+            )
+        }
+        _ => Err(StorageError::InvalidBackendTransition),
+    }
+}
+
+fn decode_backend_profile(decoder: &mut Decoder<'_>) -> Result<BackendProfile, StorageError> {
+    let provider = decoder.read_bounded_string(MAX_BACKEND_NAME_BYTES)?;
+    let instance_id = decoder.read_bounded_string(MAX_BACKEND_INSTANCE_BYTES)?;
+    let parameters = decode_backend_fields(decoder)?;
+    let credential_refs = decode_backend_fields(decoder)?;
+    let recorded_digest: [u8; 32] = decoder
+        .read_exact(32)?
+        .try_into()
+        .expect("fixed backend digest");
+    let profile = BackendProfile::new(provider, instance_id, parameters, credential_refs)?;
+    if profile.digest != recorded_digest {
+        return Err(StorageError::BackendProfileDigestMismatch);
+    }
+    Ok(profile)
+}
+
+fn decode_backend_fields(
+    decoder: &mut Decoder<'_>,
+) -> Result<BTreeMap<String, String>, StorageError> {
+    let count = usize::from(decoder.read_u16()?);
+    if count > MAX_BACKEND_FIELDS {
+        return Err(StorageError::InvalidBackendProfile);
+    }
+    let mut fields = BTreeMap::new();
+    for _ in 0..count {
+        let name = decoder.read_bounded_string(MAX_BACKEND_NAME_BYTES)?;
+        let value = decoder.read_bounded_string(MAX_BACKEND_FIELD_BYTES)?;
+        if fields.insert(name, value).is_some() {
+            return Err(StorageError::InvalidBackendProfile);
+        }
+    }
+    Ok(fields)
+}
+
 fn write_string(encoded: &mut Vec<u8>, value: &str) -> Result<(), StorageError> {
+    write_bounded_string(encoded, value, MAX_DIRECTORY_BYTES)
+}
+
+fn write_bounded_string(
+    encoded: &mut Vec<u8>,
+    value: &str,
+    maximum: usize,
+) -> Result<(), StorageError> {
+    if value.len() > maximum {
+        return Err(StorageError::StringTooLong);
+    }
     let length = u16::try_from(value.len()).map_err(|_| StorageError::StringTooLong)?;
     encoded.extend_from_slice(&length.to_be_bytes());
     encoded.extend_from_slice(value.as_bytes());
@@ -541,10 +957,14 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_string(&mut self) -> Result<String, StorageError> {
+        self.read_bounded_string(MAX_DIRECTORY_BYTES)
+    }
+
+    fn read_bounded_string(&mut self, maximum: usize) -> Result<String, StorageError> {
         let length = usize::from(u16::from_be_bytes(
             self.read_exact(2)?.try_into().expect("fixed string length"),
         ));
-        if length > MAX_DIRECTORY_BYTES {
+        if length > maximum {
             return Err(StorageError::StringTooLong);
         }
         String::from_utf8(self.read_exact(length)?.to_vec()).map_err(|_| StorageError::InvalidUtf8)

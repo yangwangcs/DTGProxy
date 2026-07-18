@@ -10,6 +10,7 @@ blake3 = "=1.8.5"
 control-plane = { path = "../control-plane" }
 cluster-protocol = { path = "../cluster-protocol" }
 crc32fast = "=1.5.0"
+prost = "=0.14.4"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
 raft-command = { path = "../raft-command" }

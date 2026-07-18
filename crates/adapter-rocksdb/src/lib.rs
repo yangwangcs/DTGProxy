@@ -592,6 +592,10 @@ impl StorageAdapter for RocksAdapter {
         })
     }
 
+    fn create_physical_checkpoint(&self, destination: &Path) -> Result<(), AdapterError> {
+        self.checkpoint(destination)
+    }
+
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         self.current_applied_log_index()
     }

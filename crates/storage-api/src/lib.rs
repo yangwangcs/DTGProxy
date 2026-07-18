@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1133,6 +1134,12 @@ pub trait StorageAdapter: Send + Sync {
         })
     }
 
+    fn create_physical_checkpoint(&self, _destination: &Path) -> Result<(), AdapterError> {
+        Err(AdapterError::UnsupportedOperation {
+            operation: "physical checkpoint",
+        })
+    }
+
     fn applied_log_index(&self) -> Result<u64, AdapterError>;
 }
 
@@ -1161,6 +1168,10 @@ where
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
         (**self).scan(span)
+    }
+
+    fn create_physical_checkpoint(&self, destination: &Path) -> Result<(), AdapterError> {
+        (**self).create_physical_checkpoint(destination)
     }
 
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
@@ -1200,6 +1211,10 @@ where
         request: LogicalSnapshotExportRequest,
     ) -> AdapterFuture<'a, Box<dyn LogicalSnapshotReader + 'a>> {
         (**self).begin_logical_export(request)
+    }
+
+    fn create_physical_checkpoint(&self, destination: &Path) -> Result<(), AdapterError> {
+        (**self).create_physical_checkpoint(destination)
     }
 
     fn applied_log_index(&self) -> Result<u64, AdapterError> {

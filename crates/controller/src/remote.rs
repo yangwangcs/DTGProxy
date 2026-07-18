@@ -10,12 +10,13 @@ use cluster_protocol::proto::meta_service_client::MetaServiceClient;
 use cluster_protocol::proto::node_admin_service_client::NodeAdminServiceClient;
 use cluster_protocol::proto::shard_service_client::ShardServiceClient;
 use cluster_protocol::proto::{
-    AcquireControllerLeaseRequest, ActivateReplicaRequest, ChangeMembershipRequest,
-    DeleteReplicaRequest, EnsureReplicaRequest, ExecuteRequest, ExportSnapshotRequest,
-    GetCatalogRequest, ProposeRequest, ReplicaRole, ReplicaStatusRequest, RequestContext,
-    ShardContext,
+    AcquireControllerLeaseRequest, ActivateReplicaRequest, BackendProfileSpec,
+    ChangeMembershipRequest, DeleteReplicaRequest, EnsureReplicaRequest, ExecuteRequest,
+    ExportSnapshotRequest, GetCatalogRequest, ProposeRequest, ReplicaBootstrapProfile, ReplicaRole,
+    ReplicaStatusRequest, RequestContext, ShardContext,
 };
 use control_plane::{CatalogCommand, CatalogState, GraphDefinition, MigrationRecord};
+use prost::Message as ProstMessage;
 use raft_command::{CommandBodyV1, CommandEnvelopeV1};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
@@ -381,12 +382,6 @@ impl DataPlaneApi for RemoteDataPlane {
         migration: &MigrationRecord,
         graph: &GraphDefinition,
     ) -> Result<(), ControllerError> {
-        if graph.backend().provider() != "rocksdb" {
-            return Err(ControllerError::Data(format!(
-                "Data-node migration runtime does not support provider {}",
-                graph.backend().provider()
-            )));
-        }
         for node in added_nodes(migration) {
             let request_id = operation_id(migration, 10, node);
             let mut client = self.admin_client(node).await?;
@@ -404,7 +399,7 @@ impl DataPlaneApi for RemoteDataPlane {
                     initial_role: ReplicaRole::Learner.into(),
                     schema_version: graph.schema_version(),
                     backend_generation: graph.backend().generation(),
-                    backend_profile: encode_rocks_profile(migration.source_voters(), &directory)?,
+                    backend_profile: encode_backend_profile(migration, graph, &directory)?,
                 }))
                 .await
                 .map_err(|error| ControllerError::Data(error.to_string()))?;
@@ -648,7 +643,12 @@ fn copy_digest(bytes: &[u8]) -> Result<[u8; 32], ControllerError> {
         .map_err(|_| ControllerError::Data("snapshot digest must contain 32 bytes".into()))
 }
 
-fn encode_rocks_profile(voters: &[u64], directory: &str) -> Result<Vec<u8>, ControllerError> {
+fn encode_backend_profile(
+    migration: &MigrationRecord,
+    graph: &GraphDefinition,
+    directory: &str,
+) -> Result<Vec<u8>, ControllerError> {
+    let voters = migration.source_voters();
     if voters.is_empty()
         || voters.len() > 64
         || voters[0] == 0
@@ -656,19 +656,61 @@ fn encode_rocks_profile(voters: &[u64], directory: &str) -> Result<Vec<u8>, Cont
         || directory.is_empty()
         || directory.len() > 255
     {
-        return Err(ControllerError::Data(
-            "invalid RocksDB Replica profile".into(),
-        ));
+        return Err(ControllerError::Data("invalid Replica profile".into()));
     }
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(b"DTRF");
-    encoded.extend_from_slice(&1_u16.to_be_bytes());
-    encoded.extend_from_slice(&(voters.len() as u16).to_be_bytes());
-    encoded.extend_from_slice(&(directory.len() as u16).to_be_bytes());
-    for voter in voters {
-        encoded.extend_from_slice(&voter.to_be_bytes());
+    let catalog = graph.backend();
+    let instance_id = format!(
+        "graph-{}-shard-{}-generation-{}",
+        graph.graph_id(),
+        migration.shard_id(),
+        catalog.generation()
+    );
+    let (provider, public_parameters) = match catalog.provider() {
+        "rocksdb" => (
+            "rocksdb".to_owned(),
+            std::collections::HashMap::from([("path".to_owned(), "adapter".to_owned())]),
+        ),
+        "postgresql" | "neo4j" | "sidecar" => {
+            let sidecar_endpoint = catalog
+                .public_parameters()
+                .get("sidecar_endpoint")
+                .ok_or_else(|| {
+                    ControllerError::Data(format!(
+                        "backend provider {} requires public parameter sidecar_endpoint",
+                        catalog.provider()
+                    ))
+                })?;
+            let mut parameters = std::collections::HashMap::from([
+                ("endpoint".to_owned(), sidecar_endpoint.clone()),
+                ("target_provider".to_owned(), catalog.provider().to_owned()),
+            ]);
+            for (name, value) in catalog.public_parameters() {
+                if name != "sidecar_endpoint" {
+                    parameters.insert(format!("target.{name}"), value.clone());
+                }
+            }
+            ("sidecar".to_owned(), parameters)
+        }
+        provider => {
+            return Err(ControllerError::Data(format!(
+                "unsupported backend provider {provider}"
+            )));
+        }
+    };
+    Ok(ReplicaBootstrapProfile {
+        format_version: 1,
+        voters: voters.to_vec(),
+        relative_directory: directory.to_owned(),
+        backend: Some(BackendProfileSpec {
+            provider,
+            instance_id,
+            public_parameters,
+            credential_refs: catalog
+                .secret_references()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        }),
     }
-    encoded.extend_from_slice(directory.as_bytes());
-    encoded.extend_from_slice(&crc32fast::hash(&encoded).to_be_bytes());
-    Ok(encoded)
+    .encode_to_vec())
 }

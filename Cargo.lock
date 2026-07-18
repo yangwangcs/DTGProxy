@@ -344,6 +344,7 @@ dependencies = [
  "control-plane",
  "crc32fast",
  "data-node",
+ "prost 0.14.4",
  "raft-command",
  "serde",
  "serde_json",
@@ -395,11 +396,14 @@ dependencies = [
 name = "data-node"
 version = "1.0.0"
 dependencies = [
+ "adapter-registry",
  "adapter-rocksdb",
+ "adapter-sidecar",
  "blake3",
  "cluster-protocol",
  "crc32fast",
  "fs2",
+ "prost 0.14.4",
  "raft",
  "raft-command",
  "raft-transport",
@@ -1961,6 +1965,7 @@ name = "shard-runtime"
 version = "1.0.0"
 dependencies = [
  "adapter-memory",
+ "adapter-registry",
  "adapter-rocksdb",
  "blake3",
  "crc32fast",

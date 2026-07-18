@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod backend;
 mod config;
 mod file_config;
 mod host;
@@ -18,7 +19,10 @@ pub use host::{
     ReplicaStatus,
 };
 pub use identity::{NodeIdentity, NodeIdentityStore};
-pub use manifest::{ReplicaEntry, ReplicaManifest, ReplicaManifestStore, ReplicaRole};
+pub use manifest::{
+    BackendProfile, BackendSlotState, ReplicaEntry, ReplicaManifest, ReplicaManifestStore,
+    ReplicaRole,
+};
 pub use migration::{
     ChunkAppendOutcome, MigrationChunk, MigrationReceipt, MigrationReceiptStore,
     MigrationStorageError, ReceiptWriteOutcome, SnapshotInbox,
@@ -27,8 +31,8 @@ pub use raft_network::{RaftDelivery, RaftNetworkError, SharedRaftTransport};
 pub use raft_runtime::{DataRaftRuntime, DataRaftRuntimeError};
 pub use service::{
     DataNodeGrpcService, DataOperation, ReadCodecError, ReplicaProfileError, RequestAuthorizer,
-    decode_key_read_result, decode_key_scan_batch, encode_key_read_plan, encode_key_scan_plan,
-    encode_rocks_replica_profile,
+    decode_key_read_result, decode_key_scan_batch, encode_backend_replica_profile,
+    encode_key_read_plan, encode_key_scan_plan, encode_rocks_replica_profile,
 };
 
 use std::error::Error;
@@ -60,6 +64,10 @@ pub enum StorageError {
     InvalidReplicaSnapshotIndex,
     InvalidReplicaRole { actual: u8 },
     InvalidReplicaDirectory,
+    InvalidBackendProfile,
+    EmbeddedBackendSecret { name: String },
+    BackendProfileDigestMismatch,
+    InvalidBackendTransition,
     ReplicaIdentityConflict { graph_id: u64, shard_id: u32 },
     ReplicaDirectoryConflict { directory: String },
     StringTooLong,
@@ -114,6 +122,17 @@ impl Display for StorageError {
                 write!(formatter, "invalid Replica role {actual}")
             }
             Self::InvalidReplicaDirectory => formatter.write_str("invalid Replica directory"),
+            Self::InvalidBackendProfile => formatter.write_str("invalid backend profile"),
+            Self::EmbeddedBackendSecret { name } => write!(
+                formatter,
+                "backend public parameter {name:?} must be a credential reference, not a secret"
+            ),
+            Self::BackendProfileDigestMismatch => {
+                formatter.write_str("backend profile digest mismatch")
+            }
+            Self::InvalidBackendTransition => {
+                formatter.write_str("invalid backend slot transition")
+            }
             Self::ReplicaIdentityConflict { graph_id, shard_id } => write!(
                 formatter,
                 "Replica ({graph_id}, {shard_id}) already has different metadata"
@@ -137,3 +156,4 @@ impl From<std::io::Error> for StorageError {
         Self::Io(error.to_string())
     }
 }
+pub use backend::{BackendError, BackendManager};

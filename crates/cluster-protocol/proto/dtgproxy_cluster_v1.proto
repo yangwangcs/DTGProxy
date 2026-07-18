@@ -252,6 +252,20 @@ message EnsureReplicaRequest {
   bytes backend_profile = 7;
 }
 
+message BackendProfileSpec {
+  string provider = 1;
+  string instance_id = 2;
+  map<string, string> public_parameters = 3;
+  map<string, string> credential_refs = 4;
+}
+
+message ReplicaBootstrapProfile {
+  uint32 format_version = 1;
+  repeated uint64 voters = 2;
+  string relative_directory = 3;
+  BackendProfileSpec backend = 4;
+}
+
 message EnsureReplicaResponse {
   bool created = 1;
   ReplicaStatusResponse status = 2;

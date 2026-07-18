@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use raft::eraftpb::Message;
 use raft_transport::RoutedRaftMessage;
@@ -10,9 +10,10 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::replica_actor::{ActorCommand, ReplicaActorHandle};
 use crate::{
-    ChunkAppendOutcome, MigrationChunk, MigrationReceipt, MigrationReceiptStore,
-    MigrationStorageError, NodeConfig, NodeIdentityStore, ReceiptWriteOutcome, ReplicaEntry,
-    ReplicaManifestStore, ReplicaRole, SnapshotInbox, StorageError,
+    BackendManager, BackendSlotState, ChunkAppendOutcome, MigrationChunk, MigrationReceipt,
+    MigrationReceiptStore, MigrationStorageError, NodeConfig, NodeIdentityStore,
+    ReceiptWriteOutcome, ReplicaEntry, ReplicaManifestStore, ReplicaRole, SnapshotInbox,
+    StorageError,
 };
 
 const MAX_QUEUE_CAPACITY: usize = 65_536;
@@ -77,6 +78,31 @@ impl ReplicaSpec {
         Self { entry }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_backend(
+        graph_id: u64,
+        shard_id: u32,
+        placement_epoch: u64,
+        voters: Vec<u64>,
+        role: ReplicaRole,
+        schema_version: u64,
+        backend_slot: BackendSlotState,
+        relative_directory: impl Into<String>,
+    ) -> Result<Self, HostError> {
+        Ok(Self {
+            entry: ReplicaEntry::new_with_backend(
+                graph_id,
+                shard_id,
+                placement_epoch,
+                voters,
+                role,
+                schema_version,
+                backend_slot,
+                relative_directory,
+            )?,
+        })
+    }
+
     pub(crate) fn entry(&self) -> &ReplicaEntry {
         &self.entry
     }
@@ -114,6 +140,11 @@ impl ReplicaSpec {
     #[must_use]
     pub const fn backend_generation(&self) -> u64 {
         self.entry.backend_generation()
+    }
+
+    #[must_use]
+    pub const fn backend_slot(&self) -> &BackendSlotState {
+        self.entry.backend_slot()
     }
 
     #[must_use]
@@ -293,6 +324,7 @@ pub struct DataNodeHost {
     manifest_store: Mutex<ReplicaManifestStore>,
     migration_receipts: Mutex<MigrationReceiptStore>,
     snapshot_inbox: SnapshotInbox,
+    backend_manager: Arc<BackendManager>,
     replicas: RwLock<BTreeMap<ReplicaKey, ReplicaActorHandle>>,
     dormant_learners: RwLock<BTreeMap<ReplicaKey, ReplicaSpec>>,
     ensure_gate: AsyncMutex<()>,
@@ -314,6 +346,9 @@ impl DataNodeHost {
         let manifest_store = ReplicaManifestStore::open(config.data_directory())?;
         let migration_receipts = MigrationReceiptStore::open(config.data_directory())?;
         let snapshot_inbox = SnapshotInbox::open(config.data_directory())?;
+        let backend_manager = Arc::new(
+            BackendManager::production().map_err(|error| HostError::Adapter(error.to_string()))?,
+        );
         let entries = manifest_store
             .manifest()
             .replicas()
@@ -331,6 +366,7 @@ impl DataNodeHost {
             let handle = ReplicaActorHandle::open(
                 config.identity().node_id(),
                 config.data_directory(),
+                backend_manager.as_ref(),
                 spec.clone(),
                 queue_capacity,
             )
@@ -343,6 +379,7 @@ impl DataNodeHost {
             manifest_store: Mutex::new(manifest_store),
             migration_receipts: Mutex::new(migration_receipts),
             snapshot_inbox,
+            backend_manager,
             replicas: RwLock::new(replicas),
             dormant_learners: RwLock::new(dormant_learners),
             ensure_gate: AsyncMutex::new(()),
@@ -450,6 +487,7 @@ impl DataNodeHost {
         let handle = ReplicaActorHandle::open(
             self.config.identity().node_id(),
             self.config.data_directory(),
+            self.backend_manager.as_ref(),
             spec.clone(),
             self.queue_capacity,
         )
@@ -677,6 +715,7 @@ impl DataNodeHost {
         let handle = ReplicaActorHandle::open(
             self.identity().node_id(),
             self.data_directory(),
+            self.backend_manager.as_ref(),
             spec.clone(),
             self.queue_capacity,
         )

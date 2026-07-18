@@ -7,14 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cluster_protocol::proto::node_admin_service_server::NodeAdminService;
 use cluster_protocol::proto::shard_service_server::ShardService;
 use cluster_protocol::proto::{
-    ActivateReplicaRequest, ActivateReplicaResponse, ChangeMembershipRequest,
+    ActivateReplicaRequest, ActivateReplicaResponse, BackendProfileSpec, ChangeMembershipRequest,
     ChangeMembershipResponse, DeleteReplicaRequest, DeleteReplicaResponse, EnsureReplicaRequest,
     EnsureReplicaResponse, ExecuteRequest, ExecuteResponse, ExportSnapshotRequest,
     GetMigrationReceiptRequest, GetMigrationReceiptResponse, InstallSnapshotResponse, ReadRequest,
-    ReadResponse, ReplicaRole as WireReplicaRole, ReplicaStatusRequest, ReplicaStatusResponse,
-    ScanBatch, ScanRequest, SnapshotChunk,
+    ReadResponse, ReplicaBootstrapProfile, ReplicaRole as WireReplicaRole, ReplicaStatusRequest,
+    ReplicaStatusResponse, ScanBatch, ScanRequest, SnapshotChunk,
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError, ShardRequestContext};
+use prost::Message as ProstMessage;
 use storage_api::{KeySpan, KeyValue, Keyspace, LogicalKey};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc};
@@ -23,8 +24,8 @@ use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    ChunkAppendOutcome, DataNodeHost, EnsureReplicaOutcome, HostError, MigrationChunk, ReplicaKey,
-    ReplicaRole, ReplicaSpec, ReplicaStatus,
+    BackendProfile, BackendSlotState, ChunkAppendOutcome, DataNodeHost, EnsureReplicaOutcome,
+    HostError, MigrationChunk, ReplicaKey, ReplicaRole, ReplicaSpec, ReplicaStatus,
 };
 
 const READ_PLAN_MAGIC: [u8; 4] = *b"DTRK";
@@ -42,6 +43,7 @@ const MAX_SCAN_ROWS: usize = 65_536;
 const REPLICA_PROFILE_MAGIC: [u8; 4] = *b"DTRF";
 const MAX_PROFILE_VOTERS: usize = 64;
 const MAX_REPLICA_DIRECTORY_BYTES: usize = 255;
+const MAX_REPLICA_PROFILE_BYTES: usize = 1024 * 1024;
 const SNAPSHOT_INSTALL_STEP: u32 = 2;
 const SNAPSHOT_EXPORT_STEP: u32 = 1;
 const SNAPSHOT_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
@@ -575,18 +577,31 @@ impl NodeAdminService for DataNodeGrpcService {
                 ));
             }
         };
-        let profile = decode_rocks_replica_profile(&request.backend_profile)
+        let profile = decode_replica_profile(&request.backend_profile, request.backend_generation)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let spec = ReplicaSpec::new(
-            key.graph_id(),
-            key.shard_id(),
-            context.placement_epoch(),
-            profile.voters,
-            role,
-            request.schema_version,
-            request.backend_generation,
-            profile.relative_directory,
-        )
+        let spec = if let Some(backend_slot) = profile.backend_slot {
+            ReplicaSpec::new_with_backend(
+                key.graph_id(),
+                key.shard_id(),
+                context.placement_epoch(),
+                profile.voters,
+                role,
+                request.schema_version,
+                backend_slot,
+                profile.relative_directory,
+            )
+        } else {
+            ReplicaSpec::new(
+                key.graph_id(),
+                key.shard_id(),
+                context.placement_epoch(),
+                profile.voters,
+                role,
+                request.schema_version,
+                request.backend_generation,
+                profile.relative_directory,
+            )
+        }
         .map_err(host_status)?;
         let outcome = self.host.ensure_replica(spec).await.map_err(host_status)?;
         let status = if initial_role == WireReplicaRole::Leader {
@@ -729,9 +744,45 @@ impl NodeAdminService for DataNodeGrpcService {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RocksReplicaProfile {
+struct DecodedReplicaProfile {
     voters: Vec<u64>,
     relative_directory: String,
+    backend_slot: Option<BackendSlotState>,
+}
+
+pub fn encode_backend_replica_profile(
+    voters: &[u64],
+    relative_directory: &str,
+    backend: &BackendProfile,
+) -> Result<Vec<u8>, ReplicaProfileError> {
+    let mut voters = voters.to_vec();
+    voters.sort_unstable();
+    voters.dedup();
+    validate_replica_profile(&voters, relative_directory)?;
+    let profile = ReplicaBootstrapProfile {
+        format_version: 1,
+        voters,
+        relative_directory: relative_directory.to_owned(),
+        backend: Some(BackendProfileSpec {
+            provider: backend.provider().to_owned(),
+            instance_id: backend.instance_id().to_owned(),
+            public_parameters: backend
+                .public_parameters()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            credential_refs: backend
+                .credential_refs()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        }),
+    };
+    let encoded = profile.encode_to_vec();
+    if encoded.len() > MAX_REPLICA_PROFILE_BYTES {
+        return Err(ReplicaProfileError::TooLarge);
+    }
+    Ok(encoded)
 }
 
 pub fn encode_rocks_replica_profile(
@@ -755,9 +806,38 @@ pub fn encode_rocks_replica_profile(
     Ok(encoded)
 }
 
-fn decode_rocks_replica_profile(
+fn decode_replica_profile(
     encoded: &[u8],
-) -> Result<RocksReplicaProfile, ReplicaProfileError> {
+    backend_generation: u64,
+) -> Result<DecodedReplicaProfile, ReplicaProfileError> {
+    if !encoded.starts_with(&REPLICA_PROFILE_MAGIC) {
+        if encoded.is_empty() || encoded.len() > MAX_REPLICA_PROFILE_BYTES {
+            return Err(ReplicaProfileError::TooLarge);
+        }
+        let decoded = ReplicaBootstrapProfile::decode(encoded)
+            .map_err(|_| ReplicaProfileError::InvalidProtobuf)?;
+        if decoded.format_version != 1 {
+            return Err(ReplicaProfileError::UnsupportedVersion {
+                actual: u16::try_from(decoded.format_version).unwrap_or(u16::MAX),
+            });
+        }
+        validate_replica_profile(&decoded.voters, &decoded.relative_directory)?;
+        let backend = decoded.backend.ok_or(ReplicaProfileError::MissingBackend)?;
+        let profile = BackendProfile::new(
+            backend.provider,
+            backend.instance_id,
+            backend.public_parameters.into_iter().collect(),
+            backend.credential_refs.into_iter().collect(),
+        )
+        .map_err(|error| ReplicaProfileError::InvalidBackend(error.to_string()))?;
+        let backend_slot = BackendSlotState::active(backend_generation, profile)
+            .map_err(|error| ReplicaProfileError::InvalidBackend(error.to_string()))?;
+        return Ok(DecodedReplicaProfile {
+            voters: decoded.voters,
+            relative_directory: decoded.relative_directory,
+            backend_slot: Some(backend_slot),
+        });
+    }
     if encoded.len() < 14 {
         return Err(ReplicaProfileError::Truncated);
     }
@@ -803,9 +883,10 @@ fn decode_rocks_replica_profile(
         .map_err(|_| ReplicaProfileError::InvalidDirectory)?
         .to_owned();
     validate_replica_profile(&voters, &relative_directory)?;
-    Ok(RocksReplicaProfile {
+    Ok(DecodedReplicaProfile {
         voters,
         relative_directory,
+        backend_slot: None,
     })
 }
 
@@ -840,6 +921,10 @@ pub enum ReplicaProfileError {
     UnsupportedVersion { actual: u16 },
     ChecksumMismatch,
     Truncated,
+    TooLarge,
+    InvalidProtobuf,
+    MissingBackend,
+    InvalidBackend(String),
 }
 
 impl Display for ReplicaProfileError {
@@ -858,6 +943,12 @@ impl Display for ReplicaProfileError {
                 formatter.write_str("RocksDB Replica profile checksum mismatch")
             }
             Self::Truncated => formatter.write_str("RocksDB Replica profile is truncated"),
+            Self::TooLarge => formatter.write_str("Replica profile exceeds its size limit"),
+            Self::InvalidProtobuf => formatter.write_str("Replica profile protobuf is invalid"),
+            Self::MissingBackend => formatter.write_str("Replica profile backend is missing"),
+            Self::InvalidBackend(message) => {
+                write!(formatter, "invalid backend profile: {message}")
+            }
         }
     }
 }

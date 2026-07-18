@@ -425,6 +425,24 @@ pub struct HotSwapAdapter {
     in_flight_applies: AtomicUsize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HotSwapRecoveryState {
+    Active {
+        generation: u64,
+        provider_name: String,
+        instance_id: String,
+    },
+    DualApplying {
+        source_generation: u64,
+        source_provider_name: String,
+        source_instance_id: String,
+        target_generation: u64,
+        target_provider_name: String,
+        target_instance_id: String,
+        synchronized_index: u64,
+    },
+}
+
 impl HotSwapAdapter {
     #[must_use]
     pub fn new(active: OpenedAdapter) -> Self {
@@ -436,6 +454,72 @@ impl HotSwapAdapter {
             }),
             in_flight_applies: AtomicUsize::new(0),
         }
+    }
+
+    pub fn recover_active(active: OpenedAdapter, generation: u64) -> Result<Self, MigrationError> {
+        if generation == 0 {
+            return Err(MigrationError::InvalidGeneration { generation });
+        }
+        Ok(Self {
+            state: Mutex::new(HotSwapState {
+                generation,
+                active,
+                shadow: None,
+            }),
+            in_flight_applies: AtomicUsize::new(0),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_dual_applying(
+        active: OpenedAdapter,
+        source_generation: u64,
+        target: OpenedAdapter,
+        target_generation: u64,
+        synchronized_index: u64,
+        requirement: AdapterRequirement,
+    ) -> Result<Self, MigrationError> {
+        if source_generation == 0 {
+            return Err(MigrationError::InvalidGeneration {
+                generation: source_generation,
+            });
+        }
+        let expected_target = source_generation
+            .checked_add(1)
+            .ok_or(MigrationError::GenerationExhausted)?;
+        if target_generation != expected_target {
+            return Err(MigrationError::NonConsecutiveGeneration {
+                source: source_generation,
+                target: target_generation,
+            });
+        }
+        target.descriptor.validate(requirement)?;
+        let source_index = active.adapter.applied_log_index()?;
+        let target_index = target.adapter.applied_log_index()?;
+        if source_index != target_index {
+            return Err(MigrationError::TargetIndexMismatch {
+                source: source_index,
+                target: target_index,
+            });
+        }
+        if synchronized_index != source_index {
+            return Err(MigrationError::SynchronizedIndexMismatch {
+                durable: source_index,
+                recorded: synchronized_index,
+            });
+        }
+        Ok(Self {
+            state: Mutex::new(HotSwapState {
+                generation: source_generation,
+                active,
+                shadow: Some(ShadowAdapter {
+                    generation: target_generation,
+                    synchronized_index,
+                    opened: target,
+                }),
+            }),
+            in_flight_applies: AtomicUsize::new(0),
+        })
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, HotSwapState>, AdapterError> {
@@ -456,6 +540,37 @@ impl HotSwapAdapter {
     #[must_use]
     pub fn active_adapter(&self) -> Arc<dyn StorageAdapter> {
         self.inspect_state().active.adapter_arc()
+    }
+
+    #[must_use]
+    pub fn active_provider_name(&self) -> String {
+        self.inspect_state().active.provider_name.clone()
+    }
+
+    #[must_use]
+    pub fn active_instance_id(&self) -> String {
+        self.inspect_state().active.instance_id.clone()
+    }
+
+    #[must_use]
+    pub fn recovery_state(&self) -> HotSwapRecoveryState {
+        let state = self.inspect_state();
+        state.shadow.as_ref().map_or_else(
+            || HotSwapRecoveryState::Active {
+                generation: state.generation,
+                provider_name: state.active.provider_name.clone(),
+                instance_id: state.active.instance_id.clone(),
+            },
+            |shadow| HotSwapRecoveryState::DualApplying {
+                source_generation: state.generation,
+                source_provider_name: state.active.provider_name.clone(),
+                source_instance_id: state.active.instance_id.clone(),
+                target_generation: shadow.generation,
+                target_provider_name: shadow.opened.provider_name.clone(),
+                target_instance_id: shadow.opened.instance_id.clone(),
+                synchronized_index: shadow.synchronized_index,
+            },
+        )
     }
 
     #[must_use]
@@ -615,6 +730,16 @@ impl StorageAdapter for HotSwapAdapter {
         Box::pin(async move { active.scan(span).await })
     }
 
+    fn create_physical_checkpoint(
+        &self,
+        destination: &std::path::Path,
+    ) -> Result<(), AdapterError> {
+        self.lock_state()?
+            .active
+            .adapter
+            .create_physical_checkpoint(destination)
+    }
+
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         self.lock_state()?.active.adapter.applied_log_index()
     }
@@ -656,6 +781,9 @@ pub enum MigrationError {
     NotMigrating,
     ApplyInFlight { count: usize },
     TargetIndexMismatch { source: u64, target: u64 },
+    SynchronizedIndexMismatch { durable: u64, recorded: u64 },
+    InvalidGeneration { generation: u64 },
+    NonConsecutiveGeneration { source: u64, target: u64 },
     GenerationExhausted,
     LockPoisoned,
 }
@@ -676,6 +804,17 @@ impl Display for MigrationError {
             Self::TargetIndexMismatch { source, target } => write!(
                 formatter,
                 "migration source applied index {source} differs from target index {target}"
+            ),
+            Self::SynchronizedIndexMismatch { durable, recorded } => write!(
+                formatter,
+                "recorded synchronized index {recorded} differs from durable index {durable}"
+            ),
+            Self::InvalidGeneration { generation } => {
+                write!(formatter, "Adapter generation {generation} is invalid")
+            }
+            Self::NonConsecutiveGeneration { source, target } => write!(
+                formatter,
+                "target Adapter generation {target} does not immediately follow source generation {source}"
             ),
             Self::GenerationExhausted => formatter.write_str("Adapter generation is exhausted"),
             Self::LockPoisoned => formatter.write_str("Adapter migration state lock is poisoned"),

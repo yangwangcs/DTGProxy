@@ -7,7 +7,7 @@ use adapter_memory::MemoryAdapter;
 use adapter_registry::{
     AdapterFactory, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry,
     AdapterRestoreFuture, AdapterRestoreSession, AdapterRestoreSessionFuture, HotSwapAdapter,
-    MigrationError, MigrationStatus, RegistryError, SecretString,
+    HotSwapRecoveryState, MigrationError, MigrationStatus, RegistryError, SecretString,
 };
 use storage_api::{
     AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, AdapterRequirement,
@@ -219,6 +219,144 @@ fn hot_swap_refuses_an_unsynchronized_target() {
     let hot = HotSwapAdapter::new(source);
     assert!(matches!(
         hot.start_migration(target, AdapterRequirement::Development),
+        Err(MigrationError::TargetIndexMismatch {
+            source: 1,
+            target: 0
+        })
+    ));
+}
+
+#[test]
+fn hot_swap_recovers_an_active_generation_and_identity() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let active = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("recovered-active"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+
+    let hot = HotSwapAdapter::recover_active(active, 7).unwrap();
+
+    assert_eq!(hot.generation(), 7);
+    assert_eq!(hot.active_provider_name(), "memory");
+    assert_eq!(hot.active_instance_id(), "recovered-active");
+    assert_eq!(
+        hot.recovery_state(),
+        HotSwapRecoveryState::Active {
+            generation: 7,
+            provider_name: "memory".into(),
+            instance_id: "recovered-active".into(),
+        }
+    );
+}
+
+#[test]
+fn hot_swap_recovery_rejects_generation_zero() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let active = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("invalid-active"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        HotSwapAdapter::recover_active(active, 0),
+        Err(MigrationError::InvalidGeneration { generation: 0 })
+    ));
+}
+
+#[test]
+fn hot_swap_recovers_a_synchronized_dual_apply_phase() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let active = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("source-generation-4"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let target = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("target-generation-5"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    block_on(active.adapter().apply_committed(batch(1, b"one"))).unwrap();
+    block_on(target.adapter().apply_committed(batch(1, b"one"))).unwrap();
+
+    let hot = HotSwapAdapter::recover_dual_applying(
+        active,
+        4,
+        target,
+        5,
+        1,
+        AdapterRequirement::Development,
+    )
+    .unwrap();
+
+    assert_eq!(
+        hot.recovery_state(),
+        HotSwapRecoveryState::DualApplying {
+            source_generation: 4,
+            source_provider_name: "memory".into(),
+            source_instance_id: "source-generation-4".into(),
+            target_generation: 5,
+            target_provider_name: "memory".into(),
+            target_instance_id: "target-generation-5".into(),
+            synchronized_index: 1,
+        }
+    );
+    block_on(hot.apply_committed(batch(2, b"two"))).unwrap();
+    assert_eq!(hot.cutover().unwrap().instance_id(), "source-generation-4");
+    assert_eq!(hot.generation(), 5);
+}
+
+#[test]
+fn hot_swap_recovery_rejects_a_non_consecutive_or_stale_shadow() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let open = |instance: &str| {
+        block_on(registry.open(
+            "memory",
+            &AdapterOpenRequest::new(instance),
+            AdapterRequirement::Development,
+        ))
+        .unwrap()
+    };
+    let active = open("source");
+    let target = open("target");
+
+    assert!(matches!(
+        HotSwapAdapter::recover_dual_applying(
+            active,
+            4,
+            target,
+            6,
+            0,
+            AdapterRequirement::Development,
+        ),
+        Err(MigrationError::NonConsecutiveGeneration {
+            source: 4,
+            target: 6
+        })
+    ));
+
+    let active = open("source-at-one");
+    let target = open("target-at-zero");
+    block_on(active.adapter().apply_committed(batch(1, b"one"))).unwrap();
+    assert!(matches!(
+        HotSwapAdapter::recover_dual_applying(
+            active,
+            4,
+            target,
+            5,
+            1,
+            AdapterRequirement::Development,
+        ),
         Err(MigrationError::TargetIndexMismatch {
             source: 1,
             target: 0

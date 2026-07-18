@@ -422,7 +422,7 @@ fn tick(request_id: u128, closed: i64) -> Vec<u8> {
     .unwrap()
 }
 
-fn read_current(adapter: &RocksAdapter) -> Option<Vec<u8>> {
+fn read_current(adapter: &impl StorageAdapter) -> Option<Vec<u8>> {
     let key = LogicalKey::in_keyspace(Keyspace::Current, b"vertex/1".to_vec());
     block_on(adapter.multi_get(&[key])).unwrap().pop().flatten()
 }

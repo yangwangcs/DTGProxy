@@ -1,8 +1,10 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
+use std::sync::Arc;
 
-use adapter_rocksdb::RocksAdapter;
+use adapter_registry::{AdapterOpenRequest, AdapterRegistry, HotSwapAdapter, RegistryError};
+use adapter_rocksdb::RocksAdapterFactory;
 use prost::Message as ProstMessage;
 use raft::eraftpb::{
     ConfChangeSingle, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, Message,
@@ -18,7 +20,7 @@ pub struct DurableRaftReplica {
     node_id: u64,
     storage: RocksRaftStorage,
     raw_node: RawNode<RocksRaftStorage>,
-    state_machine: ShardStateMachine<RocksAdapter>,
+    state_machine: ShardStateMachine<Arc<HotSwapAdapter>>,
     crash_before_apply_once: bool,
     pending_auto_leave: bool,
     pending_leader_transfer: Option<u64>,
@@ -33,10 +35,39 @@ impl DurableRaftReplica {
         raft_wal_path: impl AsRef<Path>,
         adapter_path: impl AsRef<Path>,
     ) -> Result<Self, DurableReplicaError> {
+        let adapter_path = adapter_path.as_ref();
+        let mut registry = AdapterRegistry::new();
+        registry.register(Arc::new(RocksAdapterFactory))?;
+        let opened = registry
+            .open(
+                "rocksdb",
+                &AdapterOpenRequest::new(format!("shard-{shard_id}-rocksdb"))
+                    .with_parameter("path", adapter_path.to_string_lossy()),
+                storage_api::AdapterRequirement::ManagedReplica,
+            )
+            .await?;
+        Self::open_with_adapter_slot(
+            node_id,
+            voters,
+            shard_id,
+            placement_epoch,
+            raft_wal_path,
+            Arc::new(HotSwapAdapter::new(opened)),
+        )
+        .await
+    }
+
+    pub async fn open_with_adapter_slot(
+        node_id: u64,
+        voters: &[u64],
+        shard_id: u32,
+        placement_epoch: u64,
+        raft_wal_path: impl AsRef<Path>,
+        backend_slot: Arc<HotSwapAdapter>,
+    ) -> Result<Self, DurableReplicaError> {
         let storage = RocksRaftStorage::open(raft_wal_path, voters)?;
         let state_machine =
-            ShardStateMachine::open(RocksAdapter::open(adapter_path)?, shard_id, placement_epoch)
-                .await?;
+            ShardStateMachine::open(backend_slot, shard_id, placement_epoch).await?;
         let applied = state_machine.metadata().applied_index;
         let raft_state = storage.initial_state()?;
         if raft_state.hard_state.commit < applied {
@@ -102,12 +133,17 @@ impl DurableRaftReplica {
     }
 
     #[must_use]
-    pub const fn adapter(&self) -> &RocksAdapter {
+    pub const fn adapter(&self) -> &Arc<HotSwapAdapter> {
         self.state_machine.adapter()
     }
 
     #[must_use]
-    pub const fn state_machine(&self) -> &ShardStateMachine<RocksAdapter> {
+    pub const fn backend_slot(&self) -> &Arc<HotSwapAdapter> {
+        self.state_machine.adapter()
+    }
+
+    #[must_use]
+    pub const fn state_machine(&self) -> &ShardStateMachine<Arc<HotSwapAdapter>> {
         &self.state_machine
     }
 
@@ -367,6 +403,7 @@ fn discard_logger() -> Logger {
 #[derive(Debug)]
 pub enum DurableReplicaError {
     Adapter(storage_api::AdapterError),
+    Registry(RegistryError),
     StateMachine(ShardRuntimeError),
     Command(raft_command::CommandCodecError),
     LogStore(RaftLogStoreError),
@@ -385,6 +422,7 @@ impl Display for DurableReplicaError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Adapter(error) => write!(formatter, "Adapter error: {error}"),
+            Self::Registry(error) => write!(formatter, "Adapter registry error: {error}"),
             Self::StateMachine(error) => write!(formatter, "state-machine error: {error}"),
             Self::Command(error) => write!(formatter, "command error: {error}"),
             Self::LogStore(error) => write!(formatter, "Raft WAL error: {error}"),
@@ -419,6 +457,12 @@ impl Display for DurableReplicaError {
 }
 
 impl Error for DurableReplicaError {}
+
+impl From<RegistryError> for DurableReplicaError {
+    fn from(error: RegistryError) -> Self {
+        Self::Registry(error)
+    }
+}
 
 impl From<storage_api::AdapterError> for DurableReplicaError {
     fn from(error: storage_api::AdapterError) -> Self {

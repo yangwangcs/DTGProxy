@@ -166,6 +166,14 @@ pub fn create_rocks_checkpoint(
     voters: &[u64],
     destination: impl AsRef<Path>,
 ) -> Result<SnapshotManifestV1, SnapshotError> {
+    create_adapter_checkpoint(machine, voters, destination)
+}
+
+fn create_adapter_checkpoint<A: StorageAdapter>(
+    machine: &ShardStateMachine<A>,
+    voters: &[u64],
+    destination: impl AsRef<Path>,
+) -> Result<SnapshotManifestV1, SnapshotError> {
     validate_voters(voters)?;
     let metadata = machine.metadata();
     let adapter_index = machine.adapter().applied_log_index()?;
@@ -175,7 +183,9 @@ pub fn create_rocks_checkpoint(
             adapter: adapter_index,
         });
     }
-    machine.adapter().checkpoint(destination.as_ref())?;
+    machine
+        .adapter()
+        .create_physical_checkpoint(destination.as_ref())?;
     let checkpoint_digest = hash_checkpoint(destination.as_ref())?;
     Ok(SnapshotManifestV1 {
         shard_id: metadata.shard_id,
@@ -211,7 +221,7 @@ pub fn open_verified_checkpoint(
 }
 
 pub fn create_snapshot_bundle(
-    machine: &ShardStateMachine<RocksAdapter>,
+    machine: &ShardStateMachine<impl StorageAdapter>,
     voters: &[u64],
     destination: impl AsRef<Path>,
 ) -> Result<SnapshotManifestV1, SnapshotError> {
@@ -219,7 +229,7 @@ pub fn create_snapshot_bundle(
 }
 
 pub fn create_snapshot_bundle_with_failpoint(
-    machine: &ShardStateMachine<RocksAdapter>,
+    machine: &ShardStateMachine<impl StorageAdapter>,
     voters: &[u64],
     destination: impl AsRef<Path>,
     failpoint: SnapshotFailpoint,
@@ -227,8 +237,8 @@ pub fn create_snapshot_bundle_with_failpoint(
     create_snapshot_bundle_inner(machine, voters, destination.as_ref(), Some(failpoint))
 }
 
-fn create_snapshot_bundle_inner(
-    machine: &ShardStateMachine<RocksAdapter>,
+fn create_snapshot_bundle_inner<A: StorageAdapter>(
+    machine: &ShardStateMachine<A>,
     voters: &[u64],
     destination: &Path,
     failpoint: Option<SnapshotFailpoint>,
@@ -236,7 +246,7 @@ fn create_snapshot_bundle_inner(
     let staging = StagedDirectory::new(destination)?;
     fail_if(failpoint, SnapshotFailpoint::BeforeCheckpoint)?;
     let checkpoint = staging.path().join(CHECKPOINT_DIRECTORY);
-    let manifest = create_rocks_checkpoint(machine, voters, &checkpoint)?;
+    let manifest = create_adapter_checkpoint(machine, voters, &checkpoint)?;
     sync_tree(&checkpoint)?;
     fail_if(failpoint, SnapshotFailpoint::AfterCheckpointBeforeManifest)?;
     write_manifest(staging.path(), &manifest)?;
@@ -455,8 +465,8 @@ fn validate_archive_path(relative: &str) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-pub fn create_and_activate_local_snapshot(
-    machine: &ShardStateMachine<RocksAdapter>,
+pub fn create_and_activate_local_snapshot<A: StorageAdapter>(
+    machine: &ShardStateMachine<A>,
     raft_storage: &RocksRaftStorage,
     voters: &[u64],
     destination: impl AsRef<Path>,
@@ -470,8 +480,8 @@ pub fn create_and_activate_local_snapshot(
     )
 }
 
-pub fn create_and_activate_local_snapshot_with_failpoint(
-    machine: &ShardStateMachine<RocksAdapter>,
+pub fn create_and_activate_local_snapshot_with_failpoint<A: StorageAdapter>(
+    machine: &ShardStateMachine<A>,
     raft_storage: &RocksRaftStorage,
     voters: &[u64],
     destination: impl AsRef<Path>,
@@ -486,8 +496,8 @@ pub fn create_and_activate_local_snapshot_with_failpoint(
     )
 }
 
-fn create_and_activate_local_snapshot_inner(
-    machine: &ShardStateMachine<RocksAdapter>,
+fn create_and_activate_local_snapshot_inner<A: StorageAdapter>(
+    machine: &ShardStateMachine<A>,
     raft_storage: &RocksRaftStorage,
     voters: &[u64],
     destination: &Path,

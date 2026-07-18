@@ -780,7 +780,9 @@ impl AdapterFactory for TcpSidecarAdapterFactory {
             }
             let mut target = PublicAdapterOpenRequest::new(request.instance_id());
             for (name, value) in request.public_parameters() {
-                if !is_transport_parameter(name) {
+                if let Some(target_name) = name.strip_prefix("target.") {
+                    target = target.with_parameter(target_name, value);
+                } else if !is_transport_parameter(name) && name != "target_provider" {
                     target = target.with_parameter(name, value);
                 }
             }

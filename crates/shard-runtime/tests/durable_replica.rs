@@ -2,9 +2,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
+use adapter_memory::MemoryAdapter;
+use adapter_registry::{
+    AdapterFactory, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry, HotSwapAdapter,
+};
 use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
 use shard_runtime::{DurableRaftReplica, DurableReplicaError};
-use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter};
+use storage_api::{
+    AdapterRequirement, Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter,
+};
 use temporal_types::TransactionTime;
 
 #[test]
@@ -54,6 +60,54 @@ fn committed_wal_entry_left_before_adapter_apply_is_replayed_after_crash() {
     block_on(drain(&mut reopened)).unwrap();
     assert_eq!(read_current(&reopened), Some(b"recover-me".to_vec()));
     assert!(reopened.metadata().applied_index > applied_before);
+}
+
+#[test]
+fn durable_replica_accepts_a_recovered_hot_swap_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let opened = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("injected-shard-7"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let slot = Arc::new(HotSwapAdapter::recover_active(opened, 7).unwrap());
+
+    let mut replica = block_on(DurableRaftReplica::open_with_adapter_slot(
+        1,
+        &[1],
+        7,
+        9,
+        root.path().join("raft"),
+        Arc::clone(&slot),
+    ))
+    .unwrap();
+    block_on(elect_and_drain(&mut replica));
+    replica
+        .propose(701, command(701, 700, b"injected-adapter"))
+        .unwrap();
+    block_on(drain(&mut replica)).unwrap();
+
+    assert_eq!(replica.backend_slot().generation(), 7);
+    assert_eq!(read_current(&replica), Some(b"injected-adapter".to_vec()));
+    assert_eq!(
+        slot.applied_log_index().unwrap(),
+        replica.metadata().applied_index
+    );
+}
+
+struct MemoryFactory;
+
+impl AdapterFactory for MemoryFactory {
+    fn provider_name(&self) -> &str {
+        "memory"
+    }
+
+    fn open<'a>(&'a self, _request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a> {
+        Box::pin(async { Ok(Arc::new(MemoryAdapter::new()) as Arc<dyn StorageAdapter>) })
+    }
 }
 
 async fn elect_and_drain(replica: &mut DurableRaftReplica) {
