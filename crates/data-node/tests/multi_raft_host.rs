@@ -5,7 +5,9 @@ use data_node::{
     DataNodeHost, EnsureReplicaOutcome, HostError, NodeConfig, NodeIdentity, ReplicaKey,
     ReplicaRole, ReplicaSpec, TransportSecurity,
 };
+use raft::eraftpb::{Message, MessageType};
 use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
+use raft_transport::{RaftRoute, RoutedRaftMessage};
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use tempfile::tempdir;
 use temporal_types::TransactionTime;
@@ -176,5 +178,59 @@ async fn stale_epoch_is_rejected_before_a_command_reaches_raft() {
         })
     );
     assert_eq!(host.status(key(11)).await.unwrap().applied_index(), before);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn routed_raft_messages_are_validated_before_replica_dispatch() {
+    let temporary = tempdir().unwrap();
+    let host = DataNodeHost::open(config(temporary.path()), 8)
+        .await
+        .unwrap();
+    host.ensure_replica(spec(11)).await.unwrap();
+    let message = Message {
+        msg_type: MessageType::MsgHeartbeat.into(),
+        from: 8,
+        to: 7,
+        term: 1,
+        ..Default::default()
+    };
+
+    let wrong_cluster = RoutedRaftMessage::new(
+        RaftRoute::new([0x52; 16], 1, 11, 3).unwrap(),
+        message.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        host.step_routed(wrong_cluster).await,
+        Err(HostError::WrongCluster)
+    );
+
+    let wrong_target = RoutedRaftMessage::new(
+        RaftRoute::new([0x51; 16], 1, 11, 3).unwrap(),
+        Message {
+            to: 9,
+            ..message.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        host.step_routed(wrong_target).await,
+        Err(HostError::WrongTarget {
+            expected: 7,
+            actual: 9,
+        })
+    );
+
+    let unknown_shard =
+        RoutedRaftMessage::new(RaftRoute::new([0x51; 16], 1, 12, 3).unwrap(), message).unwrap();
+    assert_eq!(
+        host.step_routed(unknown_shard).await,
+        Err(HostError::UnknownReplica {
+            graph_id: 1,
+            shard_id: 12,
+        })
+    );
+
     host.shutdown().await.unwrap();
 }

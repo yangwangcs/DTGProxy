@@ -4,6 +4,7 @@ mod config;
 mod host;
 mod identity;
 mod manifest;
+mod raft_network;
 mod replica_actor;
 
 pub use config::{ConfigError, NodeConfig, TlsFiles, TransportSecurity};
@@ -12,6 +13,7 @@ pub use host::{
 };
 pub use identity::{NodeIdentity, NodeIdentityStore};
 pub use manifest::{ReplicaEntry, ReplicaManifest, ReplicaManifestStore, ReplicaRole};
+pub use raft_network::{RaftDelivery, RaftNetworkError, SharedRaftTransport};
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};

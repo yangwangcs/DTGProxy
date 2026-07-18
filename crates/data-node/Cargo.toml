@@ -9,9 +9,10 @@ license.workspace = true
 crc32fast = "=1.5.0"
 fs2 = "=0.4.3"
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
+raft-transport = { path = "../raft-transport" }
 shard-runtime = { path = "../shard-runtime" }
 storage-api = { path = "../storage-api" }
-tokio = { version = "=1.53.0", features = ["rt", "macros", "sync"] }
+tokio = { version = "=1.53.0", features = ["rt", "macros", "sync", "net", "io-util", "time"] }
 
 [dev-dependencies]
 raft-command = { path = "../raft-command" }

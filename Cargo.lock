@@ -379,6 +379,7 @@ dependencies = [
  "fs2",
  "raft",
  "raft-command",
+ "raft-transport",
  "shard-runtime",
  "storage-api",
  "tempfile",

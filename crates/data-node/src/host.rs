@@ -4,6 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::{Mutex, RwLock};
 
 use raft::eraftpb::Message;
+use raft_transport::RoutedRaftMessage;
 use storage_api::LogicalKey;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
@@ -379,6 +380,22 @@ impl DataNodeHost {
         receiver.await.map_err(|_| HostError::ActorStopped)?
     }
 
+    pub async fn step_routed(&self, routed: RoutedRaftMessage) -> Result<ReplicaStatus, HostError> {
+        if routed.route().cluster_id() != self.config.identity().cluster_id() {
+            return Err(HostError::WrongCluster);
+        }
+        let expected_target = self.config.identity().node_id();
+        if routed.message().to != expected_target {
+            return Err(HostError::WrongTarget {
+                expected: expected_target,
+                actual: routed.message().to,
+            });
+        }
+        let key = ReplicaKey::new(routed.route().graph_id(), routed.route().shard_id())?;
+        let placement_epoch = routed.route().placement_epoch();
+        self.step(key, placement_epoch, routed.into_message()).await
+    }
+
     pub fn try_tick(&self, key: ReplicaKey) -> Result<(), HostError> {
         self.sender(key)?
             .try_send(ActorCommand::Tick)
@@ -489,6 +506,8 @@ pub enum HostError {
     ReplicaSpecConflict { graph_id: u64, shard_id: u32 },
     LocalNodeNotVoter { node_id: u64 },
     LearnerNotYetSupported,
+    WrongCluster,
+    WrongTarget { expected: u64, actual: u64 },
     StaleEpoch { expected: u64, actual: u64 },
     Overloaded { graph_id: u64, shard_id: u32 },
     OutboundOverloaded,
@@ -530,6 +549,11 @@ impl Display for HostError {
             Self::LearnerNotYetSupported => {
                 formatter.write_str("learner Replica hosting is not connected yet")
             }
+            Self::WrongCluster => formatter.write_str("routed Raft message has another cluster"),
+            Self::WrongTarget { expected, actual } => write!(
+                formatter,
+                "routed Raft message targets node {actual}; expected {expected}"
+            ),
             Self::StaleEpoch { expected, actual } => write!(
                 formatter,
                 "stale placement epoch {actual}; expected {expected}"

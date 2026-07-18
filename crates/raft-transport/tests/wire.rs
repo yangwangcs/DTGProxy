@@ -4,8 +4,39 @@ use std::time::Duration;
 
 use raft::eraftpb::{Message, MessageType};
 use raft_transport::{
-    RaftTransportError, TcpRaftTransport, decode_message_frame, encode_message_frame,
+    RaftRoute, RaftTransportError, RoutedRaftMessage, TcpRaftTransport, decode_message_frame,
+    decode_routed_message_frame, encode_message_frame, encode_routed_message_frame,
 };
+
+#[test]
+fn cluster_routed_frame_carries_graph_shard_epoch_and_revalidates_identity() {
+    let route = RaftRoute::new([0x61; 16], 7, 9, 11).unwrap();
+    let routed = RoutedRaftMessage::new(route.clone(), message(1, 2, 13)).unwrap();
+    let encoded = encode_routed_message_frame(&routed).unwrap();
+    assert_eq!(
+        decode_routed_message_frame([0x61; 16], 2, &encoded).unwrap(),
+        routed
+    );
+    assert_eq!(
+        decode_routed_message_frame([0x62; 16], 2, &encoded),
+        Err(RaftTransportError::ClusterMismatch)
+    );
+    assert!(matches!(
+        decode_routed_message_frame([0x61; 16], 3, &encoded),
+        Err(RaftTransportError::RouteMismatch {
+            expected: 3,
+            actual: 2
+        })
+    ));
+
+    let mut corrupted = encoded;
+    let middle = corrupted.len() / 2;
+    corrupted[middle] ^= 1;
+    assert_eq!(
+        decode_routed_message_frame([0x61; 16], 2, &corrupted),
+        Err(RaftTransportError::ChecksumMismatch)
+    );
+}
 
 #[test]
 fn versioned_frame_round_trips_and_rejects_corruption_or_wrong_route() {
