@@ -10,7 +10,7 @@ use dtgproxy::{
 };
 use query_executor::QueryRecord;
 use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
-use storage_api::StorageAdapter;
+use storage_api::{AdapterRequirement, StorageAdapter};
 use temporal_ir::{DiffOperator, GraphScope, PointOperator, TemporalPlan, TemporalSelector};
 use temporal_storage::{
     ElementId, ElementKind, ElementRef, GraphId, LabelId, PartitionId, PrepareContext,
@@ -34,6 +34,47 @@ fn primary_replica_routes_every_scope_to_its_only_shard() {
     assert_eq!(config.route_scope(scope(1, 0)).shard_id(), 11);
     assert_eq!(config.route_scope(scope(99, 42)).shard_id(), 11);
     assert_eq!(config.all_shards(), &[placement(11, &[1, 2, 3])]);
+}
+
+#[test]
+fn durable_catalog_graph_materializes_the_same_runtime_topology() {
+    use dtgproxy::control_plane::{
+        BackendProfile, DeploymentMode as CatalogMode, GraphDefinition,
+        Placement as CatalogPlacement, TopologyDefinition,
+    };
+
+    let graph = GraphDefinition::new(
+        9,
+        "catalog-graph",
+        1,
+        TopologyDefinition::new(
+            CatalogMode::SharedNothing,
+            77,
+            4_096,
+            3,
+            vec![
+                CatalogPlacement::new(10, 5, vec![1, 2, 3]).unwrap(),
+                CatalogPlacement::new(20, 6, vec![4, 5, 6]).unwrap(),
+            ],
+        )
+        .unwrap(),
+        BackendProfile::new(
+            "rocksdb",
+            BTreeMap::from([("path".into(), "data/catalog-graph".into())]),
+            BTreeMap::new(),
+            AdapterRequirement::HotPluggableReplica,
+            1,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let config = DeploymentConfig::from_catalog(&graph).unwrap();
+    assert_eq!(config.mode(), DeploymentMode::SharedNothing);
+    assert_eq!(config.route_seed(), 77);
+    assert_eq!(config.virtual_partitions(), 4_096);
+    assert_eq!(config.all_shards()[0].placement_epoch(), 5);
+    assert_eq!(config.all_shards()[1].voters(), &[4, 5, 6]);
 }
 
 #[test]

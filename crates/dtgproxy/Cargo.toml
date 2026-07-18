@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 adapter-rocksdb = { path = "../adapter-rocksdb" }
 blake3 = "=1.8.5"
+control-plane = { path = "../control-plane" }
 query-executor = { path = "../query-executor" }
 raft-command = { path = "../raft-command" }
 raft-transport = { path = "../raft-transport" }

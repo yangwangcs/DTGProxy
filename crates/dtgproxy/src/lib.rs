@@ -9,6 +9,7 @@
 
 mod transaction;
 
+pub use control_plane;
 pub use transaction::{
     PreparedShardTransaction, ScopedTemporalTransaction, TransactionContext,
     TransactionCoordinator, TransactionCoordinatorError, TransactionReceipt, TransactionStatus,
@@ -86,6 +87,7 @@ impl ShardPlacement {
 pub struct DeploymentConfig {
     mode: DeploymentMode,
     route_seed: u64,
+    virtual_partitions: u32,
     shards: Vec<ShardPlacement>,
 }
 
@@ -95,14 +97,26 @@ impl DeploymentConfig {
         Self {
             mode: DeploymentMode::PrimaryReplica,
             route_seed: 0,
+            virtual_partitions: 1,
             shards: vec![shard],
         }
     }
 
     pub fn shared_nothing(
         route_seed: u64,
+        shards: Vec<ShardPlacement>,
+    ) -> Result<Self, DeploymentError> {
+        Self::shared_nothing_with_virtual_partitions(route_seed, 65_536, shards)
+    }
+
+    pub fn shared_nothing_with_virtual_partitions(
+        route_seed: u64,
+        virtual_partitions: u32,
         mut shards: Vec<ShardPlacement>,
     ) -> Result<Self, DeploymentError> {
+        if virtual_partitions == 0 {
+            return Err(DeploymentError::ZeroVirtualPartitions);
+        }
         if shards.len() < 2 {
             return Err(DeploymentError::SharedNothingNeedsMultipleShards {
                 actual: shards.len(),
@@ -119,8 +133,42 @@ impl DeploymentConfig {
         Ok(Self {
             mode: DeploymentMode::SharedNothing,
             route_seed,
+            virtual_partitions,
             shards,
         })
+    }
+
+    pub fn from_catalog(graph: &control_plane::GraphDefinition) -> Result<Self, DeploymentError> {
+        let topology = graph.topology();
+        let shards = topology
+            .placements()
+            .iter()
+            .map(|placement| {
+                ShardPlacement::new(
+                    placement.shard_id(),
+                    placement.epoch(),
+                    placement.voters().to_vec(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match topology.mode() {
+            control_plane::DeploymentMode::PrimaryReplica => {
+                let shard = shards
+                    .into_iter()
+                    .next()
+                    .expect("validated catalog PrimaryReplica topology has one Shard");
+                let mut config = Self::primary_replica(shard);
+                config.virtual_partitions = topology.virtual_partitions();
+                Ok(config)
+            }
+            control_plane::DeploymentMode::SharedNothing => {
+                Self::shared_nothing_with_virtual_partitions(
+                    topology.route_seed(),
+                    topology.virtual_partitions(),
+                    shards,
+                )
+            }
+        }
     }
 
     #[must_use]
@@ -131,6 +179,11 @@ impl DeploymentConfig {
     #[must_use]
     pub const fn route_seed(&self) -> u64 {
         self.route_seed
+    }
+
+    #[must_use]
+    pub const fn virtual_partitions(&self) -> u32 {
+        self.virtual_partitions
     }
 
     #[must_use]
@@ -222,6 +275,7 @@ pub enum DeploymentError {
     DuplicateVoter { shard_id: u32, node_id: u64 },
     DuplicateShard { shard_id: u32 },
     SharedNothingNeedsMultipleShards { actual: usize },
+    ZeroVirtualPartitions,
     InvalidPlan(PlanError),
 }
 
@@ -242,6 +296,9 @@ impl Display for DeploymentError {
                 formatter,
                 "Shared-Nothing mode needs at least two Shards; got {actual}"
             ),
+            Self::ZeroVirtualPartitions => {
+                formatter.write_str("virtual partition count must be nonzero")
+            }
             Self::InvalidPlan(error) => write!(formatter, "invalid Temporal IR: {error}"),
         }
     }

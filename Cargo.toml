@@ -3,6 +3,7 @@ members = [
     "crates/temporal-types",
     "crates/timestamp-oracle",
     "crates/txn-protocol",
+    "crates/control-plane",
     "crates/temporal-model",
     "crates/storage-api",
     "crates/adapter-registry",
