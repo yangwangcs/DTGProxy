@@ -10,19 +10,24 @@ use cluster_protocol::proto::meta_service_client::MetaServiceClient;
 use cluster_protocol::proto::node_admin_service_client::NodeAdminServiceClient;
 use cluster_protocol::proto::shard_service_client::ShardServiceClient;
 use cluster_protocol::proto::{
-    AcquireControllerLeaseRequest, ActivateReplicaRequest, BackendProfileSpec,
-    ChangeMembershipRequest, DeleteReplicaRequest, EnsureReplicaRequest, ExecuteRequest,
-    ExportSnapshotRequest, GetCatalogRequest, ProposeRequest, ReplicaBootstrapProfile, ReplicaRole,
-    ReplicaStatusRequest, RequestContext, ShardContext,
+    AcquireControllerLeaseRequest, ActivateReplicaRequest, BackendLifecyclePhase,
+    BackendProfileSpec, BeginBackendDualApplyRequest, ChangeMembershipRequest,
+    DeleteReplicaRequest, EnsureReplicaRequest, ExecuteRequest, ExportSnapshotRequest,
+    FinishBackendMigrationRequest, GetBackendStatusRequest, GetBackendStatusResponse,
+    GetCatalogRequest, PrepareBackendTargetRequest, ProposeRequest, ReplicaBootstrapProfile,
+    ReplicaRole, ReplicaStatusRequest, RequestContext, ShardContext,
 };
-use control_plane::{CatalogCommand, CatalogState, GraphDefinition, MigrationRecord};
+use control_plane::{
+    BackendMigrationRecord, BackendMigrationState, BackendProfile, BackendReplicaReceipt,
+    CatalogCommand, CatalogState, GraphDefinition, MigrationRecord, Placement,
+};
 use prost::Message as ProstMessage;
 use raft_command::{CommandBodyV1, CommandEnvelopeV1};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::Request;
 
-use crate::{CatalogApi, ControllerError, DataPlaneApi, SnapshotFence};
+use crate::{BackendDataPlaneApi, CatalogApi, ControllerError, DataPlaneApi, SnapshotFence};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControllerLease {
@@ -374,6 +379,225 @@ impl RemoteDataPlane {
         }
         Ok(())
     }
+
+    fn backend_context(
+        &self,
+        graph: &GraphDefinition,
+        placement: &Placement,
+        request_id: u128,
+    ) -> Result<ShardContext, ControllerError> {
+        Ok(ShardContext {
+            request: Some(self.common(request_id)?),
+            graph_id: graph.graph_id(),
+            shard_id: placement.shard_id(),
+            placement_epoch: placement.epoch(),
+        })
+    }
+
+    async fn backend_status_on(
+        &self,
+        node_id: u64,
+        graph: &GraphDefinition,
+        placement: &Placement,
+        request_id: u128,
+    ) -> Result<GetBackendStatusResponse, ControllerError> {
+        let mut client = self.admin_client(node_id).await?;
+        client
+            .get_backend_status(Request::new(GetBackendStatusRequest {
+                context: Some(self.backend_context(graph, placement, request_id)?),
+            }))
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|error| ControllerError::Data(error.to_string()))
+    }
+
+    async fn propose_backend_begin(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+        placement: &Placement,
+        digest: [u8; 32],
+        fence_index: u64,
+    ) -> Result<(), ControllerError> {
+        let request_id = backend_operation_id(migration, 20, placement.shard_id(), 0);
+        let mut errors = Vec::new();
+        for node_id in placement.voters() {
+            match self.admin_client(*node_id).await {
+                Ok(mut client) => {
+                    let request = BeginBackendDualApplyRequest {
+                        context: Some(self.backend_context(graph, placement, request_id)?),
+                        operation_id: request_id.to_be_bytes().to_vec(),
+                        source_generation: migration.source().generation(),
+                        target_generation: migration.target().generation(),
+                        target_profile_digest: digest.to_vec(),
+                        fence_index,
+                    };
+                    match client.begin_backend_dual_apply(Request::new(request)).await {
+                        Ok(_) => return Ok(()),
+                        Err(error) => errors.push(error.to_string()),
+                    }
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        Err(ControllerError::Data(format!(
+            "backend dual-apply leader unavailable for shard {}: {}",
+            placement.shard_id(),
+            errors.join("; ")
+        )))
+    }
+
+    async fn propose_backend_finish(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+        placement: &Placement,
+        digest: [u8; 32],
+        cutover: bool,
+    ) -> Result<(), ControllerError> {
+        let step = if cutover { 40 } else { 60 };
+        let request_id = backend_operation_id(migration, step, placement.shard_id(), 0);
+        let mut errors = Vec::new();
+        for node_id in placement.voters() {
+            match self.admin_client(*node_id).await {
+                Ok(mut client) => {
+                    let request = FinishBackendMigrationRequest {
+                        context: Some(self.backend_context(graph, placement, request_id)?),
+                        operation_id: request_id.to_be_bytes().to_vec(),
+                        source_generation: migration.source().generation(),
+                        target_generation: migration.target().generation(),
+                        target_profile_digest: digest.to_vec(),
+                    };
+                    let result = if cutover {
+                        client.cutover_backend(Request::new(request)).await
+                    } else {
+                        client.abort_backend_migration(Request::new(request)).await
+                    };
+                    match result {
+                        Ok(_) => return Ok(()),
+                        Err(error) => errors.push(error.to_string()),
+                    }
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        Err(ControllerError::Data(format!(
+            "backend {} leader unavailable for shard {}: {}",
+            if cutover { "cutover" } else { "abort" },
+            placement.shard_id(),
+            errors.join("; ")
+        )))
+    }
+
+    fn backend_binding(
+        migration: &BackendMigrationRecord,
+        placement: &Placement,
+    ) -> Result<([u8; 32], u64), ControllerError> {
+        let mut digest = None;
+        let mut minimum_fence = u64::MAX;
+        for node_id in placement.voters() {
+            let receipt = migration
+                .receipts()
+                .get(&(
+                    BackendMigrationState::Restored,
+                    placement.shard_id(),
+                    *node_id,
+                ))
+                .ok_or_else(|| {
+                    ControllerError::Data(format!(
+                        "missing restored backend binding for shard {} node {}",
+                        placement.shard_id(),
+                        node_id
+                    ))
+                })?;
+            if digest.is_some_and(|expected| expected != receipt.profile_digest()) {
+                return Err(ControllerError::Data(format!(
+                    "replicas resolved different target profiles for shard {}",
+                    placement.shard_id()
+                )));
+            }
+            digest = Some(receipt.profile_digest());
+            minimum_fence = minimum_fence.min(receipt.applied_index());
+        }
+        Ok((
+            digest.ok_or_else(|| ControllerError::Data("empty backend placement".into()))?,
+            minimum_fence,
+        ))
+    }
+
+    async fn collect_backend_receipts(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+        state: BackendMigrationState,
+        expect_dual: bool,
+        require_synchronized: bool,
+    ) -> Result<Vec<BackendReplicaReceipt>, ControllerError> {
+        let mut receipts = Vec::new();
+        for placement in graph.topology().placements() {
+            let (digest, _) = Self::backend_binding(migration, placement)?;
+            for node_id in placement.voters() {
+                let request_id = backend_operation_id(
+                    migration,
+                    70 + state_tag_for_remote(state),
+                    placement.shard_id(),
+                    *node_id,
+                );
+                let response = self
+                    .backend_status_on(*node_id, graph, placement, request_id)
+                    .await?;
+                let status = response.status.ok_or_else(|| {
+                    ControllerError::Data("backend status omitted Replica status".into())
+                })?;
+                if !status.ready || status.node_id != *node_id {
+                    return Err(ControllerError::Data(format!(
+                        "backend replica shard {} node {} is not ready",
+                        placement.shard_id(),
+                        node_id
+                    )));
+                }
+                if expect_dual {
+                    if response.phase != BackendLifecyclePhase::DualApplying as i32
+                        || response.source_generation != migration.source().generation()
+                        || response.target_generation != migration.target().generation()
+                        || response.target_profile_digest.as_slice() != digest
+                        || (require_synchronized
+                            && response.synchronized_index < status.applied_index)
+                    {
+                        return Err(ControllerError::Data(format!(
+                            "backend replica shard {} node {} has not converged to dual apply",
+                            placement.shard_id(),
+                            node_id
+                        )));
+                    }
+                } else if response.phase != BackendLifecyclePhase::Active as i32
+                    || response.source_generation != migration.target().generation()
+                    || status.backend_generation != migration.target().generation()
+                {
+                    return Err(ControllerError::Data(format!(
+                        "backend replica shard {} node {} has not converged to target generation",
+                        placement.shard_id(),
+                        node_id
+                    )));
+                }
+                receipts.push(
+                    BackendReplicaReceipt::new(
+                        state,
+                        placement.shard_id(),
+                        *node_id,
+                        if expect_dual {
+                            response.synchronized_index
+                        } else {
+                            status.applied_index
+                        },
+                        digest,
+                    )
+                    .map_err(|error| ControllerError::Data(error.to_string()))?,
+                );
+            }
+        }
+        Ok(receipts)
+    }
 }
 
 impl DataPlaneApi for RemoteDataPlane {
@@ -596,6 +820,164 @@ impl DataPlaneApi for RemoteDataPlane {
     }
 }
 
+impl BackendDataPlaneApi for RemoteDataPlane {
+    async fn prepare_target(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+    ) -> Result<Vec<BackendReplicaReceipt>, ControllerError> {
+        let mut receipts = Vec::new();
+        for placement in graph.topology().placements() {
+            let target_profile = resolved_backend_profile(migration, graph, placement.shard_id())?;
+            let mut shard_digest = None;
+            for node_id in placement.voters() {
+                let request_id =
+                    backend_operation_id(migration, 10, placement.shard_id(), *node_id);
+                let mut client = self.admin_client(*node_id).await?;
+                let response = client
+                    .prepare_backend_target(Request::new(PrepareBackendTargetRequest {
+                        context: Some(self.backend_context(graph, placement, request_id)?),
+                        operation_id: request_id.to_be_bytes().to_vec(),
+                        target_generation: migration.target().generation(),
+                        target_profile: Some(target_profile.clone()),
+                    }))
+                    .await
+                    .map_err(|error| ControllerError::Data(error.to_string()))?
+                    .into_inner();
+                let status = response.status.ok_or_else(|| {
+                    ControllerError::Data("backend preparation omitted Replica status".into())
+                })?;
+                let digest = copy_digest(&response.target_profile_digest)?;
+                if !status.ready
+                    || status.node_id != *node_id
+                    || status.backend_generation != migration.source().generation()
+                    || shard_digest.is_some_and(|expected| expected != digest)
+                {
+                    return Err(ControllerError::Data(format!(
+                        "backend preparation did not converge for shard {} node {}",
+                        placement.shard_id(),
+                        node_id
+                    )));
+                }
+                shard_digest = Some(digest);
+                receipts.push(
+                    BackendReplicaReceipt::new(
+                        BackendMigrationState::Restored,
+                        placement.shard_id(),
+                        *node_id,
+                        response.fence_index,
+                        digest,
+                    )
+                    .map_err(|error| ControllerError::Data(error.to_string()))?,
+                );
+            }
+        }
+        Ok(receipts)
+    }
+
+    async fn begin_dual_apply(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+    ) -> Result<Vec<BackendReplicaReceipt>, ControllerError> {
+        for placement in graph.topology().placements() {
+            let (digest, fence_index) = Self::backend_binding(migration, placement)?;
+            self.propose_backend_begin(migration, graph, placement, digest, fence_index)
+                .await?;
+        }
+        self.collect_backend_receipts(
+            migration,
+            graph,
+            BackendMigrationState::DualApplying,
+            true,
+            false,
+        )
+        .await
+    }
+
+    async fn verify_dual_apply(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+    ) -> Result<Option<Vec<BackendReplicaReceipt>>, ControllerError> {
+        match self
+            .collect_backend_receipts(
+                migration,
+                graph,
+                BackendMigrationState::Verified,
+                true,
+                true,
+            )
+            .await
+        {
+            Ok(receipts) => Ok(Some(receipts)),
+            Err(ControllerError::Data(message))
+                if message.contains("has not converged to dual apply") =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cutover(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+    ) -> Result<Vec<BackendReplicaReceipt>, ControllerError> {
+        for placement in graph.topology().placements() {
+            let (digest, _) = Self::backend_binding(migration, placement)?;
+            self.propose_backend_finish(migration, graph, placement, digest, true)
+                .await?;
+        }
+        self.collect_backend_receipts(
+            migration,
+            graph,
+            BackendMigrationState::CutOver,
+            false,
+            false,
+        )
+        .await
+    }
+
+    async fn retire_source(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+    ) -> Result<Vec<BackendReplicaReceipt>, ControllerError> {
+        self.collect_backend_receipts(
+            migration,
+            graph,
+            BackendMigrationState::SourceRetired,
+            false,
+            false,
+        )
+        .await
+    }
+
+    async fn abort(
+        &self,
+        migration: &BackendMigrationRecord,
+        graph: &GraphDefinition,
+    ) -> Result<(), ControllerError> {
+        let prepared = if migration.receipts().is_empty() {
+            Some(self.prepare_target(migration, graph).await?)
+        } else {
+            None
+        };
+        for placement in graph.topology().placements() {
+            let digest = if let Some(receipts) = &prepared {
+                backend_digest_from_receipts(receipts, placement)?
+            } else {
+                Self::backend_binding(migration, placement)?.0
+            };
+            self.propose_backend_finish(migration, graph, placement, digest, false)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 fn now_ms() -> Result<u64, ControllerError> {
     u64::try_from(
         SystemTime::now()
@@ -637,6 +1019,147 @@ fn operation_id(migration: &MigrationRecord, step: u8, node: u64) -> u128 {
     if value == 0 { 1 } else { value }
 }
 
+fn backend_operation_id(
+    migration: &BackendMigrationRecord,
+    step: u8,
+    shard_id: u32,
+    node_id: u64,
+) -> u128 {
+    let mut input = Vec::with_capacity(48);
+    input.extend_from_slice(b"backend");
+    input.extend_from_slice(&migration.migration_id().to_be_bytes());
+    input.extend_from_slice(&migration.state_revision().to_be_bytes());
+    input.push(step);
+    input.extend_from_slice(&shard_id.to_be_bytes());
+    input.extend_from_slice(&node_id.to_be_bytes());
+    let digest = blake3::hash(&input);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    let value = u128::from_be_bytes(bytes);
+    if value == 0 { 1 } else { value }
+}
+
+const fn state_tag_for_remote(state: BackendMigrationState) -> u8 {
+    match state {
+        BackendMigrationState::Preparing => 1,
+        BackendMigrationState::Restored => 2,
+        BackendMigrationState::DualApplying => 3,
+        BackendMigrationState::Verified => 4,
+        BackendMigrationState::CutOver => 5,
+        BackendMigrationState::Published => 6,
+        BackendMigrationState::SourceRetired => 7,
+        BackendMigrationState::Aborting => 8,
+        BackendMigrationState::Aborted => 9,
+    }
+}
+
+fn resolved_backend_profile(
+    migration: &BackendMigrationRecord,
+    graph: &GraphDefinition,
+    shard_id: u32,
+) -> Result<BackendProfileSpec, ControllerError> {
+    let catalog = migration.target();
+    let instance_id = format!(
+        "graph-{}-shard-{shard_id}-generation-{}",
+        graph.graph_id(),
+        catalog.generation()
+    );
+    let (provider, public_parameters) = match catalog.provider() {
+        "rocksdb" => (
+            "rocksdb".to_owned(),
+            std::collections::HashMap::from([(
+                "path".to_owned(),
+                format!("backend-generation-{}", catalog.generation()),
+            )]),
+        ),
+        "postgresql" | "neo4j" | "sidecar" => {
+            let endpoint = sidecar_endpoint(catalog, shard_id)?;
+            let target_provider = if catalog.provider() == "sidecar" {
+                catalog
+                    .public_parameters()
+                    .get("target_provider")
+                    .ok_or_else(|| {
+                        ControllerError::Data(
+                            "sidecar backend requires public parameter target_provider".into(),
+                        )
+                    })?
+                    .clone()
+            } else {
+                catalog.provider().to_owned()
+            };
+            let mut parameters = std::collections::HashMap::from([
+                ("endpoint".to_owned(), endpoint),
+                ("target_provider".to_owned(), target_provider),
+            ]);
+            for (name, value) in catalog.public_parameters() {
+                if !name.starts_with("sidecar_endpoint") && name != "target_provider" {
+                    parameters.insert(format!("target.{name}"), value.clone());
+                }
+            }
+            ("sidecar".to_owned(), parameters)
+        }
+        provider => {
+            return Err(ControllerError::Data(format!(
+                "unsupported backend provider {provider}"
+            )));
+        }
+    };
+    Ok(BackendProfileSpec {
+        provider,
+        instance_id,
+        public_parameters,
+        credential_refs: catalog
+            .secret_references()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    })
+}
+
+fn sidecar_endpoint(profile: &BackendProfile, shard_id: u32) -> Result<String, ControllerError> {
+    let shard_key = format!("sidecar_endpoint.shard.{shard_id}");
+    profile
+        .public_parameters()
+        .get(&shard_key)
+        .or_else(|| profile.public_parameters().get("sidecar_endpoint"))
+        .cloned()
+        .ok_or_else(|| {
+            ControllerError::Data(format!(
+                "backend provider {} requires public parameter {shard_key} or sidecar_endpoint",
+                profile.provider()
+            ))
+        })
+}
+
+fn backend_digest_from_receipts(
+    receipts: &[BackendReplicaReceipt],
+    placement: &Placement,
+) -> Result<[u8; 32], ControllerError> {
+    let mut digest = None;
+    for node_id in placement.voters() {
+        let receipt = receipts
+            .iter()
+            .find(|receipt| {
+                receipt.shard_id() == placement.shard_id() && receipt.node_id() == *node_id
+            })
+            .ok_or_else(|| {
+                ControllerError::Data(format!(
+                    "missing prepared backend binding for shard {} node {}",
+                    placement.shard_id(),
+                    node_id
+                ))
+            })?;
+        if digest.is_some_and(|expected| expected != receipt.profile_digest()) {
+            return Err(ControllerError::Data(format!(
+                "replicas resolved different target profiles for shard {}",
+                placement.shard_id()
+            )));
+        }
+        digest = Some(receipt.profile_digest());
+    }
+    digest.ok_or_else(|| ControllerError::Data("empty backend placement".into()))
+}
+
 fn copy_digest(bytes: &[u8]) -> Result<[u8; 32], ControllerError> {
     bytes
         .try_into()
@@ -671,21 +1194,13 @@ fn encode_backend_profile(
             std::collections::HashMap::from([("path".to_owned(), "adapter".to_owned())]),
         ),
         "postgresql" | "neo4j" | "sidecar" => {
-            let sidecar_endpoint = catalog
-                .public_parameters()
-                .get("sidecar_endpoint")
-                .ok_or_else(|| {
-                    ControllerError::Data(format!(
-                        "backend provider {} requires public parameter sidecar_endpoint",
-                        catalog.provider()
-                    ))
-                })?;
+            let sidecar_endpoint = sidecar_endpoint(catalog, migration.shard_id())?;
             let mut parameters = std::collections::HashMap::from([
-                ("endpoint".to_owned(), sidecar_endpoint.clone()),
+                ("endpoint".to_owned(), sidecar_endpoint),
                 ("target_provider".to_owned(), catalog.provider().to_owned()),
             ]);
             for (name, value) in catalog.public_parameters() {
-                if name != "sidecar_endpoint" {
+                if !name.starts_with("sidecar_endpoint") {
                     parameters.insert(format!("target.{name}"), value.clone());
                 }
             }

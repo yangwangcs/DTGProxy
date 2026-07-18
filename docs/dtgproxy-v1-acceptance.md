@@ -24,6 +24,10 @@ This document records the implemented prototype main path. The separate
 | Crash-replayable Shard migration and epoch lineage | `controller/tests/crash_matrix.rs`, `controller/tests/remote_migration.rs`, `control-plane/tests/lineage.rs` |
 | Joint-consensus leader replacement | `data-node/tests/multi_raft_host.rs`, `controller/tests/remote_migration.rs` |
 | Durable transaction/backup/CDC cleanup pins | `control-plane/tests/retention_pins.rs`, `controller/tests/reconciliation.rs` |
+| Durable cluster-wide backend migration and generation publish | `control-plane/tests/backend_migration.rs`, `controller/tests/backend_reconciliation.rs`, `controller/tests/remote_backend_migration.rs` |
+| Raft-fenced dual apply, cutover, pre-cutover abort, and Data restart | `data-node/tests/service_backend_migration.rs`, `shard-runtime/tests/durable_replica.rs`, `controller/tests/remote_backend_migration.rs` |
+| Idempotent backend migration start/status/abort administration | `controller/tests/backend_admin.rs`, `dtgproxy-admin`, `docs/backend-migration-runbook.md` |
+| Stateful PostgreSQL and Neo4j Sidecar restore targets | `dtgproxy-postgres-sidecar`, `dtgproxy-neo4j-sidecar`, `adapter-sidecar/tests/stateful_snapshot.rs` |
 
 ## Verification commands
 
@@ -31,18 +35,26 @@ This document records the implemented prototype main path. The separate
 export CXX=/opt/homebrew/opt/llvm/bin/clang++
 export LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib
 cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Ignored live tests require disposable services:
 
 - `DTGPROXY_POSTGRES_URL` for PostgreSQL.
 - `DTGPROXY_NEO4J_ENDPOINT`, `DTGPROXY_NEO4J_PASSWORD`, and optionally `DTGPROXY_NEO4J_USERNAME`/`DTGPROXY_NEO4J_DATABASE` for Neo4j.
+- `DTGPROXY_TEST_TARGET_PROVIDER` and `DTGPROXY_TEST_SIDECAR_ENDPOINT` for the Controller's
+  external Sidecar migration test.
+
+The 2026-07-18 acceptance run additionally executed all ignored Adapter and Controller paths against
+disposable PostgreSQL 17.10 and Neo4j 5.26 Community services. Both migrations preserved writes
+made before restore and during dual apply, published generation 2, restarted the Data process, and
+read both values from the target backend.
 
 ## Boundary status
 
 Malformed Gateway isolation, Sidecar connection reuse/session bounds, schema fencing, timeout
-handling, startup transaction recovery, durable Shard migration cutover, epoch lineage, and
-recoverable source cleanup are closed. Cluster-wide backend-generation orchestration,
-external-service matrices, untrusted-network security, streaming backpressure, disk-full testing,
-SBOM review, and service capacity qualification remain production gates.
+handling, startup transaction recovery, durable Shard migration cutover, epoch lineage, recoverable
+source cleanup, and cluster-wide backend-generation orchestration are closed for the prototype.
+Sidecar active-target selector persistence, broader external-service/failover matrices,
+untrusted-network security, streaming backpressure, disk-full testing, SBOM review, and service
+capacity qualification remain production gates.

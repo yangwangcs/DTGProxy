@@ -3,7 +3,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use controller::{CatalogApi, ControllerRuntimeConfig, Reconciler, RemoteCatalog, RemoteDataPlane};
+use controller::{
+    BackendReconciler, CatalogApi, ControllerRuntimeConfig, Reconciler, RemoteCatalog,
+    RemoteDataPlane,
+};
 
 #[tokio::main]
 async fn main() {
@@ -62,10 +65,25 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     .filter(|migration| !migration.state().is_terminal())
                     .map(|migration| migration.migration_id())
                     .collect::<Vec<_>>();
+                let backend_migrations = state
+                    .backend_migrations()
+                    .values()
+                    .filter(|migration| !migration.state().is_terminal())
+                    .map(|migration| migration.migration_id())
+                    .collect::<Vec<_>>();
                 let reconciler = Reconciler::new(catalog.clone(), data.clone(), lease.owner_term)?;
                 for migration_id in migrations {
                     if let Err(error) = reconciler.reconcile(migration_id, now_ms()?).await {
                         eprintln!("dtgproxy-controller migration={migration_id:032x}: {error}");
+                    }
+                }
+                let backend_reconciler =
+                    BackendReconciler::new(catalog.clone(), data.clone(), lease.owner_term)?;
+                for migration_id in backend_migrations {
+                    if let Err(error) = backend_reconciler.reconcile(migration_id, now_ms()?).await {
+                        eprintln!(
+                            "dtgproxy-controller backend-migration={migration_id:032x}: {error}"
+                        );
                     }
                 }
             }

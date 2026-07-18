@@ -175,7 +175,7 @@ pub(crate) enum ActorCommand {
         response: oneshot::Sender<Result<ReplicaSpec, HostError>>,
     },
     CommitActivation {
-        spec: ReplicaSpec,
+        spec: Box<ReplicaSpec>,
         response: oneshot::Sender<Result<ReplicaStatus, HostError>>,
     },
     Shutdown(oneshot::Sender<Result<(), HostError>>),
@@ -429,7 +429,7 @@ async fn run_actor(
                 spec: activated,
                 response,
             } => {
-                spec = activated;
+                spec = *activated;
                 let _ = response.send(Ok(status(&replica, &spec)));
             }
             ActorCommand::Shutdown(response) => {

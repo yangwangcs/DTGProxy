@@ -324,7 +324,7 @@ impl Neo4jAdapter {
             ));
         }
         rows.iter()
-            .map(|row| row.get(1).map(decode_base64).transpose())
+            .map(|row| decode_optional_base64(row.get(1)))
             .collect()
     }
 
@@ -798,6 +798,13 @@ fn decode_base64(value: &Value) -> Result<Vec<u8>, AdapterError> {
         .map_err(|error| AdapterError::Backend(format!("invalid Neo4j base64 value: {error}")))
 }
 
+fn decode_optional_base64(value: Option<&Value>) -> Result<Option<Vec<u8>>, AdapterError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => decode_base64(value).map(Some),
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -884,5 +891,15 @@ mod tests {
             .with_parameter("database", "neo4j/other")
             .with_secret("password", adapter_registry::SecretString::new("secret"));
         assert!(Neo4jConfiguration::from_request(&request).is_err());
+    }
+
+    #[test]
+    fn optional_match_null_cells_decode_as_missing_values() {
+        assert_eq!(decode_optional_base64(None).unwrap(), None);
+        assert_eq!(decode_optional_base64(Some(&Value::Null)).unwrap(), None);
+        assert_eq!(
+            decode_optional_base64(Some(&Value::String("cGF5bG9hZA==".into()))).unwrap(),
+            Some(b"payload".to_vec())
+        );
     }
 }

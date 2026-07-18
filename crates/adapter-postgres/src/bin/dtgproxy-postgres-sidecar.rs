@@ -3,8 +3,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use adapter_postgres::{DEFAULT_POOL_SIZE, PostgresAdapter};
-use adapter_sidecar::{TcpSidecarServerConfig, spawn_tcp_sidecar_server};
+use adapter_postgres::{DEFAULT_POOL_SIZE, PostgresAdapter, PostgresAdapterFactory};
+use adapter_registry::AdapterRegistry;
+use adapter_sidecar::{
+    SidecarRestoreBackend, SidecarService, TcpSidecarServerConfig,
+    spawn_stateful_tcp_sidecar_server,
+};
 use storage_api::{AdapterRequirement, StorageAdapter};
 
 fn main() {
@@ -34,14 +38,27 @@ fn run() -> Result<(), String> {
         .transpose()
         .map_err(|_| "DTGPROXY_POSTGRES_POOL_SIZE must be an integer".to_owned())?
         .unwrap_or(DEFAULT_POOL_SIZE);
-    let adapter = PostgresAdapter::open(connection_string, instance_id, pool_size)
+    let adapter = PostgresAdapter::open(&connection_string, instance_id, pool_size)
         .map_err(|error| error.to_string())?;
     adapter
         .descriptor()
         .validate(AdapterRequirement::HotPluggableReplica)
         .map_err(|error| error.to_string())?;
     let adapter: Arc<dyn StorageAdapter> = Arc::new(adapter);
-    let server = spawn_tcp_sidecar_server(TcpSidecarServerConfig::new(listen), adapter)
+    let descriptor = adapter.descriptor();
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register(Arc::new(PostgresAdapterFactory))
+        .map_err(|error| error.to_string())?;
+    let restore = SidecarRestoreBackend::new(
+        Arc::new(registry),
+        "postgresql",
+        AdapterRequirement::HotPluggableReplica,
+        descriptor,
+    )
+    .with_secret("connection_string", connection_string);
+    let service = Arc::new(SidecarService::new(adapter, Some(restore)));
+    let server = spawn_stateful_tcp_sidecar_server(TcpSidecarServerConfig::new(listen), service)
         .map_err(|error| error.to_string())?;
     eprintln!("dtgproxy-postgres-sidecar ready on {}", server.local_addr());
     loop {

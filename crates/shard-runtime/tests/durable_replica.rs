@@ -7,7 +7,8 @@ use adapter_registry::{
     AdapterFactory, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry, HotSwapAdapter,
 };
 use raft_command::{
-    ApplyPreparedV1, BeginBackendDualApplyV1, CommandBodyV1, CommandEnvelopeV1, CutoverBackendV1,
+    AbortBackendMigrationV1, ApplyPreparedV1, BeginBackendDualApplyV1, CommandBodyV1,
+    CommandEnvelopeV1, CutoverBackendV1,
 };
 use shard_runtime::{DurableRaftReplica, DurableReplicaError};
 use storage_api::{
@@ -175,6 +176,59 @@ fn durable_replica_dual_applies_and_cuts_over_at_replicated_log_entries() {
     assert_eq!(slot.generation(), 8);
     assert_eq!(replica.metadata().backend_generation, 8);
     assert_eq!(read_current(&replica), Some(b"dual-applied".to_vec()));
+}
+
+#[test]
+fn durable_replica_aborts_a_prepared_target_before_begin_is_replicated() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let source = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("source-generation-7"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let target = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("prepared-generation-8"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let slot = Arc::new(HotSwapAdapter::recover_active(source, 7).unwrap());
+    slot.start_migration(target, AdapterRequirement::Development)
+        .unwrap();
+    let mut replica = block_on(DurableRaftReplica::open_with_adapter_slot(
+        1,
+        &[1],
+        7,
+        9,
+        root.path().join("raft"),
+        Arc::clone(&slot),
+    ))
+    .unwrap();
+    block_on(elect_and_drain(&mut replica));
+    let abort = CommandEnvelopeV1::new(
+        7,
+        9,
+        720,
+        CommandBodyV1::AbortBackendMigration(AbortBackendMigrationV1 {
+            source_generation: 7,
+            target_generation: 8,
+            target_profile_digest: [0x44; 32],
+        }),
+    )
+    .encode()
+    .unwrap();
+    replica.propose(720, abort).unwrap();
+    block_on(drain(&mut replica)).unwrap();
+
+    assert_eq!(slot.generation(), 7);
+    assert!(matches!(
+        slot.migration_status(),
+        adapter_registry::MigrationStatus::Idle { generation: 7 }
+    ));
+    assert_eq!(replica.metadata().backend_generation, 7);
 }
 
 struct MemoryFactory;

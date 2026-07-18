@@ -360,10 +360,15 @@ const fn state_tag(state: MigrationState) -> u8 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControllerError {
+    InvalidMigrationId,
     InvalidOwnerTerm,
     InvalidTime,
     ExpiredOwner { active: u64, actual: u64 },
     MissingGraph(u64),
+    MissingBackendMigration(u128),
+    ActiveBackendMigration(u64),
+    BackendMigrationIdConflict(u128),
+    BackendMigrationPastAbortFence(u128),
     MissingSnapshotFence,
     TopologyChanged,
     CutoverBehindCatchup { catchup: u64, cutover: u64 },
@@ -374,6 +379,7 @@ pub enum ControllerError {
 impl Display for ControllerError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidMigrationId => formatter.write_str("migration ID must be nonzero"),
             Self::InvalidOwnerTerm => formatter.write_str("Controller owner term must be nonzero"),
             Self::InvalidTime => formatter.write_str("reconciliation time must be nonzero"),
             Self::ExpiredOwner { active, actual } => write!(
@@ -381,6 +387,26 @@ impl Display for ControllerError {
                 "Controller owner term {actual} is expired; active term is {active}"
             ),
             Self::MissingGraph(graph_id) => write!(formatter, "graph {graph_id} does not exist"),
+            Self::MissingBackendMigration(migration_id) => {
+                write!(
+                    formatter,
+                    "backend migration {migration_id:032x} does not exist"
+                )
+            }
+            Self::ActiveBackendMigration(graph_id) => {
+                write!(
+                    formatter,
+                    "graph {graph_id} already has an active backend migration"
+                )
+            }
+            Self::BackendMigrationIdConflict(migration_id) => write!(
+                formatter,
+                "migration ID {migration_id:032x} belongs to a different backend migration"
+            ),
+            Self::BackendMigrationPastAbortFence(migration_id) => write!(
+                formatter,
+                "backend migration {migration_id:032x} has passed the abort fence"
+            ),
             Self::MissingSnapshotFence => formatter.write_str("snapshot fence is missing"),
             Self::TopologyChanged => {
                 formatter.write_str("source topology changed during migration")

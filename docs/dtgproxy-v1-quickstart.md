@@ -51,6 +51,10 @@ The Neo4j mapping uses reserved nodes and unique constraints. Keys are hexadecim
 
 Sidecar profiles use `--backend sidecar --backend-endpoint host:port`; the stateful protocol supports logical export and restore without sending backend credentials over the Sidecar wire.
 
+For the independently deployed Meta/Data/Controller path, including durable per-replica receipts,
+Raft-fenced dual apply, the `dtgproxy-admin` start/status/abort commands, and per-Shard PostgreSQL or
+Neo4j Sidecars, use the [backend migration runbook](backend-migration-runbook.md).
+
 ## Verify and migrate
 
 Live verification opens every configured replica Adapter, validates the SPI capability requirement, and reports the backend family and durable index:

@@ -174,6 +174,36 @@ fn backend_abort_returns_to_the_source_generation() {
 }
 
 #[test]
+fn backend_abort_can_cancel_local_preparation_before_dual_apply_begins() {
+    let mut machine = block_on(ShardStateMachine::open_with_backend_generation(
+        MemoryAdapter::new(),
+        7,
+        9,
+        4,
+    ))
+    .unwrap();
+    block_on(machine.apply_entry(
+        1,
+        1,
+        &backend_command(
+            813,
+            CommandBodyV1::AbortBackendMigration(AbortBackendMigrationV1 {
+                source_generation: 4,
+                target_generation: 5,
+                target_profile_digest: [0x22; 32],
+            }),
+        ),
+    ))
+    .unwrap();
+    assert_eq!(machine.metadata().backend_generation, 4);
+    assert_eq!(
+        machine.metadata().backend_lifecycle,
+        BackendLifecycle::Active
+    );
+    assert_eq!(machine.metadata().applied_index, 1);
+}
+
+#[test]
 fn an_exact_epoch_activation_retry_is_recognized_after_the_epoch_changes() {
     let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
     let command = CommandEnvelopeV1::new(7, 9, 150, CommandBodyV1::ActivatePlacementEpoch(10))

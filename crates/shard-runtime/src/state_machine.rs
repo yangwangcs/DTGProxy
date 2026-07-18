@@ -643,15 +643,17 @@ where
                 })
             }
             CommandBodyV1::AbortBackendMigration(abort) => {
-                let matches_target = matches!(
-                    self.metadata.backend_lifecycle,
+                let matches_target = match self.metadata.backend_lifecycle {
+                    BackendLifecycle::Active => true,
                     BackendLifecycle::DualApplying {
                         target_generation,
                         target_profile_digest,
                         ..
-                    } if target_generation == abort.target_generation
-                        && target_profile_digest == abort.target_profile_digest
-                );
+                    } => {
+                        target_generation == abort.target_generation
+                            && target_profile_digest == abort.target_profile_digest
+                    }
+                };
                 if self.metadata.backend_generation != abort.source_generation
                     || abort.target_generation
                         != abort.source_generation.checked_add(1).unwrap_or(0)

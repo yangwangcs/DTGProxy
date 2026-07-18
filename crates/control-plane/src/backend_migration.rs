@@ -199,13 +199,17 @@ impl BackendMigrationRecord {
     }
 
     pub(crate) fn validate_recovered(&self, placements: &[Placement]) -> Result<(), CatalogError> {
-        let digest = self.target.digest()?;
-        if self
-            .receipts
-            .values()
-            .any(|receipt| receipt.profile_digest != digest)
-        {
-            return Err(CatalogError::InvalidBackendMigrationReceipt);
+        for receipt in self.receipts.values() {
+            if receipt.state != BackendMigrationState::Restored {
+                let restored = self.receipts.get(&(
+                    BackendMigrationState::Restored,
+                    receipt.shard_id,
+                    receipt.node_id,
+                ));
+                if restored.is_none_or(|binding| binding.profile_digest != receipt.profile_digest) {
+                    return Err(CatalogError::InvalidBackendMigrationReceipt);
+                }
+            }
         }
         let required: &[BackendMigrationState] = match self.state {
             BackendMigrationState::Preparing
@@ -313,8 +317,18 @@ impl BackendMigrationRecord {
             return Err(CatalogError::StaleBackendMigrationOwner);
         }
         for receipt in receipts {
-            if receipt.state != next_state || receipt.profile_digest != self.target.digest()? {
+            if receipt.state != next_state {
                 return Err(CatalogError::InvalidBackendMigrationReceipt);
+            }
+            if next_state != BackendMigrationState::Restored {
+                let restored = self.receipts.get(&(
+                    BackendMigrationState::Restored,
+                    receipt.shard_id,
+                    receipt.node_id,
+                ));
+                if restored.is_none_or(|binding| binding.profile_digest != receipt.profile_digest) {
+                    return Err(CatalogError::InvalidBackendMigrationReceipt);
+                }
             }
             self.insert_receipt(receipt)?;
         }

@@ -1092,7 +1092,7 @@ impl DataNodeHost {
         let (commit_sender, commit_receiver) = oneshot::channel();
         sender
             .send(ActorCommand::CommitActivation {
-                spec: activated,
+                spec: Box::new(activated),
                 response: commit_sender,
             })
             .await
