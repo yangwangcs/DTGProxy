@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/temporal-types",
+    "crates/timestamp-oracle",
     "crates/temporal-model",
     "crates/storage-api",
     "crates/adapter-registry",
