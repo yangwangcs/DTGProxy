@@ -3,13 +3,17 @@ use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
-use control_plane::{Catalog, CatalogCommand, CatalogError, GraphDefinition};
+use adapter_postgres::PostgresAdapterFactory;
+use adapter_registry::{AdapterOpenRequest, AdapterRegistry, RegistryError, SecretString};
+use adapter_rocksdb::RocksAdapterFactory;
+use control_plane::{BackendProfile, Catalog, CatalogCommand, CatalogError, GraphDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use storage_api::{BackendFamily, StorageAdapter};
 use temporal_ir::GraphScope;
 use temporal_storage::{
     EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
@@ -56,6 +60,118 @@ pub struct GatewayService {
     catalog: Catalog,
     oracle: TimestampOracle,
     runtime: InProcessDeploymentRuntime,
+    backends: Vec<BackendReplicaStatus>,
+}
+
+type ReplicaAdapters = std::collections::BTreeMap<(u32, u64), Arc<dyn StorageAdapter>>;
+
+async fn open_backend_replicas(
+    config: &NodeConfig,
+    graph: &GraphDefinition,
+    deployment: &DeploymentConfig,
+) -> Result<(ReplicaAdapters, Vec<BackendReplicaStatus>), GatewayError> {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(RocksAdapterFactory))?;
+    registry.register(Arc::new(PostgresAdapterFactory))?;
+
+    let mut adapters = ReplicaAdapters::new();
+    let mut statuses = Vec::new();
+    for shard in deployment.all_shards() {
+        for node_id in shard.voters() {
+            let instance_id = format!(
+                "graph-{}-shard-{}-replica-{}-generation-{}",
+                graph.graph_id(),
+                shard.shard_id(),
+                node_id,
+                graph.backend().generation()
+            );
+            let request = backend_open_request(
+                config.root(),
+                graph.backend(),
+                shard.shard_id(),
+                *node_id,
+                instance_id,
+            )?;
+            let opened = registry
+                .open(
+                    graph.backend().provider(),
+                    &request,
+                    graph.backend().requirement(),
+                )
+                .await?;
+            let adapter = opened.into_adapter();
+            statuses.push(BackendReplicaStatus::from_adapter(
+                shard.shard_id(),
+                *node_id,
+                graph.backend().provider(),
+                adapter.as_ref(),
+            )?);
+            adapters.insert((shard.shard_id(), *node_id), adapter);
+        }
+    }
+    Ok((adapters, statuses))
+}
+
+fn backend_open_request(
+    root: &Path,
+    profile: &BackendProfile,
+    shard_id: u32,
+    node_id: u64,
+    instance_id: String,
+) -> Result<AdapterOpenRequest, GatewayError> {
+    let mut request = AdapterOpenRequest::new(instance_id);
+    for (name, value) in profile.public_parameters() {
+        let value = if profile.provider() == "rocksdb" && name == "path" {
+            let base = resolve_from_root(root, value);
+            let path = base
+                .join(format!("shard-{shard_id}"))
+                .join(format!("replica-{node_id}"));
+            std::fs::create_dir_all(path.parent().expect("replica path has a parent"))
+                .map_err(io_error)?;
+            path.to_string_lossy().into_owned()
+        } else {
+            value.clone()
+        };
+        request = request.with_parameter(name, value);
+    }
+    for (name, reference) in profile.secret_references() {
+        request = request.with_secret(name, SecretString::new(resolve_secret(root, reference)?));
+    }
+    Ok(request)
+}
+
+fn resolve_from_root(root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn resolve_secret(root: &Path, reference: &str) -> Result<String, GatewayError> {
+    let secret = if let Some(variable) = reference.strip_prefix("env:") {
+        std::env::var(variable).map_err(|_| GatewayError::SecretReference {
+            reference: reference.to_owned(),
+        })?
+    } else if let Some(path) = reference.strip_prefix("file:") {
+        std::fs::read_to_string(resolve_from_root(root, path)).map_err(|_| {
+            GatewayError::SecretReference {
+                reference: reference.to_owned(),
+            }
+        })?
+    } else {
+        std::env::var(reference).map_err(|_| GatewayError::SecretReference {
+            reference: reference.to_owned(),
+        })?
+    };
+    let secret = secret.trim().to_owned();
+    if secret.is_empty() {
+        return Err(GatewayError::SecretReference {
+            reference: reference.to_owned(),
+        });
+    }
+    Ok(secret)
 }
 
 impl GatewayService {
@@ -67,7 +183,9 @@ impl GatewayService {
             },
         )?;
         let deployment = DeploymentConfig::from_catalog(&graph)?;
-        let mut runtime = InProcessDeploymentRuntime::new(deployment).await?;
+        let (adapters, backends) = open_backend_replicas(&config, &graph, &deployment).await?;
+        let mut runtime =
+            InProcessDeploymentRuntime::new_with_adapters(deployment, adapters).await?;
         let elections = runtime
             .config()
             .all_shards()
@@ -86,6 +204,7 @@ impl GatewayService {
             catalog,
             oracle,
             runtime,
+            backends,
         })
     }
 
@@ -102,6 +221,11 @@ impl GatewayService {
     #[must_use]
     pub const fn runtime(&self) -> &InProcessDeploymentRuntime {
         &self.runtime
+    }
+
+    #[must_use]
+    pub fn backend_replicas(&self) -> &[BackendReplicaStatus] {
+        &self.backends
     }
 
     pub fn status(&self) -> Result<GatewayStatus, GatewayError> {
@@ -294,6 +418,50 @@ pub struct GatewayStatus {
     backend_provider: String,
     backend_generation: u64,
     shards: Vec<GatewayShardStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BackendReplicaStatus {
+    shard_id: u32,
+    node_id: u64,
+    provider: String,
+    spi_version: u16,
+    implementation: String,
+    implementation_version: String,
+    family: String,
+    applied_log_index: u64,
+}
+
+impl BackendReplicaStatus {
+    fn from_adapter(
+        shard_id: u32,
+        node_id: u64,
+        provider: &str,
+        adapter: &dyn StorageAdapter,
+    ) -> Result<Self, GatewayError> {
+        let descriptor = adapter.descriptor();
+        Ok(Self {
+            shard_id,
+            node_id,
+            provider: provider.to_owned(),
+            spi_version: descriptor.spi_version(),
+            implementation: descriptor.implementation().to_owned(),
+            implementation_version: descriptor.implementation_version().to_owned(),
+            family: backend_family_name(descriptor.family()).to_owned(),
+            applied_log_index: adapter
+                .applied_log_index()
+                .map_err(|error| GatewayError::Backend(error.to_string()))?,
+        })
+    }
+}
+
+const fn backend_family_name(family: BackendFamily) -> &'static str {
+    match family {
+        BackendFamily::KeyValue => "key_value",
+        BackendFamily::Sql => "sql",
+        BackendFamily::PropertyGraph => "property_graph",
+        BackendFamily::Test => "test",
+    }
 }
 
 impl GatewayStatus {
@@ -658,6 +826,7 @@ pub enum GatewayError {
     Oracle(TimestampOracleError),
     Transaction(Box<TransactionCoordinatorError>),
     Temporal(temporal_storage::TemporalStoreError),
+    Registry(RegistryError),
     UnsupportedApiVersion { version: u16 },
     InvalidRequestId,
     UnknownGraph { graph_id: u64 },
@@ -665,6 +834,8 @@ pub enum GatewayError {
     AlreadyInitialized,
     InvalidMutation(String),
     Query(String),
+    SecretReference { reference: String },
+    Backend(String),
     FrameTooLarge,
     Io(String),
 }
@@ -680,6 +851,7 @@ impl Display for GatewayError {
             Self::Oracle(error) => Display::fmt(error, formatter),
             Self::Transaction(error) => Display::fmt(error, formatter),
             Self::Temporal(error) => Display::fmt(error, formatter),
+            Self::Registry(error) => Display::fmt(error, formatter),
             Self::UnsupportedApiVersion { version } => {
                 write!(formatter, "unsupported Gateway API version {version}")
             }
@@ -696,6 +868,13 @@ impl Display for GatewayError {
                 write!(formatter, "invalid temporal mutation: {message}")
             }
             Self::Query(message) => write!(formatter, "query failed: {message}"),
+            Self::SecretReference { reference } => {
+                write!(
+                    formatter,
+                    "backend secret reference {reference:?} could not be resolved"
+                )
+            }
+            Self::Backend(message) => write!(formatter, "backend validation failed: {message}"),
             Self::FrameTooLarge => {
                 formatter.write_str("Gateway frame is empty or exceeds its size limit")
             }
@@ -715,6 +894,7 @@ impl Error for GatewayError {
             Self::Oracle(error) => Some(error),
             Self::Transaction(error) => Some(error),
             Self::Temporal(error) => Some(error),
+            Self::Registry(error) => Some(error),
             Self::UnsupportedApiVersion { .. }
             | Self::InvalidRequestId
             | Self::UnknownGraph { .. }
@@ -722,6 +902,8 @@ impl Error for GatewayError {
             | Self::AlreadyInitialized
             | Self::InvalidMutation(_)
             | Self::Query(_)
+            | Self::SecretReference { .. }
+            | Self::Backend(_)
             | Self::FrameTooLarge
             | Self::Io(_) => None,
         }
@@ -773,5 +955,11 @@ impl From<TransactionCoordinatorError> for GatewayError {
 impl From<temporal_storage::TemporalStoreError> for GatewayError {
     fn from(value: temporal_storage::TemporalStoreError) -> Self {
         Self::Temporal(value)
+    }
+}
+
+impl From<RegistryError> for GatewayError {
+    fn from(value: RegistryError) -> Self {
+        Self::Registry(value)
     }
 }

@@ -8,9 +8,7 @@ use raft_command::{
 };
 use shard_runtime::ReadBarrierError;
 use shard_runtime::ReplicationError;
-use storage_api::{
-    AdapterError, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch, StorageAdapter,
-};
+use storage_api::{AdapterError, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
 use temporal_ir::GraphScope;
 use temporal_storage::{
     PrepareContext, TemporalStore, TemporalStoreError, TemporalTransaction, decode_graph_key,

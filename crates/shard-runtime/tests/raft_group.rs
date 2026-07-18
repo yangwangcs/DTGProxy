@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 
+use adapter_rocksdb::RocksAdapter;
 use raft::eraftpb::Message;
 use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
 use shard_runtime::{
@@ -95,6 +97,59 @@ fn one_follower_can_stop_restart_and_catch_up_without_shared_replica_state() {
     assert_eq!(
         group.replica_metadata(3).unwrap().applied_index,
         receipt.index
+    );
+}
+
+#[test]
+fn persistent_adapter_rehydrates_group_at_its_applied_snapshot_boundary() {
+    let temporary = tempfile::tempdir().unwrap();
+    let backend_path = temporary.path().join("replica-1");
+    let mut adapters = BTreeMap::from([(
+        1,
+        Arc::new(RocksAdapter::open(&backend_path).unwrap()) as Arc<dyn StorageAdapter>,
+    )]);
+    let mut group = block_on(InProcessShardGroup::new_with_adapters(
+        7,
+        9,
+        &[1],
+        std::mem::take(&mut adapters),
+    ))
+    .unwrap();
+    block_on(group.elect(1)).unwrap();
+    let first = block_on(
+        group.propose_and_wait(apply_command(7, 9, 101, 100, b"before-process-restart"), 20),
+    )
+    .unwrap();
+    assert_eq!(
+        read_current(&group, 1),
+        Some(b"before-process-restart".to_vec())
+    );
+    drop(group);
+
+    let adapters = BTreeMap::from([(
+        1,
+        Arc::new(RocksAdapter::open(&backend_path).unwrap()) as Arc<dyn StorageAdapter>,
+    )]);
+    let mut recovered =
+        block_on(InProcessShardGroup::new_with_adapters(7, 9, &[1], adapters)).unwrap();
+    assert_eq!(
+        recovered.replica_metadata(1).unwrap().applied_index,
+        first.index
+    );
+    assert_eq!(
+        read_current(&recovered, 1),
+        Some(b"before-process-restart".to_vec())
+    );
+
+    block_on(recovered.elect(1)).unwrap();
+    let second = block_on(
+        recovered.propose_and_wait(apply_command(7, 9, 102, 200, b"after-process-restart"), 20),
+    )
+    .unwrap();
+    assert!(second.index > first.index);
+    assert_eq!(
+        read_current(&recovered, 1),
+        Some(b"after-process-restart".to_vec())
     );
 }
 

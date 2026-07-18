@@ -133,6 +133,12 @@ fn gateway_transaction_accepts_temporal_input_and_query_reads_it_back() {
     let committed = serde_json::to_value(committed).unwrap();
     assert_eq!(committed["ok"], true);
     assert_eq!(committed["result"]["single_shard_fast_path"], true);
+    drop(gateway);
+
+    let mut gateway = block_on(GatewayService::open(
+        NodeConfig::load(&config_path).unwrap(),
+    ))
+    .unwrap();
 
     let query = GatewayRequest {
         version: GATEWAY_API_VERSION,

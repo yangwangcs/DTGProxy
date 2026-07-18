@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1160,6 +1161,45 @@ where
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
         (**self).scan(span)
+    }
+
+    fn applied_log_index(&self) -> Result<u64, AdapterError> {
+        (**self).applied_log_index()
+    }
+}
+
+impl<T> StorageAdapter for Arc<T>
+where
+    T: StorageAdapter + ?Sized,
+{
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        (**self).descriptor()
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        (**self).capabilities()
+    }
+
+    fn apply_committed<'a>(
+        &'a self,
+        batch: CommittedMutationBatch,
+    ) -> AdapterFuture<'a, ApplyReceipt> {
+        (**self).apply_committed(batch)
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        (**self).multi_get(keys)
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        (**self).scan(span)
+    }
+
+    fn begin_logical_export<'a>(
+        &'a self,
+        request: LogicalSnapshotExportRequest,
+    ) -> AdapterFuture<'a, Box<dyn LogicalSnapshotReader + 'a>> {
+        (**self).begin_logical_export(request)
     }
 
     fn applied_log_index(&self) -> Result<u64, AdapterError> {

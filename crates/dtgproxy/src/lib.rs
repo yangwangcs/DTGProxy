@@ -17,13 +17,16 @@ pub use transaction::{
     TransactionCoordinator, TransactionCoordinatorError, TransactionReceipt, TransactionStatus,
 };
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
 
 use query_executor::{ExecutorError, LocalExecutor, QueryResult};
 use shard_runtime::{
     InProcessShardGroup, MultiRaftRuntime, ProposalReceipt, ReadBarrierError, ReplicationError,
 };
+use storage_api::StorageAdapter;
 use temporal_ir::{GraphScope, PlanBody, PlanError, TemporalPlan, TemporalSelector};
 use temporal_storage::TemporalStore;
 use temporal_types::TransactionTime;
@@ -244,6 +247,35 @@ impl DeploymentConfig {
         }
         Ok(runtime)
     }
+
+    pub async fn build_runtime_with_adapters(
+        &self,
+        mut adapters: BTreeMap<(u32, u64), Arc<dyn StorageAdapter>>,
+    ) -> Result<MultiRaftRuntime, ReplicationError> {
+        let mut runtime = MultiRaftRuntime::new();
+        for shard in &self.shards {
+            let mut shard_adapters = BTreeMap::new();
+            for node_id in shard.voters() {
+                let adapter = adapters
+                    .remove(&(shard.shard_id(), *node_id))
+                    .ok_or(ReplicationError::MissingAdapter { node_id: *node_id })?;
+                shard_adapters.insert(*node_id, adapter);
+            }
+            runtime.insert_group(
+                InProcessShardGroup::new_with_adapters(
+                    shard.shard_id(),
+                    shard.placement_epoch(),
+                    shard.voters(),
+                    shard_adapters,
+                )
+                .await?,
+            )?;
+        }
+        if let Some(((_, node_id), _)) = adapters.into_iter().next() {
+            return Err(ReplicationError::UnexpectedAdapter { node_id });
+        }
+        Ok(runtime)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,6 +361,14 @@ pub struct InProcessDeploymentRuntime {
 impl InProcessDeploymentRuntime {
     pub async fn new(config: DeploymentConfig) -> Result<Self, ReplicationError> {
         let raft = config.build_in_process_runtime().await?;
+        Ok(Self { config, raft })
+    }
+
+    pub async fn new_with_adapters(
+        config: DeploymentConfig,
+        adapters: BTreeMap<(u32, u64), Arc<dyn StorageAdapter>>,
+    ) -> Result<Self, ReplicationError> {
+        let raft = config.build_runtime_with_adapters(adapters).await?;
         Ok(Self { config, raft })
     }
 

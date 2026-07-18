@@ -109,7 +109,12 @@ fn initialize(arguments: &[String]) -> Result<(), CliError> {
     }
     let mut secret_references = BTreeMap::new();
     if let Some(reference) = options.get("--backend-secret-ref") {
-        secret_references.insert("credential".into(), reference.clone());
+        let name = match provider {
+            "postgresql" => "connection_string",
+            "neo4j" => "password",
+            _ => "credential",
+        };
+        secret_references.insert(name.into(), reference.clone());
     }
     let graph = GraphDefinition::new(
         graph_id,
@@ -189,7 +194,8 @@ fn backend_verify(arguments: &[String]) -> Result<String, CliError> {
         "provider": graph.backend().provider(),
         "generation": graph.backend().generation(),
         "configuration_valid": true,
-        "live_backend_verified": false,
+        "live_backend_verified": true,
+        "replicas": gateway.backend_replicas(),
     })
     .to_string())
 }

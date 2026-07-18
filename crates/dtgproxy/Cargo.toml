@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+adapter-postgres = { path = "../adapter-postgres" }
+adapter-registry = { path = "../adapter-registry" }
 adapter-rocksdb = { path = "../adapter-rocksdb" }
 blake3 = "=1.8.5"
 control-plane = { path = "../control-plane" }

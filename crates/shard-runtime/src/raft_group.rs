@@ -1,14 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adapter_memory::MemoryAdapter;
-use raft::eraftpb::{Entry, EntryType, Message};
+use raft::eraftpb::{ConfState, Entry, EntryType, Message, Snapshot, SnapshotMetadata};
 use raft::storage::MemStorage;
 use raft::{Config, RawNode, ReadState, StateRole};
 use raft_command::CommandEnvelopeV1;
 use slog::{Logger, o};
+use storage_api::StorageAdapter;
 use temporal_types::TransactionTime;
 
 use crate::{
@@ -41,6 +43,8 @@ pub enum ReplicationError {
     StateMachine(ShardRuntimeError),
     NoLeader,
     NodeNotFound { node_id: u64 },
+    MissingAdapter { node_id: u64 },
+    UnexpectedAdapter { node_id: u64 },
     NodeStopped { node_id: u64 },
     ShardMismatch { expected: u32, actual: u32 },
     StaleEpoch { expected: u64, actual: u64 },
@@ -61,6 +65,15 @@ impl Display for ReplicationError {
             Self::StateMachine(error) => write!(formatter, "state-machine error: {error}"),
             Self::NoLeader => formatter.write_str("Raft group has no leader"),
             Self::NodeNotFound { node_id } => write!(formatter, "Raft node {node_id} not found"),
+            Self::MissingAdapter { node_id } => {
+                write!(formatter, "Raft node {node_id} has no Storage Adapter")
+            }
+            Self::UnexpectedAdapter { node_id } => {
+                write!(
+                    formatter,
+                    "Storage Adapter was supplied for unknown Raft node {node_id}"
+                )
+            }
             Self::NodeStopped { node_id } => write!(formatter, "Raft node {node_id} is stopped"),
             Self::ShardMismatch { expected, actual } => {
                 write!(formatter, "expected shard {expected}, got shard {actual}")
@@ -162,7 +175,7 @@ struct RaftReplica {
     config: Config,
     storage: MemStorage,
     raw_node: Option<RawNode<MemStorage>>,
-    state_machine: ShardStateMachine<MemoryAdapter>,
+    state_machine: ShardStateMachine<Arc<dyn StorageAdapter>>,
 }
 
 impl RaftReplica {
@@ -172,10 +185,27 @@ impl RaftReplica {
         shard_id: u32,
         placement_epoch: u64,
     ) -> Result<Self, ReplicationError> {
-        let storage = MemStorage::new_with_conf_state((voters.to_vec(), Vec::new()));
-        let state_machine =
-            ShardStateMachine::open(MemoryAdapter::new(), shard_id, placement_epoch).await?;
-        let config = raft_config(node_id, 0)?;
+        Self::new_with_adapter(
+            node_id,
+            voters,
+            shard_id,
+            placement_epoch,
+            Arc::new(MemoryAdapter::new()),
+        )
+        .await
+    }
+
+    async fn new_with_adapter(
+        node_id: u64,
+        voters: &[u64],
+        shard_id: u32,
+        placement_epoch: u64,
+        adapter: Arc<dyn StorageAdapter>,
+    ) -> Result<Self, ReplicationError> {
+        let state_machine = ShardStateMachine::open(adapter, shard_id, placement_epoch).await?;
+        let metadata = state_machine.metadata();
+        let storage = raft_storage_from_snapshot_boundary(voters, metadata)?;
+        let config = raft_config(node_id, metadata.applied_index)?;
         let raw_node = RawNode::new(&config, storage.clone(), &discard_logger())
             .map_err(|error| ReplicationError::Raft(error.to_string()))?;
         Ok(Self {
@@ -341,7 +371,7 @@ impl RaftReplica {
 }
 
 async fn apply_entries(
-    state_machine: &mut ShardStateMachine<MemoryAdapter>,
+    state_machine: &mut ShardStateMachine<Arc<dyn StorageAdapter>>,
     entries: Vec<Entry>,
     applied_by_leader: bool,
 ) -> Result<Vec<AppliedEvent>, ReplicationError> {
@@ -374,6 +404,34 @@ async fn apply_entries(
         }
     }
     Ok(events)
+}
+
+fn raft_storage_from_snapshot_boundary(
+    voters: &[u64],
+    metadata: ReplicaMetadata,
+) -> Result<MemStorage, ReplicationError> {
+    if metadata.applied_index == 0 {
+        return Ok(MemStorage::new_with_conf_state((
+            voters.to_vec(),
+            Vec::new(),
+        )));
+    }
+    let storage = MemStorage::new();
+    storage
+        .wl()
+        .apply_snapshot(Snapshot {
+            data: Vec::new(),
+            metadata: Some(SnapshotMetadata {
+                conf_state: Some(ConfState {
+                    voters: voters.to_vec(),
+                    ..Default::default()
+                }),
+                index: metadata.applied_index,
+                term: metadata.last_term,
+            }),
+        })
+        .map_err(|error| ReplicationError::Raft(error.to_string()))?;
+    Ok(storage)
 }
 
 fn raft_config(node_id: u64, applied: u64) -> Result<Config, ReplicationError> {
@@ -422,6 +480,41 @@ impl InProcessShardGroup {
                 *node_id,
                 RaftReplica::new(*node_id, voters, shard_id, placement_epoch).await?,
             );
+        }
+        Ok(Self {
+            shard_id,
+            placement_epoch,
+            replicas,
+            transport: DeterministicTransport::new(),
+            pending: BTreeMap::new(),
+            completed: BTreeMap::new(),
+            applied_events: BTreeMap::new(),
+            completed_read_states: BTreeMap::new(),
+            pending_read_contexts: BTreeSet::new(),
+            next_read_sequence: 1,
+            next_internal_request: 1,
+        })
+    }
+
+    pub async fn new_with_adapters(
+        shard_id: u32,
+        placement_epoch: u64,
+        voters: &[u64],
+        mut adapters: BTreeMap<u64, Arc<dyn StorageAdapter>>,
+    ) -> Result<Self, ReplicationError> {
+        let mut replicas = BTreeMap::new();
+        for node_id in voters {
+            let adapter = adapters
+                .remove(node_id)
+                .ok_or(ReplicationError::MissingAdapter { node_id: *node_id })?;
+            replicas.insert(
+                *node_id,
+                RaftReplica::new_with_adapter(*node_id, voters, shard_id, placement_epoch, adapter)
+                    .await?,
+            );
+        }
+        if let Some(node_id) = adapters.keys().next().copied() {
+            return Err(ReplicationError::UnexpectedAdapter { node_id });
         }
         Ok(Self {
             shard_id,
@@ -1001,10 +1094,10 @@ impl InProcessShardGroup {
     }
 
     #[must_use]
-    pub fn replica_adapter(&self, node_id: u64) -> Option<&MemoryAdapter> {
+    pub fn replica_adapter(&self, node_id: u64) -> Option<&dyn StorageAdapter> {
         self.replicas
             .get(&node_id)
-            .map(|replica| replica.state_machine.adapter())
+            .map(|replica| replica.state_machine.adapter().as_ref())
     }
 
     #[must_use]

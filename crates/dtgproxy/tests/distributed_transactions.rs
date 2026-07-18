@@ -7,7 +7,7 @@ use dtgproxy::{
     ScopedTemporalTransaction, ShardPlacement, TransactionCoordinator, TransactionCoordinatorError,
     TransactionStatus,
 };
-use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter};
+use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use temporal_ir::GraphScope;
 use temporal_storage::{
     EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId, TemporalStore,

@@ -308,6 +308,8 @@ name = "dtgproxy"
 version = "0.1.0"
 dependencies = [
  "adapter-memory",
+ "adapter-postgres",
+ "adapter-registry",
  "adapter-rocksdb",
  "blake3",
  "control-plane",
