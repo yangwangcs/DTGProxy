@@ -1,0 +1,20 @@
+[package]
+name = "meta-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+control-plane = { path = "../control-plane" }
+crc32fast = "=1.5.0"
+raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
+raft-logstore = { path = "../raft-logstore" }
+slog = "=2.8.2"
+
+[dev-dependencies]
+storage-api = { path = "../storage-api" }
+tempfile = "3"
+
+[lints]
+workspace = true

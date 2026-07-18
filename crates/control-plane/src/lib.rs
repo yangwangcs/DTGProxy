@@ -485,6 +485,14 @@ impl CatalogState {
         &self.graphs
     }
 
+    pub fn encode_snapshot(&self) -> Result<Vec<u8>, CatalogError> {
+        encode_snapshot(self)
+    }
+
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self, CatalogError> {
+        decode_snapshot(bytes)
+    }
+
     pub fn apply(&mut self, command: CatalogCommand) -> Result<CatalogApplyReceipt, CatalogError> {
         if command.command_id == 0 {
             return Err(CatalogError::InvalidCommandId);
