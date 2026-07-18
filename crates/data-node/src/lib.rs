@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod host;
 mod identity;
 mod manifest;
+mod replica_actor;
 
 pub use config::{ConfigError, NodeConfig, TlsFiles, TransportSecurity};
+pub use host::{
+    DataNodeHost, EnsureReplicaOutcome, HostError, ReplicaKey, ReplicaSpec, ReplicaStatus,
+};
 pub use identity::{NodeIdentity, NodeIdentityStore};
 pub use manifest::{ReplicaEntry, ReplicaManifest, ReplicaManifestStore, ReplicaRole};
 
@@ -32,6 +37,7 @@ pub enum StorageError {
     TooManyReplicas,
     InvalidReplicaIdentity,
     InvalidReplicaEpoch,
+    InvalidReplicaVoters,
     InvalidReplicaGeneration,
     InvalidReplicaRole { actual: u8 },
     InvalidReplicaDirectory,
@@ -78,6 +84,7 @@ impl Display for StorageError {
             Self::TooManyReplicas => formatter.write_str("Replica manifest has too many entries"),
             Self::InvalidReplicaIdentity => formatter.write_str("invalid Replica identity"),
             Self::InvalidReplicaEpoch => formatter.write_str("invalid Replica placement epoch"),
+            Self::InvalidReplicaVoters => formatter.write_str("invalid Replica voter set"),
             Self::InvalidReplicaGeneration => {
                 formatter.write_str("invalid Replica schema or backend generation")
             }

@@ -377,7 +377,13 @@ version = "1.0.0"
 dependencies = [
  "crc32fast",
  "fs2",
+ "raft",
+ "raft-command",
+ "shard-runtime",
+ "storage-api",
  "tempfile",
+ "temporal-types",
+ "tokio",
 ]
 
 [[package]]

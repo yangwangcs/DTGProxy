@@ -8,9 +8,15 @@ license.workspace = true
 [dependencies]
 crc32fast = "=1.5.0"
 fs2 = "=0.4.3"
+raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
+shard-runtime = { path = "../shard-runtime" }
+storage-api = { path = "../storage-api" }
+tokio = { version = "=1.53.0", features = ["rt", "macros", "sync"] }
 
 [dev-dependencies]
+raft-command = { path = "../raft-command" }
 tempfile = "3"
+temporal-types = { path = "../temporal-types" }
 
 [lints]
 workspace = true

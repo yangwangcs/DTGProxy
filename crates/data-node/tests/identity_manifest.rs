@@ -12,8 +12,17 @@ fn identity(node_id: u64) -> NodeIdentity {
 }
 
 fn replica(graph_id: u64, shard_id: u32, directory: &str) -> ReplicaEntry {
-    ReplicaEntry::new(graph_id, shard_id, 3, ReplicaRole::Voter, 5, 7, directory)
-        .expect("valid replica")
+    ReplicaEntry::new(
+        graph_id,
+        shard_id,
+        3,
+        vec![7],
+        ReplicaRole::Voter,
+        5,
+        7,
+        directory,
+    )
+    .expect("valid replica")
 }
 
 #[test]
@@ -93,7 +102,7 @@ fn incomplete_trailing_manifest_record_is_discarded_on_reopen() {
     }
     let stable_length = fs::metadata(&log_path).unwrap().len();
     let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
-    file.write_all(b"DTRP\0\x01\0\0\0\x20partial").unwrap();
+    file.write_all(b"DTRP\0\x02\0\0\0\x20partial").unwrap();
     file.sync_all().unwrap();
     drop(file);
 

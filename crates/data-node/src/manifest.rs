@@ -6,11 +6,12 @@ use std::path::{Component, Path, PathBuf};
 use crate::StorageError;
 
 const RECORD_MAGIC: [u8; 4] = *b"DTRP";
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_VERSION: u16 = 2;
 const RECORD_HEADER_BYTES: usize = 10;
 const CHECKSUM_BYTES: usize = 4;
 const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REPLICAS: usize = 65_536;
+const MAX_VOTERS: usize = 1_024;
 const MAX_DIRECTORY_BYTES: usize = 240;
 const MANIFEST_FILE: &str = "replicas.manifest.log";
 
@@ -42,6 +43,7 @@ pub struct ReplicaEntry {
     graph_id: u64,
     shard_id: u32,
     placement_epoch: u64,
+    voters: Vec<u64>,
     role: ReplicaRole,
     schema_version: u64,
     backend_generation: u64,
@@ -54,6 +56,7 @@ impl ReplicaEntry {
         graph_id: u64,
         shard_id: u32,
         placement_epoch: u64,
+        mut voters: Vec<u64>,
         role: ReplicaRole,
         schema_version: u64,
         backend_generation: u64,
@@ -65,6 +68,13 @@ impl ReplicaEntry {
         if placement_epoch == 0 {
             return Err(StorageError::InvalidReplicaEpoch);
         }
+        if voters.is_empty() || voters.len() > MAX_VOTERS || voters.contains(&0) {
+            return Err(StorageError::InvalidReplicaVoters);
+        }
+        voters.sort_unstable();
+        if voters.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StorageError::InvalidReplicaVoters);
+        }
         if schema_version == 0 || backend_generation == 0 {
             return Err(StorageError::InvalidReplicaGeneration);
         }
@@ -74,6 +84,7 @@ impl ReplicaEntry {
             graph_id,
             shard_id,
             placement_epoch,
+            voters,
             role,
             schema_version,
             backend_generation,
@@ -94,6 +105,11 @@ impl ReplicaEntry {
     #[must_use]
     pub const fn placement_epoch(&self) -> u64 {
         self.placement_epoch
+    }
+
+    #[must_use]
+    pub fn voters(&self) -> &[u64] {
+        &self.voters
     }
 
     #[must_use]
@@ -281,6 +297,12 @@ fn encode_manifest(manifest: &ReplicaManifest) -> Result<Vec<u8>, StorageError> 
         encoded.extend_from_slice(&entry.graph_id.to_be_bytes());
         encoded.extend_from_slice(&entry.shard_id.to_be_bytes());
         encoded.extend_from_slice(&entry.placement_epoch.to_be_bytes());
+        let voter_count =
+            u16::try_from(entry.voters.len()).map_err(|_| StorageError::InvalidReplicaVoters)?;
+        encoded.extend_from_slice(&voter_count.to_be_bytes());
+        for voter in &entry.voters {
+            encoded.extend_from_slice(&voter.to_be_bytes());
+        }
         encoded.push(entry.role.tag());
         encoded.extend_from_slice(&entry.schema_version.to_be_bytes());
         encoded.extend_from_slice(&entry.backend_generation.to_be_bytes());
@@ -304,6 +326,14 @@ fn decode_manifest(encoded: &[u8]) -> Result<ReplicaManifest, StorageError> {
         let graph_id = decoder.read_u64()?;
         let shard_id = decoder.read_u32()?;
         let placement_epoch = decoder.read_u64()?;
+        let voter_count = usize::from(decoder.read_u16()?);
+        if voter_count == 0 || voter_count > MAX_VOTERS {
+            return Err(StorageError::InvalidReplicaVoters);
+        }
+        let mut voters = Vec::with_capacity(voter_count);
+        for _ in 0..voter_count {
+            voters.push(decoder.read_u64()?);
+        }
         let role = ReplicaRole::from_tag(decoder.read_u8()?)?;
         let schema_version = decoder.read_u64()?;
         let backend_generation = decoder.read_u64()?;
@@ -315,6 +345,7 @@ fn decode_manifest(encoded: &[u8]) -> Result<ReplicaManifest, StorageError> {
             graph_id,
             shard_id,
             placement_epoch,
+            voters,
             role,
             schema_version,
             backend_generation,
@@ -388,6 +419,12 @@ impl<'a> Decoder<'a> {
     fn read_u32(&mut self) -> Result<u32, StorageError> {
         Ok(u32::from_be_bytes(
             self.read_exact(4)?.try_into().expect("fixed u32"),
+        ))
+    }
+
+    fn read_u16(&mut self) -> Result<u16, StorageError> {
+        Ok(u16::from_be_bytes(
+            self.read_exact(2)?.try_into().expect("fixed u16"),
         ))
     }
 
