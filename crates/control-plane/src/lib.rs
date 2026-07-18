@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod migration;
+
+pub use migration::{MigrationError, MigrationProgress, MigrationRecord, MigrationState};
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -12,11 +16,15 @@ use storage_api::AdapterRequirement;
 const COMMAND_MAGIC: [u8; 4] = *b"DTCM";
 const SNAPSHOT_MAGIC: [u8; 4] = *b"DTCS";
 const LOG_MAGIC: [u8; 4] = *b"DTCL";
-const FORMAT_VERSION: u16 = 1;
+const COMMAND_FORMAT_VERSION: u16 = 1;
+const LOG_FORMAT_VERSION: u16 = 1;
+const LEGACY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
+const SNAPSHOT_FORMAT_VERSION: u16 = 2;
 const CHECKSUM_BYTES: usize = 4;
 const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GRAPHS: usize = 65_536;
+const MAX_MIGRATIONS: usize = 1_048_576;
 const MAX_PLACEMENTS: usize = 65_536;
 const MAX_VOTERS: usize = 1_024;
 const MAX_MAP_ENTRIES: usize = 1_024;
@@ -288,6 +296,20 @@ pub enum CatalogCommandBody {
         expected_generation: u64,
         profile: BackendProfile,
     },
+    CreateMigration(MigrationRecord),
+    AdvanceMigration {
+        migration_id: u128,
+        expected_state_revision: u64,
+        next_state: MigrationState,
+        progress: MigrationProgress,
+    },
+    FailMigration {
+        migration_id: u128,
+        expected_state_revision: u64,
+        owner_term: u64,
+        updated_at_unix_ms: u64,
+        error: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -374,6 +396,65 @@ impl CatalogCommand {
     }
 
     #[must_use]
+    pub fn create_migration(
+        command_id: u128,
+        expected_revision: u64,
+        migration: MigrationRecord,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::CreateMigration(migration),
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_migration(
+        command_id: u128,
+        expected_revision: u64,
+        migration_id: u128,
+        expected_state_revision: u64,
+        next_state: MigrationState,
+        progress: MigrationProgress,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::AdvanceMigration {
+                migration_id,
+                expected_state_revision,
+                next_state,
+                progress,
+            },
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_migration(
+        command_id: u128,
+        expected_revision: u64,
+        migration_id: u128,
+        expected_state_revision: u64,
+        owner_term: u64,
+        updated_at_unix_ms: u64,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::FailMigration {
+                migration_id,
+                expected_state_revision,
+                owner_term,
+                updated_at_unix_ms,
+                error: error.into(),
+            },
+        )
+    }
+
+    #[must_use]
     pub const fn command_id(&self) -> u128 {
         self.command_id
     }
@@ -394,7 +475,7 @@ impl CatalogCommand {
         }
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&COMMAND_MAGIC);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&COMMAND_FORMAT_VERSION.to_be_bytes());
         bytes.extend_from_slice(&self.command_id.to_be_bytes());
         bytes.extend_from_slice(&self.expected_revision.to_be_bytes());
         encode_command_body(&mut bytes, &self.body)?;
@@ -412,7 +493,7 @@ impl CatalogCommand {
         verify_checksum(bytes)?;
         let mut reader = Reader::without_checksum(bytes)?;
         reader.expect_magic(COMMAND_MAGIC)?;
-        reader.expect_version()?;
+        reader.expect_version(COMMAND_FORMAT_VERSION)?;
         let command_id = reader.u128()?;
         let expected_revision = reader.u64()?;
         let body = decode_command_body(&mut reader)?;
@@ -457,6 +538,8 @@ struct AppliedCommand {
 pub struct CatalogState {
     revision: u64,
     graphs: BTreeMap<u64, GraphDefinition>,
+    migrations: BTreeMap<u128, MigrationRecord>,
+    active_migrations: BTreeMap<(u64, u32), u128>,
     applied_commands: BTreeMap<u128, AppliedCommand>,
 }
 
@@ -466,6 +549,8 @@ impl CatalogState {
         Self {
             revision: 0,
             graphs: BTreeMap::new(),
+            migrations: BTreeMap::new(),
+            active_migrations: BTreeMap::new(),
             applied_commands: BTreeMap::new(),
         }
     }
@@ -483,6 +568,23 @@ impl CatalogState {
     #[must_use]
     pub const fn graphs(&self) -> &BTreeMap<u64, GraphDefinition> {
         &self.graphs
+    }
+
+    #[must_use]
+    pub fn migration(&self, migration_id: u128) -> Option<&MigrationRecord> {
+        self.migrations.get(&migration_id)
+    }
+
+    #[must_use]
+    pub const fn migrations(&self) -> &BTreeMap<u128, MigrationRecord> {
+        &self.migrations
+    }
+
+    #[must_use]
+    pub fn active_migration(&self, graph_id: u64, shard_id: u32) -> Option<&MigrationRecord> {
+        self.active_migrations
+            .get(&(graph_id, shard_id))
+            .and_then(|migration_id| self.migrations.get(migration_id))
     }
 
     pub fn encode_snapshot(&self) -> Result<Vec<u8>, CatalogError> {
@@ -629,6 +731,78 @@ impl CatalogState {
                     });
                 }
                 graph.backend = profile;
+            }
+            CatalogCommandBody::CreateMigration(migration) => {
+                let graph =
+                    self.graphs
+                        .get(&migration.graph_id)
+                        .ok_or(CatalogError::UnknownGraph {
+                            graph_id: migration.graph_id,
+                        })?;
+                let placement = graph
+                    .topology
+                    .placements
+                    .iter()
+                    .find(|placement| placement.shard_id == migration.shard_id)
+                    .ok_or(MigrationError::SourcePlacementMismatch {
+                        graph_id: migration.graph_id,
+                        shard_id: migration.shard_id,
+                    })?;
+                if placement.epoch != migration.source_epoch
+                    || placement.voters != migration.source_voters
+                {
+                    return Err(MigrationError::SourcePlacementMismatch {
+                        graph_id: migration.graph_id,
+                        shard_id: migration.shard_id,
+                    }
+                    .into());
+                }
+                let key = (migration.graph_id, migration.shard_id);
+                if self.active_migrations.contains_key(&key) {
+                    return Err(MigrationError::ActiveWorkflowConflict {
+                        graph_id: migration.graph_id,
+                        shard_id: migration.shard_id,
+                    }
+                    .into());
+                }
+                if self.migrations.contains_key(&migration.migration_id) {
+                    return Err(MigrationError::InvalidRecord.into());
+                }
+                self.active_migrations.insert(key, migration.migration_id);
+                self.migrations.insert(migration.migration_id, migration);
+            }
+            CatalogCommandBody::AdvanceMigration {
+                migration_id,
+                expected_state_revision,
+                next_state,
+                progress,
+            } => {
+                let migration = self
+                    .migrations
+                    .get_mut(&migration_id)
+                    .ok_or(MigrationError::UnknownMigration { migration_id })?;
+                let key = (migration.graph_id, migration.shard_id);
+                migration.advance(expected_state_revision, next_state, progress)?;
+                if migration.state.is_terminal() {
+                    self.active_migrations.remove(&key);
+                }
+            }
+            CatalogCommandBody::FailMigration {
+                migration_id,
+                expected_state_revision,
+                owner_term,
+                updated_at_unix_ms,
+                error,
+            } => {
+                self.migrations
+                    .get_mut(&migration_id)
+                    .ok_or(MigrationError::UnknownMigration { migration_id })?
+                    .fail(
+                        expected_state_revision,
+                        owner_term,
+                        updated_at_unix_ms,
+                        error,
+                    )?;
             }
         }
         Ok(())
@@ -817,6 +991,36 @@ fn encode_command_body(
             output.extend_from_slice(&expected_generation.to_be_bytes());
             encode_profile(output, profile)?;
         }
+        CatalogCommandBody::CreateMigration(migration) => {
+            output.push(5);
+            encode_migration_record(output, migration)?;
+        }
+        CatalogCommandBody::AdvanceMigration {
+            migration_id,
+            expected_state_revision,
+            next_state,
+            progress,
+        } => {
+            output.push(6);
+            output.extend_from_slice(&migration_id.to_be_bytes());
+            output.extend_from_slice(&expected_state_revision.to_be_bytes());
+            output.push(encode_migration_state(*next_state));
+            encode_migration_progress(output, progress);
+        }
+        CatalogCommandBody::FailMigration {
+            migration_id,
+            expected_state_revision,
+            owner_term,
+            updated_at_unix_ms,
+            error,
+        } => {
+            output.push(7);
+            output.extend_from_slice(&migration_id.to_be_bytes());
+            output.extend_from_slice(&expected_state_revision.to_be_bytes());
+            output.extend_from_slice(&owner_term.to_be_bytes());
+            output.extend_from_slice(&updated_at_unix_ms.to_be_bytes());
+            write_string(output, error)?;
+        }
     }
     Ok(())
 }
@@ -839,7 +1043,196 @@ fn decode_command_body(reader: &mut Reader<'_>) -> Result<CatalogCommandBody, Ca
             expected_generation: reader.u64()?,
             profile: decode_profile(reader)?,
         }),
+        5 => Ok(CatalogCommandBody::CreateMigration(
+            decode_migration_record(reader)?,
+        )),
+        6 => Ok(CatalogCommandBody::AdvanceMigration {
+            migration_id: reader.u128()?,
+            expected_state_revision: reader.u64()?,
+            next_state: decode_migration_state(reader.u8()?)?,
+            progress: decode_migration_progress(reader)?,
+        }),
+        7 => Ok(CatalogCommandBody::FailMigration {
+            migration_id: reader.u128()?,
+            expected_state_revision: reader.u64()?,
+            owner_term: reader.u64()?,
+            updated_at_unix_ms: reader.u64()?,
+            error: reader.string(4_096)?,
+        }),
         tag => Err(CatalogError::UnknownCommandTag { tag }),
+    }
+}
+
+fn encode_migration_state(state: MigrationState) -> u8 {
+    match state {
+        MigrationState::Preparing => 1,
+        MigrationState::Copying => 2,
+        MigrationState::CatchingUp => 3,
+        MigrationState::Ready => 4,
+        MigrationState::Committing => 5,
+        MigrationState::Committed => 6,
+        MigrationState::Cleaning => 7,
+        MigrationState::Cleaned => 8,
+        MigrationState::Aborting => 9,
+        MigrationState::Aborted => 10,
+    }
+}
+
+fn decode_migration_state(tag: u8) -> Result<MigrationState, CatalogError> {
+    match tag {
+        1 => Ok(MigrationState::Preparing),
+        2 => Ok(MigrationState::Copying),
+        3 => Ok(MigrationState::CatchingUp),
+        4 => Ok(MigrationState::Ready),
+        5 => Ok(MigrationState::Committing),
+        6 => Ok(MigrationState::Committed),
+        7 => Ok(MigrationState::Cleaning),
+        8 => Ok(MigrationState::Cleaned),
+        9 => Ok(MigrationState::Aborting),
+        10 => Ok(MigrationState::Aborted),
+        _ => Err(CatalogError::NonCanonicalRecord),
+    }
+}
+
+fn encode_migration_progress(output: &mut Vec<u8>, progress: &MigrationProgress) {
+    encode_snapshot_fence(output, progress.snapshot_index, progress.snapshot_checksum);
+    output.extend_from_slice(&progress.catchup_index.to_be_bytes());
+    output.extend_from_slice(&progress.cutover_index.to_be_bytes());
+    output.extend_from_slice(&progress.owner_term.to_be_bytes());
+    output.extend_from_slice(&progress.updated_at_unix_ms.to_be_bytes());
+}
+
+fn decode_migration_progress(reader: &mut Reader<'_>) -> Result<MigrationProgress, CatalogError> {
+    let (snapshot_index, snapshot_checksum) = decode_snapshot_fence(reader)?;
+    let progress = MigrationProgress {
+        snapshot_index,
+        snapshot_checksum,
+        catchup_index: reader.u64()?,
+        cutover_index: reader.u64()?,
+        owner_term: reader.u64()?,
+        updated_at_unix_ms: reader.u64()?,
+    };
+    if progress.owner_term == 0 || progress.updated_at_unix_ms == 0 {
+        return Err(MigrationError::InvalidProgress.into());
+    }
+    Ok(progress)
+}
+
+fn encode_migration_record(
+    output: &mut Vec<u8>,
+    migration: &MigrationRecord,
+) -> Result<(), CatalogError> {
+    output.extend_from_slice(&migration.migration_id.to_be_bytes());
+    output.extend_from_slice(&migration.graph_id.to_be_bytes());
+    output.extend_from_slice(&migration.shard_id.to_be_bytes());
+    output.extend_from_slice(&migration.source_epoch.to_be_bytes());
+    output.extend_from_slice(&migration.target_epoch.to_be_bytes());
+    encode_voters(output, &migration.source_voters)?;
+    encode_voters(output, &migration.target_voters)?;
+    output.push(encode_migration_state(migration.state));
+    output.extend_from_slice(&migration.state_revision.to_be_bytes());
+    encode_snapshot_fence(
+        output,
+        migration.snapshot_index,
+        migration.snapshot_checksum,
+    );
+    output.extend_from_slice(&migration.catchup_index.to_be_bytes());
+    output.extend_from_slice(&migration.cutover_index.to_be_bytes());
+    output.extend_from_slice(&migration.owner_term.to_be_bytes());
+    output.extend_from_slice(&migration.retry_count.to_be_bytes());
+    match &migration.last_error {
+        Some(error) => {
+            output.push(1);
+            write_string(output, error)?;
+        }
+        None => output.push(0),
+    }
+    output.extend_from_slice(&migration.created_at_unix_ms.to_be_bytes());
+    output.extend_from_slice(&migration.updated_at_unix_ms.to_be_bytes());
+    Ok(())
+}
+
+fn decode_migration_record(reader: &mut Reader<'_>) -> Result<MigrationRecord, CatalogError> {
+    let migration_id = reader.u128()?;
+    let graph_id = reader.u64()?;
+    let shard_id = reader.u32()?;
+    let source_epoch = reader.u64()?;
+    let target_epoch = reader.u64()?;
+    let source_voters = decode_voters(reader)?;
+    let target_voters = decode_voters(reader)?;
+    let state = decode_migration_state(reader.u8()?)?;
+    let state_revision = reader.u64()?;
+    let (snapshot_index, snapshot_checksum) = decode_snapshot_fence(reader)?;
+    let catchup_index = reader.u64()?;
+    let cutover_index = reader.u64()?;
+    let owner_term = reader.u64()?;
+    let retry_count = reader.u32()?;
+    let last_error = match reader.u8()? {
+        0 => None,
+        1 => Some(reader.string(4_096)?),
+        _ => return Err(CatalogError::NonCanonicalRecord),
+    };
+    let created_at_unix_ms = reader.u64()?;
+    let updated_at_unix_ms = reader.u64()?;
+    MigrationRecord::restore(
+        migration_id,
+        graph_id,
+        shard_id,
+        source_epoch,
+        target_epoch,
+        source_voters,
+        target_voters,
+        state,
+        state_revision,
+        snapshot_index,
+        snapshot_checksum,
+        catchup_index,
+        cutover_index,
+        owner_term,
+        retry_count,
+        last_error,
+        created_at_unix_ms,
+        updated_at_unix_ms,
+    )
+    .map_err(CatalogError::from)
+}
+
+fn encode_voters(output: &mut Vec<u8>, voters: &[u64]) -> Result<(), CatalogError> {
+    write_count(output, voters.len())?;
+    for voter in voters {
+        output.extend_from_slice(&voter.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn decode_voters(reader: &mut Reader<'_>) -> Result<Vec<u64>, CatalogError> {
+    let count = reader.count(MAX_VOTERS)?;
+    let mut voters = Vec::with_capacity(count);
+    for _ in 0..count {
+        voters.push(reader.u64()?);
+    }
+    Ok(voters)
+}
+
+fn encode_snapshot_fence(output: &mut Vec<u8>, index: Option<u64>, checksum: Option<[u8; 32]>) {
+    match (index, checksum) {
+        (Some(index), Some(checksum)) => {
+            output.push(1);
+            output.extend_from_slice(&index.to_be_bytes());
+            output.extend_from_slice(&checksum);
+        }
+        (None, None) => output.push(0),
+        _ => output.push(u8::MAX),
+    }
+}
+
+fn decode_snapshot_fence(
+    reader: &mut Reader<'_>,
+) -> Result<(Option<u64>, Option<[u8; 32]>), CatalogError> {
+    match reader.u8()? {
+        0 => Ok((None, None)),
+        1 => Ok((Some(reader.u64()?), Some(reader.array()?))),
+        _ => Err(CatalogError::NonCanonicalRecord),
     }
 }
 
@@ -968,13 +1361,31 @@ fn decode_map(
 }
 
 fn encode_snapshot(state: &CatalogState) -> Result<Vec<u8>, CatalogError> {
+    encode_snapshot_version(state, SNAPSHOT_FORMAT_VERSION)
+}
+
+fn encode_snapshot_version(state: &CatalogState, version: u16) -> Result<Vec<u8>, CatalogError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SNAPSHOT_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&version.to_be_bytes());
     bytes.extend_from_slice(&state.revision.to_be_bytes());
     write_count(&mut bytes, state.graphs.len())?;
     for graph in state.graphs.values() {
         encode_graph(&mut bytes, graph)?;
+    }
+    match version {
+        LEGACY_SNAPSHOT_FORMAT_VERSION => {
+            if !state.migrations.is_empty() {
+                return Err(CatalogError::UnsupportedVersion);
+            }
+        }
+        SNAPSHOT_FORMAT_VERSION => {
+            write_count(&mut bytes, state.migrations.len())?;
+            for migration in state.migrations.values() {
+                encode_migration_record(&mut bytes, migration)?;
+            }
+        }
+        _ => return Err(CatalogError::UnsupportedVersion),
     }
     write_count(&mut bytes, state.applied_commands.len())?;
     for (command_id, applied) in &state.applied_commands {
@@ -996,7 +1407,13 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
     verify_checksum(bytes)?;
     let mut reader = Reader::without_checksum(bytes)?;
     reader.expect_magic(SNAPSHOT_MAGIC)?;
-    reader.expect_version()?;
+    let version = reader.version()?;
+    if !matches!(
+        version,
+        LEGACY_SNAPSHOT_FORMAT_VERSION | SNAPSHOT_FORMAT_VERSION
+    ) {
+        return Err(CatalogError::UnsupportedVersion);
+    }
     let revision = reader.u64()?;
     let graph_count = reader.count(MAX_GRAPHS)?;
     let mut graphs = BTreeMap::new();
@@ -1004,6 +1421,36 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
         let graph = decode_graph(&mut reader)?;
         if graphs.insert(graph.graph_id, graph).is_some() {
             return Err(CatalogError::NonCanonicalRecord);
+        }
+    }
+    let mut migrations = BTreeMap::new();
+    let mut active_migrations = BTreeMap::new();
+    if version == SNAPSHOT_FORMAT_VERSION {
+        let migration_count = reader.count(MAX_MIGRATIONS)?;
+        for _ in 0..migration_count {
+            let migration = decode_migration_record(&mut reader)?;
+            let migration_id = migration.migration_id;
+            let graph = graphs
+                .get(&migration.graph_id)
+                .ok_or(CatalogError::NonCanonicalRecord)?;
+            if !graph
+                .topology
+                .placements
+                .iter()
+                .any(|placement| placement.shard_id == migration.shard_id)
+            {
+                return Err(CatalogError::NonCanonicalRecord);
+            }
+            if !migration.state.is_terminal()
+                && active_migrations
+                    .insert((migration.graph_id, migration.shard_id), migration_id)
+                    .is_some()
+            {
+                return Err(CatalogError::NonCanonicalRecord);
+            }
+            if migrations.insert(migration_id, migration).is_some() {
+                return Err(CatalogError::NonCanonicalRecord);
+            }
         }
     }
     let applied_count = reader.count(MAX_GRAPHS.saturating_mul(16))?;
@@ -1032,9 +1479,11 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
     let state = CatalogState {
         revision,
         graphs,
+        migrations,
+        active_migrations,
         applied_commands,
     };
-    if encode_snapshot(&state)? != bytes {
+    if encode_snapshot_version(&state, version)? != bytes {
         return Err(CatalogError::NonCanonicalRecord);
     }
     Ok(state)
@@ -1044,7 +1493,7 @@ fn append_log_frame(path: &Path, command: &[u8]) -> Result<(), CatalogError> {
     let length = u32::try_from(command.len()).map_err(|_| CatalogError::RecordTooLarge)?;
     let mut frame = Vec::with_capacity(10 + command.len() + CHECKSUM_BYTES);
     frame.extend_from_slice(&LOG_MAGIC);
-    frame.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    frame.extend_from_slice(&LOG_FORMAT_VERSION.to_be_bytes());
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(command);
     append_checksum(&mut frame);
@@ -1069,7 +1518,7 @@ fn replay_log(state: &mut CatalogState, bytes: &[u8]) -> Result<(), CatalogError
         if remaining[..4] != LOG_MAGIC {
             return Err(CatalogError::InvalidMagic);
         }
-        if u16::from_be_bytes([remaining[4], remaining[5]]) != FORMAT_VERSION {
+        if u16::from_be_bytes([remaining[4], remaining[5]]) != LOG_FORMAT_VERSION {
             return Err(CatalogError::UnsupportedVersion);
         }
         let command_length = usize::try_from(u32::from_be_bytes(
@@ -1224,8 +1673,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn expect_version(&mut self) -> Result<(), CatalogError> {
-        if u16::from_be_bytes(self.array()?) == FORMAT_VERSION {
+    fn version(&mut self) -> Result<u16, CatalogError> {
+        Ok(u16::from_be_bytes(self.array()?))
+    }
+
+    fn expect_version(&mut self, expected: u16) -> Result<(), CatalogError> {
+        if self.version()? == expected {
             Ok(())
         } else {
             Err(CatalogError::UnsupportedVersion)
@@ -1304,6 +1757,7 @@ pub enum CatalogError {
         expected: u64,
         actual: u64,
     },
+    Migration(MigrationError),
     InvalidMagic,
     UnsupportedVersion,
     UnknownCommandTag {
@@ -1414,6 +1868,7 @@ impl Display for CatalogError {
                 formatter,
                 "graph {graph_id} backend generation {actual} must be {expected}"
             ),
+            Self::Migration(error) => write!(formatter, "migration error: {error}"),
             Self::InvalidMagic => formatter.write_str("invalid catalog record magic"),
             Self::UnsupportedVersion => formatter.write_str("unsupported catalog record version"),
             Self::UnknownCommandTag { tag } => {
@@ -1437,3 +1892,23 @@ impl Display for CatalogError {
 }
 
 impl Error for CatalogError {}
+
+impl From<MigrationError> for CatalogError {
+    fn from(error: MigrationError) -> Self {
+        Self::Migration(error)
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn version_one_snapshot_remains_readable_after_migration_records_are_added() {
+        let state = CatalogState::new();
+        let legacy = encode_snapshot_version(&state, LEGACY_SNAPSHOT_FORMAT_VERSION).unwrap();
+        let decoded = CatalogState::decode_snapshot(&legacy).unwrap();
+        assert_eq!(decoded, state);
+        assert!(decoded.migrations().is_empty());
+    }
+}
