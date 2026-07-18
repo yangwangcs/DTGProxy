@@ -184,7 +184,7 @@ fn live_unpublished_restore_residue_is_never_served_and_can_be_reclaimed() {
     let factory = PostgresAdapterFactory;
     let restore =
         block_on(factory.begin_restore(&request, LogicalSnapshotHeaderV1::new(7, 0))).unwrap();
-    drop(restore);
+    block_on(restore.abort()).unwrap();
 
     let mut client = Client::connect(&url, NoTls).unwrap();
     assert!(

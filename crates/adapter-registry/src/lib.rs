@@ -45,10 +45,18 @@ pub trait AdapterRestoreSession: Send {
     ) -> AdapterRestoreFuture<'a, Arc<dyn StorageAdapter>>
     where
         Self: 'a;
+
+    /// Explicitly aborts a restore and reports whether its hidden target was cleaned up.
+    ///
+    /// `Drop` remains a crash-safety fallback, but callers that decide whether a target can be
+    /// retried need an observable result instead of a best-effort destructor.
+    fn abort<'a>(self: Box<Self>) -> AdapterRestoreFuture<'a, ()>
+    where
+        Self: 'a;
 }
 
 pub trait AdapterFactory: Send + Sync {
-    fn provider_name(&self) -> &'static str;
+    fn provider_name(&self) -> &str;
 
     fn open<'a>(&'a self, request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a>;
 
@@ -146,6 +154,11 @@ impl AdapterOpenRequest {
     }
 
     #[must_use]
+    pub const fn public_parameters(&self) -> &BTreeMap<String, String> {
+        &self.parameters
+    }
+
+    #[must_use]
     pub fn secret(&self, name: &str) -> Option<&SecretString> {
         self.secrets.get(name)
     }
@@ -231,14 +244,12 @@ impl AdapterRegistry {
     }
 
     pub fn register(&mut self, factory: Arc<dyn AdapterFactory>) -> Result<(), RegistryError> {
-        let provider = factory.provider_name();
-        Self::validate_provider_name(provider)?;
-        if self.factories.contains_key(provider) {
-            return Err(RegistryError::DuplicateProvider {
-                provider: provider.to_owned(),
-            });
+        let provider = factory.provider_name().to_owned();
+        Self::validate_provider_name(&provider)?;
+        if self.factories.contains_key(&provider) {
+            return Err(RegistryError::DuplicateProvider { provider });
         }
-        self.factories.insert(provider.to_owned(), factory);
+        self.factories.insert(provider, factory);
         Ok(())
     }
 
@@ -294,11 +305,24 @@ impl AdapterRegistry {
             restore.write_chunk(chunk).await?;
         }
         let manifest = reader.finish().await?;
+        let expected_applied_index = manifest.header().applied_log_index();
         let adapter = restore.finish(manifest).await?;
+        let final_descriptor = adapter.descriptor();
+        if final_descriptor != descriptor {
+            return Err(RegistryError::FinalDescriptorMismatch);
+        }
+        final_descriptor.validate(requirement)?;
+        let actual_applied_index = adapter.applied_log_index().map_err(RegistryError::Target)?;
+        if actual_applied_index != expected_applied_index {
+            return Err(RegistryError::RestoredIndexMismatch {
+                expected: expected_applied_index,
+                actual: actual_applied_index,
+            });
+        }
         Ok(OpenedAdapter {
             provider_name: provider.to_owned(),
             instance_id: request.instance_id.clone(),
-            descriptor,
+            descriptor: final_descriptor,
             adapter,
         })
     }
@@ -311,7 +335,10 @@ pub enum RegistryError {
     UnknownProvider { provider: String },
     Factory(AdapterFactoryError),
     Source(AdapterError),
+    Target(AdapterError),
     Incompatible(AdapterCompatibilityError),
+    FinalDescriptorMismatch,
+    RestoredIndexMismatch { expected: u64, actual: u64 },
 }
 
 impl Display for RegistryError {
@@ -331,7 +358,15 @@ impl Display for RegistryError {
             }
             Self::Factory(error) => write!(formatter, "Adapter factory failed: {error}"),
             Self::Source(error) => write!(formatter, "snapshot source failed: {error}"),
+            Self::Target(error) => write!(formatter, "restored Adapter validation failed: {error}"),
             Self::Incompatible(error) => Display::fmt(error, formatter),
+            Self::FinalDescriptorMismatch => formatter.write_str(
+                "restored Adapter descriptor differs from the pre-publication descriptor",
+            ),
+            Self::RestoredIndexMismatch { expected, actual } => write!(
+                formatter,
+                "restored Adapter applied index {actual} differs from snapshot index {expected}"
+            ),
         }
     }
 }
@@ -341,6 +376,7 @@ impl Error for RegistryError {
         match self {
             Self::Factory(error) => Some(error),
             Self::Source(error) => Some(error),
+            Self::Target(error) => Some(error),
             Self::Incompatible(error) => Some(error),
             _ => None,
         }

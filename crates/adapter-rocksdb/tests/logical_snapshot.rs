@@ -145,6 +145,35 @@ fn restore_does_not_publish_a_generation_with_a_bad_final_manifest() {
     }));
 }
 
+#[test]
+fn explicit_restore_abort_removes_the_hidden_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let target_path = root.path().join("aborted-target");
+    let request = AdapterOpenRequest::new("abort-target")
+        .with_parameter("path", target_path.to_str().unwrap());
+    let factory = RocksAdapterFactory;
+    let restore =
+        block_on(factory.begin_restore(&request, storage_api::LogicalSnapshotHeaderV1::new(77, 0)))
+            .unwrap();
+
+    assert!(root.path().read_dir().unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("aborted-target.dtg-restore")
+    }));
+    block_on(restore.abort()).unwrap();
+    assert!(!target_path.exists());
+    assert!(root.path().read_dir().unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("aborted-target.dtg-restore")
+    }));
+}
+
 fn batch(index: u64, key: &[u8], value: &[u8]) -> CommittedMutationBatch {
     CommittedMutationBatch {
         shard_id: 1,

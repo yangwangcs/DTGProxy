@@ -28,7 +28,7 @@ type RocksDb = DBWithThreadMode<MultiThreaded>;
 pub struct RocksAdapterFactory;
 
 impl AdapterFactory for RocksAdapterFactory {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "rocksdb"
     }
 
@@ -442,6 +442,20 @@ impl AdapterRestoreSession for RocksRestoreSession {
                 )));
             }
             Ok(Arc::new(restored) as Arc<dyn StorageAdapter>)
+        })
+    }
+
+    fn abort<'a>(mut self: Box<Self>) -> AdapterRestoreFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            drop(self.adapter.take());
+            if self.staging_path.exists() {
+                fs::remove_dir_all(&self.staging_path)
+                    .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
+            }
+            Ok(())
         })
     }
 }

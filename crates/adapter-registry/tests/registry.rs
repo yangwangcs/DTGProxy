@@ -10,15 +10,16 @@ use adapter_registry::{
     MigrationError, MigrationStatus, RegistryError, SecretString,
 };
 use storage_api::{
-    AdapterDescriptorV1, AdapterFuture, AdapterRequirement, CommittedMutationBatch, Keyspace,
-    LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1,
+    AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, AdapterRequirement,
+    ApplyReceipt, BackendFamily, CommittedMutationBatch, KeySpan, KeyValue, Keyspace, LogicalKey,
+    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1,
     LogicalSnapshotManifestV1, LogicalSnapshotReader, Mutation, StorageAdapter,
 };
 
 struct MemoryFactory;
 
 impl AdapterFactory for MemoryFactory {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "memory"
     }
 
@@ -121,6 +122,38 @@ fn secrets_are_never_exposed_by_debug_output() {
         request.secret("password").unwrap().expose(),
         "super-secret-password"
     );
+    assert_eq!(
+        request
+            .public_parameters()
+            .get("endpoint")
+            .map(String::as_str),
+        Some("postgresql://database:5432/dtg")
+    );
+    assert!(!request.public_parameters().contains_key("password"));
+}
+
+#[test]
+fn restore_rejects_final_descriptor_drift() {
+    let error = match restore_with_final_adapter("prospective", "different", 7, 7) {
+        Ok(_) => panic!("descriptor drift was accepted"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, RegistryError::FinalDescriptorMismatch));
+}
+
+#[test]
+fn restore_rejects_final_applied_index_drift() {
+    let error = match restore_with_final_adapter("stable", "stable", 7, 6) {
+        Ok(_) => panic!("applied-index drift was accepted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        RegistryError::RestoredIndexMismatch {
+            expected: 7,
+            actual: 6
+        }
+    ));
 }
 
 #[test]
@@ -198,7 +231,7 @@ struct DevelopmentRestoreFactory {
 }
 
 impl AdapterFactory for DevelopmentRestoreFactory {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "development-restore"
     }
 
@@ -247,6 +280,160 @@ impl AdapterRestoreSession for DevelopmentRestoreSession {
             Ok(Arc::new(MemoryAdapter::new()) as Arc<dyn StorageAdapter>)
         })
     }
+
+    fn abort<'a>(self: Box<Self>) -> AdapterRestoreFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+struct FinalRestoreFactory {
+    prospective: AdapterDescriptorV1,
+    final_adapter: Arc<dyn StorageAdapter>,
+}
+
+impl AdapterFactory for FinalRestoreFactory {
+    fn provider_name(&self) -> &str {
+        "final-restore"
+    }
+
+    fn open<'a>(&'a self, _request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a> {
+        let adapter = Arc::clone(&self.final_adapter);
+        Box::pin(async move { Ok(adapter) })
+    }
+
+    fn begin_restore<'a>(
+        &'a self,
+        _request: &'a AdapterOpenRequest,
+        _header: LogicalSnapshotHeaderV1,
+    ) -> AdapterRestoreSessionFuture<'a> {
+        let prospective = self.prospective.clone();
+        let final_adapter = Arc::clone(&self.final_adapter);
+        Box::pin(async move {
+            Ok(Box::new(FinalRestoreSession {
+                prospective,
+                final_adapter,
+            }) as Box<dyn AdapterRestoreSession + 'a>)
+        })
+    }
+}
+
+struct FinalRestoreSession {
+    prospective: AdapterDescriptorV1,
+    final_adapter: Arc<dyn StorageAdapter>,
+}
+
+impl AdapterRestoreSession for FinalRestoreSession {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        self.prospective.clone()
+    }
+
+    fn write_chunk<'a>(
+        &'a mut self,
+        _chunk: LogicalSnapshotChunkV1,
+    ) -> AdapterRestoreFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn finish<'a>(
+        self: Box<Self>,
+        _manifest: LogicalSnapshotManifestV1,
+    ) -> AdapterRestoreFuture<'a, Arc<dyn StorageAdapter>>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move { Ok(Arc::clone(&self.final_adapter)) })
+    }
+
+    fn abort<'a>(self: Box<Self>) -> AdapterRestoreFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+struct FixedAdapter {
+    descriptor: AdapterDescriptorV1,
+    applied_index: u64,
+}
+
+impl StorageAdapter for FixedAdapter {
+    fn descriptor(&self) -> AdapterDescriptorV1 {
+        self.descriptor.clone()
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        self.descriptor.capabilities()
+    }
+
+    fn apply_committed<'a>(
+        &'a self,
+        batch: CommittedMutationBatch,
+    ) -> AdapterFuture<'a, ApplyReceipt> {
+        Box::pin(async move {
+            Ok(ApplyReceipt {
+                applied_log_index: batch.log_index,
+                duplicate: false,
+            })
+        })
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move { Ok(vec![None; keys.len()]) })
+    }
+
+    fn scan<'a>(&'a self, _span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn applied_log_index(&self) -> Result<u64, AdapterError> {
+        Ok(self.applied_index)
+    }
+}
+
+fn restore_with_final_adapter(
+    prospective_version: &str,
+    final_version: &str,
+    snapshot_index: u64,
+    final_index: u64,
+) -> Result<adapter_registry::OpenedAdapter, RegistryError> {
+    let capabilities = MemoryAdapter::new().capabilities();
+    let prospective = AdapterDescriptorV1::new(
+        "fixed",
+        prospective_version,
+        BackendFamily::Test,
+        capabilities,
+    );
+    let final_adapter: Arc<dyn StorageAdapter> = Arc::new(FixedAdapter {
+        descriptor: AdapterDescriptorV1::new(
+            "fixed",
+            final_version,
+            BackendFamily::Test,
+            capabilities,
+        ),
+        applied_index: final_index,
+    });
+    let mut registry = AdapterRegistry::new();
+    registry
+        .register(Arc::new(FinalRestoreFactory {
+            prospective,
+            final_adapter,
+        }))
+        .unwrap();
+    let header = LogicalSnapshotHeaderV1::new(91, snapshot_index);
+    let reader: Box<dyn LogicalSnapshotReader> = Box::new(EmptySnapshotReader {
+        accumulator: LogicalSnapshotAccumulator::new(header.clone()),
+        header,
+    });
+    block_on(registry.restore(
+        "final-restore",
+        &AdapterOpenRequest::new("target"),
+        AdapterRequirement::Development,
+        reader,
+    ))
 }
 
 struct EmptySnapshotReader {

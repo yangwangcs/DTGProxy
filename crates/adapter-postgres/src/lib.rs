@@ -166,7 +166,7 @@ impl Drop for ExportSlot {
 }
 
 impl AdapterFactory for PostgresAdapterFactory {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "postgresql"
     }
 
@@ -986,6 +986,21 @@ impl AdapterRestoreSession for PostgresRestoreSession {
                 .expect("restore Adapter checked immediately before take");
             self.published = true;
             Ok(Arc::new(adapter) as Arc<dyn StorageAdapter>)
+        })
+    }
+
+    fn abort<'a>(mut self: Box<Self>) -> AdapterRestoreFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            let adapter = self.adapter.take().ok_or_else(|| {
+                AdapterFactoryError::new("PostgreSQL restore session is already finished")
+            })?;
+            adapter
+                .delete_namespace()
+                .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
+            Ok(())
         })
     }
 }
