@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "cluster_id": "11111111111111111111111111111111",
+  "node_id": 1,
+  "voters": [1],
+  "listen_address": "127.0.0.1:7001",
+  "advertise_address": "127.0.0.1:7001",
+  "raft_listen_address": "127.0.0.1:7002",
+  "peer_addresses": {},
+  "data_directory": "/tmp/dtgproxy-cluster/meta-1",
+  "security": { "mode": "loopback_plaintext" },
+  "timestamp_reservation_size": 4096,
+  "maximum_future_drift_ms": 5000,
+  "shutdown_grace_ms": 5000
+}

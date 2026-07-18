@@ -33,6 +33,12 @@ Start with the [1.0 quickstart](docs/dtgproxy-v1-quickstart.md), its
 for Raft commands, state-machine recovery, snapshots, transactions, control-plane state, Adapter
 SPI, and Sidecar transport are under [`docs/`](docs/).
 
+The independently deployable cluster path consists of `dtgproxy-meta`, `dtgproxy-data`,
+`dtgproxy-gateway`, and `dtgproxy-controller`. A loopback two-Data-node configuration set is under
+[`config/examples/cluster-dev`](config/examples/cluster-dev/README.md). The cluster Controller can
+move a live Shard with resumable snapshot transfer, learner catch-up, joint consensus, epoch
+lineage, and cleanup pins; see the [P0 verification record](docs/verification/dtgproxy-p0-cluster-runtime.md).
+
 ## Temporal persistence slice
 
 `TemporalStore` accepts a `TemporalTransaction` containing typed vertex and edge mutations with
