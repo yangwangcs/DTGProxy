@@ -29,12 +29,15 @@ fn version_reports_product_name_and_workspace_version() {
 }
 
 #[test]
-fn no_arguments_reports_phase_status_and_usage() {
+fn no_arguments_reports_v1_commands_and_usage() {
     let output = command().output().unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("DTGProxy Phase 1C local temporal query slice"));
+    assert!(stdout.contains("DTGProxy 1.0 prototype"));
+    assert!(stdout.contains("dtgproxy init"));
+    assert!(stdout.contains("dtgproxy serve"));
+    assert!(stdout.contains("dtgproxy transaction"));
     assert!(stdout.contains("dtgproxy query --db <path> --text <query>"));
     assert!(output.stderr.is_empty());
 }

@@ -12,6 +12,8 @@ control-plane = { path = "../control-plane" }
 query-executor = { path = "../query-executor" }
 raft-command = { path = "../raft-command" }
 raft-transport = { path = "../raft-transport" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
 shard-runtime = { path = "../shard-runtime" }
 storage-api = { path = "../storage-api" }
 temporal-ir = { path = "../temporal-ir" }

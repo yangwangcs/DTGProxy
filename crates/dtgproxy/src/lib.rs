@@ -7,6 +7,8 @@
 //! be a replicated Raft group; the two modes therefore share the same consensus,
 //! temporal state-machine, and read-barrier implementation.
 
+pub mod config;
+pub mod gateway;
 mod transaction;
 
 pub use control_plane;
