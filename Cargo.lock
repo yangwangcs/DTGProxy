@@ -45,7 +45,10 @@ name = "adapter-sidecar"
 version = "0.1.0"
 dependencies = [
  "adapter-memory",
+ "adapter-registry",
+ "blake3",
  "crc32fast",
+ "getrandom 0.4.3",
  "prost",
  "storage-api",
 ]

@@ -1,8 +1,8 @@
 use std::io::Cursor;
 
 use adapter_sidecar::{
-    FrameKind, HealthStatus, ProtocolError, RemoteError, Request, Response, decode_frame,
-    encode_frame, read_frame, write_frame,
+    FrameKind, HealthStatus, MAX_FRAME_PAYLOAD_BYTES, ProtocolError, RemoteError, Request,
+    Response, decode_frame, encode_frame, read_frame, write_frame,
 };
 use storage_api::{
     ADAPTER_SPI_VERSION, AdapterCapabilities, AdapterDescriptorV1, ApplyReceipt, BackendFamily,
@@ -118,6 +118,7 @@ fn stream_helpers_preserve_frame_boundaries() {
 
 #[test]
 fn corruption_wrong_version_trailing_bytes_and_oversized_lengths_fail_closed() {
+    assert_eq!(MAX_FRAME_PAYLOAD_BYTES, 20 * 1024 * 1024);
     let request = Request::Describe;
     let bytes = encode_frame(1, &request).unwrap();
 

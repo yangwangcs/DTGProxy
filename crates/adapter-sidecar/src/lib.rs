@@ -18,14 +18,193 @@ use prost::Message;
 use storage_api::{
     ADAPTER_SPI_VERSION, AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture,
     ApplyReceipt, BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace,
-    LogicalKey, Mutation, MutationOperation, SnapshotCapability, StorageAdapter,
+    LOGICAL_SNAPSHOT_FORMAT_VERSION, LogicalKey, LogicalSnapshotChunkV1,
+    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
+    MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES, MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES, Mutation,
+    MutationOperation, SnapshotCapability, StorageAdapter,
 };
 
 const MAGIC: [u8; 4] = *b"DTAS";
 const WIRE_VERSION: u16 = 1;
 const HEADER_BYTES: usize = 28;
 const CHECKSUM_BYTES: usize = 4;
-pub const MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeatureSet(u64);
+
+impl FeatureSet {
+    pub const BASE_ADAPTER_V1: Self = Self(1 << 0);
+    pub const LOGICAL_EXPORT_SESSION_V1: Self = Self(1 << 1);
+    pub const LOGICAL_RESTORE_SESSION_V1: Self = Self(1 << 2);
+    pub const RESUMABLE_ORDINAL_REPLAY_V1: Self = Self(1 << 3);
+    pub const ALL: Self = Self(
+        Self::BASE_ADAPTER_V1.0
+            | Self::LOGICAL_EXPORT_SESSION_V1.0
+            | Self::LOGICAL_RESTORE_SESSION_V1.0
+            | Self::RESUMABLE_ORDINAL_REPLAY_V1.0,
+    );
+    pub const EMPTY: Self = Self(0);
+
+    pub fn from_bits(bits: u64) -> Result<Self, ProtocolError> {
+        if bits & !Self::ALL.0 == 0 {
+            Ok(Self(bits))
+        } else {
+            Err(ProtocolError::UnknownFeatureBits {
+                bits: bits & !Self::ALL.0,
+            })
+        }
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelloRequest {
+    pub required_features: FeatureSet,
+    pub optional_features: FeatureSet,
+    pub max_payload_bytes: u32,
+}
+
+impl HelloRequest {
+    #[must_use]
+    pub fn adapter_client() -> Self {
+        Self {
+            required_features: FeatureSet::BASE_ADAPTER_V1,
+            optional_features: FeatureSet::LOGICAL_EXPORT_SESSION_V1
+                .union(FeatureSet::LOGICAL_RESTORE_SESSION_V1)
+                .union(FeatureSet::RESUMABLE_ORDINAL_REPLAY_V1),
+            max_payload_bytes: u32::try_from(MAX_FRAME_PAYLOAD_BYTES)
+                .expect("frame maximum fits in u32"),
+        }
+    }
+
+    #[must_use]
+    pub fn restore_client() -> Self {
+        Self {
+            required_features: FeatureSet::BASE_ADAPTER_V1
+                .union(FeatureSet::LOGICAL_RESTORE_SESSION_V1)
+                .union(FeatureSet::RESUMABLE_ORDINAL_REPLAY_V1),
+            optional_features: FeatureSet::EMPTY,
+            max_payload_bytes: u32::try_from(MAX_FRAME_PAYLOAD_BYTES)
+                .expect("frame maximum fits in u32"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HelloResponse {
+    pub wire_version: u16,
+    pub negotiated_features: FeatureSet,
+    pub max_payload_bytes: u32,
+    pub max_chunk_bytes: u32,
+    pub max_chunk_entries: u32,
+    pub snapshot_format_version: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicAdapterOpenRequest {
+    instance_id: String,
+    parameters: BTreeMap<String, String>,
+}
+
+impl PublicAdapterOpenRequest {
+    #[must_use]
+    pub fn new(instance_id: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            parameters: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_parameter(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.parameters.insert(name.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    #[must_use]
+    pub const fn parameters(&self) -> &BTreeMap<String, String> {
+        &self.parameters
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeginExportRequest {
+    pub limits: LogicalSnapshotExportRequest,
+    pub expected_applied_log_index: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeginRestoreRequest {
+    pub header: LogicalSnapshotHeaderV1,
+    pub target: PublicAdapterOpenRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportStarted {
+    pub session_id: u128,
+    pub header: LogicalSnapshotHeaderV1,
+    pub limits: LogicalSnapshotExportRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreStarted {
+    pub session_id: u128,
+    pub prospective_descriptor: AdapterDescriptorV1,
+    pub max_chunk_bytes: u32,
+    pub max_chunk_entries: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreComplete {
+    pub session_id: u128,
+    pub final_descriptor: AdapterDescriptorV1,
+    pub applied_log_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RemoteErrorCode {
+    FeatureUnsupported = 100,
+    NotActive = 101,
+    ResourceExhausted = 102,
+    SessionUnknown = 103,
+    SessionExpired = 104,
+    SessionKindMismatch = 105,
+    SessionBusy = 106,
+    OrdinalGap = 107,
+    OrdinalRegression = 108,
+    ChunkDigestMismatch = 109,
+    RequestReplayMismatch = 110,
+    TerminalReplayMismatch = 111,
+    RestoreAlreadyInProgress = 112,
+    ServiceFaulted = 113,
+    TargetRequestMismatch = 114,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -36,22 +215,60 @@ pub enum FrameKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
+    Hello(HelloRequest),
     Describe,
     Apply(CommittedMutationBatch),
     MultiGet(Vec<LogicalKey>),
     Scan(KeySpan),
     AppliedLogIndex,
     Health,
+    BeginExport(BeginExportRequest),
+    ExportNext {
+        session_id: u128,
+        expected_ordinal: u64,
+    },
+    BeginRestore(BeginRestoreRequest),
+    RestoreChunk {
+        session_id: u128,
+        chunk: LogicalSnapshotChunkV1,
+    },
+    FinishRestore {
+        session_id: u128,
+        manifest: LogicalSnapshotManifestV1,
+    },
+    AbortSession {
+        session_id: u128,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
+    Hello(HelloResponse),
     Descriptor(AdapterDescriptorV1),
     Apply(ApplyReceipt),
     MultiGet(Vec<Option<Vec<u8>>>),
     Scan(Vec<KeyValue>),
     AppliedLogIndex(u64),
     Health(HealthStatus),
+    ExportStarted(ExportStarted),
+    ExportChunk {
+        session_id: u128,
+        chunk: LogicalSnapshotChunkV1,
+    },
+    ExportComplete {
+        session_id: u128,
+        manifest: LogicalSnapshotManifestV1,
+    },
+    RestoreStarted(RestoreStarted),
+    RestoreChunkAccepted {
+        session_id: u128,
+        ordinal: u64,
+        digest: [u8; 32],
+    },
+    RestoreComplete(RestoreComplete),
+    SessionAborted {
+        session_id: u128,
+    },
     Error(RemoteError),
 }
 
@@ -574,6 +791,31 @@ fn block_on_dispatch<F: Future>(future: F) -> F::Output {
 /// failures are values on the wire so the connection remains reusable.
 pub async fn dispatch_request(adapter: &dyn StorageAdapter, request: Request) -> Response {
     match request {
+        Request::Hello(request) => {
+            let supported = FeatureSet::BASE_ADAPTER_V1;
+            if !supported.contains(request.required_features) {
+                Response::Error(RemoteError {
+                    code: RemoteErrorCode::FeatureUnsupported as u32,
+                    message: "required Sidecar Feature is unavailable".to_owned(),
+                    retryable: false,
+                })
+            } else {
+                Response::Hello(HelloResponse {
+                    wire_version: WIRE_VERSION,
+                    negotiated_features: request
+                        .required_features
+                        .union(request.optional_features)
+                        .intersection(supported),
+                    max_payload_bytes: u32::try_from(MAX_FRAME_PAYLOAD_BYTES)
+                        .expect("frame maximum fits in u32"),
+                    max_chunk_bytes: u32::try_from(MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES)
+                        .expect("Chunk maximum fits in u32"),
+                    max_chunk_entries: u32::try_from(MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES)
+                        .expect("Chunk entry maximum fits in u32"),
+                    snapshot_format_version: LOGICAL_SNAPSHOT_FORMAT_VERSION,
+                })
+            }
+        }
         Request::Describe => Response::Descriptor(adapter.descriptor()),
         Request::Apply(batch) => match adapter.apply_committed(batch).await {
             Ok(receipt) => Response::Apply(receipt),
@@ -601,6 +843,16 @@ pub async fn dispatch_request(adapter: &dyn StorageAdapter, request: Request) ->
                 detail: error.to_string(),
             }),
         },
+        Request::BeginExport(_)
+        | Request::ExportNext { .. }
+        | Request::BeginRestore(_)
+        | Request::RestoreChunk { .. }
+        | Request::FinishRestore { .. }
+        | Request::AbortSession { .. } => Response::Error(RemoteError {
+            code: RemoteErrorCode::FeatureUnsupported as u32,
+            message: "snapshot sessions require a stateful Sidecar service".to_owned(),
+            retryable: false,
+        }),
     }
 }
 
@@ -876,12 +1128,20 @@ fn unexpected_response(operation: &'static str, response: &Response) -> SidecarC
 
 const fn response_name(response: &Response) -> &'static str {
     match response {
+        Response::Hello(_) => "hello",
         Response::Descriptor(_) => "descriptor",
         Response::Apply(_) => "apply",
         Response::MultiGet(_) => "multi-get",
         Response::Scan(_) => "scan",
         Response::AppliedLogIndex(_) => "applied-log-index",
         Response::Health(_) => "health",
+        Response::ExportStarted(_) => "export-started",
+        Response::ExportChunk { .. } => "export-chunk",
+        Response::ExportComplete { .. } => "export-complete",
+        Response::RestoreStarted(_) => "restore-started",
+        Response::RestoreChunkAccepted { .. } => "restore-chunk-accepted",
+        Response::RestoreComplete(_) => "restore-complete",
+        Response::SessionAborted { .. } => "session-aborted",
         Response::Error(_) => "error",
     }
 }
@@ -1082,6 +1342,11 @@ impl ProtocolMessage for Request {
 
     fn encode_payload(&self) -> Result<Vec<u8>, ProtocolError> {
         let body = match self {
+            Self::Hello(request) => wire::request_envelope::Body::Hello(wire::HelloRequest {
+                required_features: request.required_features.bits(),
+                optional_features: request.optional_features.bits(),
+                max_payload_bytes: request.max_payload_bytes,
+            }),
             Self::Describe => wire::request_envelope::Body::Describe(true),
             Self::Apply(batch) => wire::request_envelope::Body::Apply(encode_batch(batch)?),
             Self::MultiGet(keys) => wire::request_envelope::Body::MultiGet(wire::MultiGetRequest {
@@ -1090,6 +1355,43 @@ impl ProtocolMessage for Request {
             Self::Scan(span) => wire::request_envelope::Body::Scan(encode_span(span)?),
             Self::AppliedLogIndex => wire::request_envelope::Body::AppliedLogIndex(true),
             Self::Health => wire::request_envelope::Body::Health(true),
+            Self::BeginExport(request) => {
+                wire::request_envelope::Body::BeginExport(wire::BeginExportRequest {
+                    limits: Some(encode_snapshot_limits(request.limits)?),
+                    expected_applied_log_index: request.expected_applied_log_index,
+                })
+            }
+            Self::ExportNext {
+                session_id,
+                expected_ordinal,
+            } => wire::request_envelope::Body::ExportNext(wire::ExportNextRequest {
+                session_id: encode_u128(*session_id),
+                expected_ordinal: *expected_ordinal,
+            }),
+            Self::BeginRestore(request) => {
+                wire::request_envelope::Body::BeginRestore(wire::BeginRestoreRequest {
+                    header: Some(encode_snapshot_header(&request.header)),
+                    target: Some(encode_public_open_request(&request.target)),
+                })
+            }
+            Self::RestoreChunk { session_id, chunk } => {
+                wire::request_envelope::Body::RestoreChunk(wire::RestoreChunkRequest {
+                    session_id: encode_u128(*session_id),
+                    chunk: Some(encode_snapshot_chunk(chunk)),
+                })
+            }
+            Self::FinishRestore {
+                session_id,
+                manifest,
+            } => wire::request_envelope::Body::FinishRestore(wire::FinishRestoreRequest {
+                session_id: encode_u128(*session_id),
+                manifest: Some(encode_snapshot_manifest(manifest)),
+            }),
+            Self::AbortSession { session_id } => {
+                wire::request_envelope::Body::AbortSession(wire::AbortSessionRequest {
+                    session_id: encode_u128(*session_id),
+                })
+            }
         };
         encode_protobuf(&wire::RequestEnvelope {
             spi_version: u32::from(ADAPTER_SPI_VERSION),
@@ -1109,6 +1411,11 @@ impl ProtocolMessage for Request {
             });
         }
         match envelope.body.ok_or(ProtocolError::MissingBody)? {
+            wire::request_envelope::Body::Hello(request) => Ok(Self::Hello(HelloRequest {
+                required_features: FeatureSet::from_bits(request.required_features)?,
+                optional_features: FeatureSet::from_bits(request.optional_features)?,
+                max_payload_bytes: request.max_payload_bytes,
+            })),
             wire::request_envelope::Body::Describe(true) => Ok(Self::Describe),
             wire::request_envelope::Body::Apply(batch) => Ok(Self::Apply(decode_batch(batch)?)),
             wire::request_envelope::Body::MultiGet(request) => Ok(Self::MultiGet(
@@ -1121,6 +1428,53 @@ impl ProtocolMessage for Request {
             wire::request_envelope::Body::Scan(span) => Ok(Self::Scan(decode_span(span)?)),
             wire::request_envelope::Body::AppliedLogIndex(true) => Ok(Self::AppliedLogIndex),
             wire::request_envelope::Body::Health(true) => Ok(Self::Health),
+            wire::request_envelope::Body::BeginExport(request) => {
+                Ok(Self::BeginExport(BeginExportRequest {
+                    limits: decode_snapshot_limits(
+                        request
+                            .limits
+                            .ok_or(ProtocolError::MissingSnapshotField("export limits"))?,
+                    )?,
+                    expected_applied_log_index: request.expected_applied_log_index,
+                }))
+            }
+            wire::request_envelope::Body::ExportNext(request) => Ok(Self::ExportNext {
+                session_id: decode_session_id(&request.session_id)?,
+                expected_ordinal: request.expected_ordinal,
+            }),
+            wire::request_envelope::Body::BeginRestore(request) => {
+                Ok(Self::BeginRestore(BeginRestoreRequest {
+                    header: decode_snapshot_header(
+                        request
+                            .header
+                            .ok_or(ProtocolError::MissingSnapshotField("restore header"))?,
+                    )?,
+                    target: decode_public_open_request(
+                        request
+                            .target
+                            .ok_or(ProtocolError::MissingSnapshotField("restore target"))?,
+                    )?,
+                }))
+            }
+            wire::request_envelope::Body::RestoreChunk(request) => Ok(Self::RestoreChunk {
+                session_id: decode_session_id(&request.session_id)?,
+                chunk: decode_snapshot_chunk(
+                    request
+                        .chunk
+                        .ok_or(ProtocolError::MissingSnapshotField("restore chunk"))?,
+                )?,
+            }),
+            wire::request_envelope::Body::FinishRestore(request) => Ok(Self::FinishRestore {
+                session_id: decode_session_id(&request.session_id)?,
+                manifest: decode_snapshot_manifest(
+                    request
+                        .manifest
+                        .ok_or(ProtocolError::MissingSnapshotField("restore manifest"))?,
+                )?,
+            }),
+            wire::request_envelope::Body::AbortSession(request) => Ok(Self::AbortSession {
+                session_id: decode_session_id(&request.session_id)?,
+            }),
             _ => Err(ProtocolError::NonCanonicalBody),
         }
     }
@@ -1131,6 +1485,28 @@ impl ProtocolMessage for Response {
 
     fn encode_payload(&self) -> Result<Vec<u8>, ProtocolError> {
         let body = match self {
+            Self::Hello(response) => {
+                if response.wire_version != WIRE_VERSION {
+                    return Err(ProtocolError::UnsupportedWireVersion {
+                        version: response.wire_version,
+                    });
+                }
+                if response.snapshot_format_version != LOGICAL_SNAPSHOT_FORMAT_VERSION {
+                    return Err(ProtocolError::UnsupportedSnapshotFormat {
+                        expected: LOGICAL_SNAPSHOT_FORMAT_VERSION,
+                        actual: u32::from(response.snapshot_format_version),
+                    });
+                }
+                validate_chunk_limits(response.max_chunk_entries, response.max_chunk_bytes)?;
+                wire::response_envelope::Body::Hello(wire::HelloResponse {
+                    wire_version: u32::from(response.wire_version),
+                    negotiated_features: response.negotiated_features.bits(),
+                    max_payload_bytes: response.max_payload_bytes,
+                    max_chunk_bytes: response.max_chunk_bytes,
+                    max_chunk_entries: response.max_chunk_entries,
+                    snapshot_format_version: u32::from(response.snapshot_format_version),
+                })
+            }
             Self::Descriptor(descriptor) => {
                 wire::response_envelope::Body::Descriptor(encode_descriptor(descriptor))
             }
@@ -1157,6 +1533,60 @@ impl ProtocolMessage for Response {
                 ready: status.ready,
                 detail: status.detail.clone(),
             }),
+            Self::ExportStarted(started) => {
+                wire::response_envelope::Body::ExportStarted(wire::ExportStartedResponse {
+                    session_id: encode_u128(started.session_id),
+                    header: Some(encode_snapshot_header(&started.header)),
+                    limits: Some(encode_snapshot_limits(started.limits)?),
+                })
+            }
+            Self::ExportChunk { session_id, chunk } => {
+                wire::response_envelope::Body::ExportChunk(wire::ExportChunkResponse {
+                    session_id: encode_u128(*session_id),
+                    chunk: Some(encode_snapshot_chunk(chunk)),
+                })
+            }
+            Self::ExportComplete {
+                session_id,
+                manifest,
+            } => wire::response_envelope::Body::ExportComplete(wire::ExportCompleteResponse {
+                session_id: encode_u128(*session_id),
+                manifest: Some(encode_snapshot_manifest(manifest)),
+            }),
+            Self::RestoreStarted(started) => {
+                validate_chunk_limits(started.max_chunk_entries, started.max_chunk_bytes)?;
+                wire::response_envelope::Body::RestoreStarted(wire::RestoreStartedResponse {
+                    session_id: encode_u128(started.session_id),
+                    prospective_descriptor: Some(encode_descriptor(
+                        &started.prospective_descriptor,
+                    )),
+                    max_chunk_bytes: started.max_chunk_bytes,
+                    max_chunk_entries: started.max_chunk_entries,
+                })
+            }
+            Self::RestoreChunkAccepted {
+                session_id,
+                ordinal,
+                digest,
+            } => wire::response_envelope::Body::RestoreChunkAccepted(
+                wire::RestoreChunkAcceptedResponse {
+                    session_id: encode_u128(*session_id),
+                    ordinal: *ordinal,
+                    digest: digest.to_vec(),
+                },
+            ),
+            Self::RestoreComplete(complete) => {
+                wire::response_envelope::Body::RestoreComplete(wire::RestoreCompleteResponse {
+                    session_id: encode_u128(complete.session_id),
+                    final_descriptor: Some(encode_descriptor(&complete.final_descriptor)),
+                    applied_log_index: complete.applied_log_index,
+                })
+            }
+            Self::SessionAborted { session_id } => {
+                wire::response_envelope::Body::SessionAborted(wire::SessionAbortedResponse {
+                    session_id: encode_u128(*session_id),
+                })
+            }
             Self::Error(error) => wire::response_envelope::Body::Error(wire::ErrorResponse {
                 code: error.code,
                 message: error.message.clone(),
@@ -1181,6 +1611,35 @@ impl ProtocolMessage for Response {
             });
         }
         match envelope.body.ok_or(ProtocolError::MissingBody)? {
+            wire::response_envelope::Body::Hello(response) => {
+                let wire_version = u16::try_from(response.wire_version)
+                    .map_err(|_| ProtocolError::InvalidWireVersion(response.wire_version))?;
+                if wire_version != WIRE_VERSION {
+                    return Err(ProtocolError::UnsupportedWireVersion {
+                        version: wire_version,
+                    });
+                }
+                let snapshot_format_version = u16::try_from(response.snapshot_format_version)
+                    .map_err(|_| ProtocolError::UnsupportedSnapshotFormat {
+                        expected: LOGICAL_SNAPSHOT_FORMAT_VERSION,
+                        actual: response.snapshot_format_version,
+                    })?;
+                if snapshot_format_version != LOGICAL_SNAPSHOT_FORMAT_VERSION {
+                    return Err(ProtocolError::UnsupportedSnapshotFormat {
+                        expected: LOGICAL_SNAPSHOT_FORMAT_VERSION,
+                        actual: response.snapshot_format_version,
+                    });
+                }
+                validate_chunk_limits(response.max_chunk_entries, response.max_chunk_bytes)?;
+                Ok(Self::Hello(HelloResponse {
+                    wire_version,
+                    negotiated_features: FeatureSet::from_bits(response.negotiated_features)?,
+                    max_payload_bytes: response.max_payload_bytes,
+                    max_chunk_bytes: response.max_chunk_bytes,
+                    max_chunk_entries: response.max_chunk_entries,
+                    snapshot_format_version,
+                }))
+            }
             wire::response_envelope::Body::Descriptor(descriptor) => {
                 Ok(Self::Descriptor(decode_descriptor(descriptor)?))
             }
@@ -1209,6 +1668,71 @@ impl ProtocolMessage for Response {
                 ready: status.ready,
                 detail: status.detail,
             })),
+            wire::response_envelope::Body::ExportStarted(started) => {
+                Ok(Self::ExportStarted(ExportStarted {
+                    session_id: decode_session_id(&started.session_id)?,
+                    header: decode_snapshot_header(
+                        started
+                            .header
+                            .ok_or(ProtocolError::MissingSnapshotField("export header"))?,
+                    )?,
+                    limits: decode_snapshot_limits(
+                        started
+                            .limits
+                            .ok_or(ProtocolError::MissingSnapshotField("export limits"))?,
+                    )?,
+                }))
+            }
+            wire::response_envelope::Body::ExportChunk(response) => Ok(Self::ExportChunk {
+                session_id: decode_session_id(&response.session_id)?,
+                chunk: decode_snapshot_chunk(
+                    response
+                        .chunk
+                        .ok_or(ProtocolError::MissingSnapshotField("export chunk"))?,
+                )?,
+            }),
+            wire::response_envelope::Body::ExportComplete(response) => Ok(Self::ExportComplete {
+                session_id: decode_session_id(&response.session_id)?,
+                manifest: decode_snapshot_manifest(
+                    response
+                        .manifest
+                        .ok_or(ProtocolError::MissingSnapshotField("export manifest"))?,
+                )?,
+            }),
+            wire::response_envelope::Body::RestoreStarted(started) => {
+                validate_chunk_limits(started.max_chunk_entries, started.max_chunk_bytes)?;
+                Ok(Self::RestoreStarted(RestoreStarted {
+                    session_id: decode_session_id(&started.session_id)?,
+                    prospective_descriptor: decode_descriptor(
+                        started.prospective_descriptor.ok_or(
+                            ProtocolError::MissingSnapshotField("prospective descriptor"),
+                        )?,
+                    )?,
+                    max_chunk_bytes: started.max_chunk_bytes,
+                    max_chunk_entries: started.max_chunk_entries,
+                }))
+            }
+            wire::response_envelope::Body::RestoreChunkAccepted(response) => {
+                Ok(Self::RestoreChunkAccepted {
+                    session_id: decode_session_id(&response.session_id)?,
+                    ordinal: response.ordinal,
+                    digest: decode_digest(&response.digest)?,
+                })
+            }
+            wire::response_envelope::Body::RestoreComplete(complete) => {
+                Ok(Self::RestoreComplete(RestoreComplete {
+                    session_id: decode_session_id(&complete.session_id)?,
+                    final_descriptor: decode_descriptor(
+                        complete
+                            .final_descriptor
+                            .ok_or(ProtocolError::MissingSnapshotField("final descriptor"))?,
+                    )?,
+                    applied_log_index: complete.applied_log_index,
+                }))
+            }
+            wire::response_envelope::Body::SessionAborted(response) => Ok(Self::SessionAborted {
+                session_id: decode_session_id(&response.session_id)?,
+            }),
             wire::response_envelope::Body::Error(error) => Ok(Self::Error(RemoteError {
                 code: error.code,
                 message: error.message,
@@ -1231,6 +1755,177 @@ fn encode_protobuf<M: Message>(message: &M) -> Result<Vec<u8>, ProtocolError> {
         .encode(&mut bytes)
         .map_err(|error| ProtocolError::PayloadEncode(error.to_string()))?;
     Ok(bytes)
+}
+
+fn encode_u128(value: u128) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+fn decode_session_id(bytes: &[u8]) -> Result<u128, ProtocolError> {
+    let array: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidSessionIdLength {
+            actual: bytes.len(),
+        })?;
+    Ok(u128::from_be_bytes(array))
+}
+
+fn decode_snapshot_id(bytes: &[u8]) -> Result<u128, ProtocolError> {
+    let array: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidSnapshotIdLength {
+            actual: bytes.len(),
+        })?;
+    Ok(u128::from_be_bytes(array))
+}
+
+fn decode_digest(bytes: &[u8]) -> Result<[u8; 32], ProtocolError> {
+    bytes
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidDigestLength {
+            actual: bytes.len(),
+        })
+}
+
+fn encode_snapshot_limits(
+    limits: LogicalSnapshotExportRequest,
+) -> Result<wire::SnapshotLimits, ProtocolError> {
+    Ok(wire::SnapshotLimits {
+        max_entries: u32::try_from(limits.max_entries_per_chunk())
+            .map_err(|_| ProtocolError::LengthOverflow)?,
+        max_bytes: u32::try_from(limits.max_bytes_per_chunk())
+            .map_err(|_| ProtocolError::LengthOverflow)?,
+    })
+}
+
+fn decode_snapshot_limits(
+    limits: wire::SnapshotLimits,
+) -> Result<LogicalSnapshotExportRequest, ProtocolError> {
+    LogicalSnapshotExportRequest::new(
+        usize::try_from(limits.max_entries).map_err(|_| ProtocolError::LengthOverflow)?,
+        usize::try_from(limits.max_bytes).map_err(|_| ProtocolError::LengthOverflow)?,
+    )
+    .map_err(|error| ProtocolError::InvalidChunkLimits(error.to_string()))
+}
+
+fn validate_chunk_limits(max_entries: u32, max_bytes: u32) -> Result<(), ProtocolError> {
+    decode_snapshot_limits(wire::SnapshotLimits {
+        max_entries,
+        max_bytes,
+    })
+    .map(drop)
+}
+
+fn encode_snapshot_header(header: &LogicalSnapshotHeaderV1) -> wire::SnapshotHeader {
+    wire::SnapshotHeader {
+        format_version: u32::from(header.format_version()),
+        snapshot_id: encode_u128(header.snapshot_id()),
+        applied_log_index: header.applied_log_index(),
+    }
+}
+
+fn decode_snapshot_header(
+    header: wire::SnapshotHeader,
+) -> Result<LogicalSnapshotHeaderV1, ProtocolError> {
+    if header.format_version != u32::from(LOGICAL_SNAPSHOT_FORMAT_VERSION) {
+        return Err(ProtocolError::UnsupportedSnapshotFormat {
+            expected: LOGICAL_SNAPSHOT_FORMAT_VERSION,
+            actual: header.format_version,
+        });
+    }
+    Ok(LogicalSnapshotHeaderV1::new(
+        decode_snapshot_id(&header.snapshot_id)?,
+        header.applied_log_index,
+    ))
+}
+
+fn encode_snapshot_chunk(chunk: &LogicalSnapshotChunkV1) -> wire::SnapshotChunk {
+    wire::SnapshotChunk {
+        snapshot_id: encode_u128(chunk.snapshot_id()),
+        ordinal: chunk.ordinal(),
+        entries: chunk.entries().iter().map(encode_key_value).collect(),
+        digest: chunk.digest().to_vec(),
+    }
+}
+
+fn decode_snapshot_chunk(
+    chunk: wire::SnapshotChunk,
+) -> Result<LogicalSnapshotChunkV1, ProtocolError> {
+    let entries = chunk
+        .entries
+        .into_iter()
+        .map(decode_key_value)
+        .collect::<Result<_, _>>()?;
+    LogicalSnapshotChunkV1::from_parts(
+        decode_snapshot_id(&chunk.snapshot_id)?,
+        chunk.ordinal,
+        entries,
+        decode_digest(&chunk.digest)?,
+    )
+    .map_err(|error| ProtocolError::InvalidSnapshot(error.to_string()))
+}
+
+fn encode_snapshot_manifest(manifest: &LogicalSnapshotManifestV1) -> wire::SnapshotManifest {
+    wire::SnapshotManifest {
+        header: Some(encode_snapshot_header(manifest.header())),
+        total_chunks: manifest.total_chunks(),
+        total_entries: manifest.total_entries(),
+        content_digest: manifest.content_digest().to_vec(),
+    }
+}
+
+fn decode_snapshot_manifest(
+    manifest: wire::SnapshotManifest,
+) -> Result<LogicalSnapshotManifestV1, ProtocolError> {
+    let header = decode_snapshot_header(
+        manifest
+            .header
+            .ok_or(ProtocolError::MissingSnapshotField("manifest header"))?,
+    )?;
+    LogicalSnapshotManifestV1::from_parts(
+        header,
+        manifest.total_chunks,
+        manifest.total_entries,
+        decode_digest(&manifest.content_digest)?,
+    )
+    .map_err(|error| ProtocolError::InvalidSnapshot(error.to_string()))
+}
+
+fn encode_public_open_request(
+    request: &PublicAdapterOpenRequest,
+) -> wire::PublicAdapterOpenRequest {
+    wire::PublicAdapterOpenRequest {
+        instance_id: request.instance_id.clone(),
+        parameters: request
+            .parameters
+            .iter()
+            .map(|(name, value)| wire::PublicParameter {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn decode_public_open_request(
+    request: wire::PublicAdapterOpenRequest,
+) -> Result<PublicAdapterOpenRequest, ProtocolError> {
+    let mut parameters = BTreeMap::new();
+    let mut previous_name: Option<String> = None;
+    for parameter in request.parameters {
+        if previous_name
+            .as_ref()
+            .is_some_and(|previous| previous >= &parameter.name)
+        {
+            return Err(ProtocolError::NonCanonicalPublicParameters);
+        }
+        previous_name = Some(parameter.name.clone());
+        parameters.insert(parameter.name, parameter.value);
+    }
+    Ok(PublicAdapterOpenRequest {
+        instance_id: request.instance_id,
+        parameters,
+    })
 }
 
 fn encode_batch(batch: &CommittedMutationBatch) -> Result<wire::ApplyRequest, ProtocolError> {
@@ -1520,6 +2215,27 @@ pub enum ProtocolError {
     MissingBody,
     NonCanonicalBody,
     InvalidTxnIdLength,
+    InvalidSessionIdLength {
+        actual: usize,
+    },
+    InvalidSnapshotIdLength {
+        actual: usize,
+    },
+    InvalidDigestLength {
+        actual: usize,
+    },
+    UnknownFeatureBits {
+        bits: u64,
+    },
+    InvalidWireVersion(u32),
+    UnsupportedSnapshotFormat {
+        expected: u16,
+        actual: u32,
+    },
+    MissingSnapshotField(&'static str),
+    InvalidSnapshot(String),
+    InvalidChunkLimits(String),
+    NonCanonicalPublicParameters,
     MissingLogicalKey,
     NonCanonicalDelete,
     UnknownMutationOperation {
@@ -1581,6 +2297,40 @@ impl Display for ProtocolError {
             Self::MissingBody => formatter.write_str("Sidecar envelope has no body"),
             Self::NonCanonicalBody => formatter.write_str("Sidecar body is non-canonical"),
             Self::InvalidTxnIdLength => formatter.write_str("transaction ID must have 16 bytes"),
+            Self::InvalidSessionIdLength { actual } => {
+                write!(formatter, "session ID has {actual} bytes; expected 16")
+            }
+            Self::InvalidSnapshotIdLength { actual } => {
+                write!(formatter, "snapshot ID has {actual} bytes; expected 16")
+            }
+            Self::InvalidDigestLength { actual } => {
+                write!(formatter, "snapshot digest has {actual} bytes; expected 32")
+            }
+            Self::UnknownFeatureBits { bits } => {
+                write!(formatter, "unknown Sidecar Feature bits {bits:#x}")
+            }
+            Self::InvalidWireVersion(version) => {
+                write!(formatter, "invalid Sidecar Wire version {version}")
+            }
+            Self::UnsupportedSnapshotFormat { expected, actual } => write!(
+                formatter,
+                "logical snapshot format {actual} differs from supported version {expected}"
+            ),
+            Self::MissingSnapshotField(field) => {
+                write!(formatter, "Sidecar snapshot field {field} is missing")
+            }
+            Self::InvalidSnapshot(message) => {
+                write!(formatter, "invalid logical snapshot object: {message}")
+            }
+            Self::InvalidChunkLimits(message) => {
+                write!(
+                    formatter,
+                    "invalid logical snapshot Chunk limits: {message}"
+                )
+            }
+            Self::NonCanonicalPublicParameters => {
+                formatter.write_str("public Adapter parameters are not strictly name-ordered")
+            }
             Self::MissingLogicalKey => formatter.write_str("logical key is missing"),
             Self::NonCanonicalDelete => formatter.write_str("delete mutation carries a value"),
             Self::UnknownMutationOperation { tag } => {
@@ -1671,15 +2421,136 @@ mod wire {
     }
 
     #[derive(Clone, PartialEq, Message)]
+    pub struct HelloRequest {
+        #[prost(uint64, tag = "1")]
+        pub required_features: u64,
+        #[prost(uint64, tag = "2")]
+        pub optional_features: u64,
+        #[prost(uint32, tag = "3")]
+        pub max_payload_bytes: u32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SnapshotLimits {
+        #[prost(uint32, tag = "1")]
+        pub max_entries: u32,
+        #[prost(uint32, tag = "2")]
+        pub max_bytes: u32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SnapshotHeader {
+        #[prost(uint32, tag = "1")]
+        pub format_version: u32,
+        #[prost(bytes = "vec", tag = "2")]
+        pub snapshot_id: Vec<u8>,
+        #[prost(uint64, tag = "3")]
+        pub applied_log_index: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SnapshotChunk {
+        #[prost(bytes = "vec", tag = "1")]
+        pub snapshot_id: Vec<u8>,
+        #[prost(uint64, tag = "2")]
+        pub ordinal: u64,
+        #[prost(message, repeated, tag = "3")]
+        pub entries: Vec<KeyValue>,
+        #[prost(bytes = "vec", tag = "4")]
+        pub digest: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SnapshotManifest {
+        #[prost(message, optional, tag = "1")]
+        pub header: Option<SnapshotHeader>,
+        #[prost(uint64, tag = "2")]
+        pub total_chunks: u64,
+        #[prost(uint64, tag = "3")]
+        pub total_entries: u64,
+        #[prost(bytes = "vec", tag = "4")]
+        pub content_digest: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct PublicParameter {
+        #[prost(string, tag = "1")]
+        pub name: String,
+        #[prost(string, tag = "2")]
+        pub value: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct PublicAdapterOpenRequest {
+        #[prost(string, tag = "1")]
+        pub instance_id: String,
+        #[prost(message, repeated, tag = "2")]
+        pub parameters: Vec<PublicParameter>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct BeginExportRequest {
+        #[prost(message, optional, tag = "1")]
+        pub limits: Option<SnapshotLimits>,
+        #[prost(uint64, optional, tag = "2")]
+        pub expected_applied_log_index: Option<u64>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ExportNextRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(uint64, tag = "2")]
+        pub expected_ordinal: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct BeginRestoreRequest {
+        #[prost(message, optional, tag = "1")]
+        pub header: Option<SnapshotHeader>,
+        #[prost(message, optional, tag = "2")]
+        pub target: Option<PublicAdapterOpenRequest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RestoreChunkRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub chunk: Option<SnapshotChunk>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct FinishRestoreRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub manifest: Option<SnapshotManifest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct AbortSessionRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
     pub struct RequestEnvelope {
         #[prost(uint32, tag = "1")]
         pub spi_version: u32,
-        #[prost(oneof = "request_envelope::Body", tags = "2, 3, 4, 5, 6, 7")]
+        #[prost(
+            oneof = "request_envelope::Body",
+            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+        )]
         pub body: Option<request_envelope::Body>,
     }
 
     pub mod request_envelope {
-        use super::{ApplyRequest, MultiGetRequest, ScanRequest};
+        use super::{
+            AbortSessionRequest, ApplyRequest, BeginExportRequest, BeginRestoreRequest,
+            ExportNextRequest, FinishRestoreRequest, HelloRequest, MultiGetRequest,
+            RestoreChunkRequest, ScanRequest,
+        };
         use prost::Oneof;
 
         #[derive(Clone, PartialEq, Oneof)]
@@ -1696,6 +2567,20 @@ mod wire {
             AppliedLogIndex(bool),
             #[prost(bool, tag = "7")]
             Health(bool),
+            #[prost(message, tag = "8")]
+            Hello(HelloRequest),
+            #[prost(message, tag = "9")]
+            BeginExport(BeginExportRequest),
+            #[prost(message, tag = "10")]
+            ExportNext(ExportNextRequest),
+            #[prost(message, tag = "11")]
+            BeginRestore(BeginRestoreRequest),
+            #[prost(message, tag = "12")]
+            RestoreChunk(RestoreChunkRequest),
+            #[prost(message, tag = "13")]
+            FinishRestore(FinishRestoreRequest),
+            #[prost(message, tag = "14")]
+            AbortSession(AbortSessionRequest),
         }
     }
 
@@ -1796,17 +2681,102 @@ mod wire {
     }
 
     #[derive(Clone, PartialEq, Message)]
+    pub struct HelloResponse {
+        #[prost(uint32, tag = "1")]
+        pub wire_version: u32,
+        #[prost(uint64, tag = "2")]
+        pub negotiated_features: u64,
+        #[prost(uint32, tag = "3")]
+        pub max_payload_bytes: u32,
+        #[prost(uint32, tag = "4")]
+        pub max_chunk_bytes: u32,
+        #[prost(uint32, tag = "5")]
+        pub max_chunk_entries: u32,
+        #[prost(uint32, tag = "6")]
+        pub snapshot_format_version: u32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ExportStartedResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub header: Option<SnapshotHeader>,
+        #[prost(message, optional, tag = "3")]
+        pub limits: Option<SnapshotLimits>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ExportChunkResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub chunk: Option<SnapshotChunk>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ExportCompleteResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub manifest: Option<SnapshotManifest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RestoreStartedResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub prospective_descriptor: Option<DescriptorResponse>,
+        #[prost(uint32, tag = "3")]
+        pub max_chunk_bytes: u32,
+        #[prost(uint32, tag = "4")]
+        pub max_chunk_entries: u32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RestoreChunkAcceptedResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(uint64, tag = "2")]
+        pub ordinal: u64,
+        #[prost(bytes = "vec", tag = "3")]
+        pub digest: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RestoreCompleteResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub final_descriptor: Option<DescriptorResponse>,
+        #[prost(uint64, tag = "3")]
+        pub applied_log_index: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct SessionAbortedResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
     pub struct ResponseEnvelope {
         #[prost(uint32, tag = "1")]
         pub spi_version: u32,
-        #[prost(oneof = "response_envelope::Body", tags = "2, 3, 4, 5, 6, 7, 8")]
+        #[prost(
+            oneof = "response_envelope::Body",
+            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
+        )]
         pub body: Option<response_envelope::Body>,
     }
 
     pub mod response_envelope {
         use super::{
-            ApplyResponse, DescriptorResponse, ErrorResponse, HealthResponse, MultiGetResponse,
-            ScanResponse,
+            ApplyResponse, DescriptorResponse, ErrorResponse, ExportChunkResponse,
+            ExportCompleteResponse, ExportStartedResponse, HealthResponse, HelloResponse,
+            MultiGetResponse, RestoreChunkAcceptedResponse, RestoreCompleteResponse,
+            RestoreStartedResponse, ScanResponse, SessionAbortedResponse,
         };
         use prost::Oneof;
 
@@ -1826,6 +2796,22 @@ mod wire {
             Health(HealthResponse),
             #[prost(message, tag = "8")]
             Error(ErrorResponse),
+            #[prost(message, tag = "9")]
+            Hello(HelloResponse),
+            #[prost(message, tag = "10")]
+            ExportStarted(ExportStartedResponse),
+            #[prost(message, tag = "11")]
+            ExportChunk(ExportChunkResponse),
+            #[prost(message, tag = "12")]
+            ExportComplete(ExportCompleteResponse),
+            #[prost(message, tag = "13")]
+            RestoreStarted(RestoreStartedResponse),
+            #[prost(message, tag = "14")]
+            RestoreChunkAccepted(RestoreChunkAcceptedResponse),
+            #[prost(message, tag = "15")]
+            RestoreComplete(RestoreCompleteResponse),
+            #[prost(message, tag = "16")]
+            SessionAborted(SessionAbortedResponse),
         }
     }
 }
