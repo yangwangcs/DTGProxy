@@ -1,3 +1,7 @@
+use std::cmp::{max, min};
+use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
+
 use raft_command::{CommandBodyV1, CommandEnvelopeV1};
 use storage_api::{
     ApplyReceipt, CommittedMutationBatch, LogicalKey, Mutation, MutationOperation, StorageAdapter,
@@ -7,13 +11,16 @@ use temporal_types::TransactionTime;
 use crate::ShardRuntimeError;
 use crate::metadata::{
     ReplicaMetadata, adapter_applied_ts_key, closed_ts_key, decode_entry_digest,
-    encode_entry_digest, encode_position, encode_timestamp, entry_digest_key,
-    is_reserved_metadata_key, load_metadata, position_key, resolved_ts_key,
+    encode_entry_digest, encode_position, encode_timestamp, encode_unresolved_intent,
+    entry_digest_key, is_reserved_metadata_key, load_metadata, load_unresolved_intents,
+    position_key, resolved_ts_key, unresolved_intent_key,
 };
+use txn_protocol::{HomeDecisionEngine, ParticipantEngine, TransactionId};
 
 pub struct ShardStateMachine<A> {
     adapter: A,
     metadata: ReplicaMetadata,
+    unresolved: UnresolvedIntents,
     faulted_at: Option<u64>,
 }
 
@@ -27,9 +34,16 @@ where
         placement_epoch: u64,
     ) -> Result<Self, ShardRuntimeError> {
         let metadata = load_metadata(&adapter, shard_id, placement_epoch).await?;
+        let unresolved = UnresolvedIntents::new(load_unresolved_intents(&adapter).await?);
+        if metadata.resolved_ts != resolved_timestamp(metadata.closed_ts, unresolved.oldest()) {
+            return Err(ShardRuntimeError::CorruptMetadata {
+                record: "resolved-ts",
+            });
+        }
         Ok(Self {
             adapter,
             metadata,
+            unresolved,
             faulted_at: None,
         })
     }
@@ -83,6 +97,7 @@ where
                 self.metadata.placement_epoch,
             )
             .await?;
+            self.unresolved = UnresolvedIntents::new(load_unresolved_intents(&self.adapter).await?);
         }
 
         let adapter_index = match self.adapter.applied_log_index() {
@@ -127,8 +142,10 @@ where
             });
         }
 
-        let request_id = command.request_id;
-        let (next_metadata, mut mutations) = self.prepare_apply(term, index, command.body)?;
+        let prepared = self.prepare_apply(term, index, command.body).await?;
+        let next_metadata = prepared.metadata;
+        let mut mutations = prepared.mutations;
+        append_unresolved_change(&mut mutations, prepared.unresolved_change)?;
         append_meta_mutation(
             &mut mutations,
             entry_digest_key(index),
@@ -143,7 +160,7 @@ where
         let batch = CommittedMutationBatch {
             shard_id: self.metadata.shard_id,
             log_index: index,
-            txn_id: request_id,
+            txn_id: (u128::from(term) << 64) | u128::from(index),
             mutations,
         };
         let receipt = match self.adapter.apply_committed(batch).await {
@@ -161,6 +178,7 @@ where
             });
         }
         self.metadata = next_metadata;
+        self.unresolved.apply(prepared.unresolved_change)?;
         self.faulted_at = None;
         Ok(receipt)
     }
@@ -183,6 +201,7 @@ where
                 self.metadata.placement_epoch,
             )
             .await?;
+            self.unresolved = UnresolvedIntents::new(load_unresolved_intents(&self.adapter).await?);
         }
         let adapter_index = match self.adapter.applied_log_index() {
             Ok(index) => index,
@@ -281,12 +300,12 @@ where
         Ok(())
     }
 
-    fn prepare_apply(
+    async fn prepare_apply(
         &self,
         term: u64,
         index: u64,
         body: CommandBodyV1,
-    ) -> Result<(ReplicaMetadata, Vec<Mutation>), ShardRuntimeError> {
+    ) -> Result<PreparedApply, ShardRuntimeError> {
         match body {
             CommandBodyV1::ApplyPrepared(apply) => {
                 validate_business_mutations(&apply.batch.mutations)?;
@@ -302,10 +321,11 @@ where
                         proposed: apply.commit_ts,
                     });
                 }
-                Ok((
-                    self.metadata.after_apply(term, index, apply.commit_ts),
-                    apply.batch.mutations,
-                ))
+                Ok(PreparedApply {
+                    metadata: self.metadata.after_apply(term, index, apply.commit_ts),
+                    mutations: apply.batch.mutations,
+                    unresolved_change: UnresolvedChange::None,
+                })
             }
             CommandBodyV1::ClosedTimestampTick(closed_ts) => {
                 if closed_ts < self.metadata.closed_ts {
@@ -314,9 +334,182 @@ where
                         proposed: closed_ts,
                     });
                 }
-                Ok((self.metadata.after_tick(term, index, closed_ts), Vec::new()))
+                let resolved_ts = resolved_timestamp(closed_ts, self.unresolved.oldest());
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        closed_ts,
+                        resolved_ts,
+                        adapter_applied_ts: max(self.metadata.adapter_applied_ts, closed_ts),
+                        ..self.metadata
+                    },
+                    mutations: Vec::new(),
+                    unresolved_change: UnresolvedChange::None,
+                })
+            }
+            CommandBodyV1::Prewrite(prewrite) => {
+                let keys = ParticipantEngine::prewrite_inspection_keys(&prewrite.request)?;
+                let values = self.adapter.multi_get(&keys).await?;
+                let outcome = ParticipantEngine::prewrite(&prewrite.request, &values)?;
+                if outcome.proof() != &prewrite.expected_proof {
+                    return Err(ShardRuntimeError::ParticipantProofMismatch);
+                }
+                if !outcome.duplicate() && prewrite.request.start_ts() <= self.metadata.closed_ts {
+                    return Err(ShardRuntimeError::IntentAtOrBeforeClosed {
+                        closed: self.metadata.closed_ts,
+                        start: prewrite.request.start_ts(),
+                    });
+                }
+                let change = if outcome.duplicate() {
+                    UnresolvedChange::None
+                } else {
+                    UnresolvedChange::Add {
+                        transaction_id: prewrite.request.transaction_id(),
+                        start_ts: prewrite.request.start_ts(),
+                    }
+                };
+                self.unresolved.validate(change)?;
+                let resolved_ts = self
+                    .unresolved
+                    .resolved_after(change, self.metadata.closed_ts)?;
+                let mutations = outcome.mutations().to_vec();
+                validate_business_mutations(&mutations)?;
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        resolved_ts,
+                        ..self.metadata
+                    },
+                    mutations,
+                    unresolved_change: change,
+                })
+            }
+            CommandBodyV1::RecordDecision(record) => {
+                let key = HomeDecisionEngine::inspection_key(
+                    record.home,
+                    record.decision.transaction_id(),
+                )?;
+                let existing = self
+                    .adapter
+                    .multi_get(std::slice::from_ref(&key))
+                    .await?
+                    .pop()
+                    .flatten();
+                let outcome =
+                    HomeDecisionEngine::record(record.home, &record.decision, existing.as_deref())?;
+                let mutations = outcome.mutations().to_vec();
+                validate_business_mutations(&mutations)?;
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        ..self.metadata
+                    },
+                    mutations,
+                    unresolved_change: UnresolvedChange::None,
+                })
+            }
+            CommandBodyV1::Finalize(finalize) => {
+                let request = self
+                    .load_participant_request(
+                        finalize.participant,
+                        finalize.transaction_id,
+                        finalize.intent_digest,
+                    )
+                    .await?;
+                let keys = ParticipantEngine::finalize_inspection_keys(&request)?;
+                let values = self.adapter.multi_get(&keys).await?;
+                let outcome = ParticipantEngine::finalize(&request, finalize.commit_ts, &values)?;
+                let change = if outcome.duplicate() {
+                    UnresolvedChange::None
+                } else {
+                    UnresolvedChange::Remove {
+                        transaction_id: finalize.transaction_id,
+                        start_ts: request.start_ts(),
+                    }
+                };
+                self.unresolved.validate(change)?;
+                let resolved_ts = self
+                    .unresolved
+                    .resolved_after(change, self.metadata.closed_ts)?;
+                let mutations = outcome.mutations().to_vec();
+                validate_business_mutations(&mutations)?;
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        resolved_ts,
+                        adapter_applied_ts: max(
+                            self.metadata.adapter_applied_ts,
+                            finalize.commit_ts,
+                        ),
+                        ..self.metadata
+                    },
+                    mutations,
+                    unresolved_change: change,
+                })
+            }
+            CommandBodyV1::AbortIntent(abort) => {
+                let request = self
+                    .load_participant_request(
+                        abort.participant,
+                        abort.transaction_id,
+                        abort.intent_digest,
+                    )
+                    .await?;
+                let keys = ParticipantEngine::abort_inspection_keys(&request)?;
+                let values = self.adapter.multi_get(&keys).await?;
+                let outcome = ParticipantEngine::abort(&request, &values)?;
+                let change = if outcome.duplicate() {
+                    UnresolvedChange::None
+                } else {
+                    UnresolvedChange::Remove {
+                        transaction_id: abort.transaction_id,
+                        start_ts: request.start_ts(),
+                    }
+                };
+                self.unresolved.validate(change)?;
+                let resolved_ts = self
+                    .unresolved
+                    .resolved_after(change, self.metadata.closed_ts)?;
+                let mutations = outcome.mutations().to_vec();
+                validate_business_mutations(&mutations)?;
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        resolved_ts,
+                        ..self.metadata
+                    },
+                    mutations,
+                    unresolved_change: change,
+                })
             }
         }
+    }
+
+    async fn load_participant_request(
+        &self,
+        participant: txn_protocol::ShardEpoch,
+        transaction_id: TransactionId,
+        intent_digest: [u8; 32],
+    ) -> Result<txn_protocol::PrewriteRequest, ShardRuntimeError> {
+        let key = ParticipantEngine::participant_record_key(participant, transaction_id)?;
+        let bytes = self
+            .adapter
+            .multi_get(std::slice::from_ref(&key))
+            .await?
+            .pop()
+            .flatten()
+            .ok_or(txn_protocol::TxnProtocolError::MissingIntent)?;
+        Ok(ParticipantEngine::request_from_participant_record(
+            participant,
+            transaction_id,
+            intent_digest,
+            &bytes,
+        )?)
     }
 
     async fn verify_replay(
@@ -340,6 +533,178 @@ where
             return Err(ShardRuntimeError::DivergentReplay { index });
         }
         Ok(())
+    }
+}
+
+struct PreparedApply {
+    metadata: ReplicaMetadata,
+    mutations: Vec<Mutation>,
+    unresolved_change: UnresolvedChange,
+}
+
+#[derive(Clone, Copy)]
+enum UnresolvedChange {
+    None,
+    Add {
+        transaction_id: TransactionId,
+        start_ts: TransactionTime,
+    },
+    Remove {
+        transaction_id: TransactionId,
+        start_ts: TransactionTime,
+    },
+}
+
+struct UnresolvedIntents {
+    by_transaction: BTreeMap<u128, TransactionTime>,
+    by_start: BTreeMap<TransactionTime, usize>,
+}
+
+impl UnresolvedIntents {
+    fn new(by_transaction: BTreeMap<u128, TransactionTime>) -> Self {
+        let mut by_start = BTreeMap::new();
+        for start_ts in by_transaction.values() {
+            *by_start.entry(*start_ts).or_insert(0) += 1;
+        }
+        Self {
+            by_transaction,
+            by_start,
+        }
+    }
+
+    fn oldest(&self) -> Option<TransactionTime> {
+        self.by_start
+            .first_key_value()
+            .map(|(timestamp, _)| *timestamp)
+    }
+
+    fn validate(&self, change: UnresolvedChange) -> Result<(), ShardRuntimeError> {
+        match change {
+            UnresolvedChange::None => Ok(()),
+            UnresolvedChange::Add { transaction_id, .. } => {
+                if self.by_transaction.contains_key(&transaction_id.value()) {
+                    return Err(ShardRuntimeError::CorruptMetadata {
+                        record: "duplicate-unresolved-intent",
+                    });
+                }
+                Ok(())
+            }
+            UnresolvedChange::Remove {
+                transaction_id,
+                start_ts,
+            } => {
+                if self.by_transaction.get(&transaction_id.value()) != Some(&start_ts) {
+                    return Err(ShardRuntimeError::CorruptMetadata {
+                        record: "missing-unresolved-intent",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn resolved_after(
+        &self,
+        change: UnresolvedChange,
+        closed_ts: TransactionTime,
+    ) -> Result<TransactionTime, ShardRuntimeError> {
+        self.validate(change)?;
+        let oldest = match change {
+            UnresolvedChange::None => self.oldest(),
+            UnresolvedChange::Add { start_ts, .. } => Some(
+                self.oldest()
+                    .map_or(start_ts, |oldest| min(oldest, start_ts)),
+            ),
+            UnresolvedChange::Remove { start_ts, .. } => {
+                let Some(oldest) = self.oldest() else {
+                    return Err(ShardRuntimeError::CorruptMetadata {
+                        record: "missing-unresolved-intent",
+                    });
+                };
+                let count = self.by_start.get(&start_ts).copied().unwrap_or(0);
+                if start_ts != oldest || count > 1 {
+                    Some(oldest)
+                } else {
+                    self.by_start
+                        .range((Excluded(start_ts), Unbounded))
+                        .next()
+                        .map(|(timestamp, _)| *timestamp)
+                }
+            }
+        };
+        Ok(resolved_timestamp(closed_ts, oldest))
+    }
+
+    fn apply(&mut self, change: UnresolvedChange) -> Result<(), ShardRuntimeError> {
+        self.validate(change)?;
+        match change {
+            UnresolvedChange::None => {}
+            UnresolvedChange::Add {
+                transaction_id,
+                start_ts,
+            } => {
+                self.by_transaction.insert(transaction_id.value(), start_ts);
+                *self.by_start.entry(start_ts).or_insert(0) += 1;
+            }
+            UnresolvedChange::Remove {
+                transaction_id,
+                start_ts,
+            } => {
+                self.by_transaction.remove(&transaction_id.value());
+                let count =
+                    self.by_start
+                        .get_mut(&start_ts)
+                        .ok_or(ShardRuntimeError::CorruptMetadata {
+                            record: "missing-unresolved-intent",
+                        })?;
+                *count -= 1;
+                if *count == 0 {
+                    self.by_start.remove(&start_ts);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resolved_timestamp(
+    closed_ts: TransactionTime,
+    oldest_intent: Option<TransactionTime>,
+) -> TransactionTime {
+    oldest_intent.map_or(closed_ts, |timestamp| {
+        min(closed_ts, timestamp_predecessor(timestamp))
+    })
+}
+
+fn timestamp_predecessor(timestamp: TransactionTime) -> TransactionTime {
+    if timestamp.logical() > 0 {
+        return TransactionTime::new(timestamp.physical_micros(), timestamp.logical() - 1);
+    }
+    timestamp
+        .physical_micros()
+        .checked_sub(1)
+        .map_or(TransactionTime::new(i64::MIN, 0), |physical_micros| {
+            TransactionTime::new(physical_micros, u32::MAX)
+        })
+}
+
+fn append_unresolved_change(
+    mutations: &mut Vec<Mutation>,
+    change: UnresolvedChange,
+) -> Result<(), ShardRuntimeError> {
+    match change {
+        UnresolvedChange::None => Ok(()),
+        UnresolvedChange::Add {
+            transaction_id,
+            start_ts,
+        } => append_meta_mutation(
+            mutations,
+            unresolved_intent_key(transaction_id.value()),
+            encode_unresolved_intent(start_ts),
+        ),
+        UnresolvedChange::Remove { transaction_id, .. } => {
+            append_meta_delete(mutations, unresolved_intent_key(transaction_id.value()))
+        }
     }
 }
 
@@ -388,6 +753,16 @@ fn append_meta_mutation(
     let sequence =
         u32::try_from(mutations.len()).map_err(|_| ShardRuntimeError::TooManyMutations)?;
     mutations.push(Mutation::put(sequence, key, value));
+    Ok(())
+}
+
+fn append_meta_delete(
+    mutations: &mut Vec<Mutation>,
+    key: LogicalKey,
+) -> Result<(), ShardRuntimeError> {
+    let sequence =
+        u32::try_from(mutations.len()).map_err(|_| ShardRuntimeError::TooManyMutations)?;
+    mutations.push(Mutation::delete(sequence, key));
     Ok(())
 }
 

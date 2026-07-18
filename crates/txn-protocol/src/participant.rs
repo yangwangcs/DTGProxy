@@ -77,6 +77,37 @@ impl AbortOutcome {
 pub struct ParticipantEngine;
 
 impl ParticipantEngine {
+    pub fn participant_record_key(
+        participant: crate::ShardEpoch,
+        transaction_id: crate::TransactionId,
+    ) -> Result<LogicalKey, TxnProtocolError> {
+        if transaction_id.value() == 0 {
+            return Err(TxnProtocolError::InvalidTransactionId);
+        }
+        let mut bytes = Vec::with_capacity(PARTICIPANT_PREFIX.len() + 4 + 16);
+        bytes.extend_from_slice(PARTICIPANT_PREFIX);
+        bytes.extend_from_slice(&participant.shard_id().to_be_bytes());
+        bytes.extend_from_slice(&transaction_id.value().to_be_bytes());
+        Ok(LogicalKey::in_keyspace(Keyspace::Txn, bytes))
+    }
+
+    pub fn request_from_participant_record(
+        participant: crate::ShardEpoch,
+        transaction_id: crate::TransactionId,
+        intent_digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<PrewriteRequest, TxnProtocolError> {
+        let record = decode_participant_record(bytes)?;
+        if record.request.participant() != participant
+            || record.request.transaction_id() != transaction_id
+            || record.request.intent_digest() != intent_digest
+            || record.proof.intent_digest() != intent_digest
+        {
+            return Err(TxnProtocolError::RequestReplayMismatch);
+        }
+        Ok(record.request)
+    }
+
     pub fn prewrite_inspection_keys(
         request: &PrewriteRequest,
     ) -> Result<Vec<LogicalKey>, TxnProtocolError> {
@@ -334,11 +365,8 @@ impl ParticipantEngine {
 }
 
 fn participant_key(request: &PrewriteRequest) -> LogicalKey {
-    let mut bytes = Vec::with_capacity(PARTICIPANT_PREFIX.len() + 4 + 16);
-    bytes.extend_from_slice(PARTICIPANT_PREFIX);
-    bytes.extend_from_slice(&request.participant().shard_id().to_be_bytes());
-    bytes.extend_from_slice(&request.transaction_id().value().to_be_bytes());
-    LogicalKey::in_keyspace(Keyspace::Txn, bytes)
+    ParticipantEngine::participant_record_key(request.participant(), request.transaction_id())
+        .expect("validated Prewrite request has a nonzero transaction ID")
 }
 
 fn metadata_key(

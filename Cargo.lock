@@ -979,6 +979,7 @@ dependencies = [
  "crc32fast",
  "storage-api",
  "temporal-types",
+ "txn-protocol",
 ]
 
 [[package]]
@@ -1225,6 +1226,7 @@ dependencies = [
  "storage-api",
  "tempfile",
  "temporal-types",
+ "txn-protocol",
 ]
 
 [[package]]

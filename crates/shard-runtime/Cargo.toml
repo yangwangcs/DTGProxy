@@ -16,6 +16,7 @@ raft-logstore = { path = "../raft-logstore" }
 slog = "=2.8.2"
 storage-api = { path = "../storage-api" }
 temporal-types = { path = "../temporal-types" }
+txn-protocol = { path = "../txn-protocol" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -23,6 +23,7 @@ pub use transport::DeterministicTransport;
 pub enum ShardRuntimeError {
     Adapter(AdapterError),
     Command(raft_command::CommandCodecError),
+    Transaction(txn_protocol::TxnProtocolError),
     InvalidLogPosition {
         term: u64,
         index: u64,
@@ -51,6 +52,11 @@ pub enum ShardRuntimeError {
         closed: TransactionTime,
         proposed: TransactionTime,
     },
+    IntentAtOrBeforeClosed {
+        closed: TransactionTime,
+        start: TransactionTime,
+    },
+    ParticipantProofMismatch,
     NonMonotonicClosed {
         current: TransactionTime,
         proposed: TransactionTime,
@@ -81,6 +87,7 @@ impl Display for ShardRuntimeError {
         match self {
             Self::Adapter(error) => write!(formatter, "Adapter error: {error}"),
             Self::Command(error) => write!(formatter, "Raft command error: {error}"),
+            Self::Transaction(error) => write!(formatter, "transaction protocol error: {error}"),
             Self::InvalidLogPosition { term, index } => {
                 write!(
                     formatter,
@@ -111,6 +118,13 @@ impl Display for ShardRuntimeError {
                 formatter,
                 "commit timestamp {proposed:?} is at or before closed timestamp {closed:?}"
             ),
+            Self::IntentAtOrBeforeClosed { closed, start } => write!(
+                formatter,
+                "transaction start timestamp {start:?} is at or before closed timestamp {closed:?}"
+            ),
+            Self::ParticipantProofMismatch => {
+                formatter.write_str("replicated participant proof differs from deterministic proof")
+            }
             Self::NonMonotonicClosed { current, proposed } => write!(
                 formatter,
                 "closed timestamp regressed from {current:?} to {proposed:?}"
@@ -150,6 +164,7 @@ impl Error for ShardRuntimeError {
         match self {
             Self::Adapter(error) => Some(error),
             Self::Command(error) => Some(error),
+            Self::Transaction(error) => Some(error),
             _ => None,
         }
     }
@@ -164,5 +179,11 @@ impl From<AdapterError> for ShardRuntimeError {
 impl From<raft_command::CommandCodecError> for ShardRuntimeError {
     fn from(error: raft_command::CommandCodecError) -> Self {
         Self::Command(error)
+    }
+}
+
+impl From<txn_protocol::TxnProtocolError> for ShardRuntimeError {
+    fn from(error: txn_protocol::TxnProtocolError) -> Self {
+        Self::Transaction(error)
     }
 }

@@ -1,6 +1,7 @@
-use std::cmp::{max, min};
+use std::cmp::min;
+use std::collections::BTreeMap;
 
-use storage_api::{Keyspace, LogicalKey, StorageAdapter};
+use storage_api::{KeySpan, Keyspace, LogicalKey, StorageAdapter};
 use temporal_types::TransactionTime;
 
 use crate::ShardRuntimeError;
@@ -11,10 +12,12 @@ const CLOSED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/closed-ts";
 const RESOLVED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/resolved-ts";
 const ADAPTER_APPLIED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/adapter-applied-ts";
 const ENTRY_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/entry/";
+const UNRESOLVED_INTENT_PREFIX: &[u8] = b"\x01dtg/replica/v1/unresolved/";
 const META_VERSION: u16 = 1;
 const POSITION_MAGIC: [u8; 4] = *b"DTRP";
 const TIMESTAMP_MAGIC: [u8; 4] = *b"DTTM";
 const ENTRY_DIGEST_MAGIC: [u8; 4] = *b"DTRE";
+const UNRESOLVED_INTENT_MAGIC: [u8; 4] = *b"DTRU";
 const POSITION_VALUE_BYTES: usize = 38;
 const TIMESTAMP_VALUE_BYTES: usize = 22;
 const ENTRY_DIGEST_VALUE_BYTES: usize = 50;
@@ -58,17 +61,6 @@ impl ReplicaMetadata {
             last_term: term,
             applied_index: index,
             adapter_applied_ts: commit_ts,
-            ..self
-        }
-    }
-
-    pub(crate) fn after_tick(self, term: u64, index: u64, closed_ts: TransactionTime) -> Self {
-        Self {
-            last_term: term,
-            applied_index: index,
-            closed_ts,
-            resolved_ts: closed_ts,
-            adapter_applied_ts: max(self.adapter_applied_ts, closed_ts),
             ..self
         }
     }
@@ -136,6 +128,44 @@ pub(crate) async fn load_metadata<A: StorageAdapter>(
     })
 }
 
+pub(crate) async fn load_unresolved_intents<A: StorageAdapter>(
+    adapter: &A,
+) -> Result<BTreeMap<u128, TransactionTime>, ShardRuntimeError> {
+    let entries = adapter
+        .scan(&KeySpan::prefix(
+            Keyspace::Meta,
+            UNRESOLVED_INTENT_PREFIX.to_vec(),
+        ))
+        .await?;
+    let mut unresolved = BTreeMap::new();
+    for entry in entries {
+        let key = entry.key().as_bytes();
+        if entry.key().keyspace() != Keyspace::Meta
+            || key.len() != UNRESOLVED_INTENT_PREFIX.len() + 16
+            || !key.starts_with(UNRESOLVED_INTENT_PREFIX)
+        {
+            return Err(ShardRuntimeError::CorruptMetadata {
+                record: "unresolved-intent-key",
+            });
+        }
+        let transaction_id = u128::from_be_bytes(
+            key[UNRESOLVED_INTENT_PREFIX.len()..]
+                .try_into()
+                .expect("validated unresolved intent key length"),
+        );
+        if transaction_id == 0
+            || unresolved
+                .insert(transaction_id, decode_unresolved_intent(entry.value())?)
+                .is_some()
+        {
+            return Err(ShardRuntimeError::CorruptMetadata {
+                record: "unresolved-intent-key",
+            });
+        }
+    }
+    Ok(unresolved)
+}
+
 fn decode_optional_timestamp(
     bytes: Option<Vec<u8>>,
     record: &'static str,
@@ -171,6 +201,36 @@ pub(crate) fn entry_digest_key(index: u64) -> LogicalKey {
     key.extend_from_slice(ENTRY_DIGEST_PREFIX);
     key.extend_from_slice(&index.to_be_bytes());
     meta_key(key)
+}
+
+pub(crate) fn unresolved_intent_key(transaction_id: u128) -> LogicalKey {
+    let mut key = Vec::with_capacity(UNRESOLVED_INTENT_PREFIX.len() + 16);
+    key.extend_from_slice(UNRESOLVED_INTENT_PREFIX);
+    key.extend_from_slice(&transaction_id.to_be_bytes());
+    meta_key(key)
+}
+
+pub(crate) fn encode_unresolved_intent(start_ts: TransactionTime) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(TIMESTAMP_VALUE_BYTES);
+    bytes.extend_from_slice(&UNRESOLVED_INTENT_MAGIC);
+    bytes.extend_from_slice(&META_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&start_ts.physical_micros().to_be_bytes());
+    bytes.extend_from_slice(&start_ts.logical().to_be_bytes());
+    append_checksum(&mut bytes);
+    bytes
+}
+
+fn decode_unresolved_intent(bytes: &[u8]) -> Result<TransactionTime, ShardRuntimeError> {
+    validate_record(
+        bytes,
+        TIMESTAMP_VALUE_BYTES,
+        UNRESOLVED_INTENT_MAGIC,
+        "unresolved-intent",
+    )?;
+    Ok(TransactionTime::new(
+        i64::from_be_bytes(bytes[6..14].try_into().expect("fixed timestamp slice")),
+        u32::from_be_bytes(bytes[14..18].try_into().expect("fixed timestamp slice")),
+    ))
 }
 
 fn meta_key(bytes: Vec<u8>) -> LogicalKey {

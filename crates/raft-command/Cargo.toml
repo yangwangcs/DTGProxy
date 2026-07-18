@@ -9,6 +9,7 @@ license.workspace = true
 crc32fast = "=1.5.0"
 storage-api = { path = "../storage-api" }
 temporal-types = { path = "../temporal-types" }
+txn-protocol = { path = "../txn-protocol" }
 
 [lints]
 workspace = true

@@ -5,11 +5,19 @@ use std::fmt::{self, Display, Formatter};
 
 use storage_api::{Keyspace, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
 use temporal_types::TransactionTime;
+use txn_protocol::{
+    HomeDecisionEngine, HomeTransactionRecord, ParticipantProof, PrewriteRequest, ShardEpoch,
+    TransactionId,
+};
 
 const MAGIC: [u8; 4] = *b"DTRC";
 const VERSION_V1: u16 = 1;
 const APPLY_PREPARED_TAG: u8 = 1;
 const CLOSED_TIMESTAMP_TICK_TAG: u8 = 2;
+const PREWRITE_TAG: u8 = 3;
+const RECORD_DECISION_TAG: u8 = 4;
+const FINALIZE_TAG: u8 = 5;
+const ABORT_INTENT_TAG: u8 = 6;
 const PUT_TAG: u8 = 1;
 const DELETE_TAG: u8 = 2;
 const HEADER_BYTES: usize = 40;
@@ -162,6 +170,46 @@ impl CommandEnvelopeV1 {
             CLOSED_TIMESTAMP_TICK_TAG => {
                 CommandBodyV1::ClosedTimestampTick(decode_transaction_time(&mut body_reader)?)
             }
+            PREWRITE_TAG => {
+                let request =
+                    PrewriteRequest::decode(body_reader.length_delimited(MAX_VALUE_BYTES)?)
+                        .map_err(transaction_protocol_error)?;
+                let expected_proof = decode_proof(&mut body_reader)?;
+                let prewrite = PrewriteV1 {
+                    request,
+                    expected_proof,
+                };
+                validate_prewrite(shard_id, placement_epoch, &prewrite)?;
+                CommandBodyV1::Prewrite(prewrite)
+            }
+            RECORD_DECISION_TAG => {
+                let home = decode_shard(&mut body_reader)?;
+                let decision =
+                    HomeTransactionRecord::decode(body_reader.length_delimited(MAX_VALUE_BYTES)?)
+                        .map_err(transaction_protocol_error)?;
+                let record = RecordDecisionV1 { home, decision };
+                validate_record_decision(shard_id, placement_epoch, &record)?;
+                CommandBodyV1::RecordDecision(record)
+            }
+            FINALIZE_TAG => {
+                let finalize = FinalizeV1 {
+                    participant: decode_shard(&mut body_reader)?,
+                    transaction_id: decode_transaction_id(&mut body_reader)?,
+                    intent_digest: decode_digest(&mut body_reader)?,
+                    commit_ts: decode_transaction_time(&mut body_reader)?,
+                };
+                validate_participant(shard_id, placement_epoch, finalize.participant)?;
+                CommandBodyV1::Finalize(finalize)
+            }
+            ABORT_INTENT_TAG => {
+                let abort = AbortIntentV1 {
+                    participant: decode_shard(&mut body_reader)?,
+                    transaction_id: decode_transaction_id(&mut body_reader)?,
+                    intent_digest: decode_digest(&mut body_reader)?,
+                };
+                validate_participant(shard_id, placement_epoch, abort.participant)?;
+                CommandBodyV1::AbortIntent(abort)
+            }
             tag => return Err(CommandCodecError::UnknownBodyTag { tag }),
         };
         body_reader.finish()?;
@@ -218,6 +266,45 @@ impl CommandEnvelopeV1 {
                 encode_transaction_time(&mut body, *closed_ts);
                 Ok((CLOSED_TIMESTAMP_TICK_TAG, body))
             }
+            CommandBodyV1::Prewrite(prewrite) => {
+                validate_prewrite(self.shard_id, self.placement_epoch, prewrite)?;
+                let request = prewrite
+                    .request
+                    .encode()
+                    .map_err(transaction_protocol_error)?;
+                let mut body = Vec::with_capacity(request.len() + 60);
+                write_length_delimited(&mut body, &request)?;
+                encode_proof(&mut body, &prewrite.expected_proof);
+                Ok((PREWRITE_TAG, body))
+            }
+            CommandBodyV1::RecordDecision(record) => {
+                validate_record_decision(self.shard_id, self.placement_epoch, record)?;
+                let decision = record
+                    .decision
+                    .encode()
+                    .map_err(transaction_protocol_error)?;
+                let mut body = Vec::with_capacity(decision.len() + 16);
+                encode_shard(&mut body, record.home);
+                write_length_delimited(&mut body, &decision)?;
+                Ok((RECORD_DECISION_TAG, body))
+            }
+            CommandBodyV1::Finalize(finalize) => {
+                validate_participant(self.shard_id, self.placement_epoch, finalize.participant)?;
+                let mut body = Vec::with_capacity(72);
+                encode_shard(&mut body, finalize.participant);
+                encode_transaction_id(&mut body, finalize.transaction_id)?;
+                body.extend_from_slice(&finalize.intent_digest);
+                encode_transaction_time(&mut body, finalize.commit_ts);
+                Ok((FINALIZE_TAG, body))
+            }
+            CommandBodyV1::AbortIntent(abort) => {
+                validate_participant(self.shard_id, self.placement_epoch, abort.participant)?;
+                let mut body = Vec::with_capacity(60);
+                encode_shard(&mut body, abort.participant);
+                encode_transaction_id(&mut body, abort.transaction_id)?;
+                body.extend_from_slice(&abort.intent_digest);
+                Ok((ABORT_INTENT_TAG, body))
+            }
         }
     }
 }
@@ -226,12 +313,141 @@ impl CommandEnvelopeV1 {
 pub enum CommandBodyV1 {
     ApplyPrepared(ApplyPreparedV1),
     ClosedTimestampTick(TransactionTime),
+    Prewrite(PrewriteV1),
+    RecordDecision(RecordDecisionV1),
+    Finalize(FinalizeV1),
+    AbortIntent(AbortIntentV1),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyPreparedV1 {
     pub commit_ts: TransactionTime,
     pub batch: PreparedMutationBatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrewriteV1 {
+    pub request: PrewriteRequest,
+    pub expected_proof: ParticipantProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordDecisionV1 {
+    pub home: ShardEpoch,
+    pub decision: HomeTransactionRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizeV1 {
+    pub participant: ShardEpoch,
+    pub transaction_id: TransactionId,
+    pub intent_digest: [u8; 32],
+    pub commit_ts: TransactionTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbortIntentV1 {
+    pub participant: ShardEpoch,
+    pub transaction_id: TransactionId,
+    pub intent_digest: [u8; 32],
+}
+
+fn validate_prewrite(
+    shard_id: u32,
+    placement_epoch: u64,
+    prewrite: &PrewriteV1,
+) -> Result<(), CommandCodecError> {
+    validate_participant(shard_id, placement_epoch, prewrite.request.participant())?;
+    if prewrite.expected_proof.participant() != prewrite.request.participant()
+        || prewrite.expected_proof.intent_digest() != prewrite.request.intent_digest()
+        || prewrite.expected_proof.min_commit_ts() <= prewrite.request.start_ts()
+    {
+        return Err(CommandCodecError::InvalidParticipantProof);
+    }
+    Ok(())
+}
+
+fn validate_record_decision(
+    shard_id: u32,
+    placement_epoch: u64,
+    record: &RecordDecisionV1,
+) -> Result<(), CommandCodecError> {
+    validate_participant(shard_id, placement_epoch, record.home)?;
+    HomeDecisionEngine::record(record.home, &record.decision, None)
+        .map_err(transaction_protocol_error)?;
+    Ok(())
+}
+
+fn validate_participant(
+    shard_id: u32,
+    placement_epoch: u64,
+    participant: ShardEpoch,
+) -> Result<(), CommandCodecError> {
+    if participant.shard_id() != shard_id {
+        return Err(CommandCodecError::ShardMismatch {
+            envelope: shard_id,
+            batch: participant.shard_id(),
+        });
+    }
+    if participant.placement_epoch() != placement_epoch {
+        return Err(CommandCodecError::PlacementEpochMismatch {
+            envelope: placement_epoch,
+            participant: participant.placement_epoch(),
+        });
+    }
+    Ok(())
+}
+
+fn encode_shard(bytes: &mut Vec<u8>, shard: ShardEpoch) {
+    bytes.extend_from_slice(&shard.shard_id().to_be_bytes());
+    bytes.extend_from_slice(&shard.placement_epoch().to_be_bytes());
+}
+
+fn decode_shard(reader: &mut Reader<'_>) -> Result<ShardEpoch, CommandCodecError> {
+    let shard_id = reader.u32()?;
+    let placement_epoch = reader.u64()?;
+    ShardEpoch::new(shard_id, placement_epoch).map_err(transaction_protocol_error)
+}
+
+fn encode_proof(bytes: &mut Vec<u8>, proof: &ParticipantProof) {
+    encode_shard(bytes, proof.participant());
+    encode_transaction_time(bytes, proof.min_commit_ts());
+    bytes.extend_from_slice(&proof.intent_digest());
+}
+
+fn decode_proof(reader: &mut Reader<'_>) -> Result<ParticipantProof, CommandCodecError> {
+    Ok(ParticipantProof::new(
+        decode_shard(reader)?,
+        decode_transaction_time(reader)?,
+        decode_digest(reader)?,
+    ))
+}
+
+fn encode_transaction_id(
+    bytes: &mut Vec<u8>,
+    transaction_id: TransactionId,
+) -> Result<(), CommandCodecError> {
+    if transaction_id.value() == 0 {
+        return Err(CommandCodecError::InvalidTransactionId);
+    }
+    bytes.extend_from_slice(&transaction_id.value().to_be_bytes());
+    Ok(())
+}
+
+fn decode_transaction_id(reader: &mut Reader<'_>) -> Result<TransactionId, CommandCodecError> {
+    let transaction_id = TransactionId::new(reader.u128()?);
+    if transaction_id.value() == 0 {
+        return Err(CommandCodecError::InvalidTransactionId);
+    }
+    Ok(transaction_id)
+}
+
+fn decode_digest(reader: &mut Reader<'_>) -> Result<[u8; 32], CommandCodecError> {
+    Ok(reader.take(32)?.try_into().expect("fixed digest slice"))
+}
+
+fn transaction_protocol_error(error: txn_protocol::TxnProtocolError) -> CommandCodecError {
+    CommandCodecError::TransactionProtocol(error.to_string())
 }
 
 fn encode_transaction_time(bytes: &mut Vec<u8>, timestamp: TransactionTime) {
@@ -391,6 +607,12 @@ impl<'a> Reader<'a> {
         ))
     }
 
+    fn u64(&mut self) -> Result<u64, CommandCodecError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("fixed reader slice"),
+        ))
+    }
+
     fn i64(&mut self) -> Result<i64, CommandCodecError> {
         Ok(i64::from_be_bytes(
             self.take(8)?.try_into().expect("fixed reader slice"),
@@ -449,6 +671,10 @@ pub enum CommandCodecError {
     ValueTooLarge { max: usize, actual: usize },
     NonCanonicalMutationSequence { expected: u32, actual: u32 },
     ShardMismatch { envelope: u32, batch: u32 },
+    PlacementEpochMismatch { envelope: u64, participant: u64 },
+    InvalidParticipantProof,
+    InvalidTransactionId,
+    TransactionProtocol(String),
     TrailingBodyBytes { remaining: usize },
 }
 
@@ -502,6 +728,18 @@ impl Display for CommandCodecError {
                 formatter,
                 "command shard {envelope} does not match prepared batch shard {batch}"
             ),
+            Self::PlacementEpochMismatch {
+                envelope,
+                participant,
+            } => write!(
+                formatter,
+                "command epoch {envelope} does not match participant epoch {participant}"
+            ),
+            Self::InvalidParticipantProof => {
+                formatter.write_str("invalid participant proof in Prewrite command")
+            }
+            Self::InvalidTransactionId => formatter.write_str("transaction ID must be nonzero"),
+            Self::TransactionProtocol(error) => write!(formatter, "transaction protocol: {error}"),
             Self::TrailingBodyBytes { remaining } => {
                 write!(formatter, "command body has {remaining} trailing bytes")
             }

@@ -629,6 +629,10 @@ pub enum TxnProtocolError {
     CorruptParticipantState,
     TransactionAlreadyAborted,
     TransactionAlreadyCommitted,
+    InvalidHomeDecisionState {
+        state: TransactionState,
+    },
+    HomeDecisionConflict,
     TimestampExhausted,
 }
 

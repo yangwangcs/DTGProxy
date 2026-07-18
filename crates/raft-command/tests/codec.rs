@@ -1,8 +1,13 @@
 use raft_command::{
-    ApplyPreparedV1, CommandBodyV1, CommandCodecError, CommandEnvelopeV1, MAX_COMMAND_BYTES,
+    AbortIntentV1, ApplyPreparedV1, CommandBodyV1, CommandCodecError, CommandEnvelopeV1,
+    FinalizeV1, MAX_COMMAND_BYTES, PrewriteV1, RecordDecisionV1,
 };
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use temporal_types::TransactionTime;
+use txn_protocol::{
+    HomeTransactionRecord, IsolationLevel, ParticipantProof, PrewriteRequest, ShardEpoch,
+    TransactionId, TransactionState,
+};
 
 fn apply_command() -> CommandEnvelopeV1 {
     CommandEnvelopeV1::new(
@@ -28,6 +33,101 @@ fn apply_command() -> CommandEnvelopeV1 {
             },
         }),
     )
+}
+
+fn participant(shard_id: u32) -> ShardEpoch {
+    ShardEpoch::new(shard_id, 11).unwrap()
+}
+
+fn prewrite_request() -> PrewriteRequest {
+    PrewriteRequest::new(
+        TransactionId::new(42),
+        TransactionTime::new(100, 0),
+        5,
+        participant(7),
+        participant(7),
+        vec![participant(7)],
+        IsolationLevel::TemporalSnapshot,
+        TransactionTime::new(200, 0),
+        PreparedMutationBatch {
+            shard_id: 7,
+            txn_id: 42,
+            mutations: vec![Mutation::put(
+                0,
+                LogicalKey::in_keyspace(Keyspace::Current, b"vertex/42".to_vec()),
+                b"value".to_vec(),
+            )],
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn every_distributed_transaction_phase_round_trips_canonically() {
+    let request = prewrite_request();
+    let proof = ParticipantProof::new(
+        request.participant(),
+        TransactionTime::new(100, 1),
+        request.intent_digest(),
+    );
+    let decision = HomeTransactionRecord::new(
+        request.transaction_id(),
+        request.start_ts(),
+        TransactionState::Committed,
+        Some(TransactionTime::new(101, 0)),
+        request.participants().to_vec(),
+        vec![proof.clone()],
+    )
+    .unwrap();
+    let commands = [
+        CommandEnvelopeV1::new(
+            7,
+            11,
+            1001,
+            CommandBodyV1::Prewrite(PrewriteV1 {
+                request: request.clone(),
+                expected_proof: proof,
+            }),
+        ),
+        CommandEnvelopeV1::new(
+            7,
+            11,
+            1002,
+            CommandBodyV1::RecordDecision(RecordDecisionV1 {
+                home: participant(7),
+                decision,
+            }),
+        ),
+        CommandEnvelopeV1::new(
+            7,
+            11,
+            1003,
+            CommandBodyV1::Finalize(FinalizeV1 {
+                participant: participant(7),
+                transaction_id: request.transaction_id(),
+                intent_digest: request.intent_digest(),
+                commit_ts: TransactionTime::new(101, 0),
+            }),
+        ),
+        CommandEnvelopeV1::new(
+            7,
+            11,
+            1004,
+            CommandBodyV1::AbortIntent(AbortIntentV1 {
+                participant: participant(7),
+                transaction_id: request.transaction_id(),
+                intent_digest: request.intent_digest(),
+            }),
+        ),
+    ];
+    for command in commands {
+        let bytes = command.encode().unwrap();
+        assert_eq!(CommandEnvelopeV1::decode(&bytes).unwrap(), command);
+        assert_eq!(
+            CommandEnvelopeV1::decode(&bytes).unwrap().encode().unwrap(),
+            bytes
+        );
+    }
 }
 
 #[test]
