@@ -1,6 +1,7 @@
 use raft_command::{
-    AbortIntentV1, ApplyPreparedV1, CommandBodyV1, CommandCodecError, CommandEnvelopeV1,
-    FinalizeV1, MAX_COMMAND_BYTES, OnePhaseCommitV1, PrewriteV1, RecordDecisionV1,
+    AbortBackendMigrationV1, AbortIntentV1, ApplyPreparedV1, BeginBackendDualApplyV1,
+    CommandBodyV1, CommandCodecError, CommandEnvelopeV1, CutoverBackendV1, FinalizeV1,
+    MAX_COMMAND_BYTES, OnePhaseCommitV1, PrewriteV1, RecordDecisionV1,
 };
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use temporal_types::TransactionTime;
@@ -171,6 +172,86 @@ fn placement_epoch_activation_is_canonical_and_strictly_sequential() {
             .unwrap_err(),
         raft_command::CommandCodecError::InvalidTargetEpoch { .. }
     ));
+}
+
+#[test]
+fn backend_lifecycle_commands_round_trip_with_generation_and_digest_fences() {
+    let digest = [0x5a; 32];
+    let commands = [
+        CommandEnvelopeV1::new(
+            11,
+            3,
+            910,
+            CommandBodyV1::BeginBackendDualApply(BeginBackendDualApplyV1 {
+                source_generation: 7,
+                target_generation: 8,
+                target_profile_digest: digest,
+                fence_index: 101,
+            }),
+        ),
+        CommandEnvelopeV1::new(
+            11,
+            3,
+            911,
+            CommandBodyV1::CutoverBackend(CutoverBackendV1 {
+                source_generation: 7,
+                target_generation: 8,
+                target_profile_digest: digest,
+            }),
+        ),
+        CommandEnvelopeV1::new(
+            11,
+            3,
+            912,
+            CommandBodyV1::AbortBackendMigration(AbortBackendMigrationV1 {
+                source_generation: 7,
+                target_generation: 8,
+                target_profile_digest: digest,
+            }),
+        ),
+    ];
+
+    for command in commands {
+        let encoded = command.encode().unwrap();
+        assert_eq!(CommandEnvelopeV1::decode(&encoded).unwrap(), command);
+        assert_eq!(
+            CommandEnvelopeV1::decode(&encoded)
+                .unwrap()
+                .encode()
+                .unwrap(),
+            encoded
+        );
+    }
+}
+
+#[test]
+fn backend_lifecycle_codec_rejects_zero_nonconsecutive_generations_and_zero_digest() {
+    let invalid = [
+        CommandBodyV1::BeginBackendDualApply(BeginBackendDualApplyV1 {
+            source_generation: 0,
+            target_generation: 1,
+            target_profile_digest: [1; 32],
+            fence_index: 0,
+        }),
+        CommandBodyV1::CutoverBackend(CutoverBackendV1 {
+            source_generation: 7,
+            target_generation: 9,
+            target_profile_digest: [1; 32],
+        }),
+        CommandBodyV1::AbortBackendMigration(AbortBackendMigrationV1 {
+            source_generation: 7,
+            target_generation: 8,
+            target_profile_digest: [0; 32],
+        }),
+    ];
+
+    for body in invalid {
+        assert!(matches!(
+            CommandEnvelopeV1::new(11, 3, 920, body).encode(),
+            Err(CommandCodecError::InvalidBackendGeneration)
+                | Err(CommandCodecError::InvalidBackendProfileDigest)
+        ));
+    }
 }
 
 #[test]

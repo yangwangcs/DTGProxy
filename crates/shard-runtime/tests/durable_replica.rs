@@ -6,7 +6,9 @@ use adapter_memory::MemoryAdapter;
 use adapter_registry::{
     AdapterFactory, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry, HotSwapAdapter,
 };
-use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
+use raft_command::{
+    ApplyPreparedV1, BeginBackendDualApplyV1, CommandBodyV1, CommandEnvelopeV1, CutoverBackendV1,
+};
 use shard_runtime::{DurableRaftReplica, DurableReplicaError};
 use storage_api::{
     AdapterRequirement, Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter,
@@ -96,6 +98,83 @@ fn durable_replica_accepts_a_recovered_hot_swap_slot() {
         slot.applied_log_index().unwrap(),
         replica.metadata().applied_index
     );
+}
+
+#[test]
+fn durable_replica_dual_applies_and_cuts_over_at_replicated_log_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let source = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("source-generation-7"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let target = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("target-generation-8"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let target_probe = target.clone();
+    let slot = Arc::new(HotSwapAdapter::recover_active(source, 7).unwrap());
+    slot.start_migration(target, AdapterRequirement::Development)
+        .unwrap();
+    let digest = [0x33; 32];
+    let mut replica = block_on(DurableRaftReplica::open_with_adapter_slot(
+        1,
+        &[1],
+        7,
+        9,
+        root.path().join("raft"),
+        Arc::clone(&slot),
+    ))
+    .unwrap();
+    block_on(elect_and_drain(&mut replica));
+    let fence = replica.metadata().applied_index;
+    let begin = CommandEnvelopeV1::new(
+        7,
+        9,
+        710,
+        CommandBodyV1::BeginBackendDualApply(BeginBackendDualApplyV1 {
+            source_generation: 7,
+            target_generation: 8,
+            target_profile_digest: digest,
+            fence_index: fence,
+        }),
+    )
+    .encode()
+    .unwrap();
+    replica.propose(710, begin).unwrap();
+    block_on(drain(&mut replica)).unwrap();
+    replica
+        .propose(711, command(711, 710, b"dual-applied"))
+        .unwrap();
+    block_on(drain(&mut replica)).unwrap();
+    assert_eq!(
+        target_probe.adapter().applied_log_index().unwrap(),
+        replica.metadata().applied_index
+    );
+
+    let cutover = CommandEnvelopeV1::new(
+        7,
+        9,
+        712,
+        CommandBodyV1::CutoverBackend(CutoverBackendV1 {
+            source_generation: 7,
+            target_generation: 8,
+            target_profile_digest: digest,
+        }),
+    )
+    .encode()
+    .unwrap();
+    replica.propose(712, cutover).unwrap();
+    block_on(drain(&mut replica)).unwrap();
+
+    assert_eq!(slot.generation(), 8);
+    assert_eq!(replica.metadata().backend_generation, 8);
+    assert_eq!(read_current(&replica), Some(b"dual-applied".to_vec()));
 }
 
 struct MemoryFactory;

@@ -4,8 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
-use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
-use shard_runtime::{MIN_REPLICA_TIME, ShardRuntimeError, ShardStateMachine};
+use raft_command::{
+    AbortBackendMigrationV1, ApplyPreparedV1, BeginBackendDualApplyV1, CommandBodyV1,
+    CommandEnvelopeV1, CutoverBackendV1,
+};
+use shard_runtime::{BackendLifecycle, MIN_REPLICA_TIME, ShardRuntimeError, ShardStateMachine};
 use storage_api::{
     AdapterCapabilities, AdapterError, AdapterFuture, KeySpan, KeyValue, Keyspace, LogicalKey,
     Mutation, PreparedMutationBatch, StorageAdapter,
@@ -47,6 +50,127 @@ fn tick_command(epoch: u64, request_id: u128, closed: i64) -> Vec<u8> {
     )
     .encode()
     .unwrap()
+}
+
+fn backend_command(request_id: u128, body: CommandBodyV1) -> Vec<u8> {
+    CommandEnvelopeV1::new(7, 9, request_id, body)
+        .encode()
+        .unwrap()
+}
+
+#[test]
+fn backend_lifecycle_is_replicated_validated_and_recovered_with_metadata() {
+    let digest = [0x7b; 32];
+    let mut machine = block_on(ShardStateMachine::open_with_backend_generation(
+        MemoryAdapter::new(),
+        7,
+        9,
+        7,
+    ))
+    .unwrap();
+    let begin = backend_command(
+        801,
+        CommandBodyV1::BeginBackendDualApply(BeginBackendDualApplyV1 {
+            source_generation: 7,
+            target_generation: 8,
+            target_profile_digest: digest,
+            fence_index: 0,
+        }),
+    );
+    block_on(machine.apply_entry(1, 1, &begin)).unwrap();
+    assert_eq!(
+        machine.metadata().backend_lifecycle,
+        BackendLifecycle::DualApplying {
+            target_generation: 8,
+            target_profile_digest: digest,
+            fence_index: 0,
+        }
+    );
+
+    block_on(machine.apply_entry(1, 2, &apply_command(9, 802, 100, b"during-dual"))).unwrap();
+    let cutover = backend_command(
+        803,
+        CommandBodyV1::CutoverBackend(CutoverBackendV1 {
+            source_generation: 7,
+            target_generation: 8,
+            target_profile_digest: digest,
+        }),
+    );
+    block_on(machine.apply_entry(1, 3, &cutover)).unwrap();
+    assert_eq!(machine.metadata().backend_generation, 8);
+    assert_eq!(
+        machine.metadata().backend_lifecycle,
+        BackendLifecycle::Active
+    );
+
+    let stale_abort = backend_command(
+        804,
+        CommandBodyV1::AbortBackendMigration(AbortBackendMigrationV1 {
+            source_generation: 7,
+            target_generation: 8,
+            target_profile_digest: digest,
+        }),
+    );
+    assert!(matches!(
+        block_on(machine.apply_entry(1, 4, &stale_abort)),
+        Err(ShardRuntimeError::BackendLifecycleConflict)
+    ));
+    assert_eq!(machine.adapter().applied_log_index().unwrap(), 3);
+
+    let adapter = machine.into_adapter();
+    let recovered = block_on(ShardStateMachine::open_with_backend_generation(
+        adapter, 7, 9, 8,
+    ))
+    .unwrap();
+    assert_eq!(recovered.metadata().backend_generation, 8);
+    assert_eq!(
+        recovered.metadata().backend_lifecycle,
+        BackendLifecycle::Active
+    );
+}
+
+#[test]
+fn backend_abort_returns_to_the_source_generation() {
+    let digest = [0x21; 32];
+    let mut machine = block_on(ShardStateMachine::open_with_backend_generation(
+        MemoryAdapter::new(),
+        7,
+        9,
+        4,
+    ))
+    .unwrap();
+    block_on(machine.apply_entry(
+        1,
+        1,
+        &backend_command(
+            811,
+            CommandBodyV1::BeginBackendDualApply(BeginBackendDualApplyV1 {
+                source_generation: 4,
+                target_generation: 5,
+                target_profile_digest: digest,
+                fence_index: 0,
+            }),
+        ),
+    ))
+    .unwrap();
+    block_on(machine.apply_entry(
+        1,
+        2,
+        &backend_command(
+            812,
+            CommandBodyV1::AbortBackendMigration(AbortBackendMigrationV1 {
+                source_generation: 4,
+                target_generation: 5,
+                target_profile_digest: digest,
+            }),
+        ),
+    ))
+    .unwrap();
+    assert_eq!(machine.metadata().backend_generation, 4);
+    assert_eq!(
+        machine.metadata().backend_lifecycle,
+        BackendLifecycle::Active
+    );
 }
 
 #[test]

@@ -11,6 +11,7 @@ const POSITION_KEY: &[u8] = b"\x01dtg/replica/v1/position";
 const CLOSED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/closed-ts";
 const RESOLVED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/resolved-ts";
 const ADAPTER_APPLIED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/adapter-applied-ts";
+const BACKEND_STATE_KEY: &[u8] = b"\x01dtg/replica/v1/backend-state";
 const ENTRY_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/entry/";
 const REQUEST_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/request/";
 const UNRESOLVED_INTENT_PREFIX: &[u8] = b"\x01dtg/replica/v1/unresolved/";
@@ -20,12 +21,24 @@ const TIMESTAMP_MAGIC: [u8; 4] = *b"DTTM";
 const ENTRY_DIGEST_MAGIC: [u8; 4] = *b"DTRE";
 const REQUEST_DIGEST_MAGIC: [u8; 4] = *b"DTRQ";
 const UNRESOLVED_INTENT_MAGIC: [u8; 4] = *b"DTRU";
+const BACKEND_STATE_MAGIC: [u8; 4] = *b"DTBG";
 const POSITION_VALUE_BYTES: usize = 38;
 const TIMESTAMP_VALUE_BYTES: usize = 22;
 const ENTRY_DIGEST_VALUE_BYTES: usize = 50;
 const REQUEST_DIGEST_VALUE_BYTES: usize = 42;
+const BACKEND_STATE_VALUE_BYTES: usize = 67;
 
 pub const MIN_REPLICA_TIME: TransactionTime = TransactionTime::new(i64::MIN, 0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendLifecycle {
+    Active,
+    DualApplying {
+        target_generation: u64,
+        target_profile_digest: [u8; 32],
+        fence_index: u64,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaMetadata {
@@ -36,10 +49,16 @@ pub struct ReplicaMetadata {
     pub closed_ts: TransactionTime,
     pub resolved_ts: TransactionTime,
     pub adapter_applied_ts: TransactionTime,
+    pub backend_generation: u64,
+    pub backend_lifecycle: BackendLifecycle,
 }
 
 impl ReplicaMetadata {
-    pub(crate) const fn initial(shard_id: u32, placement_epoch: u64) -> Self {
+    pub(crate) const fn initial(
+        shard_id: u32,
+        placement_epoch: u64,
+        backend_generation: u64,
+    ) -> Self {
         Self {
             shard_id,
             placement_epoch,
@@ -48,6 +67,8 @@ impl ReplicaMetadata {
             closed_ts: MIN_REPLICA_TIME,
             resolved_ts: MIN_REPLICA_TIME,
             adapter_applied_ts: MIN_REPLICA_TIME,
+            backend_generation,
+            backend_lifecycle: BackendLifecycle::Active,
         }
     }
 
@@ -73,12 +94,19 @@ pub(crate) async fn load_metadata<A: StorageAdapter>(
     adapter: &A,
     shard_id: u32,
     placement_epoch: u64,
+    initial_backend_generation: u64,
 ) -> Result<ReplicaMetadata, ShardRuntimeError> {
+    if initial_backend_generation == 0 {
+        return Err(ShardRuntimeError::InvalidBackendGeneration {
+            generation: initial_backend_generation,
+        });
+    }
     let keys = [
         position_key(),
         closed_ts_key(),
         resolved_ts_key(),
         adapter_applied_ts_key(),
+        backend_state_key(),
     ];
     let values = adapter.multi_get(&keys).await?;
     let adapter_index = adapter.applied_log_index()?;
@@ -87,8 +115,13 @@ pub(crate) async fn load_metadata<A: StorageAdapter>(
     let closed = values.next().flatten();
     let resolved = values.next().flatten();
     let adapter_applied = values.next().flatten();
+    let backend_state = values.next().flatten();
     if position.is_none() {
-        if closed.is_some() || resolved.is_some() || adapter_applied.is_some() {
+        if closed.is_some()
+            || resolved.is_some()
+            || adapter_applied.is_some()
+            || backend_state.is_some()
+        {
             return Err(ShardRuntimeError::CorruptMetadata { record: "position" });
         }
         if adapter_index != 0 {
@@ -97,7 +130,11 @@ pub(crate) async fn load_metadata<A: StorageAdapter>(
                 adapter: adapter_index,
             });
         }
-        return Ok(ReplicaMetadata::initial(shard_id, placement_epoch));
+        return Ok(ReplicaMetadata::initial(
+            shard_id,
+            placement_epoch,
+            initial_backend_generation,
+        ));
     }
 
     let (stored_shard, stored_epoch, last_term, applied_index) =
@@ -120,6 +157,10 @@ pub(crate) async fn load_metadata<A: StorageAdapter>(
             adapter: adapter_index,
         });
     }
+    let (backend_generation, backend_lifecycle) = backend_state.map_or(
+        Ok((initial_backend_generation, BackendLifecycle::Active)),
+        |bytes| decode_backend_state(&bytes),
+    )?;
     Ok(ReplicaMetadata {
         shard_id,
         placement_epoch,
@@ -128,6 +169,8 @@ pub(crate) async fn load_metadata<A: StorageAdapter>(
         closed_ts: decode_optional_timestamp(closed, "closed-ts")?,
         resolved_ts: decode_optional_timestamp(resolved, "resolved-ts")?,
         adapter_applied_ts: decode_optional_timestamp(adapter_applied, "adapter-applied-ts")?,
+        backend_generation,
+        backend_lifecycle,
     })
 }
 
@@ -197,6 +240,10 @@ pub(crate) fn resolved_ts_key() -> LogicalKey {
 
 pub(crate) fn adapter_applied_ts_key() -> LogicalKey {
     meta_key(ADAPTER_APPLIED_TS_KEY.to_vec())
+}
+
+pub(crate) fn backend_state_key() -> LogicalKey {
+    meta_key(BACKEND_STATE_KEY.to_vec())
 }
 
 pub(crate) fn entry_digest_key(index: u64) -> LogicalKey {
@@ -277,6 +324,80 @@ pub(crate) fn encode_timestamp(timestamp: TransactionTime) -> Vec<u8> {
     bytes.extend_from_slice(&timestamp.logical().to_be_bytes());
     append_checksum(&mut bytes);
     bytes
+}
+
+pub(crate) fn encode_backend_state(metadata: ReplicaMetadata) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(BACKEND_STATE_VALUE_BYTES);
+    bytes.extend_from_slice(&BACKEND_STATE_MAGIC);
+    bytes.extend_from_slice(&META_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&metadata.backend_generation.to_be_bytes());
+    match metadata.backend_lifecycle {
+        BackendLifecycle::Active => {
+            bytes.push(1);
+            bytes.extend_from_slice(&0_u64.to_be_bytes());
+            bytes.extend_from_slice(&[0; 32]);
+            bytes.extend_from_slice(&0_u64.to_be_bytes());
+        }
+        BackendLifecycle::DualApplying {
+            target_generation,
+            target_profile_digest,
+            fence_index,
+        } => {
+            bytes.push(2);
+            bytes.extend_from_slice(&target_generation.to_be_bytes());
+            bytes.extend_from_slice(&target_profile_digest);
+            bytes.extend_from_slice(&fence_index.to_be_bytes());
+        }
+    }
+    append_checksum(&mut bytes);
+    bytes
+}
+
+fn decode_backend_state(bytes: &[u8]) -> Result<(u64, BackendLifecycle), ShardRuntimeError> {
+    validate_record(
+        bytes,
+        BACKEND_STATE_VALUE_BYTES,
+        BACKEND_STATE_MAGIC,
+        "backend-state",
+    )?;
+    let generation = u64::from_be_bytes(
+        bytes[6..14]
+            .try_into()
+            .expect("fixed backend generation slice"),
+    );
+    let target_generation = u64::from_be_bytes(
+        bytes[15..23]
+            .try_into()
+            .expect("fixed target generation slice"),
+    );
+    let target_profile_digest = bytes[23..55]
+        .try_into()
+        .expect("fixed profile digest slice");
+    let fence_index =
+        u64::from_be_bytes(bytes[55..63].try_into().expect("fixed backend fence slice"));
+    if generation == 0 {
+        return Err(ShardRuntimeError::InvalidBackendGeneration { generation });
+    }
+    let lifecycle = match bytes[14] {
+        1 if target_generation == 0 && target_profile_digest == [0; 32] && fence_index == 0 => {
+            BackendLifecycle::Active
+        }
+        2 if target_generation == generation.checked_add(1).unwrap_or(0)
+            && target_profile_digest != [0; 32] =>
+        {
+            BackendLifecycle::DualApplying {
+                target_generation,
+                target_profile_digest,
+                fence_index,
+            }
+        }
+        _ => {
+            return Err(ShardRuntimeError::CorruptMetadata {
+                record: "backend-state",
+            });
+        }
+    };
+    Ok((generation, lifecycle))
 }
 
 fn decode_timestamp(
@@ -373,9 +494,10 @@ fn validate_record(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENTRY_DIGEST_VALUE_BYTES, ReplicaMetadata, decode_entry_digest, decode_position,
-        decode_request_digest, decode_timestamp, encode_entry_digest, encode_position,
-        encode_request_digest, encode_timestamp,
+        BackendLifecycle, ENTRY_DIGEST_VALUE_BYTES, ReplicaMetadata, decode_backend_state,
+        decode_entry_digest, decode_position, decode_request_digest, decode_timestamp,
+        encode_backend_state, encode_entry_digest, encode_position, encode_request_digest,
+        encode_timestamp,
     };
     use crate::ShardRuntimeError;
     use temporal_types::TransactionTime;
@@ -390,6 +512,12 @@ mod tests {
             closed_ts: TransactionTime::new(17, 1),
             resolved_ts: TransactionTime::new(17, 1),
             adapter_applied_ts: TransactionTime::new(19, 2),
+            backend_generation: 4,
+            backend_lifecycle: BackendLifecycle::DualApplying {
+                target_generation: 5,
+                target_profile_digest: [0x44; 32],
+                fence_index: 12,
+            },
         };
         assert_eq!(
             decode_position(&encode_position(metadata)).unwrap(),
@@ -407,6 +535,10 @@ mod tests {
         assert_eq!(
             decode_request_digest(&encode_request_digest(digest)).unwrap(),
             digest
+        );
+        assert_eq!(
+            decode_backend_state(&encode_backend_state(metadata)).unwrap(),
+            (metadata.backend_generation, metadata.backend_lifecycle)
         );
 
         let mut corrupted = encode_entry_digest(29, digest);

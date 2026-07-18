@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 pub use durable_replica::{DurableRaftReplica, DurableReplicaError};
-pub use metadata::{MIN_REPLICA_TIME, ReplicaMetadata};
+pub use metadata::{BackendLifecycle, MIN_REPLICA_TIME, ReplicaMetadata};
 pub use raft_group::{InProcessShardGroup, MultiRaftRuntime, ProposalReceipt, ReplicationError};
 pub use read_barrier::{FollowerReadProof, ReadBarrierError, ReadPermit, ReadPermitMode};
 pub use state_machine::ShardStateMachine;
@@ -87,6 +87,10 @@ pub enum ShardRuntimeError {
         request_id: u128,
     },
     TooManyMutations,
+    InvalidBackendGeneration {
+        generation: u64,
+    },
+    BackendLifecycleConflict,
 }
 
 impl Display for ShardRuntimeError {
@@ -169,6 +173,12 @@ impl Display for ShardRuntimeError {
             ),
             Self::TooManyMutations => {
                 formatter.write_str("Replica metadata exceeds mutation sequence space")
+            }
+            Self::InvalidBackendGeneration { generation } => {
+                write!(formatter, "invalid backend generation {generation}")
+            }
+            Self::BackendLifecycleConflict => {
+                formatter.write_str("backend lifecycle command conflicts with replicated state")
             }
         }
     }

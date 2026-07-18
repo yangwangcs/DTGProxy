@@ -20,6 +20,9 @@ const FINALIZE_TAG: u8 = 5;
 const ABORT_INTENT_TAG: u8 = 6;
 const ONE_PHASE_COMMIT_TAG: u8 = 7;
 const ACTIVATE_PLACEMENT_EPOCH_TAG: u8 = 8;
+const BEGIN_BACKEND_DUAL_APPLY_TAG: u8 = 9;
+const CUTOVER_BACKEND_TAG: u8 = 10;
+const ABORT_BACKEND_MIGRATION_TAG: u8 = 11;
 const PUT_TAG: u8 = 1;
 const DELETE_TAG: u8 = 2;
 const HEADER_BYTES: usize = 40;
@@ -235,6 +238,46 @@ impl CommandEnvelopeV1 {
                 }
                 CommandBodyV1::ActivatePlacementEpoch(target_epoch)
             }
+            BEGIN_BACKEND_DUAL_APPLY_TAG => {
+                let command = BeginBackendDualApplyV1 {
+                    source_generation: body_reader.u64()?,
+                    target_generation: body_reader.u64()?,
+                    target_profile_digest: decode_digest(&mut body_reader)?,
+                    fence_index: body_reader.u64()?,
+                };
+                validate_backend_transition(
+                    command.source_generation,
+                    command.target_generation,
+                    command.target_profile_digest,
+                )?;
+                CommandBodyV1::BeginBackendDualApply(command)
+            }
+            CUTOVER_BACKEND_TAG => {
+                let command = CutoverBackendV1 {
+                    source_generation: body_reader.u64()?,
+                    target_generation: body_reader.u64()?,
+                    target_profile_digest: decode_digest(&mut body_reader)?,
+                };
+                validate_backend_transition(
+                    command.source_generation,
+                    command.target_generation,
+                    command.target_profile_digest,
+                )?;
+                CommandBodyV1::CutoverBackend(command)
+            }
+            ABORT_BACKEND_MIGRATION_TAG => {
+                let command = AbortBackendMigrationV1 {
+                    source_generation: body_reader.u64()?,
+                    target_generation: body_reader.u64()?,
+                    target_profile_digest: decode_digest(&mut body_reader)?,
+                };
+                validate_backend_transition(
+                    command.source_generation,
+                    command.target_generation,
+                    command.target_profile_digest,
+                )?;
+                CommandBodyV1::AbortBackendMigration(command)
+            }
             tag => return Err(CommandCodecError::UnknownBodyTag { tag }),
         };
         body_reader.finish()?;
@@ -354,6 +397,49 @@ impl CommandEnvelopeV1 {
                     target_epoch.to_be_bytes().to_vec(),
                 ))
             }
+            CommandBodyV1::BeginBackendDualApply(command) => {
+                validate_backend_transition(
+                    command.source_generation,
+                    command.target_generation,
+                    command.target_profile_digest,
+                )?;
+                let mut body = Vec::with_capacity(56);
+                body.extend_from_slice(&command.source_generation.to_be_bytes());
+                body.extend_from_slice(&command.target_generation.to_be_bytes());
+                body.extend_from_slice(&command.target_profile_digest);
+                body.extend_from_slice(&command.fence_index.to_be_bytes());
+                Ok((BEGIN_BACKEND_DUAL_APPLY_TAG, body))
+            }
+            CommandBodyV1::CutoverBackend(command) => {
+                validate_backend_transition(
+                    command.source_generation,
+                    command.target_generation,
+                    command.target_profile_digest,
+                )?;
+                Ok((
+                    CUTOVER_BACKEND_TAG,
+                    encode_backend_transition(
+                        command.source_generation,
+                        command.target_generation,
+                        command.target_profile_digest,
+                    ),
+                ))
+            }
+            CommandBodyV1::AbortBackendMigration(command) => {
+                validate_backend_transition(
+                    command.source_generation,
+                    command.target_generation,
+                    command.target_profile_digest,
+                )?;
+                Ok((
+                    ABORT_BACKEND_MIGRATION_TAG,
+                    encode_backend_transition(
+                        command.source_generation,
+                        command.target_generation,
+                        command.target_profile_digest,
+                    ),
+                ))
+            }
         }
     }
 }
@@ -368,6 +454,9 @@ pub enum CommandBodyV1 {
     AbortIntent(AbortIntentV1),
     OnePhaseCommit(OnePhaseCommitV1),
     ActivatePlacementEpoch(u64),
+    BeginBackendDualApply(BeginBackendDualApplyV1),
+    CutoverBackend(CutoverBackendV1),
+    AbortBackendMigration(AbortBackendMigrationV1),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -408,6 +497,55 @@ pub struct OnePhaseCommitV1 {
     pub request: PrewriteRequest,
     pub expected_proof: ParticipantProof,
     pub commit_ts: TransactionTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BeginBackendDualApplyV1 {
+    pub source_generation: u64,
+    pub target_generation: u64,
+    pub target_profile_digest: [u8; 32],
+    pub fence_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CutoverBackendV1 {
+    pub source_generation: u64,
+    pub target_generation: u64,
+    pub target_profile_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AbortBackendMigrationV1 {
+    pub source_generation: u64,
+    pub target_generation: u64,
+    pub target_profile_digest: [u8; 32],
+}
+
+fn validate_backend_transition(
+    source_generation: u64,
+    target_generation: u64,
+    target_profile_digest: [u8; 32],
+) -> Result<(), CommandCodecError> {
+    if source_generation == 0 || target_generation != source_generation.checked_add(1).unwrap_or(0)
+    {
+        return Err(CommandCodecError::InvalidBackendGeneration);
+    }
+    if target_profile_digest == [0; 32] {
+        return Err(CommandCodecError::InvalidBackendProfileDigest);
+    }
+    Ok(())
+}
+
+fn encode_backend_transition(
+    source_generation: u64,
+    target_generation: u64,
+    target_profile_digest: [u8; 32],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(48);
+    body.extend_from_slice(&source_generation.to_be_bytes());
+    body.extend_from_slice(&target_generation.to_be_bytes());
+    body.extend_from_slice(&target_profile_digest);
+    body
 }
 
 fn validate_prewrite(
@@ -764,6 +902,8 @@ pub enum CommandCodecError {
     ShardMismatch { envelope: u32, batch: u32 },
     PlacementEpochMismatch { envelope: u64, participant: u64 },
     InvalidTargetEpoch { current: u64, target: u64 },
+    InvalidBackendGeneration,
+    InvalidBackendProfileDigest,
     InvalidParticipantProof,
     InvalidTransactionId,
     InvalidOnePhaseCommit,
@@ -832,6 +972,12 @@ impl Display for CommandCodecError {
                 formatter,
                 "target placement epoch {target} must immediately follow {current}"
             ),
+            Self::InvalidBackendGeneration => formatter.write_str(
+                "backend target generation must immediately follow a nonzero source generation",
+            ),
+            Self::InvalidBackendProfileDigest => {
+                formatter.write_str("backend target profile digest cannot be zero")
+            }
             Self::InvalidParticipantProof => {
                 formatter.write_str("invalid participant proof in Prewrite command")
             }

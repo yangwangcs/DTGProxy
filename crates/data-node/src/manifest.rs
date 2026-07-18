@@ -176,6 +176,56 @@ impl BackendSlotState {
             Self::DualApplying { source, .. } => source,
         }
     }
+
+    pub(crate) fn reconcile_active(&self, generation: u64) -> Result<Self, StorageError> {
+        let profile = match self {
+            Self::Active {
+                generation: current,
+                profile,
+            } if *current == generation => profile.clone(),
+            Self::DualApplying {
+                source_generation,
+                source,
+                target_generation,
+                target,
+                ..
+            } if *source_generation == generation => source.clone(),
+            Self::DualApplying {
+                target_generation,
+                target,
+                ..
+            } if *target_generation == generation => target.clone(),
+            _ => return Err(StorageError::InvalidBackendTransition),
+        };
+        Self::active(generation, profile)
+    }
+
+    pub(crate) fn validate_replicated_dual(
+        &self,
+        source_generation: u64,
+        target_generation: u64,
+        target_profile_digest: [u8; 32],
+        fence_index: u64,
+    ) -> Result<Self, StorageError> {
+        match self {
+            Self::DualApplying {
+                source_generation: local_source,
+                target_generation: local_target,
+                target,
+                fence_index: local_fence,
+                synchronized_index,
+                ..
+            } if *local_source == source_generation
+                && *local_target == target_generation
+                && target.digest() == target_profile_digest
+                && *local_fence == fence_index
+                && *synchronized_index >= fence_index =>
+            {
+                Ok(self.clone())
+            }
+            _ => Err(StorageError::InvalidBackendTransition),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -355,6 +405,15 @@ impl ReplicaEntry {
         self.role = ReplicaRole::Voter;
         Ok(self)
     }
+
+    pub(crate) fn with_backend_slot(
+        mut self,
+        backend_slot: BackendSlotState,
+    ) -> Result<Self, StorageError> {
+        self.backend_generation = backend_slot.active_generation();
+        self.backend_slot = backend_slot;
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -418,6 +477,30 @@ impl ReplicaManifest {
             || existing.schema_version != entry.schema_version
             || existing.backend_generation != entry.backend_generation
             || existing.backend_slot != entry.backend_slot
+            || existing.relative_directory != entry.relative_directory
+        {
+            return Err(StorageError::ReplicaIdentityConflict {
+                graph_id: entry.graph_id,
+                shard_id: entry.shard_id,
+            });
+        }
+        self.replicas.insert(key, entry);
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_backend(&mut self, entry: ReplicaEntry) -> Result<(), StorageError> {
+        let key = (entry.graph_id, entry.shard_id);
+        let existing = self
+            .replicas
+            .get(&key)
+            .ok_or(StorageError::InvalidReplicaIdentity)?;
+        if existing.graph_id != entry.graph_id
+            || existing.shard_id != entry.shard_id
+            || existing.placement_epoch != entry.placement_epoch
+            || existing.voters != entry.voters
+            || existing.role != entry.role
+            || existing.schema_version != entry.schema_version
+            || existing.snapshot_index != entry.snapshot_index
             || existing.relative_directory != entry.relative_directory
         {
             return Err(StorageError::ReplicaIdentityConflict {

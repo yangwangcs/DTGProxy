@@ -7,7 +7,7 @@ use std::sync::Arc;
 use adapter_registry::{AdapterOpenRequest, AdapterRegistry, HotSwapAdapter};
 use adapter_rocksdb::RocksAdapterFactory;
 use adapter_sidecar::TcpSidecarAdapterFactory;
-use storage_api::AdapterRequirement;
+use storage_api::{AdapterRequirement, LogicalSnapshotExportRequest, StorageAdapter};
 
 use crate::{BackendProfile, BackendSlotState};
 
@@ -61,11 +61,80 @@ impl BackendManager {
         }
     }
 
+    pub(crate) async fn restore_target(
+        &self,
+        replica_directory: &Path,
+        source: Arc<dyn StorageAdapter>,
+        target: &BackendProfile,
+    ) -> Result<(adapter_registry::OpenedAdapter, u64), BackendError> {
+        let source_index = source.applied_log_index()?;
+        let reader = source
+            .begin_logical_export(LogicalSnapshotExportRequest::default())
+            .await?;
+        if reader.header().applied_log_index() != source_index {
+            return Err(BackendError::SnapshotFenceMismatch {
+                source: source_index,
+                snapshot: reader.header().applied_log_index(),
+            });
+        }
+        let request = self.open_request(replica_directory, target)?;
+        match self
+            .registry
+            .restore(
+                target.provider(),
+                &request,
+                AdapterRequirement::HotPluggableReplica,
+                reader,
+            )
+            .await
+        {
+            Ok(opened) => Ok((opened, source_index)),
+            Err(restore_error) => {
+                let opened = self
+                    .registry
+                    .open(
+                        target.provider(),
+                        &request,
+                        AdapterRequirement::HotPluggableReplica,
+                    )
+                    .await
+                    .map_err(|open_error| BackendError::RestoreAndOpen {
+                        restore: restore_error.to_string(),
+                        open: open_error.to_string(),
+                    })?;
+                let target_index = opened.adapter().applied_log_index()?;
+                if target_index != source_index {
+                    return Err(BackendError::SnapshotFenceMismatch {
+                        source: source_index,
+                        snapshot: target_index,
+                    });
+                }
+                Ok((opened, source_index))
+            }
+        }
+    }
+
     async fn open_profile(
         &self,
         replica_directory: &Path,
         profile: &BackendProfile,
     ) -> Result<adapter_registry::OpenedAdapter, BackendError> {
+        let request = self.open_request(replica_directory, profile)?;
+        self.registry
+            .open(
+                profile.provider(),
+                &request,
+                AdapterRequirement::HotPluggableReplica,
+            )
+            .await
+            .map_err(BackendError::from)
+    }
+
+    fn open_request(
+        &self,
+        replica_directory: &Path,
+        profile: &BackendProfile,
+    ) -> Result<AdapterOpenRequest, BackendError> {
         let mut request = AdapterOpenRequest::new(profile.instance_id());
         for (name, value) in profile.public_parameters() {
             let value = if profile.provider() == "rocksdb" && name == "path" {
@@ -78,14 +147,7 @@ impl BackendManager {
         if profile.provider() == "sidecar" {
             validate_sidecar_endpoint(profile)?;
         }
-        self.registry
-            .open(
-                profile.provider(),
-                &request,
-                AdapterRequirement::HotPluggableReplica,
-            )
-            .await
-            .map_err(BackendError::from)
+        Ok(request)
     }
 }
 
@@ -131,6 +193,9 @@ pub enum BackendError {
     MissingSidecarEndpoint,
     InvalidSidecarEndpoint,
     NonLoopbackSidecarEndpoint { endpoint: SocketAddr },
+    Adapter(storage_api::AdapterError),
+    SnapshotFenceMismatch { source: u64, snapshot: u64 },
+    RestoreAndOpen { restore: String, open: String },
 }
 
 impl Display for BackendError {
@@ -147,6 +212,15 @@ impl Display for BackendError {
                 formatter,
                 "plaintext Sidecar endpoint {endpoint} is not loopback"
             ),
+            Self::Adapter(error) => Display::fmt(error, formatter),
+            Self::SnapshotFenceMismatch { source, snapshot } => write!(
+                formatter,
+                "source applied index {source} differs from target snapshot index {snapshot}"
+            ),
+            Self::RestoreAndOpen { restore, open } => write!(
+                formatter,
+                "target restore failed ({restore}) and idempotent open failed ({open})"
+            ),
         }
     }
 }
@@ -162,5 +236,11 @@ impl From<adapter_registry::RegistryError> for BackendError {
 impl From<adapter_registry::MigrationError> for BackendError {
     fn from(error: adapter_registry::MigrationError) -> Self {
         Self::Migration(error)
+    }
+}
+
+impl From<storage_api::AdapterError> for BackendError {
+    fn from(error: storage_api::AdapterError) -> Self {
+        Self::Adapter(error)
     }
 }

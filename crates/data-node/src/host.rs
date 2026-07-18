@@ -3,8 +3,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, Mutex, RwLock};
 
+use adapter_registry::MigrationStatus;
 use raft::eraftpb::Message;
 use raft_transport::RoutedRaftMessage;
+use shard_runtime::{BackendLifecycle, ReplicaMetadata};
 use storage_api::{KeySpan, KeyValue, LogicalKey};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
@@ -163,6 +165,41 @@ impl ReplicaSpec {
             shard_id: self.shard_id(),
         }
     }
+
+    pub(crate) fn reconcile_backend(
+        &self,
+        metadata: ReplicaMetadata,
+        local_status: MigrationStatus,
+    ) -> Result<Self, HostError> {
+        let backend_slot = match metadata.backend_lifecycle {
+            BackendLifecycle::Active => match local_status {
+                MigrationStatus::DualApplying {
+                    source_generation, ..
+                } if source_generation == metadata.backend_generation => {
+                    self.backend_slot().clone()
+                }
+                MigrationStatus::Idle { generation }
+                    if generation == metadata.backend_generation =>
+                {
+                    self.backend_slot().reconcile_active(generation)?
+                }
+                _ => return Err(StorageError::InvalidBackendTransition.into()),
+            },
+            BackendLifecycle::DualApplying {
+                target_generation,
+                target_profile_digest,
+                fence_index,
+            } => self.backend_slot().validate_replicated_dual(
+                metadata.backend_generation,
+                target_generation,
+                target_profile_digest,
+                fence_index,
+            )?,
+        };
+        Ok(Self::from_entry(
+            self.entry.clone().with_backend_slot(backend_slot)?,
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -296,6 +333,30 @@ pub enum EnsureReplicaOutcome {
     Existing,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendRuntimeStatus {
+    replica: ReplicaStatus,
+    slot: BackendSlotState,
+    local: MigrationStatus,
+}
+
+impl BackendRuntimeStatus {
+    #[must_use]
+    pub const fn replica(&self) -> ReplicaStatus {
+        self.replica
+    }
+
+    #[must_use]
+    pub const fn slot(&self) -> &BackendSlotState {
+        &self.slot
+    }
+
+    #[must_use]
+    pub const fn local(&self) -> MigrationStatus {
+        self.local
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProposalOutcome {
     status: ReplicaStatus,
@@ -343,7 +404,7 @@ impl DataNodeHost {
         }
         let identity_store =
             NodeIdentityStore::open_or_create(config.data_directory(), config.identity().clone())?;
-        let manifest_store = ReplicaManifestStore::open(config.data_directory())?;
+        let mut manifest_store = ReplicaManifestStore::open(config.data_directory())?;
         let migration_receipts = MigrationReceiptStore::open(config.data_directory())?;
         let snapshot_inbox = SnapshotInbox::open(config.data_directory())?;
         let backend_manager = Arc::new(
@@ -366,11 +427,16 @@ impl DataNodeHost {
             let handle = ReplicaActorHandle::open(
                 config.identity().node_id(),
                 config.data_directory(),
-                backend_manager.as_ref(),
+                Arc::clone(&backend_manager),
                 spec.clone(),
                 queue_capacity,
             )
             .await?;
+            if handle.spec != spec {
+                let mut manifest = manifest_store.manifest().clone();
+                manifest.reconcile_backend(handle.spec.entry().clone())?;
+                manifest_store.persist(&manifest)?;
+            }
             replicas.insert(spec.key(), handle);
         }
         Ok(Self {
@@ -487,7 +553,7 @@ impl DataNodeHost {
         let handle = ReplicaActorHandle::open(
             self.config.identity().node_id(),
             self.config.data_directory(),
-            self.backend_manager.as_ref(),
+            Arc::clone(&self.backend_manager),
             spec.clone(),
             self.queue_capacity,
         )
@@ -521,6 +587,96 @@ impl DataNodeHost {
             .await
             .map_err(|_| HostError::ActorStopped)?;
         receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    pub async fn prepare_backend_target(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        target_generation: u64,
+        target_profile: crate::BackendProfile,
+    ) -> Result<ReplicaStatus, HostError> {
+        let sender = self.sender(key)?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::PrepareBackendTarget {
+                placement_epoch,
+                target_generation,
+                target_profile,
+                response,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        let (spec, status) = receiver.await.map_err(|_| HostError::ActorStopped)??;
+        {
+            let mut store = self
+                .manifest_store
+                .lock()
+                .map_err(|_| HostError::LockPoisoned)?;
+            let mut manifest = store.manifest().clone();
+            manifest.reconcile_backend(spec.entry().clone())?;
+            store.persist(&manifest)?;
+        }
+        let mut replicas = self.replicas.write().map_err(|_| HostError::LockPoisoned)?;
+        let handle = replicas.get_mut(&key).ok_or(HostError::UnknownReplica {
+            graph_id: key.graph_id,
+            shard_id: key.shard_id,
+        })?;
+        handle.spec = spec;
+        Ok(status)
+    }
+
+    pub async fn backend_runtime_status(
+        &self,
+        key: ReplicaKey,
+    ) -> Result<BackendRuntimeStatus, HostError> {
+        let sender = self.sender(key)?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::BackendState(response))
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        let (spec, replica, local) = receiver.await.map_err(|_| HostError::ActorStopped)??;
+        Ok(BackendRuntimeStatus {
+            replica,
+            slot: spec.backend_slot().clone(),
+            local,
+        })
+    }
+
+    pub async fn propose_backend_transition(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        request_id: u128,
+        command: Vec<u8>,
+    ) -> Result<ProposalOutcome, HostError> {
+        let outcome = self
+            .propose_with_outcome(key, placement_epoch, request_id, command)
+            .await?;
+        let sender = self.sender(key)?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::BackendState(response))
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        let (spec, _, _) = receiver.await.map_err(|_| HostError::ActorStopped)??;
+        {
+            let mut store = self
+                .manifest_store
+                .lock()
+                .map_err(|_| HostError::LockPoisoned)?;
+            let mut manifest = store.manifest().clone();
+            manifest.reconcile_backend(spec.entry().clone())?;
+            store.persist(&manifest)?;
+        }
+        let mut replicas = self.replicas.write().map_err(|_| HostError::LockPoisoned)?;
+        let handle = replicas.get_mut(&key).ok_or(HostError::UnknownReplica {
+            graph_id: key.graph_id,
+            shard_id: key.shard_id,
+        })?;
+        handle.spec = spec;
+        Ok(outcome)
     }
 
     pub async fn propose(
@@ -715,7 +871,7 @@ impl DataNodeHost {
         let handle = ReplicaActorHandle::open(
             self.identity().node_id(),
             self.data_directory(),
-            self.backend_manager.as_ref(),
+            Arc::clone(&self.backend_manager),
             spec.clone(),
             self.queue_capacity,
         )

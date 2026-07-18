@@ -316,10 +316,68 @@ message GetMigrationReceiptResponse {
   bytes outcome = 3;
 }
 
+message PrepareBackendTargetRequest {
+  ShardContext context = 1;
+  bytes operation_id = 2;
+  uint64 target_generation = 3;
+  BackendProfileSpec target_profile = 4;
+}
+
+message PrepareBackendTargetResponse {
+  ReplicaStatusResponse status = 1;
+  uint64 fence_index = 2;
+  bytes target_profile_digest = 3;
+}
+
+message BeginBackendDualApplyRequest {
+  ShardContext context = 1;
+  bytes operation_id = 2;
+  uint64 source_generation = 3;
+  uint64 target_generation = 4;
+  bytes target_profile_digest = 5;
+  uint64 fence_index = 6;
+}
+
+message FinishBackendMigrationRequest {
+  ShardContext context = 1;
+  bytes operation_id = 2;
+  uint64 source_generation = 3;
+  uint64 target_generation = 4;
+  bytes target_profile_digest = 5;
+}
+
+message BackendTransitionResponse {
+  ReplicaStatusResponse status = 1;
+  bool duplicate = 2;
+}
+
+enum BackendLifecyclePhase {
+  BACKEND_LIFECYCLE_PHASE_UNSPECIFIED = 0;
+  BACKEND_LIFECYCLE_PHASE_ACTIVE = 1;
+  BACKEND_LIFECYCLE_PHASE_DUAL_APPLYING = 2;
+}
+
+message GetBackendStatusRequest { ShardContext context = 1; }
+
+message GetBackendStatusResponse {
+  ReplicaStatusResponse status = 1;
+  BackendLifecyclePhase phase = 2;
+  uint64 source_generation = 3;
+  uint64 target_generation = 4;
+  bytes target_profile_digest = 5;
+  uint64 fence_index = 6;
+  uint64 synchronized_index = 7;
+}
+
 service NodeAdminService {
   rpc EnsureReplica(EnsureReplicaRequest) returns (EnsureReplicaResponse);
   rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
   rpc ActivateReplica(ActivateReplicaRequest) returns (ActivateReplicaResponse);
   rpc DeleteReplica(DeleteReplicaRequest) returns (DeleteReplicaResponse);
   rpc GetMigrationReceipt(GetMigrationReceiptRequest) returns (GetMigrationReceiptResponse);
+  rpc PrepareBackendTarget(PrepareBackendTargetRequest) returns (PrepareBackendTargetResponse);
+  rpc BeginBackendDualApply(BeginBackendDualApplyRequest) returns (BackendTransitionResponse);
+  rpc CutoverBackend(FinishBackendMigrationRequest) returns (BackendTransitionResponse);
+  rpc AbortBackendMigration(FinishBackendMigrationRequest) returns (BackendTransitionResponse);
+  rpc GetBackendStatus(GetBackendStatusRequest) returns (GetBackendStatusResponse);
 }

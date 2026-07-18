@@ -3,7 +3,10 @@ use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 use std::sync::Arc;
 
-use adapter_registry::{AdapterOpenRequest, AdapterRegistry, HotSwapAdapter, RegistryError};
+use adapter_registry::{
+    AdapterOpenRequest, AdapterRegistry, HotSwapAdapter, MigrationError, MigrationStatus,
+    RegistryError,
+};
 use adapter_rocksdb::RocksAdapterFactory;
 use prost::Message as ProstMessage;
 use raft::eraftpb::{
@@ -14,7 +17,7 @@ use raft_command::CommandEnvelopeV1;
 use raft_logstore::{RaftLogStoreError, RocksRaftStorage};
 use slog::{Logger, o};
 
-use crate::{ReplicaMetadata, ShardRuntimeError, ShardStateMachine};
+use crate::{BackendLifecycle, ReplicaMetadata, ShardRuntimeError, ShardStateMachine};
 
 pub struct DurableRaftReplica {
     node_id: u64,
@@ -66,8 +69,15 @@ impl DurableRaftReplica {
         backend_slot: Arc<HotSwapAdapter>,
     ) -> Result<Self, DurableReplicaError> {
         let storage = RocksRaftStorage::open(raft_wal_path, voters)?;
-        let state_machine =
-            ShardStateMachine::open(backend_slot, shard_id, placement_epoch).await?;
+        let backend_generation = backend_slot.generation();
+        let state_machine = ShardStateMachine::open_with_backend_generation(
+            backend_slot,
+            shard_id,
+            placement_epoch,
+            backend_generation,
+        )
+        .await?;
+        reconcile_backend_slot(state_machine.adapter(), state_machine.metadata())?;
         let applied = state_machine.metadata().applied_index;
         let raft_state = storage.initial_state()?;
         if raft_state.hard_state.commit < applied {
@@ -281,10 +291,12 @@ impl DurableRaftReplica {
                         .await?;
                 }
                 EntryType::EntryNormal => {
-                    CommandEnvelopeV1::decode(&entry.data)?;
+                    let command = CommandEnvelopeV1::decode(&entry.data)?;
+                    self.validate_backend_transition(&command.body)?;
                     self.state_machine
                         .apply_entry(entry.term, entry.index, &entry.data)
                         .await?;
+                    self.finish_backend_transition(&command.body)?;
                 }
                 EntryType::EntryConfChangeV2 => {
                     let change = ConfChangeV2::decode(entry.data.as_ref())
@@ -313,6 +325,94 @@ impl DurableRaftReplica {
         Ok(())
     }
 
+    fn validate_backend_transition(
+        &self,
+        body: &raft_command::CommandBodyV1,
+    ) -> Result<(), DurableReplicaError> {
+        match body {
+            raft_command::CommandBodyV1::BeginBackendDualApply(begin) => {
+                match self.backend_slot().migration_status() {
+                    MigrationStatus::DualApplying {
+                        source_generation,
+                        target_generation,
+                        synchronized_index,
+                    } if source_generation == begin.source_generation
+                        && target_generation == begin.target_generation
+                        && synchronized_index >= begin.fence_index =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(DurableReplicaError::BackendSlotMismatch),
+                }
+            }
+            raft_command::CommandBodyV1::CutoverBackend(cutover) => self
+                .validate_finishing_backend_transition(
+                    cutover.source_generation,
+                    cutover.target_generation,
+                ),
+            raft_command::CommandBodyV1::AbortBackendMigration(abort) => self
+                .validate_finishing_backend_transition(
+                    abort.source_generation,
+                    abort.target_generation,
+                ),
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_finishing_backend_transition(
+        &self,
+        expected_source: u64,
+        expected_target: u64,
+    ) -> Result<(), DurableReplicaError> {
+        match self.backend_slot().migration_status() {
+            MigrationStatus::DualApplying {
+                source_generation,
+                target_generation,
+                ..
+            } if source_generation == expected_source && target_generation == expected_target => {
+                Ok(())
+            }
+            MigrationStatus::Idle { generation }
+                if generation == expected_source || generation == expected_target =>
+            {
+                Ok(())
+            }
+            _ => Err(DurableReplicaError::BackendSlotMismatch),
+        }
+    }
+
+    fn finish_backend_transition(
+        &self,
+        body: &raft_command::CommandBodyV1,
+    ) -> Result<(), DurableReplicaError> {
+        match body {
+            raft_command::CommandBodyV1::CutoverBackend(cutover) => {
+                if self.backend_slot().generation() == cutover.target_generation {
+                    return Ok(());
+                }
+                self.backend_slot().cutover()?;
+                if self.backend_slot().generation() != cutover.target_generation {
+                    return Err(DurableReplicaError::BackendSlotMismatch);
+                }
+                Ok(())
+            }
+            raft_command::CommandBodyV1::AbortBackendMigration(abort) => {
+                if matches!(
+                    self.backend_slot().migration_status(),
+                    MigrationStatus::Idle { generation } if generation == abort.source_generation
+                ) {
+                    return Ok(());
+                }
+                self.backend_slot().abort_migration()?;
+                if self.backend_slot().generation() != abort.source_generation {
+                    return Err(DurableReplicaError::BackendSlotMismatch);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn run_deferred_membership_action(&mut self) -> Result<(), DurableReplicaError> {
         if let Some(target) = self.pending_leader_transfer.take() {
             self.pending_auto_leave = false;
@@ -333,6 +433,49 @@ impl DurableRaftReplica {
             return Err(DurableReplicaError::InjectedCrashAfterWalBeforeApply);
         }
         Ok(())
+    }
+}
+
+fn reconcile_backend_slot(
+    slot: &Arc<HotSwapAdapter>,
+    metadata: ReplicaMetadata,
+) -> Result<(), DurableReplicaError> {
+    match (metadata.backend_lifecycle, slot.migration_status()) {
+        (BackendLifecycle::Active, MigrationStatus::Idle { generation })
+            if generation == metadata.backend_generation =>
+        {
+            Ok(())
+        }
+        (
+            BackendLifecycle::Active,
+            MigrationStatus::DualApplying {
+                target_generation, ..
+            },
+        ) if target_generation == metadata.backend_generation => {
+            slot.cutover()?;
+            Ok(())
+        }
+        (
+            BackendLifecycle::Active,
+            MigrationStatus::DualApplying {
+                source_generation, ..
+            },
+        ) if source_generation == metadata.backend_generation => Ok(()),
+        (
+            BackendLifecycle::DualApplying {
+                target_generation, ..
+            },
+            MigrationStatus::DualApplying {
+                source_generation,
+                target_generation: local_target,
+                ..
+            },
+        ) if source_generation == metadata.backend_generation
+            && local_target == target_generation =>
+        {
+            Ok(())
+        }
+        _ => Err(DurableReplicaError::BackendSlotMismatch),
     }
 }
 
@@ -404,6 +547,7 @@ fn discard_logger() -> Logger {
 pub enum DurableReplicaError {
     Adapter(storage_api::AdapterError),
     Registry(RegistryError),
+    BackendMigration(MigrationError),
     StateMachine(ShardRuntimeError),
     Command(raft_command::CommandCodecError),
     LogStore(RaftLogStoreError),
@@ -416,6 +560,7 @@ pub enum DurableReplicaError {
     InvalidMembership,
     JointConfigurationInProgress,
     NotLeader,
+    BackendSlotMismatch,
 }
 
 impl Display for DurableReplicaError {
@@ -423,6 +568,7 @@ impl Display for DurableReplicaError {
         match self {
             Self::Adapter(error) => write!(formatter, "Adapter error: {error}"),
             Self::Registry(error) => write!(formatter, "Adapter registry error: {error}"),
+            Self::BackendMigration(error) => write!(formatter, "backend migration error: {error}"),
             Self::StateMachine(error) => write!(formatter, "state-machine error: {error}"),
             Self::Command(error) => write!(formatter, "command error: {error}"),
             Self::LogStore(error) => write!(formatter, "Raft WAL error: {error}"),
@@ -452,6 +598,9 @@ impl Display for DurableReplicaError {
                 formatter.write_str("a joint Raft configuration is already in progress")
             }
             Self::NotLeader => formatter.write_str("Replica is not the Raft leader"),
+            Self::BackendSlotMismatch => {
+                formatter.write_str("local backend slot does not match the replicated lifecycle")
+            }
         }
     }
 }
@@ -461,6 +610,12 @@ impl Error for DurableReplicaError {}
 impl From<RegistryError> for DurableReplicaError {
     fn from(error: RegistryError) -> Self {
         Self::Registry(error)
+    }
+}
+
+impl From<MigrationError> for DurableReplicaError {
+    fn from(error: MigrationError) -> Self {
+        Self::BackendMigration(error)
     }
 }
 

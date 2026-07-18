@@ -15,8 +15,8 @@ mod service;
 pub use config::{ConfigError, NodeConfig, TlsFiles, TransportSecurity};
 pub use file_config::{DataNodeRuntimeConfig, FileConfigError};
 pub use host::{
-    DataNodeHost, EnsureReplicaOutcome, HostError, ProposalOutcome, ReplicaKey, ReplicaSpec,
-    ReplicaStatus,
+    BackendRuntimeStatus, DataNodeHost, EnsureReplicaOutcome, HostError, ProposalOutcome,
+    ReplicaKey, ReplicaSpec, ReplicaStatus,
 };
 pub use identity::{NodeIdentity, NodeIdentityStore};
 pub use manifest::{

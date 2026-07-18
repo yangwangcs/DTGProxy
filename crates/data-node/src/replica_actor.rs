@@ -1,13 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use adapter_registry::MigrationStatus;
 use raft::eraftpb::Message;
 use shard_runtime::DurableRaftReplica;
-use storage_api::{KeySpan, KeyValue, LogicalKey, StorageAdapter};
+use storage_api::{AdapterRequirement, KeySpan, KeyValue, LogicalKey, StorageAdapter};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::{BackendManager, HostError, ProposalOutcome, ReplicaSpec, ReplicaStatus};
+use crate::{
+    BackendManager, BackendProfile, BackendSlotState, HostError, ProposalOutcome, ReplicaSpec,
+    ReplicaStatus,
+};
 
 const MAX_READY_ROUNDS: usize = 256;
 
@@ -22,7 +26,7 @@ impl ReplicaActorHandle {
     pub(crate) async fn open(
         node_id: u64,
         data_directory: &Path,
-        backend_manager: &BackendManager,
+        backend_manager: Arc<BackendManager>,
         spec: ReplicaSpec,
         queue_capacity: usize,
     ) -> Result<Self, HostError> {
@@ -42,13 +46,24 @@ impl ReplicaActorHandle {
         )
         .await
         .map_err(HostError::from_durable)?;
+        let spec = spec.reconcile_backend(
+            replica.metadata(),
+            replica.backend_slot().migration_status(),
+        )?;
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (outbound_sender, outbound) = mpsc::channel(queue_capacity);
         let actor_spec = spec.clone();
-        let join =
-            tokio::spawn(
-                async move { run_actor(replica, actor_spec, receiver, outbound_sender).await },
-            );
+        let join = tokio::spawn(async move {
+            run_actor(
+                replica,
+                actor_spec,
+                replica_directory,
+                backend_manager,
+                receiver,
+                outbound_sender,
+            )
+            .await
+        });
         Ok(Self {
             spec,
             sender,
@@ -128,6 +143,7 @@ pub(crate) enum ActorCommand {
     },
     Tick,
     Status(oneshot::Sender<Result<ReplicaStatus, HostError>>),
+    BackendState(oneshot::Sender<Result<(ReplicaSpec, ReplicaStatus, MigrationStatus), HostError>>),
     MultiGet {
         keys: Vec<LogicalKey>,
         response: oneshot::Sender<Result<Vec<Option<Vec<u8>>>, HostError>>,
@@ -139,6 +155,12 @@ pub(crate) enum ActorCommand {
     CreateSnapshot {
         destination: PathBuf,
         response: oneshot::Sender<Result<replica_snapshot::SnapshotManifestV1, HostError>>,
+    },
+    PrepareBackendTarget {
+        placement_epoch: u64,
+        target_generation: u64,
+        target_profile: BackendProfile,
+        response: oneshot::Sender<Result<(ReplicaSpec, ReplicaStatus), HostError>>,
     },
     ChangeMembership {
         operation_id: u128,
@@ -162,14 +184,35 @@ pub(crate) enum ActorCommand {
 async fn run_actor(
     mut replica: DurableRaftReplica,
     mut spec: ReplicaSpec,
+    replica_directory: PathBuf,
+    backend_manager: Arc<BackendManager>,
     mut receiver: mpsc::Receiver<ActorCommand>,
     outbound: mpsc::Sender<Message>,
 ) -> Result<(), HostError> {
     while let Some(command) = receiver.recv().await {
         match command {
+            ActorCommand::PrepareBackendTarget {
+                placement_epoch,
+                target_generation,
+                target_profile,
+                response,
+            } => {
+                let result = prepare_backend_target(
+                    &mut replica,
+                    &mut spec,
+                    &replica_directory,
+                    backend_manager.as_ref(),
+                    placement_epoch,
+                    target_generation,
+                    target_profile,
+                )
+                .await
+                .map(|()| (spec.clone(), status(&replica, &spec)));
+                let _ = response.send(result);
+            }
             ActorCommand::Campaign(response) => {
                 let result = match replica.campaign() {
-                    Ok(()) => drive_ready(&mut replica, &outbound)
+                    Ok(()) => drive_ready(&mut replica, &outbound, &mut spec)
                         .await
                         .map(|()| status(&replica, &spec)),
                     Err(error) => Err(HostError::from_durable(error)),
@@ -188,7 +231,7 @@ async fn run_actor(
                 {
                     Ok(true) => Ok(ProposalOutcome::new(status(&replica, &spec), true)),
                     Ok(false) => match replica.propose(request_id, command.clone()) {
-                        Ok(()) => match drive_ready(&mut replica, &outbound).await {
+                        Ok(()) => match drive_ready(&mut replica, &outbound, &mut spec).await {
                             Ok(()) => match replica
                                 .state_machine()
                                 .request_replay(request_id, &command)
@@ -226,7 +269,7 @@ async fn run_actor(
             }
             ActorCommand::Step { message, response } => {
                 let result = match replica.step(*message) {
-                    Ok(()) => drive_ready(&mut replica, &outbound)
+                    Ok(()) => drive_ready(&mut replica, &outbound, &mut spec)
                         .await
                         .map(|()| status(&replica, &spec)),
                     Err(error) => Err(HostError::from_durable(error)),
@@ -235,10 +278,17 @@ async fn run_actor(
             }
             ActorCommand::Tick => {
                 replica.tick();
-                drive_ready(&mut replica, &outbound).await?;
+                drive_ready(&mut replica, &outbound, &mut spec).await?;
             }
             ActorCommand::Status(response) => {
                 let _ = response.send(Ok(status(&replica, &spec)));
+            }
+            ActorCommand::BackendState(response) => {
+                let _ = response.send(Ok((
+                    spec.clone(),
+                    status(&replica, &spec),
+                    replica.backend_slot().migration_status(),
+                )));
             }
             ActorCommand::MultiGet { keys, response } => {
                 let result = replica
@@ -301,20 +351,22 @@ async fn run_actor(
                             })
                         } else {
                             match replica.leave_joint_membership(operation_id) {
-                                Ok(()) => match drive_ready(&mut replica, &outbound).await {
-                                    Ok(()) => match replica.membership() {
-                                        Ok(final_state)
-                                            if final_state.voters_outgoing.is_empty()
-                                                && final_state.voters == new_voters
-                                                && final_state.learners == learners =>
-                                        {
-                                            Ok((status(&replica, &spec), false))
-                                        }
-                                        Ok(_) => Err(HostError::MembershipPending),
-                                        Err(error) => Err(HostError::from_durable(error)),
-                                    },
-                                    Err(error) => Err(error),
-                                },
+                                Ok(()) => {
+                                    match drive_ready(&mut replica, &outbound, &mut spec).await {
+                                        Ok(()) => match replica.membership() {
+                                            Ok(final_state)
+                                                if final_state.voters_outgoing.is_empty()
+                                                    && final_state.voters == new_voters
+                                                    && final_state.learners == learners =>
+                                            {
+                                                Ok((status(&replica, &spec), false))
+                                            }
+                                            Ok(_) => Err(HostError::MembershipPending),
+                                            Err(error) => Err(HostError::from_durable(error)),
+                                        },
+                                        Err(error) => Err(error),
+                                    }
+                                }
                                 Err(error) => Err(HostError::from_durable(error)),
                             }
                         }
@@ -324,7 +376,7 @@ async fn run_actor(
                     }
                     Ok(_) => {
                         match replica.propose_membership(operation_id, &new_voters, &learners) {
-                            Ok(_) => match drive_ready(&mut replica, &outbound).await {
+                            Ok(_) => match drive_ready(&mut replica, &outbound, &mut spec).await {
                                 Ok(()) => match replica.membership() {
                                     Ok(current)
                                         if current.voters == new_voters
@@ -381,7 +433,7 @@ async fn run_actor(
                 let _ = response.send(Ok(status(&replica, &spec)));
             }
             ActorCommand::Shutdown(response) => {
-                let result = drive_ready(&mut replica, &outbound).await;
+                let result = drive_ready(&mut replica, &outbound, &mut spec).await;
                 let _ = response.send(result);
                 return Ok(());
             }
@@ -393,9 +445,14 @@ async fn run_actor(
 async fn drive_ready(
     replica: &mut DurableRaftReplica,
     outbound: &mpsc::Sender<Message>,
+    spec: &mut ReplicaSpec,
 ) -> Result<(), HostError> {
     for _ in 0..MAX_READY_ROUNDS {
         if !replica.has_ready() {
+            *spec = spec.reconcile_backend(
+                replica.metadata(),
+                replica.backend_slot().migration_status(),
+            )?;
             return Ok(());
         }
         let messages = replica
@@ -410,6 +467,76 @@ async fn drive_ready(
         }
     }
     Err(HostError::ReadyLoopLimit)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_backend_target(
+    replica: &mut DurableRaftReplica,
+    spec: &mut ReplicaSpec,
+    replica_directory: &Path,
+    backend_manager: &BackendManager,
+    placement_epoch: u64,
+    target_generation: u64,
+    target_profile: BackendProfile,
+) -> Result<(), HostError> {
+    if placement_epoch != spec.placement_epoch() {
+        return Err(HostError::StaleEpoch {
+            expected: spec.placement_epoch(),
+            actual: placement_epoch,
+        });
+    }
+    let source_generation = replica.metadata().backend_generation;
+    if target_generation != source_generation.checked_add(1).unwrap_or(0) {
+        return Err(HostError::Adapter(
+            "target backend generation is not consecutive".into(),
+        ));
+    }
+    if let BackendSlotState::DualApplying {
+        source_generation: local_source,
+        target_generation: local_target,
+        target,
+        ..
+    } = spec.backend_slot()
+        && *local_source == source_generation
+        && *local_target == target_generation
+        && target.digest() == target_profile.digest()
+    {
+        return Ok(());
+    }
+    if !matches!(
+        replica.metadata().backend_lifecycle,
+        shard_runtime::BackendLifecycle::Active
+    ) || !matches!(
+        replica.backend_slot().migration_status(),
+        MigrationStatus::Idle { generation } if generation == source_generation
+    ) {
+        return Err(HostError::Adapter(
+            "backend slot is not ready to prepare a target".into(),
+        ));
+    }
+    let source_profile = spec.backend_slot().active_profile().clone();
+    let (target, fence_index) = backend_manager
+        .restore_target(
+            replica_directory,
+            replica.backend_slot().active_adapter(),
+            &target_profile,
+        )
+        .await
+        .map_err(|error| HostError::Adapter(error.to_string()))?;
+    replica
+        .backend_slot()
+        .start_migration(target, AdapterRequirement::HotPluggableReplica)
+        .map_err(|error| HostError::Adapter(error.to_string()))?;
+    let slot = BackendSlotState::dual_applying(
+        source_generation,
+        source_profile,
+        target_generation,
+        target_profile,
+        fence_index,
+        fence_index,
+    )?;
+    *spec = ReplicaSpec::from_entry(spec.entry().clone().with_backend_slot(slot)?);
+    Ok(())
 }
 
 fn status(replica: &DurableRaftReplica, spec: &ReplicaSpec) -> ReplicaStatus {

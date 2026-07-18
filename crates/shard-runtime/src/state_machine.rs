@@ -10,11 +10,11 @@ use temporal_types::TransactionTime;
 
 use crate::ShardRuntimeError;
 use crate::metadata::{
-    ReplicaMetadata, adapter_applied_ts_key, closed_ts_key, decode_entry_digest,
-    decode_request_digest, encode_entry_digest, encode_position, encode_request_digest,
-    encode_timestamp, encode_unresolved_intent, entry_digest_key, is_reserved_metadata_key,
-    load_metadata, load_unresolved_intents, position_key, request_digest_key, resolved_ts_key,
-    unresolved_intent_key,
+    BackendLifecycle, ReplicaMetadata, adapter_applied_ts_key, backend_state_key, closed_ts_key,
+    decode_entry_digest, decode_request_digest, encode_backend_state, encode_entry_digest,
+    encode_position, encode_request_digest, encode_timestamp, encode_unresolved_intent,
+    entry_digest_key, is_reserved_metadata_key, load_metadata, load_unresolved_intents,
+    position_key, request_digest_key, resolved_ts_key, unresolved_intent_key,
 };
 use txn_protocol::{HomeDecisionEngine, ParticipantEngine, TransactionId};
 
@@ -34,7 +34,17 @@ where
         shard_id: u32,
         placement_epoch: u64,
     ) -> Result<Self, ShardRuntimeError> {
-        let metadata = load_metadata(&adapter, shard_id, placement_epoch).await?;
+        Self::open_with_backend_generation(adapter, shard_id, placement_epoch, 1).await
+    }
+
+    pub async fn open_with_backend_generation(
+        adapter: A,
+        shard_id: u32,
+        placement_epoch: u64,
+        backend_generation: u64,
+    ) -> Result<Self, ShardRuntimeError> {
+        let metadata =
+            load_metadata(&adapter, shard_id, placement_epoch, backend_generation).await?;
         let unresolved = UnresolvedIntents::new(load_unresolved_intents(&adapter).await?);
         if metadata.resolved_ts != resolved_timestamp(metadata.closed_ts, unresolved.oldest()) {
             return Err(ShardRuntimeError::CorruptMetadata {
@@ -96,6 +106,7 @@ where
                 &self.adapter,
                 self.metadata.shard_id,
                 self.metadata.placement_epoch,
+                self.metadata.backend_generation,
             )
             .await?;
             self.unresolved = UnresolvedIntents::new(load_unresolved_intents(&self.adapter).await?);
@@ -180,6 +191,15 @@ where
             encode_position(next_metadata),
         )?;
         append_watermark_mutations(&mut mutations, self.metadata, next_metadata)?;
+        if self.metadata.backend_generation != next_metadata.backend_generation
+            || self.metadata.backend_lifecycle != next_metadata.backend_lifecycle
+        {
+            append_meta_mutation(
+                &mut mutations,
+                backend_state_key(),
+                encode_backend_state(next_metadata),
+            )?;
+        }
         let batch = CommittedMutationBatch {
             shard_id: self.metadata.shard_id,
             log_index: index,
@@ -225,6 +245,7 @@ where
                 &self.adapter,
                 self.metadata.shard_id,
                 self.metadata.placement_epoch,
+                self.metadata.backend_generation,
             )
             .await?;
             self.unresolved = UnresolvedIntents::new(load_unresolved_intents(&self.adapter).await?);
@@ -562,6 +583,87 @@ where
                         placement_epoch: target_epoch,
                         last_term: term,
                         applied_index: index,
+                        ..self.metadata
+                    },
+                    mutations: Vec::new(),
+                    unresolved_change: UnresolvedChange::None,
+                })
+            }
+            CommandBodyV1::BeginBackendDualApply(begin) => {
+                if self.metadata.backend_generation != begin.source_generation
+                    || begin.target_generation
+                        != begin.source_generation.checked_add(1).unwrap_or(0)
+                    || begin.target_profile_digest == [0; 32]
+                    || begin.fence_index > self.metadata.applied_index
+                    || !matches!(self.metadata.backend_lifecycle, BackendLifecycle::Active)
+                {
+                    return Err(ShardRuntimeError::BackendLifecycleConflict);
+                }
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        backend_lifecycle: BackendLifecycle::DualApplying {
+                            target_generation: begin.target_generation,
+                            target_profile_digest: begin.target_profile_digest,
+                            fence_index: begin.fence_index,
+                        },
+                        ..self.metadata
+                    },
+                    mutations: Vec::new(),
+                    unresolved_change: UnresolvedChange::None,
+                })
+            }
+            CommandBodyV1::CutoverBackend(cutover) => {
+                let expected = BackendLifecycle::DualApplying {
+                    target_generation: cutover.target_generation,
+                    target_profile_digest: cutover.target_profile_digest,
+                    fence_index: match self.metadata.backend_lifecycle {
+                        BackendLifecycle::DualApplying { fence_index, .. } => fence_index,
+                        BackendLifecycle::Active => 0,
+                    },
+                };
+                if self.metadata.backend_generation != cutover.source_generation
+                    || cutover.target_generation
+                        != cutover.source_generation.checked_add(1).unwrap_or(0)
+                    || self.metadata.backend_lifecycle != expected
+                {
+                    return Err(ShardRuntimeError::BackendLifecycleConflict);
+                }
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        backend_generation: cutover.target_generation,
+                        backend_lifecycle: BackendLifecycle::Active,
+                        ..self.metadata
+                    },
+                    mutations: Vec::new(),
+                    unresolved_change: UnresolvedChange::None,
+                })
+            }
+            CommandBodyV1::AbortBackendMigration(abort) => {
+                let matches_target = matches!(
+                    self.metadata.backend_lifecycle,
+                    BackendLifecycle::DualApplying {
+                        target_generation,
+                        target_profile_digest,
+                        ..
+                    } if target_generation == abort.target_generation
+                        && target_profile_digest == abort.target_profile_digest
+                );
+                if self.metadata.backend_generation != abort.source_generation
+                    || abort.target_generation
+                        != abort.source_generation.checked_add(1).unwrap_or(0)
+                    || !matches_target
+                {
+                    return Err(ShardRuntimeError::BackendLifecycleConflict);
+                }
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        backend_lifecycle: BackendLifecycle::Active,
                         ..self.metadata
                     },
                     mutations: Vec::new(),

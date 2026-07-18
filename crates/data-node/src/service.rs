@@ -4,14 +4,18 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use adapter_registry::MigrationStatus;
 use cluster_protocol::proto::node_admin_service_server::NodeAdminService;
 use cluster_protocol::proto::shard_service_server::ShardService;
 use cluster_protocol::proto::{
-    ActivateReplicaRequest, ActivateReplicaResponse, BackendProfileSpec, ChangeMembershipRequest,
+    ActivateReplicaRequest, ActivateReplicaResponse, BackendLifecyclePhase, BackendProfileSpec,
+    BackendTransitionResponse, BeginBackendDualApplyRequest, ChangeMembershipRequest,
     ChangeMembershipResponse, DeleteReplicaRequest, DeleteReplicaResponse, EnsureReplicaRequest,
     EnsureReplicaResponse, ExecuteRequest, ExecuteResponse, ExportSnapshotRequest,
-    GetMigrationReceiptRequest, GetMigrationReceiptResponse, InstallSnapshotResponse, ReadRequest,
-    ReadResponse, ReplicaBootstrapProfile, ReplicaRole as WireReplicaRole, ReplicaStatusRequest,
+    FinishBackendMigrationRequest, GetBackendStatusRequest, GetBackendStatusResponse,
+    GetMigrationReceiptRequest, GetMigrationReceiptResponse, InstallSnapshotResponse,
+    PrepareBackendTargetRequest, PrepareBackendTargetResponse, ReadRequest, ReadResponse,
+    ReplicaBootstrapProfile, ReplicaRole as WireReplicaRole, ReplicaStatusRequest,
     ReplicaStatusResponse, ScanBatch, ScanRequest, SnapshotChunk,
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError, ShardRequestContext};
@@ -24,8 +28,9 @@ use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    BackendProfile, BackendSlotState, ChunkAppendOutcome, DataNodeHost, EnsureReplicaOutcome,
-    HostError, MigrationChunk, ReplicaKey, ReplicaRole, ReplicaSpec, ReplicaStatus,
+    BackendProfile, BackendRuntimeStatus, BackendSlotState, ChunkAppendOutcome, DataNodeHost,
+    EnsureReplicaOutcome, HostError, MigrationChunk, ReplicaKey, ReplicaRole, ReplicaSpec,
+    ReplicaStatus,
 };
 
 const READ_PLAN_MAGIC: [u8; 4] = *b"DTRK";
@@ -65,6 +70,7 @@ pub enum DataOperation {
     ActivateReplica,
     DeleteReplica,
     MigrationReceipt,
+    BackendManagement,
 }
 
 pub trait RequestAuthorizer: Send + Sync + 'static {
@@ -164,6 +170,47 @@ impl DataNodeGrpcService {
             return Err(not_leader_status(status.leader_id()));
         }
         Ok(status)
+    }
+
+    async fn finish_backend_migration(
+        &self,
+        request: FinishBackendMigrationRequest,
+        cutover: bool,
+    ) -> Result<Response<BackendTransitionResponse>, Status> {
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::BackendManagement)?;
+        validate_operation_id(&request.operation_id, request_id)?;
+        self.require_leader(key).await?;
+        let digest = profile_digest(&request.target_profile_digest)?;
+        let body = if cutover {
+            raft_command::CommandBodyV1::CutoverBackend(raft_command::CutoverBackendV1 {
+                source_generation: request.source_generation,
+                target_generation: request.target_generation,
+                target_profile_digest: digest,
+            })
+        } else {
+            raft_command::CommandBodyV1::AbortBackendMigration(
+                raft_command::AbortBackendMigrationV1 {
+                    source_generation: request.source_generation,
+                    target_generation: request.target_generation,
+                    target_profile_digest: digest,
+                },
+            )
+        };
+        let command = raft_command::CommandEnvelopeV1::new(
+            key.shard_id(),
+            context.placement_epoch(),
+            request_id,
+            body,
+        )
+        .encode()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        backend_transition_response(
+            self.host
+                .propose_backend_transition(key, context.placement_epoch(), request_id, command)
+                .await
+                .map_err(host_status)?,
+        )
     }
 }
 
@@ -741,6 +788,109 @@ impl NodeAdminService for DataNodeGrpcService {
             },
         }))
     }
+
+    async fn prepare_backend_target(
+        &self,
+        request: Request<PrepareBackendTargetRequest>,
+    ) -> Result<Response<PrepareBackendTargetResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, _) = self.validate(request.context, DataOperation::BackendManagement)?;
+        validate_identifier(&request.operation_id, "operation ID")?;
+        let target = decode_backend_profile_spec(
+            request
+                .target_profile
+                .ok_or_else(|| Status::invalid_argument("missing target backend profile"))?,
+        )?;
+        let status = self
+            .host
+            .prepare_backend_target(
+                key,
+                context.placement_epoch(),
+                request.target_generation,
+                target.clone(),
+            )
+            .await
+            .map_err(host_status)?;
+        let runtime = self
+            .host
+            .backend_runtime_status(key)
+            .await
+            .map_err(host_status)?;
+        let fence_index = backend_fence(&runtime)?;
+        Ok(Response::new(PrepareBackendTargetResponse {
+            status: Some(status_response(status)),
+            fence_index,
+            target_profile_digest: target.digest().to_vec(),
+        }))
+    }
+
+    async fn begin_backend_dual_apply(
+        &self,
+        request: Request<BeginBackendDualApplyRequest>,
+    ) -> Result<Response<BackendTransitionResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::BackendManagement)?;
+        validate_operation_id(&request.operation_id, request_id)?;
+        self.require_leader(key).await?;
+        let digest = profile_digest(&request.target_profile_digest)?;
+        let command = raft_command::CommandEnvelopeV1::new(
+            key.shard_id(),
+            context.placement_epoch(),
+            request_id,
+            raft_command::CommandBodyV1::BeginBackendDualApply(
+                raft_command::BeginBackendDualApplyV1 {
+                    source_generation: request.source_generation,
+                    target_generation: request.target_generation,
+                    target_profile_digest: digest,
+                    fence_index: request.fence_index,
+                },
+            ),
+        )
+        .encode()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        backend_transition_response(
+            self.host
+                .propose_backend_transition(key, context.placement_epoch(), request_id, command)
+                .await
+                .map_err(host_status)?,
+        )
+    }
+
+    async fn cutover_backend(
+        &self,
+        request: Request<FinishBackendMigrationRequest>,
+    ) -> Result<Response<BackendTransitionResponse>, Status> {
+        self.finish_backend_migration(request.into_inner(), true)
+            .await
+    }
+
+    async fn abort_backend_migration(
+        &self,
+        request: Request<FinishBackendMigrationRequest>,
+    ) -> Result<Response<BackendTransitionResponse>, Status> {
+        self.finish_backend_migration(request.into_inner(), false)
+            .await
+    }
+
+    async fn get_backend_status(
+        &self,
+        request: Request<GetBackendStatusRequest>,
+    ) -> Result<Response<GetBackendStatusResponse>, Status> {
+        let (context, key, _) = self.validate(
+            request.into_inner().context,
+            DataOperation::BackendManagement,
+        )?;
+        let runtime = self
+            .host
+            .backend_runtime_status(key)
+            .await
+            .map_err(host_status)?;
+        if runtime.replica().placement_epoch() != context.placement_epoch() {
+            return Err(stale_epoch_status(runtime.replica().placement_epoch()));
+        }
+        Ok(Response::new(backend_status_response(runtime)))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -954,6 +1104,86 @@ impl Display for ReplicaProfileError {
 }
 
 impl Error for ReplicaProfileError {}
+
+fn decode_backend_profile_spec(spec: BackendProfileSpec) -> Result<BackendProfile, Status> {
+    BackendProfile::new(
+        spec.provider,
+        spec.instance_id,
+        spec.public_parameters.into_iter().collect(),
+        spec.credential_refs.into_iter().collect(),
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn validate_operation_id(encoded: &[u8], request_id: u128) -> Result<(), Status> {
+    validate_identifier(encoded, "operation ID")?;
+    if encoded != request_id.to_be_bytes() {
+        return Err(Status::invalid_argument(
+            "operation ID differs from request ID",
+        ));
+    }
+    Ok(())
+}
+
+fn profile_digest(encoded: &[u8]) -> Result<[u8; 32], Status> {
+    encoded
+        .try_into()
+        .map_err(|_| Status::invalid_argument("target profile digest must contain 32 bytes"))
+}
+
+fn backend_fence(runtime: &BackendRuntimeStatus) -> Result<u64, Status> {
+    match runtime.slot() {
+        BackendSlotState::DualApplying { fence_index, .. } => Ok(*fence_index),
+        BackendSlotState::Active { .. } => Err(Status::failed_precondition(
+            "backend target has not entered local dual-apply preparation",
+        )),
+    }
+}
+
+fn backend_transition_response(
+    outcome: crate::ProposalOutcome,
+) -> Result<Response<BackendTransitionResponse>, Status> {
+    Ok(Response::new(BackendTransitionResponse {
+        status: Some(status_response(outcome.status())),
+        duplicate: outcome.duplicate(),
+    }))
+}
+
+fn backend_status_response(runtime: BackendRuntimeStatus) -> GetBackendStatusResponse {
+    let (phase, source_generation, target_generation, digest, fence_index) = match runtime.slot() {
+        BackendSlotState::Active { generation, .. } => {
+            (BackendLifecyclePhase::Active, *generation, 0, Vec::new(), 0)
+        }
+        BackendSlotState::DualApplying {
+            source_generation,
+            target_generation,
+            target,
+            fence_index,
+            ..
+        } => (
+            BackendLifecyclePhase::DualApplying,
+            *source_generation,
+            *target_generation,
+            target.digest().to_vec(),
+            *fence_index,
+        ),
+    };
+    let synchronized_index = match runtime.local() {
+        MigrationStatus::Idle { .. } => runtime.replica().applied_index(),
+        MigrationStatus::DualApplying {
+            synchronized_index, ..
+        } => synchronized_index,
+    };
+    GetBackendStatusResponse {
+        status: Some(status_response(runtime.replica())),
+        phase: phase.into(),
+        source_generation,
+        target_generation,
+        target_profile_digest: digest,
+        fence_index,
+        synchronized_index,
+    }
+}
 
 pub fn encode_key_read_plan(keys: &[LogicalKey]) -> Result<Vec<u8>, ReadCodecError> {
     if keys.is_empty() || keys.len() > MAX_READ_KEYS {
