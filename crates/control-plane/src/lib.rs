@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod backend_migration;
 mod migration;
 
+pub use backend_migration::{BackendMigrationRecord, BackendMigrationState, BackendReplicaReceipt};
 pub use migration::{MigrationError, MigrationProgress, MigrationRecord, MigrationState};
 
 use std::collections::BTreeMap;
@@ -21,12 +23,14 @@ const LOG_FORMAT_VERSION: u16 = 1;
 const LEGACY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const MIGRATION_SNAPSHOT_FORMAT_VERSION: u16 = 2;
 const LINEAGE_SNAPSHOT_FORMAT_VERSION: u16 = 3;
-const SNAPSHOT_FORMAT_VERSION: u16 = 4;
+const RETENTION_SNAPSHOT_FORMAT_VERSION: u16 = 4;
+const SNAPSHOT_FORMAT_VERSION: u16 = 5;
 const CHECKSUM_BYTES: usize = 4;
 const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GRAPHS: usize = 65_536;
 const MAX_MIGRATIONS: usize = 1_048_576;
+const MAX_BACKEND_MIGRATIONS: usize = 65_536;
 const MAX_RETENTION_PINS: usize = 1_048_576;
 const MAX_PLACEMENTS: usize = 65_536;
 const MAX_VOTERS: usize = 1_024;
@@ -328,6 +332,12 @@ impl BackendProfile {
     pub const fn generation(&self) -> u64 {
         self.generation
     }
+
+    pub fn digest(&self) -> Result<[u8; 32], CatalogError> {
+        let mut bytes = Vec::new();
+        encode_profile(&mut bytes, self)?;
+        Ok(*blake3::hash(&bytes).as_bytes())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -434,6 +444,21 @@ pub enum CatalogCommandBody {
     AcquireRetentionPin(RetentionPin),
     ReleaseRetentionPin {
         pin_id: u128,
+    },
+    CreateBackendMigration(BackendMigrationRecord),
+    AdvanceBackendMigration {
+        migration_id: u128,
+        expected_state_revision: u64,
+        next_state: BackendMigrationState,
+        owner_term: u64,
+        updated_at_unix_ms: u64,
+        receipts: Vec<BackendReplicaReceipt>,
+    },
+    PublishBackendMigration {
+        migration_id: u128,
+        expected_state_revision: u64,
+        owner_term: u64,
+        updated_at_unix_ms: u64,
     },
 }
 
@@ -624,6 +649,67 @@ impl CatalogCommand {
     }
 
     #[must_use]
+    pub fn create_backend_migration(
+        command_id: u128,
+        expected_revision: u64,
+        migration: BackendMigrationRecord,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::CreateBackendMigration(migration),
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_backend_migration(
+        command_id: u128,
+        expected_revision: u64,
+        migration_id: u128,
+        expected_state_revision: u64,
+        next_state: BackendMigrationState,
+        owner_term: u64,
+        updated_at_unix_ms: u64,
+        receipts: Vec<BackendReplicaReceipt>,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::AdvanceBackendMigration {
+                migration_id,
+                expected_state_revision,
+                next_state,
+                owner_term,
+                updated_at_unix_ms,
+                receipts,
+            },
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_backend_migration(
+        command_id: u128,
+        expected_revision: u64,
+        migration_id: u128,
+        expected_state_revision: u64,
+        owner_term: u64,
+        updated_at_unix_ms: u64,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::PublishBackendMigration {
+                migration_id,
+                expected_state_revision,
+                owner_term,
+                updated_at_unix_ms,
+            },
+        )
+    }
+
+    #[must_use]
     pub const fn command_id(&self) -> u128 {
         self.command_id
     }
@@ -711,6 +797,8 @@ pub struct CatalogState {
     active_migrations: BTreeMap<(u64, u32), u128>,
     lineages: BTreeMap<(u64, u32, u64), ShardLineage>,
     retention_pins: BTreeMap<u128, RetentionPin>,
+    backend_migrations: BTreeMap<u128, BackendMigrationRecord>,
+    active_backend_migrations: BTreeMap<u64, u128>,
     applied_commands: BTreeMap<u128, AppliedCommand>,
 }
 
@@ -724,6 +812,8 @@ impl CatalogState {
             active_migrations: BTreeMap::new(),
             lineages: BTreeMap::new(),
             retention_pins: BTreeMap::new(),
+            backend_migrations: BTreeMap::new(),
+            active_backend_migrations: BTreeMap::new(),
             applied_commands: BTreeMap::new(),
         }
     }
@@ -778,6 +868,23 @@ impl CatalogState {
     #[must_use]
     pub const fn retention_pins(&self) -> &BTreeMap<u128, RetentionPin> {
         &self.retention_pins
+    }
+
+    #[must_use]
+    pub fn backend_migration(&self, migration_id: u128) -> Option<&BackendMigrationRecord> {
+        self.backend_migrations.get(&migration_id)
+    }
+
+    #[must_use]
+    pub const fn backend_migrations(&self) -> &BTreeMap<u128, BackendMigrationRecord> {
+        &self.backend_migrations
+    }
+
+    #[must_use]
+    pub fn active_backend_migration(&self, graph_id: u64) -> Option<&BackendMigrationRecord> {
+        self.active_backend_migrations
+            .get(&graph_id)
+            .and_then(|migration_id| self.backend_migrations.get(migration_id))
     }
 
     #[must_use]
@@ -867,6 +974,9 @@ impl CatalogState {
                 expected_epoch,
                 topology,
             } => {
+                if self.active_backend_migrations.contains_key(&graph_id) {
+                    return Err(CatalogError::BackendMigrationTopologyConflict { graph_id });
+                }
                 let graph = self.graph_mut(graph_id)?;
                 if graph.topology.epoch != expected_epoch {
                     return Err(CatalogError::StaleTopologyEpoch {
@@ -923,6 +1033,9 @@ impl CatalogState {
                 expected_generation,
                 profile,
             } => {
+                if self.active_backend_migrations.contains_key(&graph_id) {
+                    return Err(CatalogError::ActiveBackendMigrationConflict { graph_id });
+                }
                 let graph = self.graph_mut(graph_id)?;
                 if graph.backend.generation != expected_generation {
                     return Err(CatalogError::StaleBackendGeneration {
@@ -944,6 +1057,14 @@ impl CatalogState {
                 graph.backend = profile;
             }
             CatalogCommandBody::CreateMigration(migration) => {
+                if self
+                    .active_backend_migrations
+                    .contains_key(&migration.graph_id)
+                {
+                    return Err(CatalogError::BackendMigrationTopologyConflict {
+                        graph_id: migration.graph_id,
+                    });
+                }
                 let graph =
                     self.graphs
                         .get(&migration.graph_id)
@@ -1026,6 +1147,14 @@ impl CatalogState {
                     .get(&migration_id)
                     .ok_or(MigrationError::UnknownMigration { migration_id })?
                     .clone();
+                if self
+                    .active_backend_migrations
+                    .contains_key(&migration.graph_id)
+                {
+                    return Err(CatalogError::BackendMigrationTopologyConflict {
+                        graph_id: migration.graph_id,
+                    });
+                }
                 if migration.state != MigrationState::Committing {
                     return Err(MigrationError::IllegalTransition {
                         from: migration.state,
@@ -1130,6 +1259,123 @@ impl CatalogState {
                     return Err(CatalogError::InvalidRetentionPin);
                 }
                 self.retention_pins.remove(&pin_id);
+            }
+            CatalogCommandBody::CreateBackendMigration(migration) => {
+                let graph =
+                    self.graphs
+                        .get(&migration.graph_id())
+                        .ok_or(CatalogError::UnknownGraph {
+                            graph_id: migration.graph_id(),
+                        })?;
+                if graph.backend() != migration.source() {
+                    return Err(CatalogError::StaleBackendGeneration {
+                        graph_id: migration.graph_id(),
+                        expected: graph.backend().generation(),
+                        actual: migration.source().generation(),
+                    });
+                }
+                if self
+                    .active_backend_migrations
+                    .contains_key(&migration.graph_id())
+                {
+                    return Err(CatalogError::ActiveBackendMigrationConflict {
+                        graph_id: migration.graph_id(),
+                    });
+                }
+                if self
+                    .active_migrations
+                    .keys()
+                    .any(|(graph_id, _)| *graph_id == migration.graph_id())
+                {
+                    return Err(CatalogError::BackendMigrationTopologyConflict {
+                        graph_id: migration.graph_id(),
+                    });
+                }
+                if self
+                    .backend_migrations
+                    .contains_key(&migration.migration_id())
+                {
+                    return Err(CatalogError::InvalidBackendMigration);
+                }
+                self.active_backend_migrations
+                    .insert(migration.graph_id(), migration.migration_id());
+                self.backend_migrations
+                    .insert(migration.migration_id(), migration);
+            }
+            CatalogCommandBody::AdvanceBackendMigration {
+                migration_id,
+                expected_state_revision,
+                next_state,
+                owner_term,
+                updated_at_unix_ms,
+                receipts,
+            } => {
+                let graph_id = self
+                    .backend_migrations
+                    .get(&migration_id)
+                    .ok_or(CatalogError::UnknownBackendMigration { migration_id })?
+                    .graph_id();
+                let placements = self
+                    .graphs
+                    .get(&graph_id)
+                    .ok_or(CatalogError::UnknownGraph { graph_id })?
+                    .topology()
+                    .placements()
+                    .to_vec();
+                let migration = self
+                    .backend_migrations
+                    .get_mut(&migration_id)
+                    .expect("validated backend migration");
+                migration.advance(
+                    expected_state_revision,
+                    next_state,
+                    owner_term,
+                    updated_at_unix_ms,
+                    receipts,
+                    &placements,
+                )?;
+                if migration.state().is_terminal() {
+                    self.active_backend_migrations.remove(&graph_id);
+                }
+            }
+            CatalogCommandBody::PublishBackendMigration {
+                migration_id,
+                expected_state_revision,
+                owner_term,
+                updated_at_unix_ms,
+            } => {
+                let migration = self
+                    .backend_migrations
+                    .get(&migration_id)
+                    .ok_or(CatalogError::UnknownBackendMigration { migration_id })?
+                    .clone();
+                let graph_id = migration.graph_id();
+                let placements = self
+                    .graphs
+                    .get(&graph_id)
+                    .ok_or(CatalogError::UnknownGraph { graph_id })?
+                    .topology()
+                    .placements()
+                    .to_vec();
+                let mut published = migration;
+                published.advance(
+                    expected_state_revision,
+                    BackendMigrationState::Published,
+                    owner_term,
+                    updated_at_unix_ms,
+                    Vec::new(),
+                    &placements,
+                )?;
+                let graph = self.graph_mut(graph_id)?;
+                if graph.backend != *published.source() {
+                    return Err(CatalogError::StaleBackendGeneration {
+                        graph_id,
+                        expected: graph.backend.generation(),
+                        actual: published.source().generation(),
+                    });
+                }
+                graph.backend = published.target().clone();
+                self.backend_migrations.insert(migration_id, published);
             }
         }
         Ok(())
@@ -1368,6 +1614,41 @@ fn encode_command_body(
             output.push(10);
             output.extend_from_slice(&pin_id.to_be_bytes());
         }
+        CatalogCommandBody::CreateBackendMigration(migration) => {
+            output.push(11);
+            encode_backend_migration_record(output, migration)?;
+        }
+        CatalogCommandBody::AdvanceBackendMigration {
+            migration_id,
+            expected_state_revision,
+            next_state,
+            owner_term,
+            updated_at_unix_ms,
+            receipts,
+        } => {
+            output.push(12);
+            output.extend_from_slice(&migration_id.to_be_bytes());
+            output.extend_from_slice(&expected_state_revision.to_be_bytes());
+            output.push(encode_backend_migration_state(*next_state));
+            output.extend_from_slice(&owner_term.to_be_bytes());
+            output.extend_from_slice(&updated_at_unix_ms.to_be_bytes());
+            write_count(output, receipts.len())?;
+            for receipt in receipts {
+                encode_backend_replica_receipt(output, receipt);
+            }
+        }
+        CatalogCommandBody::PublishBackendMigration {
+            migration_id,
+            expected_state_revision,
+            owner_term,
+            updated_at_unix_ms,
+        } => {
+            output.push(13);
+            output.extend_from_slice(&migration_id.to_be_bytes());
+            output.extend_from_slice(&expected_state_revision.to_be_bytes());
+            output.extend_from_slice(&owner_term.to_be_bytes());
+            output.extend_from_slice(&updated_at_unix_ms.to_be_bytes());
+        }
     }
     Ok(())
 }
@@ -1418,6 +1699,35 @@ fn decode_command_body(reader: &mut Reader<'_>) -> Result<CatalogCommandBody, Ca
         10 => Ok(CatalogCommandBody::ReleaseRetentionPin {
             pin_id: reader.u128()?,
         }),
+        11 => Ok(CatalogCommandBody::CreateBackendMigration(
+            decode_backend_migration_record(reader)?,
+        )),
+        12 => {
+            let migration_id = reader.u128()?;
+            let expected_state_revision = reader.u64()?;
+            let next_state = decode_backend_migration_state(reader.u8()?)?;
+            let owner_term = reader.u64()?;
+            let updated_at_unix_ms = reader.u64()?;
+            let count = reader.count(MAX_PLACEMENTS.saturating_mul(MAX_VOTERS))?;
+            let mut receipts = Vec::with_capacity(count);
+            for _ in 0..count {
+                receipts.push(decode_backend_replica_receipt(reader)?);
+            }
+            Ok(CatalogCommandBody::AdvanceBackendMigration {
+                migration_id,
+                expected_state_revision,
+                next_state,
+                owner_term,
+                updated_at_unix_ms,
+                receipts,
+            })
+        }
+        13 => Ok(CatalogCommandBody::PublishBackendMigration {
+            migration_id: reader.u128()?,
+            expected_state_revision: reader.u64()?,
+            owner_term: reader.u64()?,
+            updated_at_unix_ms: reader.u64()?,
+        }),
         tag => Err(CatalogError::UnknownCommandTag { tag }),
     }
 }
@@ -1451,6 +1761,106 @@ fn decode_migration_state(tag: u8) -> Result<MigrationState, CatalogError> {
         10 => Ok(MigrationState::Aborted),
         _ => Err(CatalogError::NonCanonicalRecord),
     }
+}
+
+fn encode_backend_migration_state(state: BackendMigrationState) -> u8 {
+    match state {
+        BackendMigrationState::Preparing => 1,
+        BackendMigrationState::Restored => 2,
+        BackendMigrationState::DualApplying => 3,
+        BackendMigrationState::Verified => 4,
+        BackendMigrationState::CutOver => 5,
+        BackendMigrationState::Published => 6,
+        BackendMigrationState::SourceRetired => 7,
+        BackendMigrationState::Aborting => 8,
+        BackendMigrationState::Aborted => 9,
+    }
+}
+
+fn decode_backend_migration_state(tag: u8) -> Result<BackendMigrationState, CatalogError> {
+    match tag {
+        1 => Ok(BackendMigrationState::Preparing),
+        2 => Ok(BackendMigrationState::Restored),
+        3 => Ok(BackendMigrationState::DualApplying),
+        4 => Ok(BackendMigrationState::Verified),
+        5 => Ok(BackendMigrationState::CutOver),
+        6 => Ok(BackendMigrationState::Published),
+        7 => Ok(BackendMigrationState::SourceRetired),
+        8 => Ok(BackendMigrationState::Aborting),
+        9 => Ok(BackendMigrationState::Aborted),
+        _ => Err(CatalogError::NonCanonicalRecord),
+    }
+}
+
+fn encode_backend_replica_receipt(output: &mut Vec<u8>, receipt: &BackendReplicaReceipt) {
+    output.push(encode_backend_migration_state(receipt.state()));
+    output.extend_from_slice(&receipt.shard_id().to_be_bytes());
+    output.extend_from_slice(&receipt.node_id().to_be_bytes());
+    output.extend_from_slice(&receipt.applied_index().to_be_bytes());
+    output.extend_from_slice(&receipt.profile_digest());
+}
+
+fn decode_backend_replica_receipt(
+    reader: &mut Reader<'_>,
+) -> Result<BackendReplicaReceipt, CatalogError> {
+    BackendReplicaReceipt::new(
+        decode_backend_migration_state(reader.u8()?)?,
+        reader.u32()?,
+        reader.u64()?,
+        reader.u64()?,
+        reader.array::<32>()?,
+    )
+}
+
+fn encode_backend_migration_record(
+    output: &mut Vec<u8>,
+    migration: &BackendMigrationRecord,
+) -> Result<(), CatalogError> {
+    output.extend_from_slice(&migration.migration_id().to_be_bytes());
+    output.extend_from_slice(&migration.graph_id().to_be_bytes());
+    encode_profile(output, migration.source())?;
+    encode_profile(output, migration.target())?;
+    output.push(encode_backend_migration_state(migration.state()));
+    output.extend_from_slice(&migration.state_revision().to_be_bytes());
+    output.extend_from_slice(&migration.owner_term().to_be_bytes());
+    output.extend_from_slice(&migration.created_at_unix_ms().to_be_bytes());
+    output.extend_from_slice(&migration.updated_at_unix_ms().to_be_bytes());
+    write_count(output, migration.receipts().len())?;
+    for receipt in migration.receipts().values() {
+        encode_backend_replica_receipt(output, receipt);
+    }
+    Ok(())
+}
+
+fn decode_backend_migration_record(
+    reader: &mut Reader<'_>,
+) -> Result<BackendMigrationRecord, CatalogError> {
+    let migration_id = reader.u128()?;
+    let graph_id = reader.u64()?;
+    let source = decode_profile(reader)?;
+    let target = decode_profile(reader)?;
+    let state = decode_backend_migration_state(reader.u8()?)?;
+    let state_revision = reader.u64()?;
+    let owner_term = reader.u64()?;
+    let created_at_unix_ms = reader.u64()?;
+    let updated_at_unix_ms = reader.u64()?;
+    let count = reader.count(MAX_PLACEMENTS.saturating_mul(MAX_VOTERS))?;
+    let mut receipts = Vec::with_capacity(count);
+    for _ in 0..count {
+        receipts.push(decode_backend_replica_receipt(reader)?);
+    }
+    BackendMigrationRecord::restore(
+        migration_id,
+        graph_id,
+        source,
+        target,
+        state,
+        state_revision,
+        owner_term,
+        created_at_unix_ms,
+        updated_at_unix_ms,
+        receipts,
+    )
 }
 
 fn encode_migration_progress(output: &mut Vec<u8>, progress: &MigrationProgress) {
@@ -1802,12 +2212,14 @@ fn encode_snapshot_version(state: &CatalogState, version: u16) -> Result<Vec<u8>
             if !state.migrations.is_empty()
                 || !state.lineages.is_empty()
                 || !state.retention_pins.is_empty()
+                || !state.backend_migrations.is_empty()
             {
                 return Err(CatalogError::UnsupportedVersion);
             }
         }
         MIGRATION_SNAPSHOT_FORMAT_VERSION
         | LINEAGE_SNAPSHOT_FORMAT_VERSION
+        | RETENTION_SNAPSHOT_FORMAT_VERSION
         | SNAPSHOT_FORMAT_VERSION => {
             write_count(&mut bytes, state.migrations.len())?;
             for migration in state.migrations.values() {
@@ -1821,12 +2233,20 @@ fn encode_snapshot_version(state: &CatalogState, version: u16) -> Result<Vec<u8>
             } else if !state.lineages.is_empty() {
                 return Err(CatalogError::UnsupportedVersion);
             }
-            if version == SNAPSHOT_FORMAT_VERSION {
+            if version >= RETENTION_SNAPSHOT_FORMAT_VERSION {
                 write_count(&mut bytes, state.retention_pins.len())?;
                 for pin in state.retention_pins.values() {
                     encode_retention_pin(&mut bytes, pin);
                 }
             } else if !state.retention_pins.is_empty() {
+                return Err(CatalogError::UnsupportedVersion);
+            }
+            if version == SNAPSHOT_FORMAT_VERSION {
+                write_count(&mut bytes, state.backend_migrations.len())?;
+                for migration in state.backend_migrations.values() {
+                    encode_backend_migration_record(&mut bytes, migration)?;
+                }
+            } else if !state.backend_migrations.is_empty() {
                 return Err(CatalogError::UnsupportedVersion);
             }
         }
@@ -1858,6 +2278,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
         LEGACY_SNAPSHOT_FORMAT_VERSION
             | MIGRATION_SNAPSHOT_FORMAT_VERSION
             | LINEAGE_SNAPSHOT_FORMAT_VERSION
+            | RETENTION_SNAPSHOT_FORMAT_VERSION
             | SNAPSHOT_FORMAT_VERSION
     ) {
         return Err(CatalogError::UnsupportedVersion);
@@ -1935,7 +2356,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
         }
     }
     let mut retention_pins = BTreeMap::new();
-    if version == SNAPSHOT_FORMAT_VERSION {
+    if version >= RETENTION_SNAPSHOT_FORMAT_VERSION {
         let pin_count = reader.count(MAX_RETENTION_PINS)?;
         for _ in 0..pin_count {
             let pin = decode_retention_pin(&mut reader)?;
@@ -1948,6 +2369,35 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
                 .iter()
                 .any(|placement| placement.shard_id == pin.shard_id)
                 || retention_pins.insert(pin.pin_id, pin).is_some()
+            {
+                return Err(CatalogError::NonCanonicalRecord);
+            }
+        }
+    }
+    let mut backend_migrations = BTreeMap::new();
+    let mut active_backend_migrations = BTreeMap::new();
+    if version == SNAPSHOT_FORMAT_VERSION {
+        let migration_count = reader.count(MAX_BACKEND_MIGRATIONS)?;
+        for _ in 0..migration_count {
+            let migration = decode_backend_migration_record(&mut reader)?;
+            let graph = graphs
+                .get(&migration.graph_id())
+                .ok_or(CatalogError::NonCanonicalRecord)?;
+            migration.validate_recovered(graph.topology().placements())?;
+            let graph_matches = match migration.state() {
+                BackendMigrationState::Published | BackendMigrationState::SourceRetired => {
+                    graph.backend() == migration.target()
+                }
+                _ => graph.backend() == migration.source(),
+            };
+            if !graph_matches
+                || (!migration.state().is_terminal()
+                    && active_backend_migrations
+                        .insert(migration.graph_id(), migration.migration_id())
+                        .is_some())
+                || backend_migrations
+                    .insert(migration.migration_id(), migration)
+                    .is_some()
             {
                 return Err(CatalogError::NonCanonicalRecord);
             }
@@ -1983,6 +2433,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
         active_migrations,
         lineages,
         retention_pins,
+        backend_migrations,
+        active_backend_migrations,
         applied_commands,
     };
     if encode_snapshot_version(&state, version)? != bytes {
@@ -2269,6 +2721,36 @@ pub enum CatalogError {
         expected: u64,
         actual: u64,
     },
+    InvalidBackendMigration,
+    InvalidBackendMigrationReceipt,
+    UnknownBackendMigration {
+        migration_id: u128,
+    },
+    ActiveBackendMigrationConflict {
+        graph_id: u64,
+    },
+    BackendMigrationTopologyConflict {
+        graph_id: u64,
+    },
+    StaleBackendMigrationRevision {
+        migration_id: u128,
+        expected: u64,
+        actual: u64,
+    },
+    IllegalBackendMigrationTransition {
+        from: BackendMigrationState,
+        to: BackendMigrationState,
+    },
+    StaleBackendMigrationOwner,
+    IncompleteBackendMigrationReceipts {
+        migration_id: u128,
+        state: BackendMigrationState,
+    },
+    BackendMigrationReceiptConflict {
+        migration_id: u128,
+        shard_id: u32,
+        node_id: u64,
+    },
     Migration(MigrationError),
     InvalidMagic,
     UnsupportedVersion,
@@ -2392,6 +2874,55 @@ impl Display for CatalogError {
             } => write!(
                 formatter,
                 "graph {graph_id} backend generation {actual} must be {expected}"
+            ),
+            Self::InvalidBackendMigration => formatter.write_str("invalid backend migration"),
+            Self::InvalidBackendMigrationReceipt => {
+                formatter.write_str("invalid backend migration replica receipt")
+            }
+            Self::UnknownBackendMigration { migration_id } => {
+                write!(formatter, "backend migration {migration_id} does not exist")
+            }
+            Self::ActiveBackendMigrationConflict { graph_id } => {
+                write!(
+                    formatter,
+                    "graph {graph_id} already has an active backend migration"
+                )
+            }
+            Self::BackendMigrationTopologyConflict { graph_id } => write!(
+                formatter,
+                "graph {graph_id} topology cannot change during a backend migration"
+            ),
+            Self::StaleBackendMigrationRevision {
+                migration_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "backend migration {migration_id} state revision {actual} is stale; expected {expected}"
+            ),
+            Self::IllegalBackendMigrationTransition { from, to } => {
+                write!(
+                    formatter,
+                    "illegal backend migration transition {from:?} -> {to:?}"
+                )
+            }
+            Self::StaleBackendMigrationOwner => {
+                formatter.write_str("stale backend migration owner term or timestamp")
+            }
+            Self::IncompleteBackendMigrationReceipts {
+                migration_id,
+                state,
+            } => write!(
+                formatter,
+                "backend migration {migration_id} lacks complete {state:?} replica receipts"
+            ),
+            Self::BackendMigrationReceiptConflict {
+                migration_id,
+                shard_id,
+                node_id,
+            } => write!(
+                formatter,
+                "backend migration {migration_id} has a conflicting receipt for shard {shard_id} node {node_id}"
             ),
             Self::Migration(error) => write!(formatter, "migration error: {error}"),
             Self::InvalidMagic => formatter.write_str("invalid catalog record magic"),
