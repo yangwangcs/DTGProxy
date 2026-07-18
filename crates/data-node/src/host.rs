@@ -5,7 +5,7 @@ use std::sync::{Mutex, RwLock};
 
 use raft::eraftpb::Message;
 use raft_transport::RoutedRaftMessage;
-use storage_api::LogicalKey;
+use storage_api::{KeySpan, KeyValue, LogicalKey};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::replica_actor::{ActorCommand, ReplicaActorHandle};
@@ -482,6 +482,16 @@ impl DataNodeHost {
         let (response, receiver) = oneshot::channel();
         sender
             .send(ActorCommand::MultiGet { keys, response })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    pub async fn scan(&self, key: ReplicaKey, span: KeySpan) -> Result<Vec<KeyValue>, HostError> {
+        let sender = self.sender(key)?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::Scan { span, response })
             .await
             .map_err(|_| HostError::ActorStopped)?;
         receiver.await.map_err(|_| HostError::ActorStopped)?

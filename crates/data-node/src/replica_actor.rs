@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use raft::eraftpb::Message;
 use shard_runtime::DurableRaftReplica;
-use storage_api::{LogicalKey, StorageAdapter};
+use storage_api::{KeySpan, KeyValue, LogicalKey, StorageAdapter};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -122,6 +122,10 @@ pub(crate) enum ActorCommand {
         keys: Vec<LogicalKey>,
         response: oneshot::Sender<Result<Vec<Option<Vec<u8>>>, HostError>>,
     },
+    Scan {
+        span: KeySpan,
+        response: oneshot::Sender<Result<Vec<KeyValue>, HostError>>,
+    },
     Shutdown(oneshot::Sender<Result<(), HostError>>),
 }
 
@@ -152,10 +156,11 @@ async fn run_actor(
                     .request_replay(request_id, &command)
                     .await
                 {
-                    Ok(duplicate) => match replica.propose(request_id, command) {
+                    Ok(true) => Ok(ProposalOutcome::new(status(&replica, &spec), true)),
+                    Ok(false) => match replica.propose(request_id, command) {
                         Ok(()) => drive_ready(&mut replica, &outbound)
                             .await
-                            .map(|()| ProposalOutcome::new(status(&replica, &spec), duplicate)),
+                            .map(|()| ProposalOutcome::new(status(&replica, &spec), false)),
                         Err(error) => Err(HostError::from_durable(error)),
                     },
                     Err(error) => Err(HostError::from_runtime(error)),
@@ -182,6 +187,14 @@ async fn run_actor(
                 let result = replica
                     .adapter()
                     .multi_get(&keys)
+                    .await
+                    .map_err(|error| HostError::Adapter(error.to_string()));
+                let _ = response.send(result);
+            }
+            ActorCommand::Scan { span, response } => {
+                let result = replica
+                    .adapter()
+                    .scan(&span)
                     .await
                     .map_err(|error| HostError::Adapter(error.to_string()));
                 let _ = response.send(result);

@@ -426,7 +426,9 @@ dependencies = [
  "adapter-rocksdb",
  "adapter-sidecar",
  "blake3",
+ "cluster-protocol",
  "control-plane",
+ "data-node",
  "query-executor",
  "raft",
  "raft-command",
@@ -435,6 +437,7 @@ dependencies = [
  "replica-snapshot",
  "serde",
  "serde_json",
+ "shard-client",
  "shard-runtime",
  "storage-api",
  "tempfile",
@@ -443,6 +446,9 @@ dependencies = [
  "temporal-storage",
  "temporal-types",
  "timestamp-oracle",
+ "tokio",
+ "tokio-stream",
+ "tonic",
  "txn-protocol",
 ]
 
@@ -1879,6 +1885,24 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "shard-client"
+version = "1.0.0"
+dependencies = [
+ "adapter-memory",
+ "cluster-protocol",
+ "data-node",
+ "raft-command",
+ "shard-runtime",
+ "storage-api",
+ "tempfile",
+ "temporal-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "txn-protocol",
 ]
 
 [[package]]

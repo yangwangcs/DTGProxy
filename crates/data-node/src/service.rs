@@ -13,7 +13,8 @@ use cluster_protocol::proto::{
     ScanBatch, ScanRequest, SnapshotChunk,
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError, ShardRequestContext};
-use storage_api::{Keyspace, LogicalKey};
+use storage_api::{KeySpan, KeyValue, Keyspace, LogicalKey};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
@@ -25,10 +26,16 @@ use crate::{
 
 const READ_PLAN_MAGIC: [u8; 4] = *b"DTRK";
 const READ_RESULT_MAGIC: [u8; 4] = *b"DTRV";
+const SCAN_PLAN_MAGIC: [u8; 4] = *b"DTSK";
+const SCAN_BATCH_MAGIC: [u8; 4] = *b"DTSB";
 const READ_CODEC_VERSION: u16 = 1;
 const MAX_READ_KEYS: usize = 4_096;
 const MAX_READ_KEY_BYTES: usize = 1024 * 1024;
 const MAX_READ_RESULT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SCAN_PLAN_BYTES: usize = 2 * 1024 * 1024;
+const MIN_SCAN_BATCH_BYTES: usize = 1024;
+const MAX_SCAN_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SCAN_ROWS: usize = 65_536;
 const REPLICA_PROFILE_MAGIC: [u8; 4] = *b"DTRF";
 const MAX_PROFILE_VOTERS: usize = 64;
 const MAX_REPLICA_DIRECTORY_BYTES: usize = 255;
@@ -194,11 +201,64 @@ impl ShardService for DataNodeGrpcService {
 
     async fn scan(
         &self,
-        _request: Request<ScanRequest>,
+        request: Request<ScanRequest>,
     ) -> Result<Response<Self::ScanStream>, Status> {
-        Err(Status::unimplemented(
-            "Arrow scan execution is connected in the distributed query milestone",
-        ))
+        let request = request.into_inner();
+        let (context, key, _) = self.validate(request.context, DataOperation::Scan)?;
+        if !request.read_proof.is_empty() {
+            return Err(Status::invalid_argument(
+                "follower scan proofs are not enabled on the leader-only P0 path",
+            ));
+        }
+        let maximum_batch_bytes = usize::try_from(request.maximum_batch_bytes)
+            .map_err(|_| Status::invalid_argument("scan batch bound is out of range"))?;
+        if !(MIN_SCAN_BATCH_BYTES..=MAX_SCAN_BATCH_BYTES).contains(&maximum_batch_bytes) {
+            return Err(Status::invalid_argument("invalid scan batch byte bound"));
+        }
+        let status = self.require_leader(key).await?;
+        if status.placement_epoch() != context.placement_epoch() {
+            return Err(stale_epoch_status(status.placement_epoch()));
+        }
+        let span = decode_key_scan_plan(&request.plan)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let rows = self.host.scan(key, span).await.map_err(host_status)?;
+        let batches = partition_scan_rows(rows, maximum_batch_bytes)
+            .map_err(|error| Status::resource_exhausted(error.to_string()))?;
+        let applied_index = status.applied_index();
+        let (sender, receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let terminal_sequence = batches.len().saturating_sub(1);
+            for (sequence, batch) in batches.into_iter().enumerate() {
+                let encoded = match encode_key_scan_batch(&batch) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let _ = sender
+                            .send(Err(Status::resource_exhausted(error.to_string())))
+                            .await;
+                        return;
+                    }
+                };
+                let Ok(sequence) = u64::try_from(sequence) else {
+                    let _ = sender
+                        .send(Err(Status::internal("scan sequence overflow")))
+                        .await;
+                    return;
+                };
+                if sender
+                    .send(Ok(ScanBatch {
+                        sequence,
+                        applied_index,
+                        arrow_record_batch: encoded,
+                        terminal: usize::try_from(sequence).ok() == Some(terminal_sequence),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
     async fn install_snapshot(
@@ -583,6 +643,236 @@ pub fn decode_key_read_result(encoded: &[u8]) -> Result<Vec<Option<Vec<u8>>>, Re
     Ok(values)
 }
 
+pub fn encode_key_scan_plan(span: &KeySpan) -> Result<Vec<u8>, ReadCodecError> {
+    let start_length =
+        u32::try_from(span.start().len()).map_err(|_| ReadCodecError::InvalidKeyLength {
+            actual: span.start().len(),
+        })?;
+    let end_length = optional_length(span.end())?;
+    let prefix_length = optional_length(span.required_prefix())?;
+    let limit = span
+        .limit()
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| ReadCodecError::ResultTooLarge)?
+        .unwrap_or(0);
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&SCAN_PLAN_MAGIC);
+    encoded.extend_from_slice(&READ_CODEC_VERSION.to_be_bytes());
+    encoded.push(span.keyspace().tag());
+    encoded.extend_from_slice(&start_length.to_be_bytes());
+    encoded.extend_from_slice(&end_length.to_be_bytes());
+    encoded.extend_from_slice(&prefix_length.to_be_bytes());
+    encoded.extend_from_slice(&limit.to_be_bytes());
+    encoded.extend_from_slice(span.start());
+    if let Some(end) = span.end() {
+        encoded.extend_from_slice(end);
+    }
+    if let Some(prefix) = span.required_prefix() {
+        encoded.extend_from_slice(prefix);
+    }
+    if encoded.len() + 4 > MAX_SCAN_PLAN_BYTES {
+        return Err(ReadCodecError::ResultTooLarge);
+    }
+    append_checksum(&mut encoded);
+    Ok(encoded)
+}
+
+fn decode_key_scan_plan(encoded: &[u8]) -> Result<KeySpan, ReadCodecError> {
+    validate_header(encoded, SCAN_PLAN_MAGIC)?;
+    if encoded.len() < 31 || encoded.len() > MAX_SCAN_PLAN_BYTES {
+        return Err(ReadCodecError::Truncated);
+    }
+    let keyspace = decode_keyspace(encoded[6])?;
+    let start_length = usize::try_from(u32::from_be_bytes(
+        encoded[7..11].try_into().expect("fixed scan start length"),
+    ))
+    .map_err(|_| ReadCodecError::Truncated)?;
+    let end_length = u32::from_be_bytes(encoded[11..15].try_into().expect("fixed scan end length"));
+    let prefix_length = u32::from_be_bytes(
+        encoded[15..19]
+            .try_into()
+            .expect("fixed scan prefix length"),
+    );
+    let limit = u64::from_be_bytes(encoded[19..27].try_into().expect("fixed scan limit"));
+    let checksum_offset = encoded.len() - 4;
+    let mut offset = 27;
+    let start = take_scan_bytes(encoded, &mut offset, start_length, checksum_offset)?;
+    let end = take_optional_scan_bytes(encoded, &mut offset, end_length, checksum_offset)?;
+    let prefix = take_optional_scan_bytes(encoded, &mut offset, prefix_length, checksum_offset)?;
+    if offset != checksum_offset {
+        return Err(ReadCodecError::TrailingBytes);
+    }
+    let mut span = match prefix {
+        Some(prefix) => {
+            let span = KeySpan::prefix_from(keyspace, prefix, start)
+                .map_err(|_| ReadCodecError::InvalidSpan)?;
+            if span.end() != end.as_deref() {
+                return Err(ReadCodecError::InvalidSpan);
+            }
+            span
+        }
+        None => KeySpan::range(keyspace, start, end).map_err(|_| ReadCodecError::InvalidSpan)?,
+    };
+    if limit != 0 {
+        span = span
+            .with_limit(usize::try_from(limit).map_err(|_| ReadCodecError::InvalidSpan)?)
+            .map_err(|_| ReadCodecError::InvalidSpan)?;
+    }
+    Ok(span)
+}
+
+fn optional_length(bytes: Option<&[u8]>) -> Result<u32, ReadCodecError> {
+    bytes.map_or(Ok(u32::MAX), |bytes| {
+        u32::try_from(bytes.len()).map_err(|_| ReadCodecError::InvalidKeyLength {
+            actual: bytes.len(),
+        })
+    })
+}
+
+fn take_optional_scan_bytes(
+    encoded: &[u8],
+    offset: &mut usize,
+    length: u32,
+    end: usize,
+) -> Result<Option<Vec<u8>>, ReadCodecError> {
+    if length == u32::MAX {
+        return Ok(None);
+    }
+    let length = usize::try_from(length).map_err(|_| ReadCodecError::Truncated)?;
+    take_scan_bytes(encoded, offset, length, end).map(Some)
+}
+
+fn take_scan_bytes(
+    encoded: &[u8],
+    offset: &mut usize,
+    length: usize,
+    end: usize,
+) -> Result<Vec<u8>, ReadCodecError> {
+    let next = offset
+        .checked_add(length)
+        .filter(|next| *next <= end)
+        .ok_or(ReadCodecError::Truncated)?;
+    let bytes = encoded[*offset..next].to_vec();
+    *offset = next;
+    Ok(bytes)
+}
+
+fn partition_scan_rows(
+    rows: Vec<KeyValue>,
+    maximum_batch_bytes: usize,
+) -> Result<Vec<Vec<KeyValue>>, ReadCodecError> {
+    if rows.len() > MAX_SCAN_ROWS {
+        return Err(ReadCodecError::TooManyRows { actual: rows.len() });
+    }
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 14_usize;
+    for row in rows {
+        let row_bytes = 9_usize
+            .checked_add(row.key().as_bytes().len())
+            .and_then(|size| size.checked_add(row.value().len()))
+            .ok_or(ReadCodecError::ResultTooLarge)?;
+        if 14 + row_bytes > maximum_batch_bytes {
+            return Err(ReadCodecError::ResultTooLarge);
+        }
+        if !current.is_empty() && current_bytes + row_bytes > maximum_batch_bytes {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 14;
+        }
+        current_bytes += row_bytes;
+        current.push(row);
+    }
+    if !current.is_empty() || batches.is_empty() {
+        batches.push(current);
+    }
+    Ok(batches)
+}
+
+fn encode_key_scan_batch(rows: &[KeyValue]) -> Result<Vec<u8>, ReadCodecError> {
+    if rows.len() > MAX_SCAN_ROWS {
+        return Err(ReadCodecError::TooManyRows { actual: rows.len() });
+    }
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&SCAN_BATCH_MAGIC);
+    encoded.extend_from_slice(&READ_CODEC_VERSION.to_be_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(rows.len())
+            .map_err(|_| ReadCodecError::TooManyRows { actual: rows.len() })?
+            .to_be_bytes(),
+    );
+    for row in rows {
+        encoded.push(row.key().keyspace().tag());
+        encoded.extend_from_slice(
+            &u32::try_from(row.key().as_bytes().len())
+                .map_err(|_| ReadCodecError::InvalidKeyLength {
+                    actual: row.key().as_bytes().len(),
+                })?
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(
+            &u32::try_from(row.value().len())
+                .map_err(|_| ReadCodecError::ResultTooLarge)?
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(row.key().as_bytes());
+        encoded.extend_from_slice(row.value());
+        if encoded.len() + 4 > MAX_SCAN_BATCH_BYTES {
+            return Err(ReadCodecError::ResultTooLarge);
+        }
+    }
+    append_checksum(&mut encoded);
+    Ok(encoded)
+}
+
+pub fn decode_key_scan_batch(encoded: &[u8]) -> Result<Vec<KeyValue>, ReadCodecError> {
+    validate_header(encoded, SCAN_BATCH_MAGIC)?;
+    if encoded.len() > MAX_SCAN_BATCH_BYTES || encoded.len() < 14 {
+        return Err(ReadCodecError::ResultTooLarge);
+    }
+    let count = usize::try_from(u32::from_be_bytes(
+        encoded[6..10].try_into().expect("fixed scan row count"),
+    ))
+    .map_err(|_| ReadCodecError::Truncated)?;
+    if count > MAX_SCAN_ROWS {
+        return Err(ReadCodecError::TooManyRows { actual: count });
+    }
+    let checksum_offset = encoded.len() - 4;
+    let mut offset = 10;
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        if offset + 9 > checksum_offset {
+            return Err(ReadCodecError::Truncated);
+        }
+        let keyspace = decode_keyspace(encoded[offset])?;
+        let key_length = u32::from_be_bytes(
+            encoded[offset + 1..offset + 5]
+                .try_into()
+                .expect("bounded scan key length"),
+        ) as usize;
+        let value_length = u32::from_be_bytes(
+            encoded[offset + 5..offset + 9]
+                .try_into()
+                .expect("bounded scan value length"),
+        ) as usize;
+        offset += 9;
+        let key = take_scan_bytes(encoded, &mut offset, key_length, checksum_offset)?;
+        let value = take_scan_bytes(encoded, &mut offset, value_length, checksum_offset)?;
+        rows.push(KeyValue::new(LogicalKey::in_keyspace(keyspace, key), value));
+    }
+    if offset != checksum_offset {
+        return Err(ReadCodecError::TrailingBytes);
+    }
+    Ok(rows)
+}
+
+fn decode_keyspace(tag: u8) -> Result<Keyspace, ReadCodecError> {
+    Keyspace::ALL
+        .into_iter()
+        .find(|keyspace| keyspace.tag() == tag)
+        .ok_or(ReadCodecError::UnknownKeyspace { tag })
+}
+
 fn validate_header(encoded: &[u8], magic: [u8; 4]) -> Result<(), ReadCodecError> {
     if encoded.len() < 12 {
         return Err(ReadCodecError::Truncated);
@@ -621,6 +911,8 @@ pub enum ReadCodecError {
     Truncated,
     TrailingBytes,
     ResultTooLarge,
+    InvalidSpan,
+    TooManyRows { actual: usize },
 }
 
 impl Display for ReadCodecError {
@@ -643,6 +935,8 @@ impl Display for ReadCodecError {
                 formatter.write_str("read codec payload contains trailing bytes")
             }
             Self::ResultTooLarge => formatter.write_str("read result exceeds its size limit"),
+            Self::InvalidSpan => formatter.write_str("invalid scan key span"),
+            Self::TooManyRows { actual } => write!(formatter, "scan has too many rows: {actual}"),
         }
     }
 }

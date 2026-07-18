@@ -3,6 +3,7 @@ members = [
     "crates/cluster-protocol",
     "crates/data-node",
     "crates/meta-node",
+    "crates/shard-client",
     "crates/temporal-types",
     "crates/timestamp-oracle",
     "crates/txn-protocol",

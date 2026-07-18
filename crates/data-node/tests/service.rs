@@ -12,17 +12,18 @@ use cluster_protocol::proto::shard_service_server::ShardService;
 use cluster_protocol::proto::shard_service_server::ShardServiceServer;
 use cluster_protocol::proto::{
     EnsureReplicaRequest, ExecuteRequest, ReadRequest, ReplicaRole as WireReplicaRole,
-    RequestContext, ShardContext,
+    RequestContext, ScanRequest, ShardContext,
 };
 use data_node::{
     DataNodeGrpcService, DataNodeHost, NodeConfig, NodeIdentity, ReplicaKey, ReplicaRole,
-    ReplicaSpec, TransportSecurity, decode_key_read_result, encode_key_read_plan,
-    encode_rocks_replica_profile,
+    ReplicaSpec, TransportSecurity, decode_key_read_result, decode_key_scan_batch,
+    encode_key_read_plan, encode_key_scan_plan, encode_rocks_replica_profile,
 };
 use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
-use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
+use storage_api::{KeySpan, Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use tempfile::tempdir;
 use temporal_types::TransactionTime;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request};
 
@@ -270,6 +271,54 @@ async fn bounded_key_read_plan_round_trips_values_through_the_remote_contract() 
         vec![Some(b"value".to_vec()), None]
     );
 
+    drop(service);
+    Arc::try_unwrap(host)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_key_scan_streams_ordered_batches_through_the_remote_contract() {
+    let temporary = tempdir().unwrap();
+    let host = Arc::new(
+        DataNodeHost::open(config(temporary.path()), 8)
+            .await
+            .unwrap(),
+    );
+    host.ensure_replica(spec()).await.unwrap();
+    host.campaign(ReplicaKey::new(1, 11).unwrap())
+        .await
+        .unwrap();
+    let service = DataNodeGrpcService::new(Arc::clone(&host));
+    service
+        .execute(Request::new(ExecuteRequest {
+            context: Some(context(208, 3, now_ms() + 60_000)),
+            command: command(208, b"scan-value"),
+        }))
+        .await
+        .unwrap();
+
+    let span = KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec());
+    let mut stream = service
+        .scan(Request::new(ScanRequest {
+            context: Some(context(209, 3, now_ms() + 60_000)),
+            plan: encode_key_scan_plan(&span).unwrap(),
+            read_proof: Vec::new(),
+            maximum_batch_bytes: 1024,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert!(batch.terminal);
+    let rows = decode_key_scan_batch(&batch.arrow_record_batch).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value(), b"scan-value");
+
+    drop(stream);
     drop(service);
     Arc::try_unwrap(host)
         .ok()

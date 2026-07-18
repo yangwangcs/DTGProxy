@@ -18,6 +18,7 @@ raft-command = { path = "../raft-command" }
 raft-transport = { path = "../raft-transport" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
+shard-client = { path = "../shard-client" }
 shard-runtime = { path = "../shard-runtime" }
 storage-api = { path = "../storage-api" }
 temporal-ir = { path = "../temporal-ir" }
@@ -29,10 +30,15 @@ txn-protocol = { path = "../txn-protocol" }
 
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }
+cluster-protocol = { path = "../cluster-protocol" }
+data-node = { path = "../data-node" }
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
 raft-logstore = { path = "../raft-logstore" }
 replica-snapshot = { path = "../replica-snapshot" }
 tempfile = "3"
+tokio = { version = "=1.53.0", features = ["rt", "macros", "sync", "net", "time"] }
+tokio-stream = { version = "=0.1.18", features = ["net"] }
+tonic = { version = "=0.14.6", features = ["transport"] }
 
 [[bench]]
 name = "phase2"

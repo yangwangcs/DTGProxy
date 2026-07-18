@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
 
 use raft_command::{
     AbortIntentV1, CommandBodyV1, CommandCodecError, CommandEnvelopeV1, FinalizeV1,
     OnePhaseCommitV1, PrewriteV1, RecordDecisionV1,
 };
+use shard_client::{ExecuteCommand, ShardClient, ShardRequestContext};
 use shard_runtime::ReadBarrierError;
 use shard_runtime::ReplicationError;
 use storage_api::{AdapterError, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
@@ -216,6 +219,153 @@ pub struct TransactionCoordinator<'oracle> {
     max_ticks: usize,
 }
 
+type DispatchFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ReplicationError>> + 'a>>;
+
+trait TransactionDispatcher {
+    fn validate_participant(
+        &self,
+        participant: ShardEpoch,
+    ) -> Result<(), TransactionCoordinatorError>;
+
+    fn propose<'a>(
+        &'a mut self,
+        participant: ShardEpoch,
+        command: Vec<u8>,
+        max_ticks: usize,
+    ) -> DispatchFuture<'a, ()>;
+
+    fn propose_many<'a>(
+        &'a mut self,
+        commands: Vec<(u32, Vec<u8>)>,
+        max_ticks: usize,
+    ) -> DispatchFuture<'a, Vec<(u32, Result<(), ReplicationError>)>>;
+}
+
+struct InProcessDispatcher<'runtime> {
+    runtime: &'runtime mut InProcessDeploymentRuntime,
+}
+
+impl TransactionDispatcher for InProcessDispatcher<'_> {
+    fn validate_participant(
+        &self,
+        participant: ShardEpoch,
+    ) -> Result<(), TransactionCoordinatorError> {
+        let Some(placement) = self
+            .runtime
+            .config()
+            .all_shards()
+            .iter()
+            .find(|placement| placement.shard_id() == participant.shard_id())
+        else {
+            return Err(TransactionCoordinatorError::UnknownParticipant {
+                shard_id: participant.shard_id(),
+            });
+        };
+        if placement.placement_epoch() != participant.placement_epoch() {
+            return Err(TransactionCoordinatorError::StalePlacementEpoch {
+                shard_id: participant.shard_id(),
+                expected: placement.placement_epoch(),
+                actual: participant.placement_epoch(),
+            });
+        }
+        Ok(())
+    }
+
+    fn propose<'a>(
+        &'a mut self,
+        participant: ShardEpoch,
+        command: Vec<u8>,
+        max_ticks: usize,
+    ) -> DispatchFuture<'a, ()> {
+        Box::pin(async move {
+            self.runtime
+                .propose_shard(participant.shard_id(), command, max_ticks)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn propose_many<'a>(
+        &'a mut self,
+        commands: Vec<(u32, Vec<u8>)>,
+        max_ticks: usize,
+    ) -> DispatchFuture<'a, Vec<(u32, Result<(), ReplicationError>)>> {
+        Box::pin(async move {
+            self.runtime
+                .propose_shards(commands, max_ticks)
+                .await
+                .map(|results| {
+                    results
+                        .into_iter()
+                        .map(|(shard_id, result)| (shard_id, result.map(|_| ())))
+                        .collect()
+                })
+        })
+    }
+}
+
+struct RemoteDispatcher<'client> {
+    client: &'client dyn ShardClient,
+    graph_id: u64,
+    deadline_unix_ms: u64,
+}
+
+impl TransactionDispatcher for RemoteDispatcher<'_> {
+    fn validate_participant(
+        &self,
+        _participant: ShardEpoch,
+    ) -> Result<(), TransactionCoordinatorError> {
+        Ok(())
+    }
+
+    fn propose<'a>(
+        &'a mut self,
+        participant: ShardEpoch,
+        command: Vec<u8>,
+        _max_ticks: usize,
+    ) -> DispatchFuture<'a, ()> {
+        Box::pin(async move {
+            let envelope = CommandEnvelopeV1::decode(&command)?;
+            let context = ShardRequestContext::new(
+                self.graph_id,
+                participant.shard_id(),
+                participant.placement_epoch(),
+                envelope.request_id,
+                self.deadline_unix_ms,
+            )
+            .map_err(|error| ReplicationError::Raft(error.to_string()))?;
+            self.client
+                .execute(
+                    ExecuteCommand::new(context, command)
+                        .map_err(|error| ReplicationError::Raft(error.to_string()))?,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| ReplicationError::Raft(error.to_string()))
+        })
+    }
+
+    fn propose_many<'a>(
+        &'a mut self,
+        commands: Vec<(u32, Vec<u8>)>,
+        max_ticks: usize,
+    ) -> DispatchFuture<'a, Vec<(u32, Result<(), ReplicationError>)>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(commands.len());
+            for (shard_id, command) in commands {
+                let envelope = CommandEnvelopeV1::decode(&command)?;
+                let participant = ShardEpoch::new(shard_id, envelope.placement_epoch)
+                    .map_err(|error| ReplicationError::Raft(error.to_string()))?;
+                results.push((
+                    shard_id,
+                    self.propose(participant, command, max_ticks).await,
+                ));
+            }
+            Ok(results)
+        })
+    }
+}
+
 impl<'oracle> TransactionCoordinator<'oracle> {
     #[must_use]
     pub const fn new(oracle: &'oracle TimestampOracle, max_ticks: usize) -> Self {
@@ -260,6 +410,39 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         &self,
         runtime: &mut InProcessDeploymentRuntime,
         context: TransactionContext,
+        writes: Vec<PreparedShardTransaction>,
+    ) -> Result<TransactionReceipt, TransactionCoordinatorError> {
+        self.commit_via(&mut InProcessDispatcher { runtime }, context, writes)
+            .await
+    }
+
+    pub async fn commit_remote(
+        &self,
+        client: &dyn ShardClient,
+        graph_id: u64,
+        deadline_unix_ms: u64,
+        context: TransactionContext,
+        writes: Vec<PreparedShardTransaction>,
+    ) -> Result<TransactionReceipt, TransactionCoordinatorError> {
+        if graph_id == 0 || deadline_unix_ms == 0 {
+            return Err(TransactionCoordinatorError::InvalidRemoteContext);
+        }
+        self.commit_via(
+            &mut RemoteDispatcher {
+                client,
+                graph_id,
+                deadline_unix_ms,
+            },
+            context,
+            writes,
+        )
+        .await
+    }
+
+    async fn commit_via<D: TransactionDispatcher>(
+        &self,
+        dispatcher: &mut D,
+        context: TransactionContext,
         mut writes: Vec<PreparedShardTransaction>,
     ) -> Result<TransactionReceipt, TransactionCoordinatorError> {
         if writes.is_empty() {
@@ -273,7 +456,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             return Err(TransactionCoordinatorError::DuplicateParticipant);
         }
         for write in &writes {
-            self.validate_write(runtime, context, write)?;
+            self.validate_write(dispatcher, context, write)?;
         }
         let participants = writes
             .iter()
@@ -313,8 +496,8 @@ impl<'oracle> TransactionCoordinator<'oracle> {
                 }),
             )
             .encode()?;
-            runtime
-                .propose_shard(write.participant.shard_id(), command, self.max_ticks)
+            dispatcher
+                .propose(write.participant, command, self.max_ticks)
                 .await
                 .map_err(|source| TransactionCoordinatorError::Replication {
                     phase: "single-shard-commit",
@@ -373,8 +556,8 @@ impl<'oracle> TransactionCoordinator<'oracle> {
                 ))
             })
             .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
-        let prewrite_results = runtime
-            .propose_shards(prewrite_commands, self.max_ticks)
+        let prewrite_results = dispatcher
+            .propose_many(prewrite_commands, self.max_ticks)
             .await?;
         let mut prepared = Vec::with_capacity(requests.len());
         let mut failed = Vec::new();
@@ -395,7 +578,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         }
         if let Some((participant, source)) = first_failure {
             let (abort_decision_durable, mut cleanup_pending) = self
-                .rollback_prepared(runtime, context, home, &participants, &prepared)
+                .rollback_prepared(dispatcher, context, home, &participants, &prepared)
                 .await;
             cleanup_pending.extend(failed);
             cleanup_pending.sort_unstable();
@@ -429,10 +612,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             CommandBodyV1::RecordDecision(RecordDecisionV1 { home, decision }),
         )
         .encode()?;
-        if let Err(source) = runtime
-            .propose_shard(home.shard_id(), command, self.max_ticks)
-            .await
-        {
+        if let Err(source) = dispatcher.propose(home, command, self.max_ticks).await {
             return Err(TransactionCoordinatorError::DecisionUnknown {
                 transaction_id: context.transaction_id,
                 home,
@@ -464,8 +644,8 @@ impl<'oracle> TransactionCoordinator<'oracle> {
                 ))
             })
             .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
-        let finalize_results = runtime
-            .propose_shards(finalize_commands, self.max_ticks)
+        let finalize_results = dispatcher
+            .propose_many(finalize_commands, self.max_ticks)
             .await?;
         let mut pending = Vec::new();
         let mut first_error = None;
@@ -789,38 +969,22 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         Ok(receipt)
     }
 
-    fn validate_write(
+    fn validate_write<D: TransactionDispatcher>(
         &self,
-        runtime: &InProcessDeploymentRuntime,
+        dispatcher: &D,
         context: TransactionContext,
         write: &PreparedShardTransaction,
     ) -> Result<(), TransactionCoordinatorError> {
-        let Some(placement) = runtime
-            .config()
-            .all_shards()
-            .iter()
-            .find(|placement| placement.shard_id() == write.participant.shard_id())
-        else {
-            return Err(TransactionCoordinatorError::UnknownParticipant {
-                shard_id: write.participant.shard_id(),
-            });
-        };
-        if placement.placement_epoch() != write.participant.placement_epoch() {
-            return Err(TransactionCoordinatorError::StalePlacementEpoch {
-                shard_id: write.participant.shard_id(),
-                expected: placement.placement_epoch(),
-                actual: write.participant.placement_epoch(),
-            });
-        }
+        dispatcher.validate_participant(write.participant)?;
         if write.batch.txn_id != context.transaction_id.value() {
             return Err(TransactionCoordinatorError::BatchTransactionMismatch);
         }
         Ok(())
     }
 
-    async fn rollback_prepared(
+    async fn rollback_prepared<D: TransactionDispatcher>(
         &self,
-        runtime: &mut InProcessDeploymentRuntime,
+        dispatcher: &mut D,
         context: TransactionContext,
         home: ShardEpoch,
         participants: &[ShardEpoch],
@@ -843,8 +1007,8 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             )
             .encode()
             {
-                Ok(command) => runtime
-                    .propose_shard(home.shard_id(), command, self.max_ticks)
+                Ok(command) => dispatcher
+                    .propose(home, command, self.max_ticks)
                     .await
                     .is_ok(),
                 Err(_) => false,
@@ -875,7 +1039,10 @@ impl<'oracle> TransactionCoordinator<'oracle> {
                 Err(_) => pending.push(request.participant()),
             }
         }
-        match runtime.propose_shards(abort_commands, self.max_ticks).await {
+        match dispatcher
+            .propose_many(abort_commands, self.max_ticks)
+            .await
+        {
             Ok(results) => {
                 for (shard_id, result) in results {
                     if result.is_err() {
@@ -1048,6 +1215,7 @@ pub enum TransactionCoordinatorError {
     Temporal(TemporalStoreError),
     InvalidSchemaVersion,
     InvalidTransactionTtl,
+    InvalidRemoteContext,
     ExpiryOverflow,
     TimestampExhausted,
     EmptyWriteSet,
@@ -1110,6 +1278,9 @@ impl Display for TransactionCoordinatorError {
             Self::Temporal(error) => Display::fmt(error, formatter),
             Self::InvalidSchemaVersion => formatter.write_str("schema version must be nonzero"),
             Self::InvalidTransactionTtl => formatter.write_str("transaction TTL must be nonzero"),
+            Self::InvalidRemoteContext => {
+                formatter.write_str("remote transaction graph or deadline is invalid")
+            }
             Self::ExpiryOverflow => formatter.write_str("transaction expiry overflows timestamp"),
             Self::TimestampExhausted => {
                 formatter.write_str("transaction timestamp space exhausted")
