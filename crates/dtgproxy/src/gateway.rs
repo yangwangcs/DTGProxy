@@ -785,7 +785,7 @@ pub enum ApiMutation {
 }
 
 impl ApiMutation {
-    fn into_scoped(self, graph_id: u64) -> Result<ScopedTemporalTransaction, GatewayError> {
+    pub fn into_scoped(self, graph_id: u64) -> Result<ScopedTemporalTransaction, GatewayError> {
         let graph = GraphId::new(graph_id);
         match self {
             Self::PutVertex {

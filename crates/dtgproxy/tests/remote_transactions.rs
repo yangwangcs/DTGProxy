@@ -8,13 +8,22 @@ use data_node::{
     DataNodeGrpcService, DataNodeHost, NodeConfig, NodeIdentity, ReplicaKey, ReplicaRole,
     ReplicaSpec, TransportSecurity,
 };
-use dtgproxy::{PreparedShardTransaction, TransactionCoordinator};
+use dtgproxy::{
+    DeploymentConfig, PreparedShardTransaction, ScopedTemporalTransaction, ShardPlacement,
+    TransactionCoordinator,
+};
 use shard_client::{
     ReadKeysRequest, RemoteReplica, RemoteShardClient, RemoteTopology, ShardClient,
-    ShardRequestContext,
+    ShardClientStorageAdapter, ShardRequestContext,
 };
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use tempfile::tempdir;
+use temporal_ir::GraphScope;
+use temporal_storage::{
+    ElementId, ElementRef, GraphId, LabelId, PartitionId, TemporalStore, TemporalTransaction,
+    VertexMutation,
+};
+use temporal_types::{CanonicalElement, GraphValue, Interval, ValidTime};
 use timestamp_oracle::{ManualClock, MemoryTimestampStore, TimestampOracle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -130,7 +139,7 @@ async fn coordinator_commits_cross_shard_transaction_only_through_remote_clients
         ],
     )
     .unwrap();
-    let client = RemoteShardClient::new_loopback_plaintext([0x72; 16], topology).unwrap();
+    let client = Arc::new(RemoteShardClient::new_loopback_plaintext([0x72; 16], topology).unwrap());
     let oracle = TimestampOracle::open(
         Arc::new(MemoryTimestampStore::new()),
         Arc::new(ManualClock::new(1_000)),
@@ -143,7 +152,7 @@ async fn coordinator_commits_cross_shard_transaction_only_through_remote_clients
         .unwrap();
     let receipt = coordinator
         .commit_remote(
-            &client,
+            client.as_ref(),
             1,
             now_ms() + 60_000,
             transaction,
@@ -174,7 +183,88 @@ async fn coordinator_commits_cross_shard_transaction_only_through_remote_clients
         assert_eq!(values, vec![Some(expected.to_vec())]);
     }
 
+    let deployment = DeploymentConfig::shared_nothing(
+        13,
+        vec![
+            ShardPlacement::new(10, 7, vec![10]).unwrap(),
+            ShardPlacement::new(20, 7, vec![20]).unwrap(),
+        ],
+    )
+    .unwrap();
+    let scopes = (0..1_000)
+        .map(|partition| {
+            let scope = GraphScope::new(GraphId::new(1), PartitionId::new(partition));
+            (deployment.route_scope(scope).shard_id(), scope)
+        })
+        .fold(BTreeMap::new(), |mut scopes, (shard, scope)| {
+            scopes.entry(shard).or_insert(scope);
+            scopes
+        });
+    let scope_10 = scopes[&10];
+    let scope_20 = scopes[&20];
+    let vertex_10 = ElementRef::vertex(scope_10.graph(), scope_10.partition(), ElementId::new(10));
+    let vertex_20 = ElementRef::vertex(scope_20.graph(), scope_20.partition(), ElementId::new(20));
+    let valid = Interval::new(ValidTime::from_micros(0), None).unwrap();
+    let payload = |value: &str| {
+        CanonicalElement::new(
+            1,
+            BTreeMap::from([(1, GraphValue::String(value.to_owned()))]),
+        )
+    };
+    let payload_10 = payload("temporal-ten");
+    let payload_20 = payload("temporal-twenty");
+    let client_trait: Arc<dyn ShardClient> = client.clone();
+    let temporal_context = coordinator
+        .begin(3, IsolationLevel::TemporalSnapshot, 10_000)
+        .unwrap();
+    let temporal_receipt = coordinator
+        .commit_temporal_remote(
+            Arc::clone(&client_trait),
+            &deployment,
+            1,
+            now_ms() + 60_000,
+            temporal_context,
+            vec![
+                ScopedTemporalTransaction::new(
+                    scope_10,
+                    TemporalTransaction::new().with_vertex(
+                        VertexMutation::put(vertex_10, LabelId::new(1), valid, payload_10.clone())
+                            .unwrap(),
+                    ),
+                ),
+                ScopedTemporalTransaction::new(
+                    scope_20,
+                    TemporalTransaction::new().with_vertex(
+                        VertexMutation::put(vertex_20, LabelId::new(1), valid, payload_20.clone())
+                            .unwrap(),
+                    ),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(temporal_receipt.participants().len(), 2);
+    for (shard_id, vertex, expected) in [(10, vertex_10, payload_10), (20, vertex_20, payload_20)] {
+        let adapter = ShardClientStorageAdapter::new(
+            Arc::clone(&client_trait),
+            1,
+            shard_id,
+            7,
+            now_ms() + 60_000,
+            900 + u64::from(shard_id),
+        )
+        .unwrap();
+        assert_eq!(
+            TemporalStore::new(adapter)
+                .vertex_current(vertex, ValidTime::from_micros(1))
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
+
     drop(client);
+    drop(client_trait);
     shutdown_10.send(()).unwrap();
     shutdown_20.send(()).unwrap();
     server_10.await.unwrap().unwrap();

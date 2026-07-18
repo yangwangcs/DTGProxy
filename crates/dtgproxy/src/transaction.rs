@@ -3,12 +3,13 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use raft_command::{
     AbortIntentV1, CommandBodyV1, CommandCodecError, CommandEnvelopeV1, FinalizeV1,
     OnePhaseCommitV1, PrewriteV1, RecordDecisionV1,
 };
-use shard_client::{ExecuteCommand, ShardClient, ShardRequestContext};
+use shard_client::{ExecuteCommand, ShardClient, ShardClientStorageAdapter, ShardRequestContext};
 use shard_runtime::ReadBarrierError;
 use shard_runtime::ReplicationError;
 use storage_api::{AdapterError, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
@@ -25,7 +26,7 @@ use txn_protocol::{
     TransactionState, TxnProtocolError, recovery_action,
 };
 
-use crate::InProcessDeploymentRuntime;
+use crate::{DeploymentConfig, InProcessDeploymentRuntime};
 
 const SINGLE_SHARD_PHASE: u8 = 1;
 const PREWRITE_PHASE: u8 = 2;
@@ -45,6 +46,41 @@ pub struct TransactionContext {
 }
 
 impl TransactionContext {
+    pub fn from_allocated(
+        start_ts: TransactionTime,
+        commit_ts: TransactionTime,
+        schema_version: u64,
+        isolation: IsolationLevel,
+        ttl_micros: u64,
+    ) -> Result<Self, TransactionCoordinatorError> {
+        if schema_version == 0 {
+            return Err(TransactionCoordinatorError::InvalidSchemaVersion);
+        }
+        if ttl_micros == 0 {
+            return Err(TransactionCoordinatorError::InvalidTransactionTtl);
+        }
+        if commit_ts <= start_ts {
+            return Err(TransactionCoordinatorError::CommitTimestampTooEarly);
+        }
+        let ttl_micros =
+            i64::try_from(ttl_micros).map_err(|_| TransactionCoordinatorError::ExpiryOverflow)?;
+        let expires_at = TransactionTime::new(
+            start_ts
+                .physical_micros()
+                .checked_add(ttl_micros)
+                .ok_or(TransactionCoordinatorError::ExpiryOverflow)?,
+            0,
+        );
+        Ok(Self {
+            transaction_id: transaction_id_from_time(start_ts),
+            start_ts,
+            commit_ts,
+            expires_at,
+            schema_version,
+            isolation,
+        })
+    }
+
     #[must_use]
     pub const fn transaction_id(self) -> TransactionId {
         self.transaction_id
@@ -215,11 +251,11 @@ impl TransactionReceipt {
 }
 
 pub struct TransactionCoordinator<'oracle> {
-    oracle: &'oracle TimestampOracle,
+    oracle: Option<&'oracle TimestampOracle>,
     max_ticks: usize,
 }
 
-type DispatchFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ReplicationError>> + 'a>>;
+type DispatchFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ReplicationError>> + Send + 'a>>;
 
 trait TransactionDispatcher {
     fn validate_participant(
@@ -369,7 +405,18 @@ impl TransactionDispatcher for RemoteDispatcher<'_> {
 impl<'oracle> TransactionCoordinator<'oracle> {
     #[must_use]
     pub const fn new(oracle: &'oracle TimestampOracle, max_ticks: usize) -> Self {
-        Self { oracle, max_ticks }
+        Self {
+            oracle: Some(oracle),
+            max_ticks,
+        }
+    }
+
+    #[must_use]
+    pub const fn remote(max_ticks: usize) -> Self {
+        Self {
+            oracle: None,
+            max_ticks,
+        }
     }
 
     pub fn begin(
@@ -384,9 +431,12 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         if ttl_micros == 0 {
             return Err(TransactionCoordinatorError::InvalidTransactionTtl);
         }
-        let start_ts = self.oracle.next()?;
-        let proof_floor = self.oracle.next_after(start_ts)?;
-        let commit_ts = self.oracle.next_after(proof_floor)?;
+        let oracle = self
+            .oracle
+            .ok_or(TransactionCoordinatorError::LocalOracleUnavailable)?;
+        let start_ts = oracle.next()?;
+        let proof_floor = oracle.next_after(start_ts)?;
+        let commit_ts = oracle.next_after(proof_floor)?;
         let ttl_micros =
             i64::try_from(ttl_micros).map_err(|_| TransactionCoordinatorError::ExpiryOverflow)?;
         let expires_at = TransactionTime::new(
@@ -789,6 +839,119 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         self.commit(runtime, context, writes).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_temporal_remote(
+        &self,
+        client: Arc<dyn ShardClient>,
+        deployment: &DeploymentConfig,
+        graph_id: u64,
+        deadline_unix_ms: u64,
+        context: TransactionContext,
+        transactions: Vec<ScopedTemporalTransaction>,
+    ) -> Result<TransactionReceipt, TransactionCoordinatorError> {
+        if transactions.is_empty() {
+            return Err(TransactionCoordinatorError::EmptyWriteSet);
+        }
+        if graph_id == 0 || deadline_unix_ms == 0 {
+            return Err(TransactionCoordinatorError::InvalidRemoteContext);
+        }
+        let namespace = u64::try_from(context.transaction_id.value() & u128::from(u64::MAX))
+            .expect("masked transaction namespace fits u64")
+            .max(1);
+        let mut grouped = BTreeMap::<ShardEpoch, TemporalTransaction>::new();
+        let mut endpoint_guards = Vec::new();
+        for scoped in transactions {
+            if scoped.scope.graph().value() != graph_id
+                || !scoped
+                    .transaction
+                    .is_scoped_to(scoped.scope.graph(), scoped.scope.partition())
+            {
+                return Err(TransactionCoordinatorError::ScopeMismatch);
+            }
+            let placement = deployment.route_scope(scoped.scope);
+            let participant = ShardEpoch::new(placement.shard_id(), placement.placement_epoch())?;
+            endpoint_guards.extend(scoped.transaction.remote_endpoint_guards());
+            grouped
+                .entry(participant)
+                .or_default()
+                .extend(scoped.transaction);
+        }
+
+        let mut routed = BTreeMap::<ShardEpoch, BTreeMap<LogicalKey, MutationOperation>>::new();
+        for (participant, transaction) in grouped {
+            let adapter = ShardClientStorageAdapter::new(
+                Arc::clone(&client),
+                graph_id,
+                participant.shard_id(),
+                participant.placement_epoch(),
+                deadline_unix_ms,
+                namespace ^ u64::from(participant.shard_id()),
+            )?;
+            let batch = TemporalStore::new(adapter)
+                .prepare_transaction(
+                    PrepareContext::new(
+                        participant.shard_id(),
+                        context.transaction_id.value(),
+                        context.start_ts,
+                        context.commit_ts,
+                    ),
+                    transaction,
+                )
+                .await?;
+            for mutation in batch.mutations {
+                let destination = route_operation_with_config(deployment, &mutation.operation)?;
+                insert_routed_operation(&mut routed, destination, mutation.operation)?;
+            }
+        }
+        for guard in endpoint_guards {
+            let scope = GraphScope::new(guard.vertex().graph(), guard.vertex().partition());
+            let placement = deployment.route_scope(scope);
+            let participant = ShardEpoch::new(placement.shard_id(), placement.placement_epoch())?;
+            let adapter = ShardClientStorageAdapter::new(
+                Arc::clone(&client),
+                graph_id,
+                participant.shard_id(),
+                participant.placement_epoch(),
+                deadline_unix_ms,
+                namespace ^ u64::from(participant.shard_id()),
+            )?;
+            let operation = TemporalStore::new(adapter)
+                .prepare_endpoint_guard(context.start_ts, guard.vertex(), guard.valid())
+                .await?;
+            insert_routed_operation(&mut routed, participant, operation)?;
+        }
+
+        let writes = routed
+            .into_iter()
+            .map(|(participant, operations)| {
+                let mutations = operations
+                    .into_values()
+                    .enumerate()
+                    .map(|(sequence, operation)| {
+                        let sequence = u32::try_from(sequence)
+                            .map_err(|_| TransactionCoordinatorError::TooManyRoutedMutations)?;
+                        Ok(match operation {
+                            MutationOperation::Put { key, value } => {
+                                Mutation::put(sequence, key, value)
+                            }
+                            MutationOperation::Delete { key } => Mutation::delete(sequence, key),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
+                Ok(PreparedShardTransaction {
+                    participant,
+                    batch: PreparedMutationBatch {
+                        shard_id: participant.shard_id(),
+                        txn_id: context.transaction_id.value(),
+                        mutations,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
+        self.commit_remote(client.as_ref(), graph_id, deadline_unix_ms, context, writes)
+            .await
+    }
+
     pub async fn status(
         &self,
         runtime: &mut InProcessDeploymentRuntime,
@@ -851,7 +1014,10 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         &self,
         runtime: &mut InProcessDeploymentRuntime,
     ) -> Result<TransactionRecoveryReceipt, TransactionCoordinatorError> {
-        let observed_at = self.oracle.next()?;
+        let observed_at = self
+            .oracle
+            .ok_or(TransactionCoordinatorError::LocalOracleUnavailable)?
+            .next()?;
         let placements = runtime.config().all_shards().to_vec();
         let mut records = Vec::new();
         let mut receipt = TransactionRecoveryReceipt::default();
@@ -1093,6 +1259,20 @@ fn route_operation(
     )?)
 }
 
+fn route_operation_with_config(
+    deployment: &DeploymentConfig,
+    operation: &MutationOperation,
+) -> Result<ShardEpoch, TransactionCoordinatorError> {
+    let key = operation_key(operation);
+    let graph_key = decode_graph_key(key).map_err(TemporalStoreError::from)?;
+    let (graph, partition) = graph_key_scope(graph_key);
+    let placement = deployment.route_scope(GraphScope::new(graph, partition));
+    Ok(ShardEpoch::new(
+        placement.shard_id(),
+        placement.placement_epoch(),
+    )?)
+}
+
 fn insert_routed_operation(
     routed: &mut BTreeMap<ShardEpoch, BTreeMap<LogicalKey, MutationOperation>>,
     participant: ShardEpoch,
@@ -1216,6 +1396,7 @@ pub enum TransactionCoordinatorError {
     InvalidSchemaVersion,
     InvalidTransactionTtl,
     InvalidRemoteContext,
+    LocalOracleUnavailable,
     ExpiryOverflow,
     TimestampExhausted,
     EmptyWriteSet,
@@ -1280,6 +1461,9 @@ impl Display for TransactionCoordinatorError {
             Self::InvalidTransactionTtl => formatter.write_str("transaction TTL must be nonzero"),
             Self::InvalidRemoteContext => {
                 formatter.write_str("remote transaction graph or deadline is invalid")
+            }
+            Self::LocalOracleUnavailable => {
+                formatter.write_str("this coordinator requires timestamps from remote Meta")
             }
             Self::ExpiryOverflow => formatter.write_str("transaction expiry overflows timestamp"),
             Self::TimestampExhausted => {

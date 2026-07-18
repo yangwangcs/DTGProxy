@@ -617,6 +617,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-node"
+version = "1.0.0"
+dependencies = [
+ "cluster-protocol",
+ "control-plane",
+ "crc32fast",
+ "data-node",
+ "dtgproxy",
+ "meta-node",
+ "query-executor",
+ "raft-command",
+ "serde",
+ "serde_json",
+ "shard-client",
+ "storage-api",
+ "tempfile",
+ "temporal-ir",
+ "temporal-query",
+ "temporal-storage",
+ "temporal-types",
+ "timestamp-oracle",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "txn-protocol",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -130,6 +130,19 @@ service MetaRaftService {
   rpc Step(MetaRaftStepRequest) returns (MetaRaftStepResponse);
 }
 
+message GatewaySubmitRequest {
+  RequestContext context = 1;
+  bytes request_json = 2;
+}
+
+message GatewaySubmitResponse {
+  bytes response_json = 1;
+}
+
+service GatewayService {
+  rpc Submit(GatewaySubmitRequest) returns (GatewaySubmitResponse);
+}
+
 message ExecuteRequest {
   ShardContext context = 1;
   bytes command = 2;

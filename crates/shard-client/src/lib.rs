@@ -2,9 +2,11 @@
 
 mod embedded;
 mod remote;
+mod storage_adapter;
 
 pub use embedded::EmbeddedShardClient;
 pub use remote::{RemoteReplica, RemoteShardClient, RemoteTopology, RemoteTopologyError};
+pub use storage_adapter::ShardClientStorageAdapter;
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
