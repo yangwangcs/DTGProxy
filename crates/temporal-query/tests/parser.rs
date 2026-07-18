@@ -1,6 +1,6 @@
 use temporal_ir::{
-    DiffOperator, ExpandDirection, GraphScope, PlanBody, PlanError, PointOperator, TemporalPlan,
-    TemporalSelector,
+    DiffOperator, ExpandDirection, GraphScope, PlanBody, PlanError, PointOperator, ScanOperator,
+    TemporalPlan, TemporalSelector,
 };
 use temporal_query::{ParseError, parse};
 use temporal_storage::{ElementId, ElementKind, GraphId, PartitionId};
@@ -71,6 +71,26 @@ fn element_diff_syntax_compiles_to_ordered_transaction_bounds() {
             tx(200, 3),
             8,
         )
+    );
+}
+
+#[test]
+fn global_scan_syntax_carries_one_graph_wide_temporal_selector() {
+    assert_eq!(
+        parse("SCAN VERTICES GRAPH 2 FOR VALID TIME 50 AS OF TRANSACTION TIME 100:4 LIMIT 32")
+            .unwrap(),
+        TemporalPlan::global_scan(
+            GraphId::new(2),
+            ScanOperator::Vertices,
+            ValidTime::from_micros(50),
+            TemporalSelector::AsOf(tx(100, 4)),
+            32,
+        )
+    );
+    assert!(
+        parse("SCAN EDGES GRAPH 2 FOR VALID TIME 50 CURRENT LIMIT 8")
+            .unwrap()
+            .is_global()
     );
 }
 

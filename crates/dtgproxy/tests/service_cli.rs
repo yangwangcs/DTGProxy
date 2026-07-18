@@ -55,6 +55,19 @@ fn cli_init_and_status_open_the_persisted_primary_replica_service() {
     assert_eq!(status["mode"], "primary_replica");
     assert_eq!(status["backend_provider"], "rocksdb");
     assert_eq!(status["shards"][0]["leader_id"], 10);
+
+    let verification = Command::new(env!("CARGO_BIN_EXE_dtgproxy"))
+        .args(["backend", "verify", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        verification.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verification.stderr)
+    );
+    let verification: serde_json::Value = serde_json::from_slice(&verification.stdout).unwrap();
+    assert_eq!(verification["live_backend_verified"], true);
+    assert_eq!(verification["replicas"][0]["family"], "key_value");
 }
 
 #[test]
@@ -154,6 +167,79 @@ fn gateway_transaction_accepts_temporal_input_and_query_reads_it_back() {
 }
 
 #[test]
+fn online_backend_migration_snapshots_cuts_over_and_publishes_catalog_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("node.json");
+    let config = NodeConfig::new(
+        directory.path().join("data"),
+        7,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        20,
+        16,
+    )
+    .unwrap();
+    initialize_node(&config_path, &config, graph(DeploymentMode::PrimaryReplica)).unwrap();
+    let mut gateway = block_on(GatewayService::open(config)).unwrap();
+    let payload = CanonicalElement::new(
+        1,
+        BTreeMap::from([(1, GraphValue::String("migrated".into()))]),
+    );
+    let before =
+        block_on(gateway.execute_request(put_vertex_request("before-migration", "9", &payload)));
+    assert!(serde_json::to_value(before).unwrap()["ok"] == true);
+
+    let migration = block_on(gateway.execute_request(GatewayRequest {
+        version: GATEWAY_API_VERSION,
+        request_id: "migration-1".into(),
+        operation: GatewayOperation::MigrateBackend {
+            provider: "rocksdb".into(),
+            public_parameters: BTreeMap::from([(
+                "path".into(),
+                "backends/migrated-generation-2".into(),
+            )]),
+            secret_references: BTreeMap::new(),
+        },
+    }));
+    let migration = serde_json::to_value(migration).unwrap();
+    assert_eq!(migration["ok"], true, "{migration}");
+    assert_eq!(migration["result"]["target_generation"], 2);
+
+    let after =
+        block_on(gateway.execute_request(put_vertex_request("after-migration", "10", &payload)));
+    assert!(serde_json::to_value(after).unwrap()["ok"] == true);
+    drop(gateway);
+
+    let mut reopened = block_on(GatewayService::open(
+        NodeConfig::load(&config_path).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        reopened
+            .catalog()
+            .state()
+            .graph(7)
+            .unwrap()
+            .backend()
+            .generation(),
+        2
+    );
+    for vertex_id in ["9", "10"] {
+        let queried = block_on(reopened.execute_request(GatewayRequest {
+            version: GATEWAY_API_VERSION,
+            request_id: format!("query-{vertex_id}"),
+            operation: GatewayOperation::Query {
+                text: format!(
+                    "VERTEX {vertex_id} GRAPH 7 PARTITION 0 FOR VALID TIME 1 CURRENT LIMIT 1"
+                ),
+            },
+        }));
+        let queried = serde_json::to_value(queried).unwrap();
+        assert_eq!(queried["ok"], true, "{queried}");
+        assert_eq!(queried["result"]["records"][0]["element_id"], vertex_id);
+    }
+}
+
+#[test]
 fn bounded_tcp_gateway_serves_a_canonical_status_frame() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("node.json");
@@ -207,6 +293,29 @@ fn graph(mode: DeploymentMode) -> GraphDefinition {
         .unwrap(),
     )
     .unwrap()
+}
+
+fn put_vertex_request(
+    request_id: &str,
+    vertex_id: &str,
+    payload: &CanonicalElement,
+) -> GatewayRequest {
+    GatewayRequest {
+        version: GATEWAY_API_VERSION,
+        request_id: request_id.into(),
+        operation: GatewayOperation::Transaction {
+            schema_version: 1,
+            ttl_micros: 10_000,
+            mutations: vec![ApiMutation::PutVertex {
+                partition: 0,
+                vertex_id: vertex_id.into(),
+                label_id: 1,
+                valid_from_micros: 0,
+                valid_to_micros: None,
+                payload_dtp1: hex(&payload.encode().unwrap()),
+            }],
+        },
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

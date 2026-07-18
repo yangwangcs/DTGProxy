@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "request_id": "shared-example-1",
+  "operation": "transaction",
+  "schema_version": 1,
+  "ttl_micros": 10000000,
+  "mutations": [
+    {
+      "kind": "put_vertex",
+      "partition": 0,
+      "vertex_id": "1",
+      "label_id": 1,
+      "valid_from_micros": 0,
+      "valid_to_micros": null,
+      "payload_dtp1": "44545031000000000000000100000000"
+    },
+    {
+      "kind": "put_vertex",
+      "partition": 1,
+      "vertex_id": "2",
+      "label_id": 1,
+      "valid_from_micros": 0,
+      "valid_to_micros": null,
+      "payload_dtp1": "44545031000000000000000100000000"
+    },
+    {
+      "kind": "put_edge",
+      "edge_partition": 0,
+      "edge_id": "3",
+      "edge_type_id": 1,
+      "source_partition": 0,
+      "source_id": "1",
+      "destination_partition": 1,
+      "destination_id": "2",
+      "valid_from_micros": 0,
+      "valid_to_micros": null,
+      "payload_dtp1": "44545031000000000000000100000000"
+    }
+  ]
+}

@@ -58,6 +58,12 @@ pub enum PointOperator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanOperator {
+    Vertices,
+    Edges,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemporalSelector {
     Current,
     AsOf(TransactionTime),
@@ -91,13 +97,21 @@ pub enum PlanBody {
         to_transaction: TransactionTime,
         limit: u32,
     },
+    Scan {
+        operator: ScanOperator,
+        valid_time: ValidTime,
+        transaction: TemporalSelector,
+        limit: u32,
+    },
 }
 
 impl PlanBody {
     #[must_use]
     pub const fn limit(&self) -> u32 {
         match self {
-            Self::Point { limit, .. } | Self::Diff { limit, .. } => *limit,
+            Self::Point { limit, .. } | Self::Diff { limit, .. } | Self::Scan { limit, .. } => {
+                *limit
+            }
         }
     }
 }
@@ -151,6 +165,26 @@ impl TemporalPlan {
     }
 
     #[must_use]
+    pub const fn global_scan(
+        graph: GraphId,
+        operator: ScanOperator,
+        valid_time: ValidTime,
+        transaction: TemporalSelector,
+        limit: u32,
+    ) -> Self {
+        Self::with_version(
+            PLAN_VERSION,
+            GraphScope::new(graph, PartitionId::new(u32::MAX)),
+            PlanBody::Scan {
+                operator,
+                valid_time,
+                transaction,
+                limit,
+            },
+        )
+    }
+
+    #[must_use]
     pub const fn with_version(version: u16, scope: GraphScope, body: PlanBody) -> Self {
         Self {
             version,
@@ -172,6 +206,11 @@ impl TemporalPlan {
     #[must_use]
     pub const fn body(&self) -> &PlanBody {
         &self.body
+    }
+
+    #[must_use]
+    pub const fn is_global(&self) -> bool {
+        matches!(self.body, PlanBody::Scan { .. })
     }
 
     pub fn validate(&self) -> Result<(), PlanError> {

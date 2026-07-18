@@ -454,6 +454,11 @@ impl HotSwapAdapter {
     }
 
     #[must_use]
+    pub fn active_adapter(&self) -> Arc<dyn StorageAdapter> {
+        self.inspect_state().active.adapter_arc()
+    }
+
+    #[must_use]
     pub fn migration_status(&self) -> MigrationStatus {
         let state = self.inspect_state();
         state.shadow.as_ref().map_or(

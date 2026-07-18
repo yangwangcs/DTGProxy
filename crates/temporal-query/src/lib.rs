@@ -5,8 +5,8 @@ use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
 use temporal_ir::{
-    DiffOperator, ExpandDirection, GraphScope, PlanError, PointOperator, TemporalPlan,
-    TemporalSelector,
+    DiffOperator, ExpandDirection, GraphScope, PlanError, PointOperator, ScanOperator,
+    TemporalPlan, TemporalSelector,
 };
 use temporal_storage::{ElementId, ElementKind, GraphId, PartitionId};
 use temporal_types::{TransactionTime, ValidTime};
@@ -38,6 +38,8 @@ pub fn parse(input: &str) -> Result<TemporalPlan, ParseError> {
         parse_element(statement, &mut cursor)?
     } else if keyword(statement, "EXPAND") {
         parse_expand(&mut cursor)?
+    } else if keyword(statement, "SCAN") {
+        parse_scan(&mut cursor)?
     } else {
         return Err(ParseError::UnsupportedStatement {
             token: statement.to_owned(),
@@ -46,6 +48,46 @@ pub fn parse(input: &str) -> Result<TemporalPlan, ParseError> {
     cursor.finish()?;
     plan.validate().map_err(ParseError::InvalidPlan)?;
     Ok(plan)
+}
+
+fn parse_scan(cursor: &mut Cursor<'_>) -> Result<TemporalPlan, ParseError> {
+    let position = cursor.position();
+    let operator = match cursor.take() {
+        Some(token) if keyword(token, "VERTICES") => ScanOperator::Vertices,
+        Some(token) if keyword(token, "EDGES") => ScanOperator::Edges,
+        actual => {
+            return Err(ParseError::UnexpectedToken {
+                position,
+                expected: "VERTICES or EDGES",
+                actual: actual.map(str::to_owned),
+            });
+        }
+    };
+    cursor.expect("GRAPH")?;
+    let graph = GraphId::new(cursor.integer("graph id")?);
+    cursor.expect("FOR")?;
+    cursor.expect("VALID")?;
+    cursor.expect("TIME")?;
+    let valid_time = ValidTime::from_micros(cursor.integer("valid time")?);
+    let transaction = if cursor.peek_is("CURRENT") {
+        cursor.expect("CURRENT")?;
+        TemporalSelector::Current
+    } else {
+        cursor.expect("AS")?;
+        cursor.expect("OF")?;
+        cursor.expect("TRANSACTION")?;
+        cursor.expect("TIME")?;
+        TemporalSelector::AsOf(cursor.transaction_time()?)
+    };
+    cursor.expect("LIMIT")?;
+    let limit = cursor.integer("result limit")?;
+    Ok(TemporalPlan::global_scan(
+        graph,
+        operator,
+        valid_time,
+        transaction,
+        limit,
+    ))
 }
 
 fn parse_element(statement: &str, cursor: &mut Cursor<'_>) -> Result<TemporalPlan, ParseError> {

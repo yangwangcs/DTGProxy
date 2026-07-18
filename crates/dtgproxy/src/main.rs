@@ -70,10 +70,8 @@ fn run(arguments: Vec<String>) -> Result<Option<String>, CliError> {
         [command, subcommand, rest @ ..] if command == "backend" && subcommand == "verify" => {
             backend_verify(rest).map(Some)
         }
-        [command, subcommand, ..] if command == "backend" && subcommand == "migrate" => {
-            Err(CliError::Runtime(
-                "backend migration is enabled by the backend-matrix milestone".into(),
-            ))
+        [command, subcommand, rest @ ..] if command == "backend" && subcommand == "migrate" => {
+            backend_migrate(rest).map(Some)
         }
         [argument, ..] => Err(CliError::Usage(format!("unknown argument: {argument}"))),
     }
@@ -106,6 +104,12 @@ fn initialize(arguments: &[String]) -> Result<(), CliError> {
     }
     if let Some(endpoint) = options.get("--backend-endpoint") {
         parameters.insert("endpoint".into(), endpoint.clone());
+    }
+    if let Some(database) = options.get("--backend-database") {
+        parameters.insert("database".into(), database.clone());
+    }
+    if let Some(username) = options.get("--backend-user") {
+        parameters.insert("username".into(), username.clone());
     }
     let mut secret_references = BTreeMap::new();
     if let Some(reference) = options.get("--backend-secret-ref") {
@@ -198,6 +202,45 @@ fn backend_verify(arguments: &[String]) -> Result<String, CliError> {
         "replicas": gateway.backend_replicas(),
     })
     .to_string())
+}
+
+fn backend_migrate(arguments: &[String]) -> Result<String, CliError> {
+    let options = options(arguments)?;
+    let config = NodeConfig::load(required(&options, "--config")?).map_err(runtime_error)?;
+    let provider = required(&options, "--provider")?;
+    let mut public_parameters = BTreeMap::new();
+    for (option, parameter) in [
+        ("--backend-path", "path"),
+        ("--backend-endpoint", "endpoint"),
+        ("--backend-database", "database"),
+        ("--backend-user", "username"),
+        ("--backend-pool-size", "pool_size"),
+    ] {
+        if let Some(value) = options.get(option) {
+            public_parameters.insert(parameter.to_owned(), value.clone());
+        }
+    }
+    let mut secret_references = BTreeMap::new();
+    if let Some(reference) = options.get("--backend-secret-ref") {
+        let name = match provider {
+            "postgresql" => "connection_string",
+            "neo4j" => "password",
+            _ => "credential",
+        };
+        secret_references.insert(name.to_owned(), reference.clone());
+    }
+    let request = GatewayRequest {
+        version: GATEWAY_API_VERSION,
+        request_id: "cli-backend-migrate".into(),
+        operation: GatewayOperation::MigrateBackend {
+            provider: provider.to_owned(),
+            public_parameters,
+            secret_references,
+        },
+    };
+    let request = serde_json::to_vec(&request).map_err(runtime_error)?;
+    let response = send_request(config.listen(), &request).map_err(runtime_error)?;
+    String::from_utf8(response).map_err(runtime_error)
 }
 
 fn load_config(arguments: &[String]) -> Result<NodeConfig, CliError> {

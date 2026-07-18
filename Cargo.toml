@@ -16,6 +16,7 @@ members = [
     "crates/adapter-memory",
     "crates/adapter-rocksdb",
     "crates/adapter-postgres",
+    "crates/adapter-neo4j",
     "crates/temporal-storage",
     "crates/temporal-ir",
     "crates/query-executor",

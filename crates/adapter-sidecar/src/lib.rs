@@ -20,8 +20,14 @@ use storage_api::{
     ApplyReceipt, BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace,
     LOGICAL_SNAPSHOT_FORMAT_VERSION, LogicalKey, LogicalSnapshotChunkV1,
     LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
-    MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES, MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES, Mutation,
-    MutationOperation, SnapshotCapability, StorageAdapter,
+    LogicalSnapshotReader, MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES, MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES,
+    Mutation, MutationOperation, SnapshotCapability, StorageAdapter,
+};
+
+mod service;
+pub use service::{
+    SidecarRestoreBackend, SidecarService, TcpSidecarAdapterFactory,
+    spawn_stateful_tcp_sidecar_server,
 };
 
 const MAGIC: [u8; 4] = *b"DTAS";
@@ -683,7 +689,10 @@ fn run_tcp_sidecar_server(
         }
         match listener.accept() {
             Ok((stream, _peer)) => {
-                if let Err(error) = stream.set_nodelay(true) {
+                if let Err(error) = stream
+                    .set_nonblocking(false)
+                    .and_then(|()| stream.set_nodelay(true))
+                {
                     break Err(SidecarServerError::Io(error.to_string()));
                 }
                 match sender.try_send(stream) {
@@ -902,6 +911,7 @@ pub enum SidecarClientError {
         actual: u64,
     },
     InvalidScan(String),
+    InvalidSnapshotResponse(String),
 }
 
 impl Display for SidecarClientError {
@@ -941,6 +951,9 @@ impl Display for SidecarClientError {
             ),
             Self::InvalidScan(message) => {
                 write!(formatter, "invalid Sidecar scan response: {message}")
+            }
+            Self::InvalidSnapshotResponse(message) => {
+                write!(formatter, "invalid Sidecar snapshot response: {message}")
             }
         }
     }
@@ -1088,8 +1101,129 @@ impl<T: SidecarTransport> StorageAdapter for SidecarAdapter<T> {
         })
     }
 
+    fn begin_logical_export<'a>(
+        &'a self,
+        request: LogicalSnapshotExportRequest,
+    ) -> AdapterFuture<'a, Box<dyn LogicalSnapshotReader + 'a>> {
+        Box::pin(async move {
+            let response = self
+                .transport
+                .call(Request::BeginExport(BeginExportRequest {
+                    limits: request,
+                    expected_applied_log_index: Some(
+                        self.applied_log_index.load(Ordering::Acquire),
+                    ),
+                }))
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ExportStarted(started) => {
+                    if started.limits != request {
+                        return Err(AdapterError::from(
+                            SidecarClientError::InvalidSnapshotResponse(
+                                "Sidecar changed logical export limits".into(),
+                            ),
+                        ));
+                    }
+                    Ok(Box::new(SidecarLogicalSnapshotReader {
+                        transport: &self.transport,
+                        session_id: started.session_id,
+                        header: started.header,
+                        next_ordinal: 0,
+                        manifest: None,
+                    })
+                        as Box<dyn LogicalSnapshotReader + 'a>)
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "begin-export",
+                    &response,
+                ))),
+            }
+        })
+    }
+
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         Ok(self.applied_log_index.load(Ordering::Acquire))
+    }
+}
+
+struct SidecarLogicalSnapshotReader<'transport, T> {
+    transport: &'transport T,
+    session_id: u128,
+    header: LogicalSnapshotHeaderV1,
+    next_ordinal: u64,
+    manifest: Option<LogicalSnapshotManifestV1>,
+}
+
+impl<T: SidecarTransport> LogicalSnapshotReader for SidecarLogicalSnapshotReader<'_, T> {
+    fn header(&self) -> &LogicalSnapshotHeaderV1 {
+        &self.header
+    }
+
+    fn next_chunk<'a>(&'a mut self) -> AdapterFuture<'a, Option<LogicalSnapshotChunkV1>> {
+        Box::pin(async move {
+            if self.manifest.is_some() {
+                return Ok(None);
+            }
+            let response = self
+                .transport
+                .call(Request::ExportNext {
+                    session_id: self.session_id,
+                    expected_ordinal: self.next_ordinal,
+                })
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ExportChunk { session_id, chunk }
+                    if session_id == self.session_id && chunk.ordinal() == self.next_ordinal =>
+                {
+                    self.next_ordinal = self
+                        .next_ordinal
+                        .checked_add(1)
+                        .ok_or(storage_api::LogicalSnapshotError::CountOverflow)?;
+                    Ok(Some(chunk))
+                }
+                Response::ExportComplete {
+                    session_id,
+                    manifest,
+                } if session_id == self.session_id => {
+                    if manifest.header() != &self.header
+                        || manifest.total_chunks() != self.next_ordinal
+                    {
+                        return Err(AdapterError::from(
+                            SidecarClientError::InvalidSnapshotResponse(
+                                "Sidecar export manifest does not match the session".into(),
+                            ),
+                        ));
+                    }
+                    self.manifest = Some(manifest);
+                    Ok(None)
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "export-next",
+                    &response,
+                ))),
+            }
+        })
+    }
+
+    fn finish<'a>(self: Box<Self>) -> AdapterFuture<'a, LogicalSnapshotManifestV1>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            self.manifest.ok_or_else(|| {
+                AdapterError::from(SidecarClientError::InvalidSnapshotResponse(
+                    "Sidecar export was not exhausted before finish".into(),
+                ))
+            })
+        })
     }
 }
 

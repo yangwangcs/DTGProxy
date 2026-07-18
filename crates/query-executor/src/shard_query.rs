@@ -44,6 +44,9 @@ fn validate_plan_scope(
     plan: &TemporalPlan,
 ) -> Result<(), ShardQueryError> {
     plan.validate().map_err(ExecutorError::Plan)?;
+    if plan.is_global() {
+        return Ok(());
+    }
     let actual = plan.scope().partition().value();
     if actual != group.shard_id() {
         return Err(ShardQueryError::ShardMismatch {
@@ -64,7 +67,15 @@ fn follower_read_timestamp(plan: &TemporalPlan) -> Result<TransactionTime, Shard
         PlanBody::Point {
             transaction: TemporalSelector::Current,
             ..
+        }
+        | PlanBody::Scan {
+            transaction: TemporalSelector::Current,
+            ..
         } => Err(ShardQueryError::FollowerCurrentUnsupported),
+        PlanBody::Scan {
+            transaction: TemporalSelector::AsOf(read_ts),
+            ..
+        } => Ok(*read_ts),
     }
 }
 

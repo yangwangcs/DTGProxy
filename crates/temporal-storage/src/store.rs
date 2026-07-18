@@ -18,9 +18,11 @@ use crate::{
     EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryEntry,
     KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError, TemporalTransaction,
     VertexIdentity, cross_in_adjacency_key, cross_in_adjacency_prefix, cross_out_adjacency_key,
-    cross_out_adjacency_prefix, current_edge_key, current_vertex_key, decode_graph_key,
+    cross_out_adjacency_prefix, current_edge_graph_prefix, current_edge_key,
+    current_vertex_graph_prefix, current_vertex_key, decode_graph_key, edge_identity_graph_prefix,
     edge_identity_key, edge_identity_prefix, history_anchor_key, history_prefix, in_adjacency_key,
-    in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix, vertex_identity_key,
+    in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix, vertex_identity_graph_prefix,
+    vertex_identity_key,
 };
 
 pub type TemporalStoreFuture<'a, T> =
@@ -740,6 +742,134 @@ where
         })
     }
 
+    pub fn scan_vertices_current<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+    ) -> TemporalStoreFuture<'a, Vec<(ElementRef, CanonicalElement)>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Current,
+                    current_vertex_graph_prefix(graph),
+                ))
+                .await?;
+            let mut vertices = Vec::new();
+            for entry in entries {
+                let GraphKey::CurrentVertex(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedCurrentKey);
+                };
+                let projection = ProjectionRecord::decode(entry.value())?;
+                if let Some(payload) = projection.visible_at(valid_time) {
+                    vertices.push((element, payload.clone()));
+                }
+            }
+            Ok(vertices)
+        })
+    }
+
+    pub fn scan_vertices_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<(ElementRef, CanonicalElement)>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Identity,
+                    vertex_identity_graph_prefix(graph),
+                ))
+                .await?;
+            let mut vertices = Vec::new();
+            for entry in entries {
+                let GraphKey::VertexIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedVertexIdentityKey);
+                };
+                if let Some(payload) = self
+                    .load_projection_at(element, transaction_time)
+                    .await?
+                    .as_ref()
+                    .and_then(|projection| projection.visible_at(valid_time))
+                {
+                    vertices.push((element, payload.clone()));
+                }
+            }
+            Ok(vertices)
+        })
+    }
+
+    pub fn scan_edges_current<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Current,
+                    current_edge_graph_prefix(graph),
+                ))
+                .await?;
+            let mut edges = Vec::new();
+            for entry in entries {
+                let GraphKey::CurrentEdge(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedCurrentKey);
+                };
+                let projection = ProjectionRecord::decode(entry.value())?;
+                let Some(payload) = projection.visible_at(valid_time).cloned() else {
+                    continue;
+                };
+                let identity = self
+                    .load_edge_identity(element)
+                    .await?
+                    .ok_or(TemporalStoreError::MissingEdgeIdentity { edge: element })?;
+                edges.push(edge_view(identity, payload));
+            }
+            Ok(edges)
+        })
+    }
+
+    pub fn scan_edges_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Identity,
+                    edge_identity_graph_prefix(graph),
+                ))
+                .await?;
+            let mut edges = Vec::new();
+            for entry in entries {
+                let GraphKey::EdgeIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedEdgeIdentityKey);
+                };
+                let identity = EdgeIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                if let Some(payload) = self
+                    .load_projection_at(element, transaction_time)
+                    .await?
+                    .as_ref()
+                    .and_then(|projection| projection.visible_at(valid_time))
+                    .cloned()
+                {
+                    edges.push(edge_view(identity, payload));
+                }
+            }
+            Ok(edges)
+        })
+    }
+
     pub fn expand_out_current<'a>(
         &'a self,
         graph: GraphId,
@@ -1272,6 +1402,8 @@ pub enum TemporalStoreError {
     MissingEdgeIdentity {
         edge: ElementRef,
     },
+    UnexpectedCurrentKey,
+    UnexpectedVertexIdentityKey,
     UnexpectedEdgeIdentityKey,
     UnexpectedAdjacencyKey,
     UnexpectedHistoryAnchor,
@@ -1326,6 +1458,12 @@ impl Display for TemporalStoreError {
             }
             Self::MissingEdgeIdentity { edge } => {
                 write!(formatter, "visible edge has no identity record: {edge:?}")
+            }
+            Self::UnexpectedCurrentKey => {
+                formatter.write_str("Current scan returned an unexpected key type")
+            }
+            Self::UnexpectedVertexIdentityKey => {
+                formatter.write_str("vertex identity scan returned an unexpected key type")
             }
             Self::UnexpectedEdgeIdentityKey => {
                 formatter.write_str("edge identity scan returned an unexpected key type")

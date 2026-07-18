@@ -2,46 +2,35 @@
 
 DTGProxy is a distributed bitemporal property-graph middleware written in Rust. It owns valid-time and transaction-time semantics above pluggable ordinary KV and graph database backends.
 
-The repository is being delivered in independently verifiable phases. The implemented kernel contains:
+The 1.0 prototype implements the complete main path:
 
-- `temporal-types`: bitemporal primitives and canonical values;
-- `temporal-model`: executable in-memory semantic oracle;
-- `storage-api`: backend-neutral prepared/committed mutation contracts;
-- `raft-command`: bounded, checksummed, versioned deterministic Raft command codec;
-- `raft-logstore`: synchronous RocksDB Raft WAL with durable HardState, entries, membership,
-  snapshots, conflict truncation, and restart reconstruction;
-- `shard-runtime`: epoch-fenced durable Replica state machine and safe-time metadata;
-- `replica-snapshot`: checksummed RocksDB checkpoint manifests and verified suffix recovery;
-- `adapter-memory`: atomic and idempotent reference adapter;
-- `adapter-rocksdb`: durable RocksDB 0.24.0 adapter with atomic cross-keyspace writes,
-  idempotent replay, restart recovery, snapshot reads, and checkpoints;
-- `temporal-storage`: deterministic graph key/value codecs, Current/History rewriting, typed
-  vertex and edge reads, double adjacency, AS OF, and temporal DIFF;
-- `temporal-ir`: versioned, validated backend-neutral plans for point lookup, expansion, AS OF,
-  and DIFF;
-- `query-executor`: deterministic local execution with typed vertex, edge, and change records;
-- `temporal-query`: bounded hand-written parser compiling a small temporal syntax to the IR;
-- `dtgproxy`: executable product entry point.
-
-Phase 0, the Phase 1A durable adapter, and the Phase 1B temporal persistence slice are
-implemented and tested. Bounded Anchor+Delta history, atomic multi-element single-node
-transactions, typed Temporal IR, the local executor, and the minimal text query frontend are also
-implemented in Phase 1C. Distributed transactions, external database adapters, and analytics
-integration remain active implementation phases described by the design. Phase 2 now includes the
-deterministic prepare/apply boundary, three-node in-process Raft groups, checkpoint manifests, and
-a process-recoverable single-Replica runtime. Temporal validation and graph rewriting produce a
-log-position-independent `PreparedMutationBatch`; committed state-machine application alone
-assigns the Raft log index and touches the Adapter. The durable runtime persists Raft Ready state
-before Adapter apply and restarts RawNode at the Adapter's atomic `applied_index`, so a crash in
-that window replays committed entries. Snapshot transfer/install, durable three-node orchestration,
-and read barriers remain active work.
+- bitemporal Current/History storage, bounded Anchor+Delta reconstruction, `AS OF`, `DIFF`, and
+  double adjacency;
+- independent Raft groups with durable WAL, checkpoint/suffix recovery, epoch fencing, ReadIndex,
+  and follower safe-time reads;
+- durable timestamp allocation and distributed temporal transactions with Home decisions,
+  participant intents, 2PC recovery metadata, and a single-Shard fast path;
+- `PrimaryReplica` and rendezvous-routed `SharedNothing` deployment modes, including
+  cross-partition edge projections;
+- one versioned Adapter SPI over Memory, RocksDB, PostgreSQL, Neo4j Query API v2, and remote
+  Sidecar backends;
+- logical snapshots, stateful Sidecar export/restore, online dual-apply backend migration, and
+  generation-based catalog publication;
+- typed Temporal IR plus point lookup, expansion, history, and deterministic distributed global
+  scans;
+- a runnable `dtgproxy` Gateway and CLI for initialization, serving, transaction submission,
+  querying, backend verification, and migration.
 
 The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
 `adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column
 Family is also present because RocksDB requires it, but DTGProxy does not place logical data
 there.
 
-The approved architecture and remaining distributed phases are specified in [the detailed design](docs/superpowers/specs/2026-07-17-dtgproxy-design.md). The durable replicated command layout is specified in [Raft Command V1](docs/raft-command-v1.md), its local apply/recovery contract is described in [the Shard state machine](docs/shard-state-machine.md), the WAL restart rules in [Durable Raft WAL](docs/raft-wal.md), generation-based recovery in [Replica Snapshot](docs/replica-snapshot.md), the three-replica consensus harness in [the replicated Shard Group](docs/replicated-shard-group.md), and authorized leader/Follower reads in [Consistent Shard Read Barriers](docs/read-barriers.md).
+Start with the [1.0 quickstart](docs/dtgproxy-v1-quickstart.md), its
+[main-path acceptance record](docs/dtgproxy-v1-acceptance.md), and the
+[detailed design](docs/superpowers/specs/2026-07-17-dtgproxy-design.md). Protocol specifications
+for Raft commands, state-machine recovery, snapshots, transactions, control-plane state, Adapter
+SPI, and Sidecar transport are under [`docs/`](docs/).
 
 ## Temporal persistence slice
 
@@ -100,8 +89,8 @@ capability-aware pushdown without changing IR semantics.
 
 ## Minimal temporal query syntax
 
-The Phase 1C frontend intentionally accepts only fixed-shape ID lookup, one-hop expansion, and
-element DIFF. Keywords are case-insensitive; identifiers and times are decimal integers;
+The frontend accepts fixed-shape ID lookup, one-hop expansion, element DIFF, and graph-wide
+vertex/edge scans. Keywords are case-insensitive; identifiers and times are decimal integers;
 transaction timestamps are `physical_micros:logical`. The complete forms are:
 
 ```text
@@ -117,6 +106,9 @@ EXPAND OUT|IN|BOTH FROM <vertex-id> GRAPH <graph> PARTITION <partition>
 VERTEX|EDGE <id> GRAPH <graph> PARTITION <partition>
   DIFF TRANSACTION TIME <from-physical>:<from-logical>
   TO <to-physical>:<to-logical> LIMIT <n>
+
+SCAN VERTICES|EDGES GRAPH <graph> FOR VALID TIME <micros>
+  CURRENT|AS OF TRANSACTION TIME <physical>:<logical> LIMIT <n>
 ```
 
 Input is capped at 4,096 bytes and 64 tokens. Integer widths, unknown statements, missing clauses,
@@ -134,32 +126,21 @@ The CLI emits canonical JSON. Graph/element identifiers and times are decimal st
 consumer precision loss; canonical property payloads are DTP1 bytes encoded as lowercase hex, so
 all graph value types round-trip without lossy JSON coercion.
 
-## Phase 1C isolation and deployment boundary
+## Prototype 1.0 isolation and deployment boundary
 
-Phase 1C is a complete single-node semantic/product slice, not yet a distributed deployment. Its
-transaction contract is Temporal Snapshot Isolation for written element/valid-time intervals:
-overlapping intervening writes conflict, while disjoint valid-time corrections may commit. It also
-enforces immutable identities and strict same-partition edge lifetime coverage. It does not yet
-detect arbitrary read/write predicates or provide Temporal Serializable isolation.
+The transaction contract is Temporal Snapshot Isolation for written element/valid-time intervals:
+overlapping intervening writes conflict while disjoint valid-time corrections may commit. A durable
+timestamp oracle assigns transaction time; multi-Shard transactions prewrite epoch-fenced intents,
+persist their final decision on the Home Shard, and then resolve every participant. Single-Shard
+transactions use one replicated command. Vertex/edge identity and lifetime validation includes
+cross-partition OUT/IN edge projections.
 
-`CommitContext` timestamps, transaction IDs, shard IDs, and log indices are supplied by the caller.
-The next-log-index barrier models one ordered state machine and prevents a successful transaction
-from preparing over an unapplied lower log entry. Phase 2 must replace this local ordering
-assumption with replicated Raft proposal/apply and safe-time tracking; Phase 3 must add the global
-timestamp oracle, intents, cross-shard 2PC, epoch checks, recovery, and edge guard locks. Endpoint
-references currently use one graph partition; cross-partition edge projections are therefore not
-claimed by Phase 1C.
-
-The Phase 2 `PrepareContext` deliberately omits a log index. `prepare_transaction` is read-only and
-deterministic for one applied shard state; `commit_transaction` remains a compatibility wrapper
-that prepares and locally applies. The replicated runtime will serialize state-dependent prepare
-operations per shard before proposing them so concurrent proposals cannot validate against the
-same stale applied frontier.
-
-Only Memory and RocksDB adapters are implemented. Neo4j and other graph backends remain subject to
-the same capability contract and TCK. Historical expansion is semantically complete but performs a
-partition edge-identity scan; it is not a production complexity target until versioned adjacency
-indexes and capability-aware pushdown are added.
+This prototype does not claim predicate-level Temporal Serializable isolation. Historical
+expansion is semantically complete but still uses an edge-identity scan; global scans fan out and
+merge in the middleware rather than pushing a distributed plan into every backend. PostgreSQL and
+Neo4j have environment-gated live integration tests because the default workspace test does not
+provision external services. Production hardening findings are recorded separately after the main
+path acceptance run.
 
 ## Performance probe
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
@@ -7,13 +8,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
+use adapter_neo4j::Neo4jAdapterFactory;
 use adapter_postgres::PostgresAdapterFactory;
-use adapter_registry::{AdapterOpenRequest, AdapterRegistry, RegistryError, SecretString};
+use adapter_registry::{
+    AdapterOpenRequest, AdapterRegistry, HotSwapAdapter, MigrationError, RegistryError,
+    SecretString,
+};
 use adapter_rocksdb::RocksAdapterFactory;
+use adapter_sidecar::TcpSidecarAdapterFactory;
 use control_plane::{BackendProfile, Catalog, CatalogCommand, CatalogError, GraphDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use storage_api::{BackendFamily, StorageAdapter};
+use storage_api::{
+    AdapterRequirement, BackendFamily, LogicalSnapshotExportRequest, StorageAdapter,
+};
 use temporal_ir::GraphScope;
 use temporal_storage::{
     EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
@@ -61,36 +69,30 @@ pub struct GatewayService {
     oracle: TimestampOracle,
     runtime: InProcessDeploymentRuntime,
     backends: Vec<BackendReplicaStatus>,
+    backend_slots: BTreeMap<(u32, u64), Arc<HotSwapAdapter>>,
 }
 
-type ReplicaAdapters = std::collections::BTreeMap<(u32, u64), Arc<dyn StorageAdapter>>;
+type ReplicaAdapters = BTreeMap<(u32, u64), Arc<dyn StorageAdapter>>;
+type BackendSlots = BTreeMap<(u32, u64), Arc<HotSwapAdapter>>;
 
 async fn open_backend_replicas(
     config: &NodeConfig,
     graph: &GraphDefinition,
     deployment: &DeploymentConfig,
-) -> Result<(ReplicaAdapters, Vec<BackendReplicaStatus>), GatewayError> {
-    let mut registry = AdapterRegistry::new();
-    registry.register(Arc::new(RocksAdapterFactory))?;
-    registry.register(Arc::new(PostgresAdapterFactory))?;
+) -> Result<(ReplicaAdapters, Vec<BackendReplicaStatus>, BackendSlots), GatewayError> {
+    let registry = backend_registry()?;
 
     let mut adapters = ReplicaAdapters::new();
     let mut statuses = Vec::new();
+    let mut slots = BackendSlots::new();
     for shard in deployment.all_shards() {
         for node_id in shard.voters() {
-            let instance_id = format!(
-                "graph-{}-shard-{}-replica-{}-generation-{}",
-                graph.graph_id(),
-                shard.shard_id(),
-                node_id,
-                graph.backend().generation()
-            );
             let request = backend_open_request(
                 config.root(),
+                graph.graph_id(),
                 graph.backend(),
                 shard.shard_id(),
                 *node_id,
-                instance_id,
             )?;
             let opened = registry
                 .open(
@@ -99,26 +101,41 @@ async fn open_backend_replicas(
                     graph.backend().requirement(),
                 )
                 .await?;
-            let adapter = opened.into_adapter();
             statuses.push(BackendReplicaStatus::from_adapter(
                 shard.shard_id(),
                 *node_id,
                 graph.backend().provider(),
-                adapter.as_ref(),
+                opened.adapter(),
             )?);
+            let slot = Arc::new(HotSwapAdapter::new(opened));
+            let adapter: Arc<dyn StorageAdapter> = slot.clone();
             adapters.insert((shard.shard_id(), *node_id), adapter);
+            slots.insert((shard.shard_id(), *node_id), slot);
         }
     }
-    Ok((adapters, statuses))
+    Ok((adapters, statuses, slots))
+}
+
+fn backend_registry() -> Result<AdapterRegistry, GatewayError> {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(Neo4jAdapterFactory))?;
+    registry.register(Arc::new(RocksAdapterFactory))?;
+    registry.register(Arc::new(TcpSidecarAdapterFactory))?;
+    registry.register(Arc::new(PostgresAdapterFactory))?;
+    Ok(registry)
 }
 
 fn backend_open_request(
     root: &Path,
+    graph_id: u64,
     profile: &BackendProfile,
     shard_id: u32,
     node_id: u64,
-    instance_id: String,
 ) -> Result<AdapterOpenRequest, GatewayError> {
+    let instance_id = format!(
+        "graph-{graph_id}-shard-{shard_id}-replica-{node_id}-generation-{}",
+        profile.generation()
+    );
     let mut request = AdapterOpenRequest::new(instance_id);
     for (name, value) in profile.public_parameters() {
         let value = if profile.provider() == "rocksdb" && name == "path" {
@@ -183,7 +200,8 @@ impl GatewayService {
             },
         )?;
         let deployment = DeploymentConfig::from_catalog(&graph)?;
-        let (adapters, backends) = open_backend_replicas(&config, &graph, &deployment).await?;
+        let (adapters, backends, backend_slots) =
+            open_backend_replicas(&config, &graph, &deployment).await?;
         let mut runtime =
             InProcessDeploymentRuntime::new_with_adapters(deployment, adapters).await?;
         let elections = runtime
@@ -205,6 +223,7 @@ impl GatewayService {
             oracle,
             runtime,
             backends,
+            backend_slots,
         })
     }
 
@@ -226,6 +245,140 @@ impl GatewayService {
     #[must_use]
     pub fn backend_replicas(&self) -> &[BackendReplicaStatus] {
         &self.backends
+    }
+
+    pub async fn migrate_backend(
+        &mut self,
+        provider: String,
+        mut public_parameters: BTreeMap<String, String>,
+        secret_references: BTreeMap<String, String>,
+    ) -> Result<BackendMigrationReceipt, GatewayError> {
+        let graph = self
+            .catalog
+            .state()
+            .graph(self.config.graph_id())
+            .cloned()
+            .ok_or(GatewayError::UnknownGraph {
+                graph_id: self.config.graph_id(),
+            })?;
+        let next_generation = graph
+            .backend()
+            .generation()
+            .checked_add(1)
+            .ok_or_else(|| GatewayError::Backend("backend generation is exhausted".into()))?;
+        if provider == "rocksdb" && !public_parameters.contains_key("path") {
+            public_parameters.insert(
+                "path".into(),
+                format!(
+                    "backends/graph-{}-generation-{next_generation}",
+                    graph.graph_id()
+                ),
+            );
+        }
+        let target_profile = BackendProfile::new(
+            provider,
+            public_parameters,
+            secret_references,
+            AdapterRequirement::HotPluggableReplica,
+            next_generation,
+        )?;
+        let registry = backend_registry()?;
+        let placements = self
+            .runtime
+            .config()
+            .all_shards()
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .voters()
+                    .iter()
+                    .map(move |node_id| (shard.shard_id(), *node_id))
+            })
+            .collect::<Vec<_>>();
+        let mut started = Vec::new();
+        for (shard_id, node_id) in &placements {
+            let slot = self
+                .backend_slots
+                .get(&(*shard_id, *node_id))
+                .expect("runtime placement has a backend slot");
+            let source = slot.active_adapter();
+            let reader = source
+                .begin_logical_export(LogicalSnapshotExportRequest::default())
+                .await
+                .map_err(|error| GatewayError::Backend(error.to_string()))?;
+            let request = backend_open_request(
+                self.config.root(),
+                graph.graph_id(),
+                &target_profile,
+                *shard_id,
+                *node_id,
+            )?;
+            let target = match registry
+                .restore(
+                    target_profile.provider(),
+                    &request,
+                    target_profile.requirement(),
+                    reader,
+                )
+                .await
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    self.abort_started_migrations(&started);
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = slot.start_migration(target, target_profile.requirement()) {
+                self.abort_started_migrations(&started);
+                return Err(error.into());
+            }
+            started.push((*shard_id, *node_id));
+        }
+        for key in &started {
+            self.backend_slots
+                .get(key)
+                .expect("started migration has a backend slot")
+                .cutover()?;
+        }
+        let expected_revision = self.catalog.state().revision();
+        let command_id =
+            (u128::from(expected_revision.saturating_add(1)) << 64) | u128::from(graph.graph_id());
+        self.catalog.execute(CatalogCommand::publish_backend(
+            command_id,
+            expected_revision,
+            graph.graph_id(),
+            graph.backend().generation(),
+            target_profile.clone(),
+        ))?;
+        self.catalog.checkpoint()?;
+        self.refresh_backend_statuses(target_profile.provider())?;
+        Ok(BackendMigrationReceipt {
+            source_provider: graph.backend().provider().to_owned(),
+            target_provider: target_profile.provider().to_owned(),
+            source_generation: graph.backend().generation(),
+            target_generation: target_profile.generation(),
+            replicas: placements.len(),
+        })
+    }
+
+    fn abort_started_migrations(&self, keys: &[(u32, u64)]) {
+        for key in keys {
+            if let Some(slot) = self.backend_slots.get(key) {
+                let _ = slot.abort_migration();
+            }
+        }
+    }
+
+    fn refresh_backend_statuses(&mut self, provider: &str) -> Result<(), GatewayError> {
+        self.backends = self
+            .backend_slots
+            .iter()
+            .map(|((shard_id, node_id), slot)| {
+                let adapter = slot.active_adapter();
+                BackendReplicaStatus::from_adapter(*shard_id, *node_id, provider, adapter.as_ref())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(())
     }
 
     pub fn status(&self) -> Result<GatewayStatus, GatewayError> {
@@ -307,10 +460,22 @@ impl GatewayService {
                         actual: plan.scope().graph().value(),
                     });
                 }
-                let result = self
-                    .runtime
-                    .execute_leader(&plan, self.config.max_raft_ticks())
-                    .await?;
+                let result = if plan.is_global() {
+                    let topology_epoch = self
+                        .catalog
+                        .state()
+                        .graph(self.config.graph_id())
+                        .expect("Gateway graph remains present")
+                        .topology()
+                        .epoch();
+                    self.runtime
+                        .execute_global_leader(&plan, topology_epoch, self.config.max_raft_ticks())
+                        .await?
+                } else {
+                    self.runtime
+                        .execute_leader(&plan, self.config.max_raft_ticks())
+                        .await?
+                };
                 let canonical = result
                     .to_canonical_json()
                     .map_err(|error| GatewayError::Query(error.to_string()))?;
@@ -350,6 +515,15 @@ impl GatewayService {
                     "single_shard_fast_path": receipt.single_shard_fast_path(),
                 }))
             }
+            GatewayOperation::MigrateBackend {
+                provider,
+                public_parameters,
+                secret_references,
+            } => Ok(serde_json::to_value(
+                self.migrate_backend(provider, public_parameters, secret_references)
+                    .await?,
+            )
+            .expect("BackendMigrationReceipt is JSON serializable")),
         }
     }
 }
@@ -430,6 +604,15 @@ pub struct BackendReplicaStatus {
     implementation_version: String,
     family: String,
     applied_log_index: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BackendMigrationReceipt {
+    source_provider: String,
+    target_provider: String,
+    source_generation: u64,
+    target_generation: u64,
+    replicas: usize,
 }
 
 impl BackendReplicaStatus {
@@ -519,6 +702,13 @@ pub enum GatewayOperation {
         schema_version: u64,
         ttl_micros: u64,
         mutations: Vec<ApiMutation>,
+    },
+    MigrateBackend {
+        provider: String,
+        #[serde(default)]
+        public_parameters: BTreeMap<String, String>,
+        #[serde(default)]
+        secret_references: BTreeMap<String, String>,
     },
 }
 
@@ -827,6 +1017,7 @@ pub enum GatewayError {
     Transaction(Box<TransactionCoordinatorError>),
     Temporal(temporal_storage::TemporalStoreError),
     Registry(RegistryError),
+    Migration(MigrationError),
     UnsupportedApiVersion { version: u16 },
     InvalidRequestId,
     UnknownGraph { graph_id: u64 },
@@ -852,6 +1043,7 @@ impl Display for GatewayError {
             Self::Transaction(error) => Display::fmt(error, formatter),
             Self::Temporal(error) => Display::fmt(error, formatter),
             Self::Registry(error) => Display::fmt(error, formatter),
+            Self::Migration(error) => Display::fmt(error, formatter),
             Self::UnsupportedApiVersion { version } => {
                 write!(formatter, "unsupported Gateway API version {version}")
             }
@@ -895,6 +1087,7 @@ impl Error for GatewayError {
             Self::Transaction(error) => Some(error),
             Self::Temporal(error) => Some(error),
             Self::Registry(error) => Some(error),
+            Self::Migration(error) => Some(error),
             Self::UnsupportedApiVersion { .. }
             | Self::InvalidRequestId
             | Self::UnknownGraph { .. }
@@ -961,5 +1154,11 @@ impl From<temporal_storage::TemporalStoreError> for GatewayError {
 impl From<RegistryError> for GatewayError {
     fn from(value: RegistryError) -> Self {
         Self::Registry(value)
+    }
+}
+
+impl From<MigrationError> for GatewayError {
+    fn from(value: MigrationError) -> Self {
+        Self::Migration(value)
     }
 }

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod distributed;
 mod shard_query;
 
 use std::collections::BTreeMap;
@@ -11,7 +12,8 @@ use std::pin::Pin;
 
 use storage_api::StorageAdapter;
 use temporal_ir::{
-    ExpandDirection, PlanBody, PlanError, PointOperator, TemporalPlan, TemporalSelector,
+    ExpandDirection, PlanBody, PlanError, PointOperator, ScanOperator, TemporalPlan,
+    TemporalSelector,
 };
 use temporal_storage::{
     EdgeTypeId, EdgeView, ElementId, ElementKind, ElementRef, TemporalChange, TemporalChangeKind,
@@ -19,6 +21,9 @@ use temporal_storage::{
 };
 use temporal_types::{CanonicalElement, CodecError};
 
+pub use distributed::{
+    DistributedQueryError, ShardQueryBatch, SnapshotToken, merge_distributed_results,
+};
 pub use shard_query::{ShardQueryError, ShardQueryExecutor};
 
 pub type ExecutorFuture<'a, T> =
@@ -124,6 +129,16 @@ impl QueryResult {
     #[must_use]
     pub fn records(&self) -> &[QueryRecord] {
         &self.records
+    }
+
+    #[must_use]
+    pub fn into_records(self) -> Vec<QueryRecord> {
+        self.records
+    }
+
+    #[must_use]
+    pub fn from_records(records: Vec<QueryRecord>) -> Self {
+        Self { records }
     }
 
     pub fn to_canonical_json(&self) -> Result<String, CodecError> {
@@ -287,9 +302,74 @@ where
                         .map(|change| QueryRecord::Change(ChangeRecord { element, change }))
                         .collect()
                 }
+                PlanBody::Scan {
+                    operator,
+                    valid_time,
+                    transaction,
+                    limit,
+                } => {
+                    self.execute_scan(
+                        plan,
+                        *operator,
+                        *valid_time,
+                        *transaction,
+                        usize::try_from(*limit).expect("u32 result limit fits usize"),
+                    )
+                    .await?
+                }
             };
             Ok(QueryResult { records })
         })
+    }
+
+    async fn execute_scan(
+        &self,
+        plan: &TemporalPlan,
+        operator: ScanOperator,
+        valid_time: temporal_types::ValidTime,
+        transaction: TemporalSelector,
+        limit: usize,
+    ) -> Result<Vec<QueryRecord>, ExecutorError> {
+        let graph = plan.scope().graph();
+        match operator {
+            ScanOperator::Vertices => {
+                let vertices = match transaction {
+                    TemporalSelector::Current => {
+                        self.store.scan_vertices_current(graph, valid_time).await?
+                    }
+                    TemporalSelector::AsOf(transaction_time) => {
+                        self.store
+                            .scan_vertices_as_of(graph, valid_time, transaction_time)
+                            .await?
+                    }
+                };
+                Ok(vertices
+                    .into_iter()
+                    .take(limit)
+                    .map(|(element, payload)| {
+                        QueryRecord::Vertex(VertexRecord { element, payload })
+                    })
+                    .collect())
+            }
+            ScanOperator::Edges => {
+                let edges = match transaction {
+                    TemporalSelector::Current => {
+                        self.store.scan_edges_current(graph, valid_time).await?
+                    }
+                    TemporalSelector::AsOf(transaction_time) => {
+                        self.store
+                            .scan_edges_as_of(graph, valid_time, transaction_time)
+                            .await?
+                    }
+                };
+                Ok(edges
+                    .into_iter()
+                    .take(limit)
+                    .map(EdgeRecord::from)
+                    .map(QueryRecord::Edge)
+                    .collect())
+            }
+        }
     }
 
     async fn execute_point(

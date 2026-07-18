@@ -246,6 +246,16 @@ pub fn edge_identity_prefix(graph: GraphId, partition: PartitionId) -> Vec<u8> {
 }
 
 #[must_use]
+pub fn vertex_identity_graph_prefix(graph: GraphId) -> Vec<u8> {
+    graph_prefix(TAG_VERTEX_IDENTITY, graph)
+}
+
+#[must_use]
+pub fn edge_identity_graph_prefix(graph: GraphId) -> Vec<u8> {
+    graph_prefix(TAG_EDGE_IDENTITY, graph)
+}
+
+#[must_use]
 pub fn current_vertex_key(element: ElementRef) -> LogicalKey {
     entity_key(Keyspace::Current, TAG_CURRENT_VERTEX, element)
 }
@@ -253,6 +263,23 @@ pub fn current_vertex_key(element: ElementRef) -> LogicalKey {
 #[must_use]
 pub fn current_edge_key(element: ElementRef) -> LogicalKey {
     entity_key(Keyspace::Current, TAG_CURRENT_EDGE, element)
+}
+
+#[must_use]
+pub fn current_vertex_graph_prefix(graph: GraphId) -> Vec<u8> {
+    graph_prefix(TAG_CURRENT_VERTEX, graph)
+}
+
+#[must_use]
+pub fn current_edge_graph_prefix(graph: GraphId) -> Vec<u8> {
+    graph_prefix(TAG_CURRENT_EDGE, graph)
+}
+
+fn graph_prefix(tag: u8, graph: GraphId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9);
+    key.push(tag);
+    key.extend_from_slice(&graph.value().to_be_bytes());
+    key
 }
 
 #[must_use]

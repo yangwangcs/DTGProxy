@@ -1,5 +1,5 @@
 [package]
-name = "adapter-sidecar"
+name = "adapter-neo4j"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,15 +7,12 @@ license.workspace = true
 
 [dependencies]
 adapter-registry = { path = "../adapter-registry" }
-blake3 = "=1.8.5"
-crc32fast = "=1.5.0"
-getrandom = "=0.4.3"
-prost = "=0.11.9"
+base64 = "=0.22.1"
+serde_json = "=1.0.145"
 storage-api = { path = "../storage-api" }
+ureq = { version = "=2.12.1", features = ["json"] }
 
 [dev-dependencies]
-adapter-memory = { path = "../adapter-memory" }
-adapter-rocksdb = { path = "../adapter-rocksdb" }
 tempfile = "3"
 
 [lints]

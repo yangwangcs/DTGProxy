@@ -22,7 +22,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
-use query_executor::{ExecutorError, LocalExecutor, QueryResult};
+use query_executor::{
+    DistributedQueryError, ExecutorError, LocalExecutor, QueryResult, ShardQueryBatch,
+    SnapshotToken, merge_distributed_results,
+};
 use shard_runtime::{
     InProcessShardGroup, MultiRaftRuntime, ProposalReceipt, ReadBarrierError, ReplicationError,
 };
@@ -227,6 +230,7 @@ impl DeploymentConfig {
             PlanBody::Diff { to_transaction, .. } => QueryRoutePolicy::FollowerEligible {
                 read_ts: *to_transaction,
             },
+            PlanBody::Scan { .. } => return Err(DeploymentError::GlobalPlanRequiresFanOut),
         };
         Ok(QueryRoute {
             shard: self.route_scope(plan.scope()),
@@ -311,6 +315,7 @@ pub enum DeploymentError {
     SharedNothingNeedsMultipleShards { actual: usize },
     ZeroVirtualPartitions,
     InvalidPlan(PlanError),
+    GlobalPlanRequiresFanOut,
 }
 
 impl Display for DeploymentError {
@@ -334,6 +339,9 @@ impl Display for DeploymentError {
                 formatter.write_str("virtual partition count must be nonzero")
             }
             Self::InvalidPlan(error) => write!(formatter, "invalid Temporal IR: {error}"),
+            Self::GlobalPlanRequiresFanOut => {
+                formatter.write_str("global Temporal IR requires distributed fan-out")
+            }
         }
     }
 }
@@ -496,6 +504,60 @@ impl InProcessDeploymentRuntime {
             .await
             .map_err(Into::into)
     }
+
+    pub async fn execute_global_leader(
+        &mut self,
+        plan: &TemporalPlan,
+        topology_epoch: u64,
+        max_ticks: usize,
+    ) -> Result<QueryResult, RoutedRuntimeError> {
+        let PlanBody::Scan { transaction, .. } = plan.body() else {
+            return Err(RoutedRuntimeError::Deployment(
+                DeploymentError::GlobalPlanRequiresFanOut,
+            ));
+        };
+        plan.validate()
+            .map_err(DeploymentError::InvalidPlan)
+            .map_err(RoutedRuntimeError::Deployment)?;
+        let placements = self
+            .config
+            .all_shards()
+            .iter()
+            .map(|placement| (placement.shard_id(), placement.placement_epoch()))
+            .collect::<Vec<_>>();
+        let expected_shards = placements
+            .iter()
+            .map(|(shard_id, _)| *shard_id)
+            .collect::<Vec<_>>();
+        let snapshot = SnapshotToken::from(*transaction);
+        let mut batches = Vec::with_capacity(placements.len());
+        for (shard_id, placement_epoch) in placements {
+            let group = self.raft.group_mut(shard_id)?;
+            let leader_id = group
+                .leader_id()
+                .ok_or(RoutedRuntimeError::NoLeader { shard_id })?;
+            let permit = group
+                .leader_read_permit(leader_id, placement_epoch, max_ticks)
+                .await?;
+            let adapter =
+                group
+                    .replica_adapter(permit.node_id())
+                    .ok_or(ReadBarrierError::NodeNotFound {
+                        node_id: permit.node_id(),
+                    })?;
+            let result = LocalExecutor::new(TemporalStore::new(adapter))
+                .execute(plan)
+                .await?;
+            batches.push(ShardQueryBatch::new(
+                shard_id,
+                topology_epoch,
+                snapshot,
+                result,
+            ));
+        }
+        merge_distributed_results(plan, topology_epoch, &expected_shards, batches)
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Debug)]
@@ -504,6 +566,7 @@ pub enum RoutedRuntimeError {
     Replication(ReplicationError),
     Barrier(ReadBarrierError),
     Executor(ExecutorError),
+    Distributed(DistributedQueryError),
     NoLeader { shard_id: u32 },
     CurrentRequiresLeader,
 }
@@ -515,6 +578,7 @@ impl Display for RoutedRuntimeError {
             Self::Replication(error) => Display::fmt(error, formatter),
             Self::Barrier(error) => Display::fmt(error, formatter),
             Self::Executor(error) => Display::fmt(error, formatter),
+            Self::Distributed(error) => Display::fmt(error, formatter),
             Self::NoLeader { shard_id } => write!(formatter, "Shard {shard_id} has no leader"),
             Self::CurrentRequiresLeader => {
                 formatter.write_str("CURRENT plans require leader execution")
@@ -530,6 +594,7 @@ impl Error for RoutedRuntimeError {
             Self::Replication(error) => Some(error),
             Self::Barrier(error) => Some(error),
             Self::Executor(error) => Some(error),
+            Self::Distributed(error) => Some(error),
             Self::NoLeader { .. } | Self::CurrentRequiresLeader => None,
         }
     }
@@ -556,6 +621,12 @@ impl From<ReadBarrierError> for RoutedRuntimeError {
 impl From<ExecutorError> for RoutedRuntimeError {
     fn from(error: ExecutorError) -> Self {
         Self::Executor(error)
+    }
+}
+
+impl From<DistributedQueryError> for RoutedRuntimeError {
+    fn from(value: DistributedQueryError) -> Self {
+        Self::Distributed(value)
     }
 }
 
