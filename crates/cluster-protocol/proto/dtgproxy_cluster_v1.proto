@@ -1,0 +1,250 @@
+syntax = "proto3";
+
+package dtgproxy.cluster.v1;
+
+// Required on every client and internal request. IDs are fixed-width 16-byte
+// values validated by the receiving service before dispatch.
+message RequestContext {
+  uint32 protocol_version = 1;
+  bytes cluster_id = 2;
+  bytes request_id = 3;
+  uint64 deadline_unix_ms = 4;
+}
+
+message ShardContext {
+  RequestContext request = 1;
+  uint64 graph_id = 2;
+  uint32 shard_id = 3;
+  uint64 placement_epoch = 4;
+}
+
+enum StatusReason {
+  STATUS_REASON_UNSPECIFIED = 0;
+  STATUS_REASON_NOT_LEADER = 1;
+  STATUS_REASON_STALE_EPOCH = 2;
+  STATUS_REASON_REVISION_COMPACTED = 3;
+  STATUS_REASON_RESOURCE_EXHAUSTED = 4;
+}
+
+message StatusDetail {
+  StatusReason reason = 1;
+  uint64 leader_node_id = 2;
+  uint64 current_epoch = 3;
+  uint64 current_revision = 4;
+  uint64 retry_after_ms = 5;
+}
+
+message GetCatalogRequest {
+  RequestContext context = 1;
+  uint64 minimum_revision = 2;
+}
+
+message CatalogSnapshot {
+  uint64 revision = 1;
+  bytes payload = 2;
+  uint32 checksum = 3;
+}
+
+message GetCatalogResponse { CatalogSnapshot snapshot = 1; }
+
+message WatchCatalogRequest {
+  RequestContext context = 1;
+  uint64 after_revision = 2;
+}
+
+message CatalogEvent {
+  uint64 revision = 1;
+  bytes command = 2;
+  uint32 checksum = 3;
+}
+
+message ProposeRequest {
+  RequestContext context = 1;
+  bytes command = 2;
+}
+
+message ProposeResponse {
+  uint64 revision = 1;
+  bool duplicate = 2;
+}
+
+message AllocateTimestampRequest {
+  RequestContext context = 1;
+  uint32 count = 2;
+  uint64 observed_physical_ms = 3;
+}
+
+message AllocateTimestampResponse {
+  uint64 first_physical_ms = 1;
+  uint32 first_logical = 2;
+  uint32 count = 3;
+  uint64 lease_high_water_physical_ms = 4;
+  uint32 lease_high_water_logical = 5;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_META = 1;
+  NODE_ROLE_DATA = 2;
+  NODE_ROLE_GATEWAY = 3;
+  NODE_ROLE_CONTROLLER = 4;
+}
+
+message HeartbeatRequest {
+  RequestContext context = 1;
+  uint64 node_id = 2;
+  NodeRole role = 3;
+  string advertise_address = 4;
+  uint64 observed_catalog_revision = 5;
+  bytes capacity = 6;
+}
+
+message HeartbeatResponse {
+  uint64 catalog_revision = 1;
+  uint64 lease_expires_unix_ms = 2;
+}
+
+service MetaService {
+  rpc GetCatalog(GetCatalogRequest) returns (GetCatalogResponse);
+  rpc WatchCatalog(WatchCatalogRequest) returns (stream CatalogEvent);
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+  rpc AllocateTimestamp(AllocateTimestampRequest) returns (AllocateTimestampResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message ExecuteRequest {
+  ShardContext context = 1;
+  bytes command = 2;
+}
+
+message ExecuteResponse {
+  uint64 raft_index = 1;
+  bytes result = 2;
+  bool duplicate = 3;
+}
+
+message ReadRequest {
+  ShardContext context = 1;
+  bytes plan = 2;
+  bytes read_proof = 3;
+}
+
+message ReadResponse {
+  uint64 applied_index = 1;
+  bytes result = 2;
+}
+
+message ScanRequest {
+  ShardContext context = 1;
+  bytes plan = 2;
+  bytes read_proof = 3;
+  uint32 maximum_batch_bytes = 4;
+}
+
+message ScanBatch {
+  uint64 sequence = 1;
+  uint64 applied_index = 2;
+  bytes arrow_record_batch = 3;
+  bool terminal = 4;
+}
+
+message SnapshotChunk {
+  ShardContext context = 1;
+  bytes migration_id = 2;
+  uint64 ordinal = 3;
+  bytes payload = 4;
+  uint32 checksum = 5;
+  bool terminal = 6;
+  bytes manifest_digest = 7;
+}
+
+message InstallSnapshotResponse {
+  bytes migration_id = 1;
+  uint64 installed_index = 2;
+  bytes content_digest = 3;
+  bool duplicate = 4;
+}
+
+message ReplicaStatusRequest { ShardContext context = 1; }
+
+enum ReplicaRole {
+  REPLICA_ROLE_UNSPECIFIED = 0;
+  REPLICA_ROLE_LEARNER = 1;
+  REPLICA_ROLE_FOLLOWER = 2;
+  REPLICA_ROLE_LEADER = 3;
+}
+
+message ReplicaStatusResponse {
+  uint64 node_id = 1;
+  ReplicaRole role = 2;
+  uint64 term = 3;
+  uint64 commit_index = 4;
+  uint64 applied_index = 5;
+  uint64 snapshot_index = 6;
+  uint64 schema_version = 7;
+  uint64 backend_generation = 8;
+  bool ready = 9;
+}
+
+service ShardService {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Scan(ScanRequest) returns (stream ScanBatch);
+  rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
+  rpc ReplicaStatus(ReplicaStatusRequest) returns (ReplicaStatusResponse);
+}
+
+message EnsureReplicaRequest {
+  ShardContext context = 1;
+  bytes operation_id = 2;
+  uint64 local_node_id = 3;
+  ReplicaRole initial_role = 4;
+  uint64 schema_version = 5;
+  uint64 backend_generation = 6;
+  bytes backend_profile = 7;
+}
+
+message EnsureReplicaResponse {
+  bool created = 1;
+  ReplicaStatusResponse status = 2;
+}
+
+message ChangeMembershipRequest {
+  ShardContext context = 1;
+  bytes operation_id = 2;
+  repeated uint64 old_voters = 3;
+  repeated uint64 new_voters = 4;
+  repeated uint64 learners = 5;
+}
+
+message ChangeMembershipResponse {
+  uint64 applied_index = 1;
+  bool duplicate = 2;
+}
+
+message DeleteReplicaRequest {
+  ShardContext context = 1;
+  bytes operation_id = 2;
+  uint64 minimum_safe_index = 3;
+}
+
+message DeleteReplicaResponse { bool deleted = 1; }
+
+message GetMigrationReceiptRequest {
+  RequestContext context = 1;
+  bytes migration_id = 2;
+  uint32 step = 3;
+}
+
+message GetMigrationReceiptResponse {
+  bool present = 1;
+  bytes input_digest = 2;
+  bytes outcome = 3;
+}
+
+service NodeAdminService {
+  rpc EnsureReplica(EnsureReplicaRequest) returns (EnsureReplicaResponse);
+  rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
+  rpc DeleteReplica(DeleteReplicaRequest) returns (DeleteReplicaResponse);
+  rpc GetMigrationReceipt(GetMigrationReceiptRequest) returns (GetMigrationReceiptResponse);
+}

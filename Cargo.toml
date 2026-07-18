@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cluster-protocol",
     "crates/temporal-types",
     "crates/timestamp-oracle",
     "crates/txn-protocol",

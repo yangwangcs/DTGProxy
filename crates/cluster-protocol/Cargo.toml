@@ -1,0 +1,18 @@
+[package]
+name = "cluster-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32fast = "=1.5.0"
+prost = "=0.14.4"
+tonic = { version = "=0.14.6", features = ["transport", "tls-ring"] }
+tonic-prost = "=0.14.6"
+
+[build-dependencies]
+tonic-prost-build = "=0.14.6"
+
+[lints]
+workspace = true
