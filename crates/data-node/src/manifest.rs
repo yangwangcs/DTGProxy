@@ -3,6 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+use cluster_protocol::backend_profile_digest;
+
 use crate::StorageError;
 
 const RECORD_MAGIC: [u8; 4] = *b"DTRP";
@@ -839,29 +841,6 @@ fn is_secret_parameter(name: &str) -> bool {
     ]
     .iter()
     .any(|secret| lower == *secret || lower.ends_with(&format!("_{secret}")))
-}
-
-fn backend_profile_digest(
-    provider: &str,
-    instance_id: &str,
-    parameters: &BTreeMap<String, String>,
-    credential_refs: &BTreeMap<String, String>,
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    for value in [provider, instance_id] {
-        hasher.update(&(value.len() as u64).to_be_bytes());
-        hasher.update(value.as_bytes());
-    }
-    for fields in [parameters, credential_refs] {
-        hasher.update(&(fields.len() as u64).to_be_bytes());
-        for (name, value) in fields {
-            hasher.update(&(name.len() as u64).to_be_bytes());
-            hasher.update(name.as_bytes());
-            hasher.update(&(value.len() as u64).to_be_bytes());
-            hasher.update(value.as_bytes());
-        }
-    }
-    *hasher.finalize().as_bytes()
 }
 
 fn encode_backend_slot(encoded: &mut Vec<u8>, slot: &BackendSlotState) -> Result<(), StorageError> {

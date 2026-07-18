@@ -8,8 +8,8 @@ is a Catalog-owned workflow; do not invoke a local Adapter cutover on an individ
 The Controller reconciles this durable state machine:
 
 ```text
-Preparing -> Restored -> DualApplying -> Verified -> CutOver
-          -> Published -> SourceRetired
+Preparing -> Restored -> DualApplying -> Verified -> Committing
+          -> CutOver -> Published -> SourceRetired
 
 Preparing/Restored/DualApplying/Verified -> Aborting -> Aborted
 ```
@@ -18,12 +18,14 @@ Preparing/Restored/DualApplying/Verified -> Aborting -> Aborted
 `(shard, voter)`. A restored receipt binds that physical replica to the digest of its resolved Data
 backend profile. This digest is intentionally different from the logical Catalog profile digest:
 the Controller derives a unique instance and path for every Shard, and may resolve a logical
-PostgreSQL/Neo4j target through a local Sidecar.
+PostgreSQL/Neo4j target through a local Sidecar. Catalog accepts only current voters, requires one
+digest per Shard, and rejects applied-index regression between receipt phases.
 
 The target generation is always `source_generation + 1`. Data restores a logical snapshot at an
-applied-index fence, Raft commits the start of dual apply, verification waits until every target is
-at least as current as its source replica, and Raft commits cutover before Meta atomically publishes
-the graph's new Backend Profile. Controller and Data restarts replay these steps idempotently.
+applied-index fence, Raft commits the start of dual apply, and verification waits until every target
+is at least as current as its source replica. Meta then CAS-commits the non-abortable `Committing`
+fence before any physical cutover RPC; Raft commits cutover before Meta atomically publishes the
+graph's new Backend Profile. Controller and Data restarts replay these steps idempotently.
 
 ## Controller and admin commands
 
@@ -50,7 +52,8 @@ The configuration has this versioned shape:
 
 Choose a stable, nonzero 128-bit hexadecimal migration ID and retain it in the change ticket. The
 same ID and target may be submitted again safely after a lost response; reuse with a different
-target is rejected.
+target is rejected. Start validates the provider and resolves an endpoint for every Shard before
+persisting the workflow.
 
 ```bash
 cargo run -p controller --bin dtgproxy-admin -- \
@@ -60,15 +63,16 @@ cargo run -p controller --bin dtgproxy-admin -- \
   backend-status controller.json 019f0000000000000000000000000001
 ```
 
-Before `CutOver`, request a durable rollback with:
+Before `Committing`, request a durable rollback with:
 
 ```bash
 cargo run -p controller --bin dtgproxy-admin -- \
   backend-abort controller.json 019f0000000000000000000000000001
 ```
 
-Rollback after the cutover fence is rejected. At that point, finish reconciliation and, if needed,
-start a new forward migration to another generation.
+Rollback at or after the commit fence is rejected. The abort command derives the prepared target
+digest from Catalog and does not require the target backend to be reachable. After the fence, finish
+reconciliation and, if needed, start a new forward migration to another generation.
 
 ## RocksDB target
 

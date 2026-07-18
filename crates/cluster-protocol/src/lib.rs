@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -7,6 +8,31 @@ pub const CLUSTER_PROTOCOL_VERSION: u32 = 1;
 pub const IDENTIFIER_BYTES: usize = 16;
 pub const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Computes the canonical physical-backend profile digest shared by Controllers and Data nodes.
+#[must_use]
+pub fn backend_profile_digest(
+    provider: &str,
+    instance_id: &str,
+    parameters: &BTreeMap<String, String>,
+    credential_refs: &BTreeMap<String, String>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for value in [provider, instance_id] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    for fields in [parameters, credential_refs] {
+        hasher.update(&(fields.len() as u64).to_be_bytes());
+        for (name, value) in fields {
+            hasher.update(&(name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
+}
 
 pub mod proto {
     tonic::include_proto!("dtgproxy.cluster.v1");

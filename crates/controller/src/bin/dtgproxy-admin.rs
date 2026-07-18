@@ -149,6 +149,7 @@ const fn state_name(state: BackendMigrationState) -> &'static str {
         BackendMigrationState::Restored => "restored",
         BackendMigrationState::DualApplying => "dual_applying",
         BackendMigrationState::Verified => "verified",
+        BackendMigrationState::Committing => "committing",
         BackendMigrationState::CutOver => "cut_over",
         BackendMigrationState::Published => "published",
         BackendMigrationState::SourceRetired => "source_retired",

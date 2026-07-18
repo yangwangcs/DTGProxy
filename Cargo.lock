@@ -301,6 +301,7 @@ dependencies = [
 name = "cluster-protocol"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "crc32fast",
  "prost 0.14.4",
  "tonic",

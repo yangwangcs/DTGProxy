@@ -164,6 +164,56 @@ async fn remote_controller_aborts_targets_prepared_before_catalog_receipts_were_
     server.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn remote_controller_recovers_an_unresolvable_pre_receipt_abort() {
+    let target = BackendProfile::new(
+        "postgresql",
+        BTreeMap::new(),
+        BTreeMap::new(),
+        AdapterRequirement::HotPluggableReplica,
+        2,
+    )
+    .unwrap();
+    let catalog = MemoryCatalog(Arc::new(Mutex::new(initial_state(target))));
+    let before = catalog.load().await.unwrap();
+    let migration = before.backend_migration(MIGRATION_ID).unwrap();
+    catalog
+        .propose(CatalogCommand::advance_backend_migration(
+            3,
+            before.revision(),
+            MIGRATION_ID,
+            migration.state_revision(),
+            BackendMigrationState::Aborting,
+            10,
+            2_000,
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    let data = RemoteDataPlane::new(
+        [0x44; 16],
+        9,
+        BTreeMap::from([(1, "127.0.0.1:1".parse().unwrap())]),
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    BackendReconciler::new(catalog.clone(), data, 10)
+        .unwrap()
+        .reconcile(MIGRATION_ID, 2_001)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .load()
+            .await
+            .unwrap()
+            .backend_migration(MIGRATION_ID)
+            .unwrap()
+            .state(),
+        BackendMigrationState::Aborted
+    );
+}
+
 async fn run_backend_migration(target: BackendProfile) {
     let root = tempfile::tempdir().unwrap();
     let service_address = free_address();

@@ -8,6 +8,7 @@ pub enum BackendMigrationState {
     Restored,
     DualApplying,
     Verified,
+    Committing,
     CutOver,
     Published,
     SourceRetired,
@@ -27,7 +28,8 @@ impl BackendMigrationState {
             (Self::Preparing, Self::Restored)
                 | (Self::Restored, Self::DualApplying)
                 | (Self::DualApplying, Self::Verified)
-                | (Self::Verified, Self::CutOver)
+                | (Self::Verified, Self::Committing)
+                | (Self::Committing, Self::CutOver)
                 | (Self::CutOver, Self::Published)
                 | (Self::Published, Self::SourceRetired)
                 | (Self::Preparing, Self::Aborting)
@@ -70,9 +72,13 @@ impl BackendReplicaReceipt {
         if shard_id == 0
             || node_id == 0
             || profile_digest == [0; 32]
-            || matches!(
+            || !matches!(
                 state,
-                BackendMigrationState::Preparing | BackendMigrationState::Published
+                BackendMigrationState::Restored
+                    | BackendMigrationState::DualApplying
+                    | BackendMigrationState::Verified
+                    | BackendMigrationState::CutOver
+                    | BackendMigrationState::SourceRetired
             )
         {
             return Err(CatalogError::InvalidBackendMigrationReceipt);
@@ -199,7 +205,18 @@ impl BackendMigrationRecord {
     }
 
     pub(crate) fn validate_recovered(&self, placements: &[Placement]) -> Result<(), CatalogError> {
+        let mut shard_digests = BTreeMap::new();
         for receipt in self.receipts.values() {
+            if !receipt_is_current_voter(receipt, placements) {
+                return Err(CatalogError::InvalidBackendMigrationReceipt);
+            }
+            if receipt.state == BackendMigrationState::Restored
+                && shard_digests
+                    .insert(receipt.shard_id, receipt.profile_digest)
+                    .is_some_and(|digest| digest != receipt.profile_digest)
+            {
+                return Err(CatalogError::InvalidBackendMigrationReceipt);
+            }
             if receipt.state != BackendMigrationState::Restored {
                 let restored = self.receipts.get(&(
                     BackendMigrationState::Restored,
@@ -207,6 +224,14 @@ impl BackendMigrationRecord {
                     receipt.node_id,
                 ));
                 if restored.is_none_or(|binding| binding.profile_digest != receipt.profile_digest) {
+                    return Err(CatalogError::InvalidBackendMigrationReceipt);
+                }
+            }
+            if let Some(previous_state) = previous_receipt_state(receipt.state) {
+                let previous =
+                    self.receipts
+                        .get(&(previous_state, receipt.shard_id, receipt.node_id));
+                if previous.is_none_or(|binding| binding.applied_index > receipt.applied_index) {
                     return Err(CatalogError::InvalidBackendMigrationReceipt);
                 }
             }
@@ -221,6 +246,11 @@ impl BackendMigrationRecord {
                 BackendMigrationState::DualApplying,
             ],
             BackendMigrationState::Verified => &[
+                BackendMigrationState::Restored,
+                BackendMigrationState::DualApplying,
+                BackendMigrationState::Verified,
+            ],
+            BackendMigrationState::Committing => &[
                 BackendMigrationState::Restored,
                 BackendMigrationState::DualApplying,
                 BackendMigrationState::Verified,
@@ -317,16 +347,36 @@ impl BackendMigrationRecord {
             return Err(CatalogError::StaleBackendMigrationOwner);
         }
         for receipt in receipts {
-            if receipt.state != next_state {
+            if receipt.state != next_state || !receipt_is_current_voter(&receipt, placements) {
                 return Err(CatalogError::InvalidBackendMigrationReceipt);
             }
-            if next_state != BackendMigrationState::Restored {
+            if next_state == BackendMigrationState::Restored {
+                if self
+                    .receipts
+                    .values()
+                    .find(|existing| {
+                        existing.state == BackendMigrationState::Restored
+                            && existing.shard_id == receipt.shard_id
+                    })
+                    .is_some_and(|binding| binding.profile_digest != receipt.profile_digest)
+                {
+                    return Err(CatalogError::InvalidBackendMigrationReceipt);
+                }
+            } else {
                 let restored = self.receipts.get(&(
                     BackendMigrationState::Restored,
                     receipt.shard_id,
                     receipt.node_id,
                 ));
                 if restored.is_none_or(|binding| binding.profile_digest != receipt.profile_digest) {
+                    return Err(CatalogError::InvalidBackendMigrationReceipt);
+                }
+            }
+            if let Some(previous_state) = previous_receipt_state(receipt.state) {
+                let previous =
+                    self.receipts
+                        .get(&(previous_state, receipt.shard_id, receipt.node_id));
+                if previous.is_none_or(|binding| binding.applied_index > receipt.applied_index) {
                     return Err(CatalogError::InvalidBackendMigrationReceipt);
                 }
             }
@@ -371,5 +421,27 @@ impl BackendMigrationRecord {
                     .contains_key(&(state, placement.shard_id(), *node_id))
             })
         })
+    }
+}
+
+fn receipt_is_current_voter(receipt: &BackendReplicaReceipt, placements: &[Placement]) -> bool {
+    placements.iter().any(|placement| {
+        placement.shard_id() == receipt.shard_id
+            && placement.voters().binary_search(&receipt.node_id).is_ok()
+    })
+}
+
+const fn previous_receipt_state(state: BackendMigrationState) -> Option<BackendMigrationState> {
+    match state {
+        BackendMigrationState::DualApplying => Some(BackendMigrationState::Restored),
+        BackendMigrationState::Verified => Some(BackendMigrationState::DualApplying),
+        BackendMigrationState::CutOver => Some(BackendMigrationState::Verified),
+        BackendMigrationState::SourceRetired => Some(BackendMigrationState::CutOver),
+        BackendMigrationState::Preparing
+        | BackendMigrationState::Restored
+        | BackendMigrationState::Committing
+        | BackendMigrationState::Published
+        | BackendMigrationState::Aborting
+        | BackendMigrationState::Aborted => None,
     }
 }

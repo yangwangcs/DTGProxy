@@ -86,6 +86,7 @@ where
     let graph = state
         .graph(graph_id)
         .ok_or(ControllerError::MissingGraph(graph_id))?;
+    validate_target_for_graph(&target, graph)?;
     let generation = graph
         .backend()
         .generation()
@@ -145,7 +146,8 @@ where
         BackendMigrationState::Aborting | BackendMigrationState::Aborted => {
             return Ok(migration);
         }
-        BackendMigrationState::CutOver
+        BackendMigrationState::Committing
+        | BackendMigrationState::CutOver
         | BackendMigrationState::Published
         | BackendMigrationState::SourceRetired => {
             return Err(ControllerError::BackendMigrationPastAbortFence(
@@ -192,6 +194,40 @@ fn target_matches(profile: &BackendProfile, target: &BackendTargetSpec) -> bool 
         && profile.public_parameters() == &target.public_parameters
         && profile.secret_references() == &target.secret_references
         && profile.requirement() == AdapterRequirement::HotPluggableReplica
+}
+
+fn validate_target_for_graph(
+    target: &BackendTargetSpec,
+    graph: &control_plane::GraphDefinition,
+) -> Result<(), ControllerError> {
+    match target.provider() {
+        "rocksdb" => return Ok(()),
+        "postgresql" | "neo4j" => {}
+        "sidecar" => {
+            if !target.public_parameters().contains_key("target_provider") {
+                return Err(ControllerError::Catalog(
+                    "sidecar backend requires public parameter target_provider".into(),
+                ));
+            }
+        }
+        provider => {
+            return Err(ControllerError::Catalog(format!(
+                "unsupported backend provider {provider}"
+            )));
+        }
+    }
+    for placement in graph.topology().placements() {
+        let shard_key = format!("sidecar_endpoint.shard.{}", placement.shard_id());
+        if !target.public_parameters().contains_key(&shard_key)
+            && !target.public_parameters().contains_key("sidecar_endpoint")
+        {
+            return Err(ControllerError::Catalog(format!(
+                "backend provider {} requires public parameter {shard_key} or sidecar_endpoint",
+                target.provider()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn start_command_id(migration_id: u128) -> u128 {

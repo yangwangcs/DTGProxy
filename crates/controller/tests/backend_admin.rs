@@ -120,6 +120,29 @@ async fn admin_requests_an_idempotent_abort_for_a_pre_cutover_migration() {
     assert_eq!(state.lock().unwrap().revision(), revision);
 }
 
+#[tokio::test]
+async fn admin_rejects_targets_that_cannot_resolve_every_shard() {
+    let catalog = MemoryCatalog(Arc::new(Mutex::new(initial_state())));
+    let missing_endpoint =
+        BackendTargetSpec::new("postgresql", BTreeMap::new(), BTreeMap::new()).unwrap();
+    assert!(
+        start_backend_migration(&catalog, MIGRATION_ID, 7, missing_endpoint, 9, 1_000)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("sidecar_endpoint.shard.10")
+    );
+
+    let unsupported = BackendTargetSpec::new("unknown", BTreeMap::new(), BTreeMap::new()).unwrap();
+    assert!(
+        start_backend_migration(&catalog, MIGRATION_ID + 1, 7, unsupported, 9, 1_000)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported backend provider")
+    );
+}
+
 fn initial_state() -> CatalogState {
     let mut state = CatalogState::new();
     let topology = TopologyDefinition::new(

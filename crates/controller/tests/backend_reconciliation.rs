@@ -145,6 +145,7 @@ async fn backend_workflow_reconciles_to_source_retired_and_survives_catalog_relo
         BackendMigrationState::Restored,
         BackendMigrationState::DualApplying,
         BackendMigrationState::Verified,
+        BackendMigrationState::Committing,
         BackendMigrationState::CutOver,
         BackendMigrationState::Published,
         BackendMigrationState::SourceRetired,

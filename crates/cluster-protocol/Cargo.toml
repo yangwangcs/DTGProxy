@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3 = "=1.8.5"
 crc32fast = "=1.5.0"
 prost = "=0.14.4"
 tonic = { version = "=0.14.6", features = ["transport", "tls-ring"] }

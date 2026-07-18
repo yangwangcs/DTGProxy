@@ -146,6 +146,16 @@ where
                 .await
             }
             BackendMigrationState::Verified => {
+                self.advance(
+                    &state,
+                    &migration,
+                    BackendMigrationState::Committing,
+                    now_unix_ms,
+                    vec![],
+                )
+                .await
+            }
+            BackendMigrationState::Committing => {
                 let receipts = self.data.cutover(&migration, graph).await?;
                 self.advance(
                     &state,
@@ -252,6 +262,7 @@ const fn state_tag(state: BackendMigrationState) -> u8 {
         BackendMigrationState::Restored => 2,
         BackendMigrationState::DualApplying => 3,
         BackendMigrationState::Verified => 4,
+        BackendMigrationState::Committing => 10,
         BackendMigrationState::CutOver => 5,
         BackendMigrationState::Published => 6,
         BackendMigrationState::SourceRetired => 7,

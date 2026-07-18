@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cluster_protocol::CLUSTER_PROTOCOL_VERSION;
 use cluster_protocol::proto::meta_service_client::MetaServiceClient;
 use cluster_protocol::proto::node_admin_service_client::NodeAdminServiceClient;
 use cluster_protocol::proto::shard_service_client::ShardServiceClient;
@@ -17,6 +16,7 @@ use cluster_protocol::proto::{
     GetCatalogRequest, PrepareBackendTargetRequest, ProposeRequest, ReplicaBootstrapProfile,
     ReplicaRole, ReplicaStatusRequest, RequestContext, ShardContext,
 };
+use cluster_protocol::{CLUSTER_PROTOCOL_VERSION, backend_profile_digest};
 use control_plane::{
     BackendMigrationRecord, BackendMigrationState, BackendProfile, BackendReplicaReceipt,
     CatalogCommand, CatalogState, GraphDefinition, MigrationRecord, Placement,
@@ -960,17 +960,13 @@ impl BackendDataPlaneApi for RemoteDataPlane {
         migration: &BackendMigrationRecord,
         graph: &GraphDefinition,
     ) -> Result<(), ControllerError> {
-        let prepared = if migration.receipts().is_empty() {
-            Some(self.prepare_target(migration, graph).await?)
-        } else {
-            None
-        };
         for placement in graph.topology().placements() {
-            let digest = if let Some(receipts) = &prepared {
-                backend_digest_from_receipts(receipts, placement)?
-            } else {
-                Self::backend_binding(migration, placement)?.0
+            let profile = match resolved_backend_profile(migration, graph, placement.shard_id()) {
+                Ok(profile) => profile,
+                Err(_) if migration.receipts().is_empty() => continue,
+                Err(error) => return Err(error),
             };
+            let digest = resolved_backend_profile_digest(&profile);
             self.propose_backend_finish(migration, graph, placement, digest, false)
                 .await?;
         }
@@ -1045,6 +1041,7 @@ const fn state_tag_for_remote(state: BackendMigrationState) -> u8 {
         BackendMigrationState::Restored => 2,
         BackendMigrationState::DualApplying => 3,
         BackendMigrationState::Verified => 4,
+        BackendMigrationState::Committing => 10,
         BackendMigrationState::CutOver => 5,
         BackendMigrationState::Published => 6,
         BackendMigrationState::SourceRetired => 7,
@@ -1131,33 +1128,23 @@ fn sidecar_endpoint(profile: &BackendProfile, shard_id: u32) -> Result<String, C
         })
 }
 
-fn backend_digest_from_receipts(
-    receipts: &[BackendReplicaReceipt],
-    placement: &Placement,
-) -> Result<[u8; 32], ControllerError> {
-    let mut digest = None;
-    for node_id in placement.voters() {
-        let receipt = receipts
-            .iter()
-            .find(|receipt| {
-                receipt.shard_id() == placement.shard_id() && receipt.node_id() == *node_id
-            })
-            .ok_or_else(|| {
-                ControllerError::Data(format!(
-                    "missing prepared backend binding for shard {} node {}",
-                    placement.shard_id(),
-                    node_id
-                ))
-            })?;
-        if digest.is_some_and(|expected| expected != receipt.profile_digest()) {
-            return Err(ControllerError::Data(format!(
-                "replicas resolved different target profiles for shard {}",
-                placement.shard_id()
-            )));
-        }
-        digest = Some(receipt.profile_digest());
-    }
-    digest.ok_or_else(|| ControllerError::Data("empty backend placement".into()))
+fn resolved_backend_profile_digest(profile: &BackendProfileSpec) -> [u8; 32] {
+    let parameters = profile
+        .public_parameters
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let credential_refs = profile
+        .credential_refs
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    backend_profile_digest(
+        &profile.provider,
+        &profile.instance_id,
+        &parameters,
+        &credential_refs,
+    )
 }
 
 fn copy_digest(bytes: &[u8]) -> Result<[u8; 32], ControllerError> {
