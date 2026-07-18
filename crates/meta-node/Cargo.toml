@@ -6,11 +6,20 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+cluster-protocol = { path = "../cluster-protocol" }
 control-plane = { path = "../control-plane" }
 crc32fast = "=1.5.0"
+prost = "=0.11.9"
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
 raft-logstore = { path = "../raft-logstore" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
 slog = "=2.8.2"
+temporal-types = { path = "../temporal-types" }
+timestamp-oracle = { path = "../timestamp-oracle" }
+tokio = { version = "=1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio-stream = { version = "=0.1.18", features = ["net"] }
+tonic = { version = "=0.14.6", features = ["transport", "tls-ring"] }
 
 [dev-dependencies]
 storage-api = { path = "../storage-api" }

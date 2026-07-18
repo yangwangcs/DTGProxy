@@ -293,7 +293,7 @@ impl SnapshotToken {
     }
 }
 
-fn advance_timestamp(
+pub fn advance_timestamp(
     timestamp: TransactionTime,
     steps: u32,
 ) -> Result<TransactionTime, TimestampOracleError> {

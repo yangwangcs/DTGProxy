@@ -112,6 +112,24 @@ service MetaService {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
+// Internal Meta-group Raft transport. The encoded message is raft-rs' stable
+// protobuf representation and is additionally bounded and identity-checked by
+// the receiver before it enters the consensus state machine.
+message MetaRaftStepRequest {
+  RequestContext context = 1;
+  uint64 from_node_id = 2;
+  uint64 to_node_id = 3;
+  bytes message = 4;
+}
+
+message MetaRaftStepResponse {
+  uint64 current_term = 1;
+}
+
+service MetaRaftService {
+  rpc Step(MetaRaftStepRequest) returns (MetaRaftStepResponse);
+}
+
 message ExecuteRequest {
   ShardContext context = 1;
   bytes command = 2;

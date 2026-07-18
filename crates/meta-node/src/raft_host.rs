@@ -10,7 +10,7 @@ use raft::{Config, RawNode, StateRole, Storage};
 use raft_logstore::{RaftLogStoreError, RocksRaftStorage};
 use slog::{Logger, o};
 
-use crate::{MetaStateError, MetaStateMachine};
+use crate::{MetaStateError, MetaStateMachine, ReserveTimestampCommand};
 
 const JOURNAL_MAGIC: [u8; 4] = *b"DTMJ";
 const JOURNAL_VERSION: u16 = 1;
@@ -121,6 +121,30 @@ impl MetaRaftReplica {
         validation.apply(decoded.clone())?;
         self.raw_node
             .propose(decoded.command_id().to_be_bytes().to_vec(), command)
+            .map_err(|error| MetaRaftError::Raft(error.to_string()))
+    }
+
+    pub fn propose_timestamp(
+        &mut self,
+        command: ReserveTimestampCommand,
+    ) -> Result<(), MetaRaftError> {
+        if !self.is_leader() {
+            return Err(MetaRaftError::NotLeader {
+                leader_id: self.leader_id(),
+            });
+        }
+        if command.expected_high_water() != self.state().timestamp_high_water() {
+            return Err(crate::TsoError::StaleHighWater {
+                expected: self.state().timestamp_high_water(),
+                actual: command.expected_high_water(),
+            }
+            .into());
+        }
+        self.raw_node
+            .propose(
+                command.command_id().to_be_bytes().to_vec(),
+                command.encode(),
+            )
             .map_err(|error| MetaRaftError::Raft(error.to_string()))
     }
 
@@ -414,6 +438,7 @@ pub enum MetaRaftError {
     Io(String),
     Catalog(control_plane::CatalogError),
     State(MetaStateError),
+    Tso(crate::TsoError),
     LogStore(RaftLogStoreError),
     Raft(String),
     NotLeader { leader_id: Option<u64> },
@@ -435,6 +460,7 @@ impl Display for MetaRaftError {
             Self::Io(message) => write!(formatter, "Meta I/O error: {message}"),
             Self::Catalog(error) => write!(formatter, "Meta Catalog error: {error}"),
             Self::State(error) => write!(formatter, "Meta state error: {error}"),
+            Self::Tso(error) => write!(formatter, "Meta TSO error: {error}"),
             Self::LogStore(error) => write!(formatter, "Meta Raft WAL error: {error}"),
             Self::Raft(message) => write!(formatter, "Meta Raft error: {message}"),
             Self::NotLeader { leader_id } => {
@@ -483,6 +509,12 @@ impl From<control_plane::CatalogError> for MetaRaftError {
 impl From<MetaStateError> for MetaRaftError {
     fn from(error: MetaStateError) -> Self {
         Self::State(error)
+    }
+}
+
+impl From<crate::TsoError> for MetaRaftError {
+    fn from(error: crate::TsoError) -> Self {
+        Self::Tso(error)
     }
 }
 
