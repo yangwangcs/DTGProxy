@@ -550,6 +550,24 @@ where
                     unresolved_change: UnresolvedChange::None,
                 })
             }
+            CommandBodyV1::ActivatePlacementEpoch(target_epoch) => {
+                if target_epoch != self.metadata.placement_epoch.checked_add(1).unwrap_or(0) {
+                    return Err(ShardRuntimeError::StaleEpoch {
+                        expected: self.metadata.placement_epoch.saturating_add(1),
+                        actual: target_epoch,
+                    });
+                }
+                Ok(PreparedApply {
+                    metadata: ReplicaMetadata {
+                        placement_epoch: target_epoch,
+                        last_term: term,
+                        applied_index: index,
+                        ..self.metadata
+                    },
+                    mutations: Vec::new(),
+                    unresolved_change: UnresolvedChange::None,
+                })
+            }
         }
     }
 
@@ -604,15 +622,20 @@ where
         command_bytes: &[u8],
     ) -> Result<bool, ShardRuntimeError> {
         let command = CommandEnvelopeV1::decode(command_bytes)?;
-        self.validate_authority(&command)?;
         if command.request_id != request_id {
             return Err(ShardRuntimeError::RequestEnvelopeMismatch {
                 expected: request_id,
                 actual: command.request_id,
             });
         }
-        self.request_disposition(request_id, command_digest(command_bytes))
-            .await
+        let duplicate = self
+            .request_disposition(request_id, command_digest(command_bytes))
+            .await?;
+        if duplicate {
+            return Ok(true);
+        }
+        self.validate_authority(&command)?;
+        Ok(false)
     }
 
     async fn request_disposition(

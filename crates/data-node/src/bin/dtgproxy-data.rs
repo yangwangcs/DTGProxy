@@ -6,7 +6,9 @@ use std::sync::Arc;
 use cluster_protocol::MAX_COMMAND_BYTES;
 use cluster_protocol::proto::node_admin_service_server::NodeAdminServiceServer;
 use cluster_protocol::proto::shard_service_server::ShardServiceServer;
-use data_node::{DataNodeGrpcService, DataNodeHost, DataNodeRuntimeConfig, TransportSecurity};
+use data_node::{
+    DataNodeGrpcService, DataNodeHost, DataNodeRuntimeConfig, DataRaftRuntime, TransportSecurity,
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
@@ -27,7 +29,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let security = runtime.node().transport_security().clone();
     let queue_capacity = runtime.actor_queue_capacity();
     let shutdown_grace = runtime.shutdown_grace();
+    let raft_listen_address = runtime.raft_listen_address();
+    let raft_peers = runtime.raft_peers().clone();
     let host = Arc::new(DataNodeHost::open(runtime.into_node(), queue_capacity).await?);
+    let raft_runtime = match raft_listen_address {
+        Some(address) => Some(
+            DataRaftRuntime::start(
+                Arc::clone(&host),
+                address,
+                &raft_peers,
+                queue_capacity,
+                std::time::Duration::from_millis(20),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let service = DataNodeGrpcService::new(Arc::clone(&host));
     let listener = tokio::net::TcpListener::bind(listen_address).await?;
 
@@ -51,9 +68,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .max_decoding_message_size(maximum_message)
         .max_encoding_message_size(maximum_message);
     println!(
-        "DTGPROXY_DATA_READY node={} address={}",
+        "DTGPROXY_DATA_READY node={} address={} raft_address={}",
         host.identity().node_id(),
-        listener.local_addr()?
+        listener.local_addr()?,
+        raft_runtime.as_ref().map_or_else(
+            || "disabled".to_owned(),
+            |runtime| runtime.local_addr().to_string()
+        )
     );
     std::io::stdout().flush()?;
 
@@ -62,6 +83,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .add_service(admin_service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown_signal())
         .await?;
+
+    if let Some(runtime) = raft_runtime {
+        tokio::time::timeout(shutdown_grace, runtime.shutdown())
+            .await
+            .map_err(|_| "Data Raft graceful shutdown exceeded its deadline")??;
+    }
 
     let host = Arc::try_unwrap(host)
         .map_err(|_| "Data node service retained a host reference after shutdown")?;

@@ -147,6 +147,25 @@ impl ReplicaEntry {
         self.snapshot_index = snapshot_index;
         Ok(self)
     }
+
+    pub(crate) fn activated(
+        mut self,
+        target_epoch: u64,
+        mut voters: Vec<u64>,
+    ) -> Result<Self, StorageError> {
+        voters.sort_unstable();
+        if target_epoch != self.placement_epoch.checked_add(1).unwrap_or(0)
+            || voters.is_empty()
+            || voters.contains(&0)
+            || voters.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(StorageError::InvalidReplicaEpoch);
+        }
+        self.placement_epoch = target_epoch;
+        self.voters = voters;
+        self.role = ReplicaRole::Voter;
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -192,6 +211,10 @@ impl ReplicaManifest {
         self.replicas.values()
     }
 
+    pub(crate) fn get(&self, graph_id: u64, shard_id: u32) -> Option<&ReplicaEntry> {
+        self.replicas.get(&(graph_id, shard_id))
+    }
+
     pub(crate) fn replace(&mut self, entry: ReplicaEntry) -> Result<(), StorageError> {
         let key = (entry.graph_id, entry.shard_id);
         let existing = self
@@ -206,6 +229,34 @@ impl ReplicaManifest {
             || existing.schema_version != entry.schema_version
             || existing.backend_generation != entry.backend_generation
             || existing.relative_directory != entry.relative_directory
+        {
+            return Err(StorageError::ReplicaIdentityConflict {
+                graph_id: entry.graph_id,
+                shard_id: entry.shard_id,
+            });
+        }
+        self.replicas.insert(key, entry);
+        Ok(())
+    }
+
+    pub(crate) fn remove(&mut self, graph_id: u64, shard_id: u32) -> Option<ReplicaEntry> {
+        self.replicas.remove(&(graph_id, shard_id))
+    }
+
+    pub(crate) fn activate(&mut self, entry: ReplicaEntry) -> Result<(), StorageError> {
+        let key = (entry.graph_id, entry.shard_id);
+        let current = self
+            .replicas
+            .get(&key)
+            .ok_or(StorageError::InvalidReplicaIdentity)?;
+        if current == &entry {
+            return Ok(());
+        }
+        if entry.placement_epoch != current.placement_epoch.checked_add(1).unwrap_or(0)
+            || entry.role != ReplicaRole::Voter
+            || entry.schema_version != current.schema_version
+            || entry.backend_generation != current.backend_generation
+            || entry.relative_directory != current.relative_directory
         {
             return Err(StorageError::ReplicaIdentityConflict {
                 graph_id: entry.graph_id,

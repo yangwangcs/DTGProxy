@@ -50,6 +50,17 @@ fn tick_command(epoch: u64, request_id: u128, closed: i64) -> Vec<u8> {
 }
 
 #[test]
+fn an_exact_epoch_activation_retry_is_recognized_after_the_epoch_changes() {
+    let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
+    let command = CommandEnvelopeV1::new(7, 9, 150, CommandBodyV1::ActivatePlacementEpoch(10))
+        .encode()
+        .unwrap();
+    block_on(machine.apply_entry(1, 1, &command)).unwrap();
+    assert_eq!(machine.metadata().placement_epoch, 10);
+    assert!(block_on(machine.request_replay(150, &command)).unwrap());
+}
+
+#[test]
 fn committed_commands_atomically_advance_business_state_metadata_and_safe_time() {
     let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
     assert_eq!(machine.metadata().safe_ts(), MIN_REPLICA_TIME);

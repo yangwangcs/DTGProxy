@@ -3,9 +3,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cluster_protocol::proto::meta_service_server::MetaService;
 use cluster_protocol::proto::{
-    AllocateTimestampRequest, AllocateTimestampResponse, CatalogEvent as WireCatalogEvent,
-    CatalogSnapshot, GetCatalogRequest, GetCatalogResponse, HeartbeatRequest, HeartbeatResponse,
-    ProposeRequest, ProposeResponse, WatchCatalogRequest,
+    AcquireControllerLeaseRequest, AcquireControllerLeaseResponse, AllocateTimestampRequest,
+    AllocateTimestampResponse, CatalogEvent as WireCatalogEvent, CatalogSnapshot,
+    GetCatalogRequest, GetCatalogResponse, HeartbeatRequest, HeartbeatResponse, ProposeRequest,
+    ProposeResponse, WatchCatalogRequest,
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError};
 use control_plane::CatalogCommand;
@@ -29,6 +30,14 @@ pub struct MetaNodeService {
     runtime_notify: Option<Arc<Notify>>,
     proposal_gate: Arc<Mutex<()>>,
     reservation_gate: Arc<Mutex<()>>,
+    controller_lease: Arc<Mutex<Option<ControllerLease>>>,
+}
+
+#[derive(Clone, Copy)]
+struct ControllerLease {
+    controller_id: u64,
+    owner_term: u64,
+    expires_unix_ms: u64,
 }
 
 impl MetaNodeService {
@@ -45,6 +54,7 @@ impl MetaNodeService {
             runtime_notify: None,
             proposal_gate: Arc::new(Mutex::new(())),
             reservation_gate: Arc::new(Mutex::new(())),
+            controller_lease: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -279,6 +289,43 @@ impl MetaService for MetaNodeService {
             count: batch.count(),
             lease_high_water_physical_ms: physical_ms(high_water)?,
             lease_high_water_logical: high_water.logical(),
+        }))
+    }
+
+    async fn acquire_controller_lease(
+        &self,
+        request: Request<AcquireControllerLeaseRequest>,
+    ) -> Result<Response<AcquireControllerLeaseResponse>, Status> {
+        let request = request.into_inner();
+        self.validate(request.context)?;
+        if request.controller_id == 0 {
+            return Err(Status::invalid_argument("Controller ID must be nonzero"));
+        }
+        let replica = self.replica.lock().await;
+        require_leader(&replica, &self.tso)?;
+        let owner_term = replica.current_term();
+        let now = unix_time_ms()?;
+        let mut lease = self.controller_lease.lock().await;
+        if let Some(active) = *lease
+            && active.owner_term == owner_term
+            && active.expires_unix_ms > now
+            && active.controller_id != request.controller_id
+        {
+            return Err(Status::resource_exhausted(
+                "another Controller owns the active Meta lease",
+            ));
+        }
+        let expires_unix_ms = now
+            .checked_add(HEARTBEAT_LEASE_MS)
+            .ok_or_else(|| Status::internal("Controller lease time overflow"))?;
+        *lease = Some(ControllerLease {
+            controller_id: request.controller_id,
+            owner_term,
+            expires_unix_ms,
+        });
+        Ok(Response::new(AcquireControllerLeaseResponse {
+            owner_term,
+            lease_expires_unix_ms: expires_unix_ms,
         }))
     }
 

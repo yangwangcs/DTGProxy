@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cluster_protocol::CLUSTER_PROTOCOL_VERSION;
 use cluster_protocol::proto::meta_service_server::MetaService;
 use cluster_protocol::proto::{
-    AllocateTimestampRequest, GetCatalogRequest, ProposeRequest, RequestContext,
-    WatchCatalogRequest,
+    AcquireControllerLeaseRequest, AllocateTimestampRequest, GetCatalogRequest, ProposeRequest,
+    RequestContext, WatchCatalogRequest,
 };
 use control_plane::{
     BackendProfile, CatalogCommand, CatalogState, DeploymentMode, GraphDefinition, Placement,
@@ -173,4 +173,37 @@ async fn timestamp_rpc_commits_lease_before_returning_disjoint_batches() {
     assert_eq!(first.count, 3);
     assert_eq!(second.count, 3);
     assert!(first.lease_high_water_physical_ms >= first.first_physical_ms);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_controller_owns_the_current_meta_term_lease() {
+    let temporary = tempfile::tempdir().unwrap();
+    let service = elected_service(temporary.path());
+    let first = service
+        .acquire_controller_lease(Request::new(AcquireControllerLeaseRequest {
+            context: Some(context(301)),
+            controller_id: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.owner_term > 0);
+    assert!(first.lease_expires_unix_ms > now_ms());
+    let renewed = service
+        .acquire_controller_lease(Request::new(AcquireControllerLeaseRequest {
+            context: Some(context(302)),
+            controller_id: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(renewed.owner_term, first.owner_term);
+    let conflict = service
+        .acquire_controller_lease(Request::new(AcquireControllerLeaseRequest {
+            context: Some(context(303)),
+            controller_id: 11,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::ResourceExhausted);
 }

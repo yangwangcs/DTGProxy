@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use raft::eraftpb::Message;
@@ -112,6 +112,11 @@ pub(crate) enum ActorCommand {
         command: Vec<u8>,
         response: oneshot::Sender<Result<ProposalOutcome, HostError>>,
     },
+    ProposalStatus {
+        request_id: u128,
+        command: Vec<u8>,
+        response: oneshot::Sender<Result<ProposalOutcome, HostError>>,
+    },
     Step {
         message: Box<Message>,
         response: oneshot::Sender<Result<ReplicaStatus, HostError>>,
@@ -126,12 +131,32 @@ pub(crate) enum ActorCommand {
         span: KeySpan,
         response: oneshot::Sender<Result<Vec<KeyValue>, HostError>>,
     },
+    CreateSnapshot {
+        destination: PathBuf,
+        response: oneshot::Sender<Result<replica_snapshot::SnapshotManifestV1, HostError>>,
+    },
+    ChangeMembership {
+        operation_id: u128,
+        old_voters: Vec<u64>,
+        new_voters: Vec<u64>,
+        learners: Vec<u64>,
+        response: oneshot::Sender<Result<(ReplicaStatus, bool), HostError>>,
+    },
+    PrepareActivation {
+        target_epoch: u64,
+        voters: Vec<u64>,
+        response: oneshot::Sender<Result<ReplicaSpec, HostError>>,
+    },
+    CommitActivation {
+        spec: ReplicaSpec,
+        response: oneshot::Sender<Result<ReplicaStatus, HostError>>,
+    },
     Shutdown(oneshot::Sender<Result<(), HostError>>),
 }
 
 async fn run_actor(
     mut replica: DurableRaftReplica,
-    spec: ReplicaSpec,
+    mut spec: ReplicaSpec,
     mut receiver: mpsc::Receiver<ActorCommand>,
     outbound: mpsc::Sender<Message>,
 ) -> Result<(), HostError> {
@@ -157,12 +182,39 @@ async fn run_actor(
                     .await
                 {
                     Ok(true) => Ok(ProposalOutcome::new(status(&replica, &spec), true)),
-                    Ok(false) => match replica.propose(request_id, command) {
-                        Ok(()) => drive_ready(&mut replica, &outbound)
-                            .await
-                            .map(|()| ProposalOutcome::new(status(&replica, &spec), false)),
+                    Ok(false) => match replica.propose(request_id, command.clone()) {
+                        Ok(()) => match drive_ready(&mut replica, &outbound).await {
+                            Ok(()) => match replica
+                                .state_machine()
+                                .request_replay(request_id, &command)
+                                .await
+                            {
+                                Ok(true) => {
+                                    Ok(ProposalOutcome::new(status(&replica, &spec), false))
+                                }
+                                Ok(false) => Err(HostError::ProposalPending { request_id }),
+                                Err(error) => Err(HostError::from_runtime(error)),
+                            },
+                            Err(error) => Err(error),
+                        },
                         Err(error) => Err(HostError::from_durable(error)),
                     },
+                    Err(error) => Err(HostError::from_runtime(error)),
+                };
+                let _ = response.send(result);
+            }
+            ActorCommand::ProposalStatus {
+                request_id,
+                command,
+                response,
+            } => {
+                let result = match replica
+                    .state_machine()
+                    .request_replay(request_id, &command)
+                    .await
+                {
+                    Ok(true) => Ok(ProposalOutcome::new(status(&replica, &spec), false)),
+                    Ok(false) => Err(HostError::ProposalPending { request_id }),
                     Err(error) => Err(HostError::from_runtime(error)),
                 };
                 let _ = response.send(result);
@@ -198,6 +250,130 @@ async fn run_actor(
                     .await
                     .map_err(|error| HostError::Adapter(error.to_string()));
                 let _ = response.send(result);
+            }
+            ActorCommand::CreateSnapshot {
+                destination,
+                response,
+            } => {
+                let result = if !replica.is_leader() {
+                    Err(HostError::NotLeader {
+                        leader_id: replica.leader_id(),
+                    })
+                } else {
+                    replica_snapshot::create_snapshot_bundle(
+                        replica.state_machine(),
+                        spec.voters(),
+                        destination,
+                    )
+                    .map_err(|error| HostError::Snapshot(error.to_string()))
+                };
+                let _ = response.send(result);
+            }
+            ActorCommand::ChangeMembership {
+                operation_id,
+                old_voters,
+                new_voters,
+                learners,
+                response,
+            } => {
+                let result = match replica.membership() {
+                    Ok(current)
+                        if current.voters_outgoing.is_empty()
+                            && current.voters == new_voters
+                            && current.learners == learners =>
+                    {
+                        Ok((status(&replica, &spec), true))
+                    }
+                    Ok(current)
+                        if !current.voters_outgoing.is_empty()
+                            && current.voters == new_voters
+                            && current.voters_outgoing == old_voters
+                            && current.learners == learners =>
+                    {
+                        if !replica.is_leader() {
+                            Err(HostError::NotLeader {
+                                leader_id: replica.leader_id(),
+                            })
+                        } else {
+                            match replica.leave_joint_membership(operation_id) {
+                                Ok(()) => match drive_ready(&mut replica, &outbound).await {
+                                    Ok(()) => match replica.membership() {
+                                        Ok(final_state)
+                                            if final_state.voters_outgoing.is_empty()
+                                                && final_state.voters == new_voters
+                                                && final_state.learners == learners =>
+                                        {
+                                            Ok((status(&replica, &spec), false))
+                                        }
+                                        Ok(_) => Err(HostError::MembershipPending),
+                                        Err(error) => Err(HostError::from_durable(error)),
+                                    },
+                                    Err(error) => Err(error),
+                                },
+                                Err(error) => Err(HostError::from_durable(error)),
+                            }
+                        }
+                    }
+                    Ok(current) if current.voters != old_voters => {
+                        Err(HostError::MembershipConflict)
+                    }
+                    Ok(_) => {
+                        match replica.propose_membership(operation_id, &new_voters, &learners) {
+                            Ok(_) => match drive_ready(&mut replica, &outbound).await {
+                                Ok(()) => match replica.membership() {
+                                    Ok(current)
+                                        if current.voters == new_voters
+                                            && current.learners == learners =>
+                                    {
+                                        Ok((status(&replica, &spec), false))
+                                    }
+                                    Ok(_) => Err(HostError::MembershipPending),
+                                    Err(error) => Err(HostError::from_durable(error)),
+                                },
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(HostError::from_durable(error)),
+                        }
+                    }
+                    Err(error) => Err(HostError::from_durable(error)),
+                };
+                let _ = response.send(result);
+            }
+            ActorCommand::PrepareActivation {
+                target_epoch,
+                voters,
+                response,
+            } => {
+                let result = if spec.placement_epoch() == target_epoch
+                    && spec.voters() == voters
+                    && spec.role() == crate::ReplicaRole::Voter
+                {
+                    Ok(spec.clone())
+                } else {
+                    match replica.membership() {
+                        Ok(membership)
+                            if replica.metadata().placement_epoch == target_epoch
+                                && membership.voters == voters
+                                && membership.learners.is_empty() =>
+                        {
+                            spec.entry()
+                                .clone()
+                                .activated(target_epoch, voters)
+                                .map(ReplicaSpec::from_entry)
+                                .map_err(HostError::from)
+                        }
+                        Ok(_) => Err(HostError::ActivationFenceMismatch),
+                        Err(error) => Err(HostError::from_durable(error)),
+                    }
+                };
+                let _ = response.send(result);
+            }
+            ActorCommand::CommitActivation {
+                spec: activated,
+                response,
+            } => {
+                spec = activated;
+                let _ = response.send(Ok(status(&replica, &spec)));
             }
             ActorCommand::Shutdown(response) => {
                 let result = drive_ready(&mut replica, &outbound).await;
@@ -245,7 +421,7 @@ fn status(replica: &DurableRaftReplica, spec: &ReplicaSpec) -> ReplicaStatus {
         spec.role(),
         spec.schema_version(),
         spec.backend_generation(),
-        0,
+        spec.snapshot_index(),
         true,
     )
 }

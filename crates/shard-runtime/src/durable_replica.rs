@@ -3,7 +3,10 @@ use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
 use adapter_rocksdb::RocksAdapter;
-use raft::eraftpb::{Entry, EntryType, Message};
+use prost::Message as ProstMessage;
+use raft::eraftpb::{
+    ConfChangeSingle, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, Message,
+};
 use raft::{Config, RawNode, StateRole, Storage};
 use raft_command::CommandEnvelopeV1;
 use raft_logstore::{RaftLogStoreError, RocksRaftStorage};
@@ -17,6 +20,8 @@ pub struct DurableRaftReplica {
     raw_node: RawNode<RocksRaftStorage>,
     state_machine: ShardStateMachine<RocksAdapter>,
     crash_before_apply_once: bool,
+    pending_auto_leave: bool,
+    pending_leader_transfer: Option<u64>,
 }
 
 impl DurableRaftReplica {
@@ -56,6 +61,8 @@ impl DurableRaftReplica {
             raw_node,
             state_machine,
             crash_before_apply_once: false,
+            pending_auto_leave: false,
+            pending_leader_transfer: None,
         })
     }
 
@@ -125,6 +132,62 @@ impl DurableRaftReplica {
             .map_err(|error| DurableReplicaError::Raft(error.to_string()))
     }
 
+    pub fn propose_membership(
+        &mut self,
+        operation_id: u128,
+        voters: &[u64],
+        learners: &[u64],
+    ) -> Result<bool, DurableReplicaError> {
+        let current = self.membership()?;
+        if current.voters == voters && current.learners == learners {
+            return Ok(true);
+        }
+        if !current.voters_outgoing.is_empty() {
+            return Err(DurableReplicaError::JointConfigurationInProgress);
+        }
+        let changes = membership_changes(&current, voters, learners)?;
+        if changes.is_empty() {
+            return Ok(true);
+        }
+        self.raw_node
+            .propose_conf_change(
+                operation_id.to_be_bytes().to_vec(),
+                ConfChangeV2 {
+                    transition: 0,
+                    changes,
+                    context: operation_id.to_be_bytes().to_vec(),
+                },
+            )
+            .map_err(|error| DurableReplicaError::Raft(error.to_string()))?;
+        Ok(false)
+    }
+
+    pub fn leave_joint_membership(
+        &mut self,
+        operation_id: u128,
+    ) -> Result<(), DurableReplicaError> {
+        let current = self.membership()?;
+        if current.voters_outgoing.is_empty() {
+            return Ok(());
+        }
+        if !self.is_leader() {
+            return Err(DurableReplicaError::NotLeader);
+        }
+        self.raw_node
+            .propose_conf_change(
+                operation_id.to_be_bytes().to_vec(),
+                ConfChangeV2 {
+                    context: operation_id.to_be_bytes().to_vec(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| DurableReplicaError::Raft(error.to_string()))
+    }
+
+    pub fn membership(&self) -> Result<ConfState, DurableReplicaError> {
+        Ok(self.storage.initial_state()?.conf_state)
+    }
+
     pub fn step(&mut self, message: Message) -> Result<(), DurableReplicaError> {
         self.raw_node
             .step(message)
@@ -158,7 +221,7 @@ impl DurableRaftReplica {
         messages.extend(ready.take_persisted_messages());
         let committed_entries = ready.take_committed_entries();
         self.fail_before_apply_if_requested(&committed_entries)?;
-        apply_entries(&mut self.state_machine, committed_entries).await?;
+        self.apply_entries(committed_entries).await?;
 
         let mut light_ready = self.raw_node.advance(ready);
         if let Some(commit_index) = light_ready.commit_index() {
@@ -167,9 +230,62 @@ impl DurableRaftReplica {
         messages.extend(light_ready.take_messages());
         let committed_entries = light_ready.take_committed_entries();
         self.fail_before_apply_if_requested(&committed_entries)?;
-        apply_entries(&mut self.state_machine, committed_entries).await?;
+        self.apply_entries(committed_entries).await?;
         self.raw_node.advance_apply();
+        self.run_deferred_membership_action()?;
         Ok(messages)
+    }
+
+    async fn apply_entries(&mut self, entries: Vec<Entry>) -> Result<(), DurableReplicaError> {
+        for entry in entries {
+            match entry.get_entry_type() {
+                EntryType::EntryNormal if entry.data.is_empty() => {
+                    self.state_machine
+                        .apply_noop_entry(entry.term, entry.index)
+                        .await?;
+                }
+                EntryType::EntryNormal => {
+                    CommandEnvelopeV1::decode(&entry.data)?;
+                    self.state_machine
+                        .apply_entry(entry.term, entry.index, &entry.data)
+                        .await?;
+                }
+                EntryType::EntryConfChangeV2 => {
+                    let change = ConfChangeV2::decode(entry.data.as_ref())
+                        .map_err(|error| DurableReplicaError::Raft(error.to_string()))?;
+                    let conf_state = self.raw_node.apply_conf_change(&change)?;
+                    self.storage.set_conf_state(&conf_state)?;
+                    self.state_machine
+                        .apply_noop_entry(entry.term, entry.index)
+                        .await?;
+                    if self.raw_node.raft.state == StateRole::Leader
+                        && conf_state.auto_leave
+                        && !conf_state.voters_outgoing.is_empty()
+                    {
+                        if conf_state.voters.binary_search(&self.node_id).is_err() {
+                            self.pending_leader_transfer = conf_state.voters.first().copied();
+                        } else {
+                            self.pending_auto_leave = true;
+                        }
+                    }
+                }
+                EntryType::EntryConfChange => {
+                    return Err(DurableReplicaError::UnsupportedEntryType);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_deferred_membership_action(&mut self) -> Result<(), DurableReplicaError> {
+        if let Some(target) = self.pending_leader_transfer.take() {
+            self.pending_auto_leave = false;
+            self.raw_node.transfer_leader(target);
+        } else if std::mem::take(&mut self.pending_auto_leave) && self.is_leader() {
+            self.raw_node
+                .propose_conf_change(Vec::new(), ConfChangeV2::default())?;
+        }
+        Ok(())
     }
 
     fn fail_before_apply_if_requested(
@@ -184,29 +300,48 @@ impl DurableRaftReplica {
     }
 }
 
-async fn apply_entries(
-    state_machine: &mut ShardStateMachine<RocksAdapter>,
-    entries: Vec<Entry>,
-) -> Result<(), DurableReplicaError> {
-    for entry in entries {
-        match entry.get_entry_type() {
-            EntryType::EntryNormal if entry.data.is_empty() => {
-                state_machine
-                    .apply_noop_entry(entry.term, entry.index)
-                    .await?;
-            }
-            EntryType::EntryNormal => {
-                CommandEnvelopeV1::decode(&entry.data)?;
-                state_machine
-                    .apply_entry(entry.term, entry.index, &entry.data)
-                    .await?;
-            }
-            EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
-                return Err(DurableReplicaError::UnsupportedEntryType);
-            }
+fn membership_changes(
+    current: &ConfState,
+    voters: &[u64],
+    learners: &[u64],
+) -> Result<Vec<ConfChangeSingle>, DurableReplicaError> {
+    let valid = !voters.is_empty()
+        && voters.iter().all(|node| *node != 0)
+        && learners.iter().all(|node| *node != 0)
+        && voters.windows(2).all(|pair| pair[0] < pair[1])
+        && learners.windows(2).all(|pair| pair[0] < pair[1])
+        && voters
+            .iter()
+            .all(|node| learners.binary_search(node).is_err());
+    if !valid {
+        return Err(DurableReplicaError::InvalidMembership);
+    }
+    let mut changes = Vec::new();
+    for node in voters {
+        if current.voters.binary_search(node).is_err() {
+            changes.push(ConfChangeSingle {
+                change_type: ConfChangeType::AddNode as i32,
+                node_id: *node,
+            });
         }
     }
-    Ok(())
+    for node in learners {
+        if current.learners.binary_search(node).is_err() {
+            changes.push(ConfChangeSingle {
+                change_type: ConfChangeType::AddLearnerNode as i32,
+                node_id: *node,
+            });
+        }
+    }
+    for node in current.voters.iter().chain(&current.learners) {
+        if voters.binary_search(node).is_err() && learners.binary_search(node).is_err() {
+            changes.push(ConfChangeSingle {
+                change_type: ConfChangeType::RemoveNode as i32,
+                node_id: *node,
+            });
+        }
+    }
+    Ok(changes)
 }
 
 fn raft_config(node_id: u64, applied: u64) -> Result<Config, DurableReplicaError> {
@@ -241,6 +376,9 @@ pub enum DurableReplicaError {
     SnapshotInstallNotConnected,
     InjectedCrashAfterWalBeforeApply,
     UnsupportedEntryType,
+    InvalidMembership,
+    JointConfigurationInProgress,
+    NotLeader,
 }
 
 impl Display for DurableReplicaError {
@@ -271,6 +409,11 @@ impl Display for DurableReplicaError {
             Self::UnsupportedEntryType => {
                 formatter.write_str("dynamic membership is not supported by this Replica")
             }
+            Self::InvalidMembership => formatter.write_str("invalid Raft membership"),
+            Self::JointConfigurationInProgress => {
+                formatter.write_str("a joint Raft configuration is already in progress")
+            }
+            Self::NotLeader => formatter.write_str("Replica is not the Raft leader"),
         }
     }
 }

@@ -336,6 +336,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "controller"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "cluster-protocol",
+ "control-plane",
+ "crc32fast",
+ "data-node",
+ "raft-command",
+ "serde",
+ "serde_json",
+ "storage-api",
+ "tempfile",
+ "temporal-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1945,6 +1965,7 @@ dependencies = [
  "blake3",
  "crc32fast",
  "futures-util",
+ "prost 0.11.9",
  "raft",
  "raft-command",
  "raft-logstore",

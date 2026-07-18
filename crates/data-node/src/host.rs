@@ -324,7 +324,7 @@ impl DataNodeHost {
         for entry in entries {
             let spec = ReplicaSpec::from_entry(entry);
             validate_local_replica(config.identity().node_id(), &spec)?;
-            if spec.role() == ReplicaRole::Learner {
+            if spec.role() == ReplicaRole::Learner && spec.snapshot_index() == 0 {
                 dormant_learners.insert(spec.key(), spec);
                 continue;
             }
@@ -353,6 +353,16 @@ impl DataNodeHost {
     #[must_use]
     pub fn data_directory(&self) -> &std::path::Path {
         self.config.data_directory()
+    }
+
+    pub fn replica_keys(&self) -> Result<Vec<ReplicaKey>, HostError> {
+        Ok(self
+            .replicas
+            .read()
+            .map_err(|_| HostError::LockPoisoned)?
+            .keys()
+            .copied()
+            .collect())
     }
 
     pub fn append_migration_chunk(
@@ -513,6 +523,25 @@ impl DataNodeHost {
         receiver.await.map_err(|_| HostError::ActorStopped)?
     }
 
+    pub async fn proposal_status(
+        &self,
+        key: ReplicaKey,
+        request_id: u128,
+        command: Vec<u8>,
+    ) -> Result<ProposalOutcome, HostError> {
+        let sender = self.sender(key)?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::ProposalStatus {
+                request_id,
+                command,
+                response,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
     pub async fn step(
         &self,
         key: ReplicaKey,
@@ -583,7 +612,29 @@ impl DataNodeHost {
         receiver.await.map_err(|_| HostError::ActorStopped)?
     }
 
-    pub fn mark_learner_snapshot(
+    pub fn learner_replica_directory(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+    ) -> Result<std::path::PathBuf, HostError> {
+        let learners = self
+            .dormant_learners
+            .read()
+            .map_err(|_| HostError::LockPoisoned)?;
+        let spec = learners.get(&key).ok_or(HostError::UnknownReplica {
+            graph_id: key.graph_id,
+            shard_id: key.shard_id,
+        })?;
+        if spec.placement_epoch() != placement_epoch {
+            return Err(HostError::StaleEpoch {
+                expected: spec.placement_epoch(),
+                actual: placement_epoch,
+            });
+        }
+        Ok(self.data_directory().join(spec.relative_directory()))
+    }
+
+    pub async fn mark_learner_snapshot(
         &self,
         key: ReplicaKey,
         placement_epoch: u64,
@@ -592,14 +643,16 @@ impl DataNodeHost {
         if snapshot_index == 0 {
             return Err(HostError::InvalidSnapshotIndex);
         }
-        let mut learners = self
+        let current = self
             .dormant_learners
-            .write()
-            .map_err(|_| HostError::LockPoisoned)?;
-        let current = learners.get(&key).ok_or(HostError::UnknownReplica {
-            graph_id: key.graph_id,
-            shard_id: key.shard_id,
-        })?;
+            .read()
+            .map_err(|_| HostError::LockPoisoned)?
+            .get(&key)
+            .cloned()
+            .ok_or(HostError::UnknownReplica {
+                graph_id: key.graph_id,
+                shard_id: key.shard_id,
+            })?;
         if current.placement_epoch() != placement_epoch {
             return Err(HostError::StaleEpoch {
                 expected: current.placement_epoch(),
@@ -612,14 +665,30 @@ impl DataNodeHost {
             .with_snapshot_index(snapshot_index)?;
         let spec = ReplicaSpec::from_entry(entry.clone());
         let status = dormant_status(self.identity().node_id(), &spec);
-        let mut store = self
-            .manifest_store
-            .lock()
-            .map_err(|_| HostError::LockPoisoned)?;
-        let mut manifest = store.manifest().clone();
-        manifest.replace(entry)?;
-        store.persist(&manifest)?;
-        learners.insert(key, spec);
+        {
+            let mut store = self
+                .manifest_store
+                .lock()
+                .map_err(|_| HostError::LockPoisoned)?;
+            let mut manifest = store.manifest().clone();
+            manifest.replace(entry)?;
+            store.persist(&manifest)?;
+        }
+        let handle = ReplicaActorHandle::open(
+            self.identity().node_id(),
+            self.data_directory(),
+            spec.clone(),
+            self.queue_capacity,
+        )
+        .await?;
+        self.dormant_learners
+            .write()
+            .map_err(|_| HostError::LockPoisoned)?
+            .remove(&key);
+        self.replicas
+            .write()
+            .map_err(|_| HostError::LockPoisoned)?
+            .insert(key, handle);
         Ok(status)
     }
 
@@ -645,6 +714,198 @@ impl DataNodeHost {
             .await
             .map_err(|_| HostError::ActorStopped)?;
         receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    pub async fn create_snapshot(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        destination: std::path::PathBuf,
+    ) -> Result<replica_snapshot::SnapshotManifestV1, HostError> {
+        let (sender, actual_epoch) = self.sender_and_epoch(key)?;
+        if placement_epoch != actual_epoch {
+            return Err(HostError::StaleEpoch {
+                expected: actual_epoch,
+                actual: placement_epoch,
+            });
+        }
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::CreateSnapshot {
+                destination,
+                response,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn change_membership(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        operation_id: u128,
+        old_voters: Vec<u64>,
+        new_voters: Vec<u64>,
+        learners: Vec<u64>,
+    ) -> Result<(ReplicaStatus, bool), HostError> {
+        let (sender, actual_epoch) = self.sender_and_epoch(key)?;
+        if placement_epoch != actual_epoch {
+            return Err(HostError::StaleEpoch {
+                expected: actual_epoch,
+                actual: placement_epoch,
+            });
+        }
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::ChangeMembership {
+                operation_id,
+                old_voters,
+                new_voters,
+                learners,
+                response,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    pub async fn delete_replica(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        operation_id: u128,
+        minimum_safe_index: u64,
+    ) -> Result<bool, HostError> {
+        let status = match self.status(key).await {
+            Ok(status) => status,
+            Err(HostError::UnknownReplica { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if status.placement_epoch() != placement_epoch {
+            return Err(HostError::StaleEpoch {
+                expected: status.placement_epoch(),
+                actual: placement_epoch,
+            });
+        }
+        if status.applied_index() < minimum_safe_index || status.is_leader() {
+            return Err(HostError::UnsafeReplicaDelete {
+                applied: status.applied_index(),
+                minimum: minimum_safe_index,
+            });
+        }
+        let handle = self
+            .replicas
+            .write()
+            .map_err(|_| HostError::LockPoisoned)?
+            .remove(&key);
+        let dormant = self
+            .dormant_learners
+            .write()
+            .map_err(|_| HostError::LockPoisoned)?
+            .remove(&key);
+        let relative_directory = handle
+            .as_ref()
+            .map(|handle| handle.spec.relative_directory().to_owned())
+            .or_else(|| {
+                dormant
+                    .as_ref()
+                    .map(|spec| spec.relative_directory().to_owned())
+            })
+            .ok_or(HostError::UnknownReplica {
+                graph_id: key.graph_id,
+                shard_id: key.shard_id,
+            })?;
+        if let Some(handle) = handle {
+            handle.shutdown().await?;
+        }
+        {
+            let mut store = self
+                .manifest_store
+                .lock()
+                .map_err(|_| HostError::LockPoisoned)?;
+            let mut manifest = store.manifest().clone();
+            manifest.remove(key.graph_id, key.shard_id);
+            store.persist(&manifest)?;
+        }
+        let source = self.data_directory().join(relative_directory);
+        if source.exists() {
+            let trash = self
+                .data_directory()
+                .join("trash")
+                .join(format!("{operation_id:032x}"));
+            std::fs::create_dir_all(
+                trash
+                    .parent()
+                    .expect("trash destination always has a parent"),
+            )
+            .map_err(HostError::from_io)?;
+            std::fs::rename(source, trash).map_err(HostError::from_io)?;
+        }
+        Ok(true)
+    }
+
+    pub async fn activate_replica(
+        &self,
+        key: ReplicaKey,
+        source_epoch: u64,
+        target_epoch: u64,
+        voters: Vec<u64>,
+    ) -> Result<(ReplicaStatus, bool), HostError> {
+        let _guard = self.ensure_gate.lock().await;
+        let sender = self.sender(key)?;
+        let current_epoch = self
+            .manifest_store
+            .lock()
+            .map_err(|_| HostError::LockPoisoned)?
+            .manifest()
+            .get(key.graph_id, key.shard_id)
+            .ok_or(HostError::UnknownReplica {
+                graph_id: key.graph_id,
+                shard_id: key.shard_id,
+            })?
+            .placement_epoch();
+        if current_epoch != source_epoch && current_epoch != target_epoch {
+            return Err(HostError::StaleEpoch {
+                expected: current_epoch,
+                actual: source_epoch,
+            });
+        }
+        let (prepared_sender, prepared_receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::PrepareActivation {
+                target_epoch,
+                voters,
+                response: prepared_sender,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        let activated = prepared_receiver
+            .await
+            .map_err(|_| HostError::ActorStopped)??;
+        let duplicate = current_epoch == target_epoch;
+        {
+            let mut store = self
+                .manifest_store
+                .lock()
+                .map_err(|_| HostError::LockPoisoned)?;
+            let mut manifest = store.manifest().clone();
+            manifest.activate(activated.entry().clone())?;
+            store.persist(&manifest)?;
+        }
+        let (commit_sender, commit_receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::CommitActivation {
+                spec: activated,
+                response: commit_sender,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        let status = commit_receiver
+            .await
+            .map_err(|_| HostError::ActorStopped)??;
+        Ok((status, duplicate))
     }
 
     pub async fn take_outbound(
@@ -706,12 +967,23 @@ impl DataNodeHost {
             graph_id: key.graph_id,
             shard_id: key.shard_id,
         })?;
-        Ok((handle.sender(), handle.spec.placement_epoch()))
+        let epoch = self
+            .manifest_store
+            .lock()
+            .map_err(|_| HostError::LockPoisoned)?
+            .manifest()
+            .get(key.graph_id, key.shard_id)
+            .ok_or(HostError::UnknownReplica {
+                graph_id: key.graph_id,
+                shard_id: key.shard_id,
+            })?
+            .placement_epoch();
+        Ok((handle.sender(), epoch))
     }
 }
 
 fn validate_local_replica(node_id: u64, spec: &ReplicaSpec) -> Result<(), HostError> {
-    if !spec.voters().contains(&node_id) {
+    if spec.role() == ReplicaRole::Voter && !spec.voters().contains(&node_id) {
         return Err(HostError::LocalNodeNotVoter { node_id });
     }
     Ok(())
@@ -742,6 +1014,7 @@ pub enum HostError {
     MigrationStorage(MigrationStorageError),
     Io(String),
     DurableReplica(String),
+    Snapshot(String),
     Adapter(String),
     InvalidQueueCapacity,
     InvalidReplicaKey,
@@ -751,10 +1024,16 @@ pub enum HostError {
     LocalNodeNotVoter { node_id: u64 },
     LearnerNotYetSupported,
     InvalidSnapshotIndex,
+    NotLeader { leader_id: Option<u64> },
+    MembershipConflict,
+    MembershipPending,
+    UnsafeReplicaDelete { applied: u64, minimum: u64 },
+    ActivationFenceMismatch,
     WrongCluster,
     WrongTarget { expected: u64, actual: u64 },
     RequestEnvelopeMismatch { expected: u128, actual: u128 },
     RequestMismatch { request_id: u128 },
+    ProposalPending { request_id: u128 },
     StaleEpoch { expected: u64, actual: u64 },
     Overloaded { graph_id: u64, shard_id: u32 },
     OutboundOverloaded,
@@ -793,6 +1072,7 @@ impl Display for HostError {
             Self::MigrationStorage(error) => write!(formatter, "migration storage error: {error}"),
             Self::Io(message) => write!(formatter, "data node I/O error: {message}"),
             Self::DurableReplica(message) => write!(formatter, "durable Replica error: {message}"),
+            Self::Snapshot(message) => write!(formatter, "snapshot error: {message}"),
             Self::Adapter(message) => write!(formatter, "Adapter error: {message}"),
             Self::InvalidQueueCapacity => formatter.write_str("invalid actor queue capacity"),
             Self::InvalidReplicaKey => formatter.write_str("invalid Replica key"),
@@ -813,6 +1093,25 @@ impl Display for HostError {
                 formatter.write_str("learner Replica hosting is not connected yet")
             }
             Self::InvalidSnapshotIndex => formatter.write_str("invalid snapshot index"),
+            Self::NotLeader { leader_id } => {
+                write!(
+                    formatter,
+                    "Replica is not leader; current leader is {leader_id:?}"
+                )
+            }
+            Self::MembershipConflict => {
+                formatter.write_str("Raft membership differs from the expected voter set")
+            }
+            Self::MembershipPending => {
+                formatter.write_str("Raft membership change has not committed yet")
+            }
+            Self::UnsafeReplicaDelete { applied, minimum } => write!(
+                formatter,
+                "Replica applied index {applied} is below safe delete index {minimum} or it is still leader"
+            ),
+            Self::ActivationFenceMismatch => formatter.write_str(
+                "Replica epoch or Raft membership does not satisfy the activation fence",
+            ),
             Self::WrongCluster => formatter.write_str("routed Raft message has another cluster"),
             Self::WrongTarget { expected, actual } => write!(
                 formatter,
@@ -826,6 +1125,9 @@ impl Display for HostError {
                 formatter,
                 "request {request_id} was retried with different command bytes"
             ),
+            Self::ProposalPending { request_id } => {
+                write!(formatter, "proposal {request_id} has not applied yet")
+            }
             Self::StaleEpoch { expected, actual } => write!(
                 formatter,
                 "stale placement epoch {actual}; expected {expected}"

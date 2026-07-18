@@ -7,14 +7,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cluster_protocol::proto::node_admin_service_server::NodeAdminService;
 use cluster_protocol::proto::shard_service_server::ShardService;
 use cluster_protocol::proto::{
-    ChangeMembershipRequest, ChangeMembershipResponse, DeleteReplicaRequest, DeleteReplicaResponse,
-    EnsureReplicaRequest, EnsureReplicaResponse, ExecuteRequest, ExecuteResponse,
+    ActivateReplicaRequest, ActivateReplicaResponse, ChangeMembershipRequest,
+    ChangeMembershipResponse, DeleteReplicaRequest, DeleteReplicaResponse, EnsureReplicaRequest,
+    EnsureReplicaResponse, ExecuteRequest, ExecuteResponse, ExportSnapshotRequest,
     GetMigrationReceiptRequest, GetMigrationReceiptResponse, InstallSnapshotResponse, ReadRequest,
     ReadResponse, ReplicaRole as WireReplicaRole, ReplicaStatusRequest, ReplicaStatusResponse,
     ScanBatch, ScanRequest, SnapshotChunk,
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError, ShardRequestContext};
 use storage_api::{KeySpan, KeyValue, Keyspace, LogicalKey};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::metadata::MetadataValue;
@@ -41,19 +43,24 @@ const REPLICA_PROFILE_MAGIC: [u8; 4] = *b"DTRF";
 const MAX_PROFILE_VOTERS: usize = 64;
 const MAX_REPLICA_DIRECTORY_BYTES: usize = 255;
 const SNAPSHOT_INSTALL_STEP: u32 = 2;
+const SNAPSHOT_EXPORT_STEP: u32 = 1;
+const SNAPSHOT_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
 const SNAPSHOT_OUTCOME_MAGIC: [u8; 4] = *b"DTSO";
 const SNAPSHOT_OUTCOME_VERSION: u16 = 1;
 const SNAPSHOT_OUTCOME_BYTES: usize = 50;
+const PROPOSAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataOperation {
     Execute,
     Read,
     Scan,
+    ExportSnapshot,
     InstallSnapshot,
     ReplicaStatus,
     EnsureReplica,
     ChangeMembership,
+    ActivateReplica,
     DeleteReplica,
     MigrationReceipt,
 }
@@ -168,16 +175,24 @@ impl ShardService for DataNodeGrpcService {
         let (context, key, request_id) = self.validate(request.context, DataOperation::Execute)?;
         let command = CommandPayload::try_from(request.command).map_err(protocol_status)?;
         self.require_leader(key).await?;
-        let outcome = self
+        let command = command.into_bytes();
+        let mut outcome = self
             .host
-            .propose_with_outcome(
-                key,
-                context.placement_epoch(),
-                request_id,
-                command.into_bytes(),
-            )
-            .await
-            .map_err(host_status)?;
+            .propose_with_outcome(key, context.placement_epoch(), request_id, command.clone())
+            .await;
+        while matches!(outcome, Err(HostError::ProposalPending { .. })) {
+            if unix_time_ms()? >= context.common().deadline_unix_ms() {
+                return Err(Status::deadline_exceeded(
+                    "Raft proposal did not apply before request deadline",
+                ));
+            }
+            tokio::time::sleep(PROPOSAL_POLL_INTERVAL).await;
+            outcome = self
+                .host
+                .proposal_status(key, request_id, command.clone())
+                .await;
+        }
+        let outcome = outcome.map_err(host_status)?;
         Ok(Response::new(ExecuteResponse {
             raft_index: outcome.status().applied_index(),
             result: Vec::new(),
@@ -267,6 +282,114 @@ impl ShardService for DataNodeGrpcService {
                 {
                     return;
                 }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    type ExportSnapshotStream = ReceiverStream<Result<SnapshotChunk, Status>>;
+
+    async fn export_snapshot(
+        &self,
+        request: Request<ExportSnapshotRequest>,
+    ) -> Result<Response<Self::ExportSnapshotStream>, Status> {
+        let _gate = self.migration_gate.lock().await;
+        let request = request.into_inner();
+        let wire_context = request
+            .context
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("missing Shard context"))?;
+        let (context, key, _) = self.validate(request.context, DataOperation::ExportSnapshot)?;
+        validate_identifier(&request.migration_id, "migration ID")?;
+        self.require_leader(key).await?;
+        let migration_id: [u8; 16] = request
+            .migration_id
+            .as_slice()
+            .try_into()
+            .expect("validated migration ID length");
+        let root = self
+            .host
+            .data_directory()
+            .join("migration")
+            .join("exports")
+            .join(hex_identifier(migration_id));
+        let bundle = root.join("bundle");
+        let archive = root.join("snapshot.archive");
+        std::fs::create_dir_all(&root).map_err(|error| Status::internal(error.to_string()))?;
+        let manifest = if bundle.exists() {
+            replica_snapshot::open_snapshot_bundle(&bundle)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+        } else {
+            self.host
+                .create_snapshot(key, context.placement_epoch(), bundle.clone())
+                .await
+                .map_err(host_status)?
+        };
+        let content_digest = if archive.exists() {
+            hash_file(&archive).map_err(|error| Status::internal(error.to_string()))?
+        } else {
+            let mut output =
+                File::create(&archive).map_err(|error| Status::internal(error.to_string()))?;
+            let digest = replica_snapshot::write_snapshot_archive(&bundle, &mut output)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            output
+                .sync_all()
+                .map_err(|error| Status::internal(error.to_string()))?;
+            digest
+        };
+        let outcome = encode_snapshot_outcome(manifest.applied_index, manifest.checkpoint_digest);
+        self.host
+            .record_migration_receipt(migration_id, SNAPSHOT_EXPORT_STEP, content_digest, outcome)
+            .map_err(host_status)?;
+        let file_length = std::fs::metadata(&archive)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .len();
+        if file_length == 0 {
+            return Err(Status::internal("snapshot archive is empty"));
+        }
+        let (sender, receiver) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut file = match tokio::fs::File::open(archive).await {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                    return;
+                }
+            };
+            let mut ordinal = 0_u64;
+            let mut consumed = 0_u64;
+            loop {
+                let mut payload = vec![0_u8; SNAPSHOT_STREAM_CHUNK_BYTES];
+                let read = match file.read(&mut payload).await {
+                    Ok(read) => read,
+                    Err(error) => {
+                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        return;
+                    }
+                };
+                if read == 0 {
+                    return;
+                }
+                payload.truncate(read);
+                consumed = consumed.saturating_add(read as u64);
+                let terminal = consumed == file_length;
+                let chunk = SnapshotChunk {
+                    context: Some(wire_context.clone()),
+                    migration_id: migration_id.to_vec(),
+                    ordinal,
+                    checksum: crc32fast::hash(&payload),
+                    payload,
+                    terminal,
+                    manifest_digest: if terminal {
+                        content_digest.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                };
+                if sender.send(Ok(chunk)).await.is_err() || terminal {
+                    return;
+                }
+                ordinal = ordinal.saturating_add(1);
             }
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
@@ -367,7 +490,10 @@ impl ShardService for DataNodeGrpcService {
             .join("snapshots")
             .join(hex_identifier(migration_id));
         let bundle_path = migration_root.join("bundle");
-        let installed_path = migration_root.join("installed");
+        let installed_path = self
+            .host
+            .learner_replica_directory(key, placement_epoch)
+            .map_err(host_status)?;
         std::fs::create_dir_all(&migration_root)
             .map_err(|error| Status::internal(error.to_string()))?;
         let manifest = if bundle_path.exists() {
@@ -396,6 +522,7 @@ impl ShardService for DataNodeGrpcService {
         );
         self.host
             .mark_learner_snapshot(key, placement_epoch, installed.manifest.applied_index)
+            .await
             .map_err(host_status)?;
         let receipt_outcome = self
             .host
@@ -475,20 +602,96 @@ impl NodeAdminService for DataNodeGrpcService {
 
     async fn change_membership(
         &self,
-        _request: Request<ChangeMembershipRequest>,
+        request: Request<ChangeMembershipRequest>,
     ) -> Result<Response<ChangeMembershipResponse>, Status> {
-        Err(Status::unimplemented(
-            "joint-consensus membership is connected in the migration milestone",
-        ))
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::ChangeMembership)?;
+        validate_identifier(&request.operation_id, "operation ID")?;
+        if request.operation_id.as_slice() != request_id.to_be_bytes() {
+            return Err(Status::invalid_argument(
+                "operation ID differs from request ID",
+            ));
+        }
+        validate_membership(&request.old_voters, &request.new_voters, &request.learners)?;
+        self.require_leader(key).await?;
+        let (status, duplicate) = self
+            .host
+            .change_membership(
+                key,
+                context.placement_epoch(),
+                request_id,
+                request.old_voters,
+                request.new_voters,
+                request.learners,
+            )
+            .await
+            .map_err(host_status)?;
+        Ok(Response::new(ChangeMembershipResponse {
+            applied_index: status.applied_index(),
+            duplicate,
+        }))
     }
 
     async fn delete_replica(
         &self,
-        _request: Request<DeleteReplicaRequest>,
+        request: Request<DeleteReplicaRequest>,
     ) -> Result<Response<DeleteReplicaResponse>, Status> {
-        Err(Status::unimplemented(
-            "receipt-gated Replica deletion is connected in the migration milestone",
-        ))
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::DeleteReplica)?;
+        validate_identifier(&request.operation_id, "operation ID")?;
+        if request.operation_id.as_slice() != request_id.to_be_bytes() {
+            return Err(Status::invalid_argument(
+                "operation ID differs from request ID",
+            ));
+        }
+        let deleted = self
+            .host
+            .delete_replica(
+                key,
+                context.placement_epoch(),
+                request_id,
+                request.minimum_safe_index,
+            )
+            .await
+            .map_err(host_status)?;
+        Ok(Response::new(DeleteReplicaResponse { deleted }))
+    }
+
+    async fn activate_replica(
+        &self,
+        request: Request<ActivateReplicaRequest>,
+    ) -> Result<Response<ActivateReplicaResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::ActivateReplica)?;
+        validate_identifier(&request.operation_id, "operation ID")?;
+        if request.operation_id.as_slice() != request_id.to_be_bytes() {
+            return Err(Status::invalid_argument(
+                "operation ID differs from request ID",
+            ));
+        }
+        if request.target_placement_epoch != context.placement_epoch().checked_add(1).unwrap_or(0) {
+            return Err(Status::invalid_argument(
+                "target placement epoch must immediately follow source epoch",
+            ));
+        }
+        validate_membership(&request.voters, &request.voters, &[])?;
+        let (status, duplicate) = self
+            .host
+            .activate_replica(
+                key,
+                context.placement_epoch(),
+                request.target_placement_epoch,
+                request.voters,
+            )
+            .await
+            .map_err(host_status)?;
+        Ok(Response::new(ActivateReplicaResponse {
+            status: Some(status_response(status)),
+            duplicate,
+        }))
     }
 
     async fn get_migration_receipt(
@@ -1120,6 +1323,23 @@ fn validate_identifier(identifier: &[u8], name: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_membership(old: &[u64], new: &[u64], learners: &[u64]) -> Result<(), Status> {
+    let canonical =
+        |nodes: &[u64]| !nodes.contains(&0) && nodes.windows(2).all(|pair| pair[0] < pair[1]);
+    if old.is_empty()
+        || new.is_empty()
+        || !canonical(old)
+        || !canonical(new)
+        || !canonical(learners)
+        || new.iter().any(|node| learners.binary_search(node).is_ok())
+    {
+        return Err(Status::invalid_argument(
+            "Raft voters and learners must be canonical and disjoint",
+        ));
+    }
+    Ok(())
+}
+
 fn encode_snapshot_outcome(installed_index: u64, checkpoint_digest: [u8; 32]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(SNAPSHOT_OUTCOME_BYTES);
     encoded.extend_from_slice(&SNAPSHOT_OUTCOME_MAGIC);
@@ -1159,6 +1379,19 @@ fn hex_identifier(identifier: [u8; 16]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn hash_file(path: &std::path::Path) -> Result<[u8; 32], std::io::Error> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            return Ok(*hasher.finalize().as_bytes());
+        }
+        hasher.update(&buffer[..read]);
+    }
 }
 
 fn status_response(status: ReplicaStatus) -> ReplicaStatusResponse {
@@ -1203,6 +1436,12 @@ fn host_status(error: HostError) -> Status {
         HostError::RequestEnvelopeMismatch { .. } => Status::invalid_argument(error.to_string()),
         HostError::RequestMismatch { .. } => Status::already_exists(error.to_string()),
         HostError::ReplicaNotReady { .. } => Status::failed_precondition(error.to_string()),
+        HostError::NotLeader { leader_id } => not_leader_status(leader_id),
+        HostError::MembershipConflict => Status::failed_precondition(error.to_string()),
+        HostError::MembershipPending => Status::unavailable(error.to_string()),
+        HostError::ProposalPending { .. } => Status::unavailable(error.to_string()),
+        HostError::UnsafeReplicaDelete { .. } => Status::failed_precondition(error.to_string()),
+        HostError::ActivationFenceMismatch => Status::failed_precondition(error.to_string()),
         HostError::LearnerNotYetSupported => Status::failed_precondition(error.to_string()),
         HostError::ActorStopped => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),

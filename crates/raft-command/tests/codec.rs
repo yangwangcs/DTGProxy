@@ -161,6 +161,19 @@ fn apply_and_closed_timestamp_commands_round_trip_exactly() {
 }
 
 #[test]
+fn placement_epoch_activation_is_canonical_and_strictly_sequential() {
+    let command = CommandEnvelopeV1::new(11, 3, 900, CommandBodyV1::ActivatePlacementEpoch(4));
+    let encoded = command.encode().unwrap();
+    assert_eq!(CommandEnvelopeV1::decode(&encoded).unwrap(), command);
+    assert!(matches!(
+        CommandEnvelopeV1::new(11, 3, 901, CommandBodyV1::ActivatePlacementEpoch(5),)
+            .encode()
+            .unwrap_err(),
+        raft_command::CommandCodecError::InvalidTargetEpoch { .. }
+    ));
+}
+
+#[test]
 fn closed_timestamp_wire_format_has_stable_golden_bytes() {
     let tick = CommandEnvelopeV1::new(
         1,

@@ -7,6 +7,7 @@ mod identity;
 mod manifest;
 mod migration;
 mod raft_network;
+mod raft_runtime;
 mod replica_actor;
 mod service;
 
@@ -23,6 +24,7 @@ pub use migration::{
     MigrationStorageError, ReceiptWriteOutcome, SnapshotInbox,
 };
 pub use raft_network::{RaftDelivery, RaftNetworkError, SharedRaftTransport};
+pub use raft_runtime::{DataRaftRuntime, DataRaftRuntimeError};
 pub use service::{
     DataNodeGrpcService, DataOperation, ReadCodecError, ReplicaProfileError, RequestAuthorizer,
     decode_key_read_result, decode_key_scan_batch, encode_key_read_plan, encode_key_scan_plan,

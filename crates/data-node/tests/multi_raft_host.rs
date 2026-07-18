@@ -138,6 +138,118 @@ async fn two_shards_progress_independently_and_recover_from_separate_wals() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn joint_membership_is_applied_durably_and_retries_are_idempotent() {
+    let temporary = tempdir().unwrap();
+    let node_config = config(temporary.path());
+    let host = DataNodeHost::open(node_config.clone(), 8).await.unwrap();
+    host.ensure_replica(spec(11)).await.unwrap();
+    host.campaign(key(11)).await.unwrap();
+
+    let (changed, duplicate) = host
+        .change_membership(key(11), 3, 800, vec![7], vec![7], vec![8])
+        .await
+        .unwrap();
+    assert!(!duplicate);
+    assert!(changed.applied_index() > 0);
+    let (same, duplicate) = host
+        .change_membership(key(11), 3, 800, vec![7], vec![7], vec![8])
+        .await
+        .unwrap();
+    assert!(duplicate);
+    assert_eq!(same.applied_index(), changed.applied_index());
+    host.shutdown().await.unwrap();
+
+    let reopened = DataNodeHost::open(node_config, 8).await.unwrap();
+    reopened.campaign(key(11)).await.unwrap();
+    let (_, duplicate) = reopened
+        .change_membership(key(11), 3, 800, vec![7], vec![7], vec![8])
+        .await
+        .unwrap();
+    assert!(duplicate);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn placement_epoch_fence_precedes_durable_replica_activation() {
+    let temporary = tempdir().unwrap();
+    let node_config = config(temporary.path());
+    let host = DataNodeHost::open(node_config.clone(), 8).await.unwrap();
+    host.ensure_replica(spec(11)).await.unwrap();
+    host.campaign(key(11)).await.unwrap();
+    let fence = CommandEnvelopeV1::new(11, 3, 850, CommandBodyV1::ActivatePlacementEpoch(4))
+        .encode()
+        .unwrap();
+    host.propose(key(11), 3, 850, fence).await.unwrap();
+
+    let (activated, duplicate) = host.activate_replica(key(11), 3, 4, vec![7]).await.unwrap();
+    assert!(!duplicate);
+    assert_eq!(activated.placement_epoch(), 4);
+    assert!(matches!(
+        host.propose(key(11), 3, 851, command(11, 851, 300, b"stale"))
+            .await
+            .unwrap_err(),
+        HostError::StaleEpoch {
+            expected: 4,
+            actual: 3
+        }
+    ));
+    let (_, duplicate) = host.activate_replica(key(11), 3, 4, vec![7]).await.unwrap();
+    assert!(duplicate);
+    host.shutdown().await.unwrap();
+
+    let reopened = DataNodeHost::open(node_config, 8).await.unwrap();
+    assert_eq!(reopened.status(key(11)).await.unwrap().placement_epoch(), 4);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn safe_delete_removes_admission_and_moves_replica_data_to_recoverable_trash() {
+    let temporary = tempdir().unwrap();
+    let node_config = config(temporary.path());
+    let host = DataNodeHost::open(node_config.clone(), 8).await.unwrap();
+    let learner = ReplicaSpec::new(
+        1,
+        13,
+        3,
+        vec![8],
+        ReplicaRole::Learner,
+        5,
+        7,
+        "graph-1-shard-13",
+    )
+    .unwrap();
+    host.ensure_replica(learner).await.unwrap();
+    let replica_directory = temporary.path().join("graph-1-shard-13");
+    std::fs::create_dir_all(&replica_directory).unwrap();
+    std::fs::write(replica_directory.join("marker"), b"recoverable").unwrap();
+
+    assert!(host.delete_replica(key(13), 3, 990, 0).await.unwrap());
+    assert!(matches!(
+        host.status(key(13)).await,
+        Err(HostError::UnknownReplica { .. })
+    ));
+    assert_eq!(
+        std::fs::read(
+            temporary
+                .path()
+                .join("trash")
+                .join(format!("{:032x}", 990_u128))
+                .join("marker")
+        )
+        .unwrap(),
+        b"recoverable"
+    );
+    host.shutdown().await.unwrap();
+
+    let reopened = DataNodeHost::open(node_config, 8).await.unwrap();
+    assert!(matches!(
+        reopened.status(key(13)).await,
+        Err(HostError::UnknownReplica { .. })
+    ));
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn one_full_shard_queue_does_not_consume_another_shards_capacity() {
     let temporary = tempdir().unwrap();
     let host = DataNodeHost::open(config(temporary.path()), 1)

@@ -19,6 +19,7 @@ const RECORD_DECISION_TAG: u8 = 4;
 const FINALIZE_TAG: u8 = 5;
 const ABORT_INTENT_TAG: u8 = 6;
 const ONE_PHASE_COMMIT_TAG: u8 = 7;
+const ACTIVATE_PLACEMENT_EPOCH_TAG: u8 = 8;
 const PUT_TAG: u8 = 1;
 const DELETE_TAG: u8 = 2;
 const HEADER_BYTES: usize = 40;
@@ -224,6 +225,16 @@ impl CommandEnvelopeV1 {
                 validate_one_phase(shard_id, placement_epoch, &one_phase)?;
                 CommandBodyV1::OnePhaseCommit(one_phase)
             }
+            ACTIVATE_PLACEMENT_EPOCH_TAG => {
+                let target_epoch = body_reader.u64()?;
+                if target_epoch != placement_epoch.checked_add(1).unwrap_or(0) {
+                    return Err(CommandCodecError::InvalidTargetEpoch {
+                        current: placement_epoch,
+                        target: target_epoch,
+                    });
+                }
+                CommandBodyV1::ActivatePlacementEpoch(target_epoch)
+            }
             tag => return Err(CommandCodecError::UnknownBodyTag { tag }),
         };
         body_reader.finish()?;
@@ -331,6 +342,18 @@ impl CommandEnvelopeV1 {
                 encode_transaction_time(&mut body, one_phase.commit_ts);
                 Ok((ONE_PHASE_COMMIT_TAG, body))
             }
+            CommandBodyV1::ActivatePlacementEpoch(target_epoch) => {
+                if *target_epoch != self.placement_epoch.checked_add(1).unwrap_or(0) {
+                    return Err(CommandCodecError::InvalidTargetEpoch {
+                        current: self.placement_epoch,
+                        target: *target_epoch,
+                    });
+                }
+                Ok((
+                    ACTIVATE_PLACEMENT_EPOCH_TAG,
+                    target_epoch.to_be_bytes().to_vec(),
+                ))
+            }
         }
     }
 }
@@ -344,6 +367,7 @@ pub enum CommandBodyV1 {
     Finalize(FinalizeV1),
     AbortIntent(AbortIntentV1),
     OnePhaseCommit(OnePhaseCommitV1),
+    ActivatePlacementEpoch(u64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -739,6 +763,7 @@ pub enum CommandCodecError {
     NonCanonicalMutationSequence { expected: u32, actual: u32 },
     ShardMismatch { envelope: u32, batch: u32 },
     PlacementEpochMismatch { envelope: u64, participant: u64 },
+    InvalidTargetEpoch { current: u64, target: u64 },
     InvalidParticipantProof,
     InvalidTransactionId,
     InvalidOnePhaseCommit,
@@ -802,6 +827,10 @@ impl Display for CommandCodecError {
             } => write!(
                 formatter,
                 "command epoch {envelope} does not match participant epoch {participant}"
+            ),
+            Self::InvalidTargetEpoch { current, target } => write!(
+                formatter,
+                "target placement epoch {target} must immediately follow {current}"
             ),
             Self::InvalidParticipantProof => {
                 formatter.write_str("invalid participant proof in Prewrite command")

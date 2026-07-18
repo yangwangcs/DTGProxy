@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
@@ -19,6 +20,8 @@ pub struct DataNodeRuntimeConfig {
     node: NodeConfig,
     actor_queue_capacity: usize,
     shutdown_grace: Duration,
+    raft_listen_address: Option<SocketAddr>,
+    raft_peers: BTreeMap<u64, SocketAddr>,
 }
 
 impl DataNodeRuntimeConfig {
@@ -50,6 +53,16 @@ impl DataNodeRuntimeConfig {
     }
 
     #[must_use]
+    pub const fn raft_listen_address(&self) -> Option<SocketAddr> {
+        self.raft_listen_address
+    }
+
+    #[must_use]
+    pub const fn raft_peers(&self) -> &BTreeMap<u64, SocketAddr> {
+        &self.raft_peers
+    }
+
+    #[must_use]
     pub fn into_node(self) -> NodeConfig {
         self.node
     }
@@ -68,6 +81,10 @@ struct RawDataNodeConfig {
     security: RawSecurity,
     actor_queue_capacity: usize,
     shutdown_grace_ms: u64,
+    #[serde(default)]
+    raft_listen_address: Option<SocketAddr>,
+    #[serde(default)]
+    raft_peers: BTreeMap<u64, SocketAddr>,
 }
 
 impl RawDataNodeConfig {
@@ -86,6 +103,27 @@ impl RawDataNodeConfig {
             return Err(FileConfigError::InvalidShutdownGrace {
                 actual_ms: self.shutdown_grace_ms,
             });
+        }
+        if self.raft_listen_address.is_none() && !self.raft_peers.is_empty() {
+            return Err(FileConfigError::MissingRaftListenAddress);
+        }
+        if let Some(raft_listen_address) = self.raft_listen_address
+            && (raft_listen_address.port() == 0
+                || !raft_listen_address.ip().is_loopback()
+                || raft_listen_address == self.listen_address)
+        {
+            return Err(FileConfigError::InvalidRaftListenAddress);
+        }
+        let mut peer_addresses = std::collections::BTreeSet::new();
+        for (&peer_id, &address) in &self.raft_peers {
+            if peer_id == 0
+                || peer_id == self.node_id
+                || address.port() == 0
+                || !address.ip().is_loopback()
+                || !peer_addresses.insert(address)
+            {
+                return Err(FileConfigError::InvalidRaftPeer { node_id: peer_id });
+            }
         }
         let cluster_id = decode_cluster_id(&self.cluster_id)?;
         let identity = NodeIdentity::new(cluster_id, self.node_id)?;
@@ -114,6 +152,8 @@ impl RawDataNodeConfig {
             node,
             actor_queue_capacity: self.actor_queue_capacity,
             shutdown_grace: Duration::from_millis(self.shutdown_grace_ms),
+            raft_listen_address: self.raft_listen_address,
+            raft_peers: self.raft_peers,
         })
     }
 }
@@ -154,6 +194,9 @@ pub enum FileConfigError {
     InvalidClusterId,
     InvalidActorQueueCapacity { actual: usize },
     InvalidShutdownGrace { actual_ms: u64 },
+    MissingRaftListenAddress,
+    InvalidRaftListenAddress,
+    InvalidRaftPeer { node_id: u64 },
     NodeConfig(String),
     Identity(String),
 }
@@ -183,6 +226,14 @@ impl Display for FileConfigError {
             }
             Self::InvalidShutdownGrace { actual_ms } => {
                 write!(formatter, "invalid shutdown_grace_ms {actual_ms}")
+            }
+            Self::MissingRaftListenAddress => formatter
+                .write_str("raft_listen_address is required when raft_peers are configured"),
+            Self::InvalidRaftListenAddress => formatter.write_str(
+                "raft_listen_address must be a distinct loopback address with a non-zero port",
+            ),
+            Self::InvalidRaftPeer { node_id } => {
+                write!(formatter, "invalid Raft peer address for node {node_id}")
             }
             Self::NodeConfig(message) => write!(formatter, "invalid node config: {message}"),
             Self::Identity(message) => write!(formatter, "invalid node identity: {message}"),

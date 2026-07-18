@@ -104,12 +104,23 @@ message HeartbeatResponse {
   uint64 lease_expires_unix_ms = 2;
 }
 
+message AcquireControllerLeaseRequest {
+  RequestContext context = 1;
+  uint64 controller_id = 2;
+}
+
+message AcquireControllerLeaseResponse {
+  uint64 owner_term = 1;
+  uint64 lease_expires_unix_ms = 2;
+}
+
 service MetaService {
   rpc GetCatalog(GetCatalogRequest) returns (GetCatalogResponse);
   rpc WatchCatalog(WatchCatalogRequest) returns (stream CatalogEvent);
   rpc Propose(ProposeRequest) returns (ProposeResponse);
   rpc AllocateTimestamp(AllocateTimestampRequest) returns (AllocateTimestampResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc AcquireControllerLease(AcquireControllerLeaseRequest) returns (AcquireControllerLeaseResponse);
 }
 
 // Internal Meta-group Raft transport. The encoded message is raft-rs' stable
@@ -196,6 +207,11 @@ message InstallSnapshotResponse {
   bool duplicate = 4;
 }
 
+message ExportSnapshotRequest {
+  ShardContext context = 1;
+  bytes migration_id = 2;
+}
+
 message ReplicaStatusRequest { ShardContext context = 1; }
 
 enum ReplicaRole {
@@ -221,6 +237,7 @@ service ShardService {
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc Read(ReadRequest) returns (ReadResponse);
   rpc Scan(ScanRequest) returns (stream ScanBatch);
+  rpc ExportSnapshot(ExportSnapshotRequest) returns (stream SnapshotChunk);
   rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
   rpc ReplicaStatus(ReplicaStatusRequest) returns (ReplicaStatusResponse);
 }
@@ -253,6 +270,18 @@ message ChangeMembershipResponse {
   bool duplicate = 2;
 }
 
+message ActivateReplicaRequest {
+  ShardContext context = 1;
+  bytes operation_id = 2;
+  uint64 target_placement_epoch = 3;
+  repeated uint64 voters = 4;
+}
+
+message ActivateReplicaResponse {
+  ReplicaStatusResponse status = 1;
+  bool duplicate = 2;
+}
+
 message DeleteReplicaRequest {
   ShardContext context = 1;
   bytes operation_id = 2;
@@ -276,6 +305,7 @@ message GetMigrationReceiptResponse {
 service NodeAdminService {
   rpc EnsureReplica(EnsureReplicaRequest) returns (EnsureReplicaResponse);
   rpc ChangeMembership(ChangeMembershipRequest) returns (ChangeMembershipResponse);
+  rpc ActivateReplica(ActivateReplicaRequest) returns (ActivateReplicaResponse);
   rpc DeleteReplica(DeleteReplicaRequest) returns (DeleteReplicaResponse);
   rpc GetMigrationReceipt(GetMigrationReceiptRequest) returns (GetMigrationReceiptResponse);
 }

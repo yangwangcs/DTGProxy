@@ -19,12 +19,15 @@ const LOG_MAGIC: [u8; 4] = *b"DTCL";
 const COMMAND_FORMAT_VERSION: u16 = 1;
 const LOG_FORMAT_VERSION: u16 = 1;
 const LEGACY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
-const SNAPSHOT_FORMAT_VERSION: u16 = 2;
+const MIGRATION_SNAPSHOT_FORMAT_VERSION: u16 = 2;
+const LINEAGE_SNAPSHOT_FORMAT_VERSION: u16 = 3;
+const SNAPSHOT_FORMAT_VERSION: u16 = 4;
 const CHECKSUM_BYTES: usize = 4;
 const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GRAPHS: usize = 65_536;
 const MAX_MIGRATIONS: usize = 1_048_576;
+const MAX_RETENTION_PINS: usize = 1_048_576;
 const MAX_PLACEMENTS: usize = 65_536;
 const MAX_VOTERS: usize = 1_024;
 const MAX_MAP_ENTRIES: usize = 1_024;
@@ -77,6 +80,118 @@ impl Placement {
     #[must_use]
     pub fn voters(&self) -> &[u64] {
         &self.voters
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardLineage {
+    graph_id: u64,
+    shard_id: u32,
+    source_epoch: u64,
+    target_epoch: u64,
+    migration_id: u128,
+    cutover_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetentionPinKind {
+    Transaction,
+    Backup,
+    ChangeDataCapture,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetentionPin {
+    pin_id: u128,
+    graph_id: u64,
+    shard_id: u32,
+    placement_epoch: u64,
+    kind: RetentionPinKind,
+    expires_unix_ms: u64,
+}
+
+impl RetentionPin {
+    pub fn new(
+        pin_id: u128,
+        graph_id: u64,
+        shard_id: u32,
+        placement_epoch: u64,
+        kind: RetentionPinKind,
+        expires_unix_ms: u64,
+    ) -> Result<Self, CatalogError> {
+        if pin_id == 0
+            || graph_id == 0
+            || shard_id == 0
+            || placement_epoch == 0
+            || expires_unix_ms == 0
+        {
+            return Err(CatalogError::InvalidRetentionPin);
+        }
+        Ok(Self {
+            pin_id,
+            graph_id,
+            shard_id,
+            placement_epoch,
+            kind,
+            expires_unix_ms,
+        })
+    }
+
+    #[must_use]
+    pub const fn pin_id(&self) -> u128 {
+        self.pin_id
+    }
+    #[must_use]
+    pub const fn graph_id(&self) -> u64 {
+        self.graph_id
+    }
+    #[must_use]
+    pub const fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+    #[must_use]
+    pub const fn placement_epoch(&self) -> u64 {
+        self.placement_epoch
+    }
+    #[must_use]
+    pub const fn kind(&self) -> RetentionPinKind {
+        self.kind
+    }
+    #[must_use]
+    pub const fn expires_unix_ms(&self) -> u64 {
+        self.expires_unix_ms
+    }
+}
+
+impl ShardLineage {
+    #[must_use]
+    pub const fn graph_id(&self) -> u64 {
+        self.graph_id
+    }
+
+    #[must_use]
+    pub const fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+
+    #[must_use]
+    pub const fn source_epoch(&self) -> u64 {
+        self.source_epoch
+    }
+
+    #[must_use]
+    pub const fn target_epoch(&self) -> u64 {
+        self.target_epoch
+    }
+
+    #[must_use]
+    pub const fn migration_id(&self) -> u128 {
+        self.migration_id
+    }
+
+    #[must_use]
+    pub const fn cutover_index(&self) -> u64 {
+        self.cutover_index
     }
 }
 
@@ -310,6 +425,16 @@ pub enum CatalogCommandBody {
         updated_at_unix_ms: u64,
         error: String,
     },
+    CommitMigration {
+        migration_id: u128,
+        expected_state_revision: u64,
+        topology: TopologyDefinition,
+        progress: MigrationProgress,
+    },
+    AcquireRetentionPin(RetentionPin),
+    ReleaseRetentionPin {
+        pin_id: u128,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -455,6 +580,50 @@ impl CatalogCommand {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_migration(
+        command_id: u128,
+        expected_revision: u64,
+        migration_id: u128,
+        expected_state_revision: u64,
+        topology: TopologyDefinition,
+        progress: MigrationProgress,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::CommitMigration {
+                migration_id,
+                expected_state_revision,
+                topology,
+                progress,
+            },
+        )
+    }
+
+    #[must_use]
+    pub fn acquire_retention_pin(
+        command_id: u128,
+        expected_revision: u64,
+        pin: RetentionPin,
+    ) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::AcquireRetentionPin(pin),
+        )
+    }
+
+    #[must_use]
+    pub fn release_retention_pin(command_id: u128, expected_revision: u64, pin_id: u128) -> Self {
+        Self::new(
+            command_id,
+            expected_revision,
+            CatalogCommandBody::ReleaseRetentionPin { pin_id },
+        )
+    }
+
+    #[must_use]
     pub const fn command_id(&self) -> u128 {
         self.command_id
     }
@@ -540,6 +709,8 @@ pub struct CatalogState {
     graphs: BTreeMap<u64, GraphDefinition>,
     migrations: BTreeMap<u128, MigrationRecord>,
     active_migrations: BTreeMap<(u64, u32), u128>,
+    lineages: BTreeMap<(u64, u32, u64), ShardLineage>,
+    retention_pins: BTreeMap<u128, RetentionPin>,
     applied_commands: BTreeMap<u128, AppliedCommand>,
 }
 
@@ -551,6 +722,8 @@ impl CatalogState {
             graphs: BTreeMap::new(),
             migrations: BTreeMap::new(),
             active_migrations: BTreeMap::new(),
+            lineages: BTreeMap::new(),
+            retention_pins: BTreeMap::new(),
             applied_commands: BTreeMap::new(),
         }
     }
@@ -587,6 +760,42 @@ impl CatalogState {
             .and_then(|migration_id| self.migrations.get(migration_id))
     }
 
+    #[must_use]
+    pub fn lineage(
+        &self,
+        graph_id: u64,
+        shard_id: u32,
+        source_epoch: u64,
+    ) -> Option<&ShardLineage> {
+        self.lineages.get(&(graph_id, shard_id, source_epoch))
+    }
+
+    #[must_use]
+    pub const fn lineages(&self) -> &BTreeMap<(u64, u32, u64), ShardLineage> {
+        &self.lineages
+    }
+
+    #[must_use]
+    pub const fn retention_pins(&self) -> &BTreeMap<u128, RetentionPin> {
+        &self.retention_pins
+    }
+
+    #[must_use]
+    pub fn cleanup_is_pinned(
+        &self,
+        graph_id: u64,
+        shard_id: u32,
+        placement_epoch: u64,
+        now_unix_ms: u64,
+    ) -> bool {
+        self.retention_pins.values().any(|pin| {
+            pin.graph_id == graph_id
+                && pin.shard_id == shard_id
+                && pin.placement_epoch <= placement_epoch
+                && pin.expires_unix_ms > now_unix_ms
+        })
+    }
+
     pub fn encode_snapshot(&self) -> Result<Vec<u8>, CatalogError> {
         encode_snapshot(self)
     }
@@ -617,18 +826,20 @@ impl CatalogState {
                 actual: command.expected_revision,
             });
         }
-        self.apply_body(command.body)?;
-        self.revision = self
+        let mut next = self.clone();
+        next.apply_body(command.body)?;
+        next.revision = next
             .revision
             .checked_add(1)
             .ok_or(CatalogError::RevisionExhausted)?;
-        self.applied_commands.insert(
+        next.applied_commands.insert(
             command.command_id,
             AppliedCommand {
                 digest,
-                revision: self.revision,
+                revision: next.revision,
             },
         );
+        *self = next;
         Ok(CatalogApplyReceipt {
             revision: self.revision,
             duplicate: false,
@@ -804,6 +1015,122 @@ impl CatalogState {
                         error,
                     )?;
             }
+            CatalogCommandBody::CommitMigration {
+                migration_id,
+                expected_state_revision,
+                topology,
+                progress,
+            } => {
+                let migration = self
+                    .migrations
+                    .get(&migration_id)
+                    .ok_or(MigrationError::UnknownMigration { migration_id })?
+                    .clone();
+                if migration.state != MigrationState::Committing {
+                    return Err(MigrationError::IllegalTransition {
+                        from: migration.state,
+                        to: MigrationState::Committed,
+                    }
+                    .into());
+                }
+                let graph =
+                    self.graphs
+                        .get(&migration.graph_id)
+                        .ok_or(CatalogError::UnknownGraph {
+                            graph_id: migration.graph_id,
+                        })?;
+                if graph.topology.epoch != migration.source_epoch
+                    || topology.epoch != migration.target_epoch
+                {
+                    return Err(MigrationError::SourcePlacementMismatch {
+                        graph_id: migration.graph_id,
+                        shard_id: migration.shard_id,
+                    }
+                    .into());
+                }
+                let target = topology
+                    .placements
+                    .iter()
+                    .find(|placement| placement.shard_id == migration.shard_id)
+                    .ok_or(MigrationError::SourcePlacementMismatch {
+                        graph_id: migration.graph_id,
+                        shard_id: migration.shard_id,
+                    })?;
+                if target.epoch != migration.target_epoch
+                    || target.voters != migration.target_voters
+                {
+                    return Err(MigrationError::SourcePlacementMismatch {
+                        graph_id: migration.graph_id,
+                        shard_id: migration.shard_id,
+                    }
+                    .into());
+                }
+                validate_placement_transition(&graph.topology, &topology)?;
+                let mut committed = migration.clone();
+                committed.advance(expected_state_revision, MigrationState::Committed, progress)?;
+                let lineage = ShardLineage {
+                    graph_id: migration.graph_id,
+                    shard_id: migration.shard_id,
+                    source_epoch: migration.source_epoch,
+                    target_epoch: migration.target_epoch,
+                    migration_id,
+                    cutover_index: committed.cutover_index,
+                };
+                let key = (
+                    migration.graph_id,
+                    migration.shard_id,
+                    migration.source_epoch,
+                );
+                if self.lineages.contains_key(&key) {
+                    return Err(CatalogError::DuplicateLineage {
+                        graph_id: migration.graph_id,
+                        shard_id: migration.shard_id,
+                        source_epoch: migration.source_epoch,
+                    });
+                }
+                self.graphs
+                    .get_mut(&migration.graph_id)
+                    .expect("validated graph")
+                    .topology = topology;
+                self.migrations.insert(migration_id, committed);
+                self.lineages.insert(key, lineage);
+            }
+            CatalogCommandBody::AcquireRetentionPin(pin) => {
+                if self.retention_pins.len() >= MAX_RETENTION_PINS {
+                    return Err(CatalogError::TooManyRetentionPins);
+                }
+                let graph = self
+                    .graphs
+                    .get(&pin.graph_id)
+                    .ok_or(CatalogError::UnknownGraph {
+                        graph_id: pin.graph_id,
+                    })?;
+                let current_epoch = graph
+                    .topology
+                    .placements
+                    .iter()
+                    .find(|placement| placement.shard_id == pin.shard_id)
+                    .map(Placement::epoch)
+                    .ok_or(CatalogError::InvalidRetentionPin)?;
+                if pin.placement_epoch != current_epoch {
+                    return Err(CatalogError::InvalidRetentionPin);
+                }
+                match self.retention_pins.get(&pin.pin_id) {
+                    Some(existing) if existing == &pin => {}
+                    Some(_) => {
+                        return Err(CatalogError::RetentionPinConflict { pin_id: pin.pin_id });
+                    }
+                    None => {
+                        self.retention_pins.insert(pin.pin_id, pin);
+                    }
+                }
+            }
+            CatalogCommandBody::ReleaseRetentionPin { pin_id } => {
+                if pin_id == 0 {
+                    return Err(CatalogError::InvalidRetentionPin);
+                }
+                self.retention_pins.remove(&pin_id);
+            }
         }
         Ok(())
     }
@@ -894,14 +1221,14 @@ fn validate_placement_transition(
         .collect::<BTreeMap<_, _>>();
     for placement in &new.placements {
         if let Some(previous) = old.get(&placement.shard_id) {
-            let expected =
+            let next =
                 previous
                     .epoch
                     .checked_add(1)
                     .ok_or(CatalogError::InvalidPlacementTransition {
                         shard_id: placement.shard_id,
                     })?;
-            if placement.epoch != expected {
+            if placement.epoch != previous.epoch && placement.epoch != next {
                 return Err(CatalogError::InvalidPlacementTransition {
                     shard_id: placement.shard_id,
                 });
@@ -1021,6 +1348,26 @@ fn encode_command_body(
             output.extend_from_slice(&updated_at_unix_ms.to_be_bytes());
             write_string(output, error)?;
         }
+        CatalogCommandBody::CommitMigration {
+            migration_id,
+            expected_state_revision,
+            topology,
+            progress,
+        } => {
+            output.push(8);
+            output.extend_from_slice(&migration_id.to_be_bytes());
+            output.extend_from_slice(&expected_state_revision.to_be_bytes());
+            encode_topology(output, topology)?;
+            encode_migration_progress(output, progress);
+        }
+        CatalogCommandBody::AcquireRetentionPin(pin) => {
+            output.push(9);
+            encode_retention_pin(output, pin);
+        }
+        CatalogCommandBody::ReleaseRetentionPin { pin_id } => {
+            output.push(10);
+            output.extend_from_slice(&pin_id.to_be_bytes());
+        }
     }
     Ok(())
 }
@@ -1058,6 +1405,18 @@ fn decode_command_body(reader: &mut Reader<'_>) -> Result<CatalogCommandBody, Ca
             owner_term: reader.u64()?,
             updated_at_unix_ms: reader.u64()?,
             error: reader.string(4_096)?,
+        }),
+        8 => Ok(CatalogCommandBody::CommitMigration {
+            migration_id: reader.u128()?,
+            expected_state_revision: reader.u64()?,
+            topology: decode_topology(reader)?,
+            progress: decode_migration_progress(reader)?,
+        }),
+        9 => Ok(CatalogCommandBody::AcquireRetentionPin(
+            decode_retention_pin(reader)?,
+        )),
+        10 => Ok(CatalogCommandBody::ReleaseRetentionPin {
+            pin_id: reader.u128()?,
         }),
         tag => Err(CatalogError::UnknownCommandTag { tag }),
     }
@@ -1195,6 +1554,71 @@ fn decode_migration_record(reader: &mut Reader<'_>) -> Result<MigrationRecord, C
         updated_at_unix_ms,
     )
     .map_err(CatalogError::from)
+}
+
+fn encode_lineage(output: &mut Vec<u8>, lineage: &ShardLineage) {
+    output.extend_from_slice(&lineage.graph_id.to_be_bytes());
+    output.extend_from_slice(&lineage.shard_id.to_be_bytes());
+    output.extend_from_slice(&lineage.source_epoch.to_be_bytes());
+    output.extend_from_slice(&lineage.target_epoch.to_be_bytes());
+    output.extend_from_slice(&lineage.migration_id.to_be_bytes());
+    output.extend_from_slice(&lineage.cutover_index.to_be_bytes());
+}
+
+fn decode_lineage(reader: &mut Reader<'_>) -> Result<ShardLineage, CatalogError> {
+    let lineage = ShardLineage {
+        graph_id: reader.u64()?,
+        shard_id: reader.u32()?,
+        source_epoch: reader.u64()?,
+        target_epoch: reader.u64()?,
+        migration_id: reader.u128()?,
+        cutover_index: reader.u64()?,
+    };
+    if lineage.graph_id == 0
+        || lineage.shard_id == 0
+        || lineage.source_epoch == 0
+        || lineage.target_epoch != lineage.source_epoch.checked_add(1).unwrap_or(0)
+        || lineage.migration_id == 0
+        || lineage.cutover_index == 0
+    {
+        return Err(CatalogError::NonCanonicalRecord);
+    }
+    Ok(lineage)
+}
+
+fn encode_retention_pin(output: &mut Vec<u8>, pin: &RetentionPin) {
+    output.extend_from_slice(&pin.pin_id.to_be_bytes());
+    output.extend_from_slice(&pin.graph_id.to_be_bytes());
+    output.extend_from_slice(&pin.shard_id.to_be_bytes());
+    output.extend_from_slice(&pin.placement_epoch.to_be_bytes());
+    output.push(match pin.kind {
+        RetentionPinKind::Transaction => 1,
+        RetentionPinKind::Backup => 2,
+        RetentionPinKind::ChangeDataCapture => 3,
+    });
+    output.extend_from_slice(&pin.expires_unix_ms.to_be_bytes());
+}
+
+fn decode_retention_pin(reader: &mut Reader<'_>) -> Result<RetentionPin, CatalogError> {
+    let pin_id = reader.u128()?;
+    let graph_id = reader.u64()?;
+    let shard_id = reader.u32()?;
+    let placement_epoch = reader.u64()?;
+    let kind = match reader.u8()? {
+        1 => RetentionPinKind::Transaction,
+        2 => RetentionPinKind::Backup,
+        3 => RetentionPinKind::ChangeDataCapture,
+        _ => return Err(CatalogError::NonCanonicalRecord),
+    };
+    let expires_unix_ms = reader.u64()?;
+    RetentionPin::new(
+        pin_id,
+        graph_id,
+        shard_id,
+        placement_epoch,
+        kind,
+        expires_unix_ms,
+    )
 }
 
 fn encode_voters(output: &mut Vec<u8>, voters: &[u64]) -> Result<(), CatalogError> {
@@ -1375,14 +1799,35 @@ fn encode_snapshot_version(state: &CatalogState, version: u16) -> Result<Vec<u8>
     }
     match version {
         LEGACY_SNAPSHOT_FORMAT_VERSION => {
-            if !state.migrations.is_empty() {
+            if !state.migrations.is_empty()
+                || !state.lineages.is_empty()
+                || !state.retention_pins.is_empty()
+            {
                 return Err(CatalogError::UnsupportedVersion);
             }
         }
-        SNAPSHOT_FORMAT_VERSION => {
+        MIGRATION_SNAPSHOT_FORMAT_VERSION
+        | LINEAGE_SNAPSHOT_FORMAT_VERSION
+        | SNAPSHOT_FORMAT_VERSION => {
             write_count(&mut bytes, state.migrations.len())?;
             for migration in state.migrations.values() {
                 encode_migration_record(&mut bytes, migration)?;
+            }
+            if version >= LINEAGE_SNAPSHOT_FORMAT_VERSION {
+                write_count(&mut bytes, state.lineages.len())?;
+                for lineage in state.lineages.values() {
+                    encode_lineage(&mut bytes, lineage);
+                }
+            } else if !state.lineages.is_empty() {
+                return Err(CatalogError::UnsupportedVersion);
+            }
+            if version == SNAPSHOT_FORMAT_VERSION {
+                write_count(&mut bytes, state.retention_pins.len())?;
+                for pin in state.retention_pins.values() {
+                    encode_retention_pin(&mut bytes, pin);
+                }
+            } else if !state.retention_pins.is_empty() {
+                return Err(CatalogError::UnsupportedVersion);
             }
         }
         _ => return Err(CatalogError::UnsupportedVersion),
@@ -1410,7 +1855,10 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
     let version = reader.version()?;
     if !matches!(
         version,
-        LEGACY_SNAPSHOT_FORMAT_VERSION | SNAPSHOT_FORMAT_VERSION
+        LEGACY_SNAPSHOT_FORMAT_VERSION
+            | MIGRATION_SNAPSHOT_FORMAT_VERSION
+            | LINEAGE_SNAPSHOT_FORMAT_VERSION
+            | SNAPSHOT_FORMAT_VERSION
     ) {
         return Err(CatalogError::UnsupportedVersion);
     }
@@ -1425,7 +1873,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
     }
     let mut migrations = BTreeMap::new();
     let mut active_migrations = BTreeMap::new();
-    if version == SNAPSHOT_FORMAT_VERSION {
+    if version >= MIGRATION_SNAPSHOT_FORMAT_VERSION {
         let migration_count = reader.count(MAX_MIGRATIONS)?;
         for _ in 0..migration_count {
             let migration = decode_migration_record(&mut reader)?;
@@ -1449,6 +1897,58 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
                 return Err(CatalogError::NonCanonicalRecord);
             }
             if migrations.insert(migration_id, migration).is_some() {
+                return Err(CatalogError::NonCanonicalRecord);
+            }
+        }
+    }
+    let mut lineages = BTreeMap::new();
+    if version >= LINEAGE_SNAPSHOT_FORMAT_VERSION {
+        let lineage_count = reader.count(MAX_MIGRATIONS)?;
+        for _ in 0..lineage_count {
+            let lineage = decode_lineage(&mut reader)?;
+            let key = (lineage.graph_id, lineage.shard_id, lineage.source_epoch);
+            let migration = migrations
+                .get(&lineage.migration_id)
+                .ok_or(CatalogError::NonCanonicalRecord)?;
+            let graph = graphs
+                .get(&lineage.graph_id)
+                .ok_or(CatalogError::NonCanonicalRecord)?;
+            let target_matches = graph.topology.epoch >= lineage.target_epoch
+                && graph.topology.placements.iter().any(|placement| {
+                    placement.shard_id == lineage.shard_id
+                        && placement.epoch >= lineage.target_epoch
+                });
+            if migration.graph_id != lineage.graph_id
+                || migration.shard_id != lineage.shard_id
+                || migration.source_epoch != lineage.source_epoch
+                || migration.target_epoch != lineage.target_epoch
+                || migration.cutover_index != lineage.cutover_index
+                || !matches!(
+                    migration.state,
+                    MigrationState::Committed | MigrationState::Cleaning | MigrationState::Cleaned
+                )
+                || !target_matches
+                || lineages.insert(key, lineage).is_some()
+            {
+                return Err(CatalogError::NonCanonicalRecord);
+            }
+        }
+    }
+    let mut retention_pins = BTreeMap::new();
+    if version == SNAPSHOT_FORMAT_VERSION {
+        let pin_count = reader.count(MAX_RETENTION_PINS)?;
+        for _ in 0..pin_count {
+            let pin = decode_retention_pin(&mut reader)?;
+            let graph = graphs
+                .get(&pin.graph_id)
+                .ok_or(CatalogError::NonCanonicalRecord)?;
+            if !graph
+                .topology
+                .placements
+                .iter()
+                .any(|placement| placement.shard_id == pin.shard_id)
+                || retention_pins.insert(pin.pin_id, pin).is_some()
+            {
                 return Err(CatalogError::NonCanonicalRecord);
             }
         }
@@ -1481,6 +1981,8 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
         graphs,
         migrations,
         active_migrations,
+        lineages,
+        retention_pins,
         applied_commands,
     };
     if encode_snapshot_version(&state, version)? != bytes {
@@ -1734,6 +2236,16 @@ pub enum CatalogError {
         expected: u64,
         actual: u64,
     },
+    DuplicateLineage {
+        graph_id: u64,
+        shard_id: u32,
+        source_epoch: u64,
+    },
+    InvalidRetentionPin,
+    TooManyRetentionPins,
+    RetentionPinConflict {
+        pin_id: u128,
+    },
     StaleSchemaVersion {
         graph_id: u64,
         expected: u64,
@@ -1829,6 +2341,19 @@ impl Display for CatalogError {
                 formatter,
                 "graph {graph_id} topology epoch {actual} must be {expected}"
             ),
+            Self::DuplicateLineage {
+                graph_id,
+                shard_id,
+                source_epoch,
+            } => write!(
+                formatter,
+                "graph {graph_id} Shard {shard_id} already has lineage from epoch {source_epoch}"
+            ),
+            Self::InvalidRetentionPin => formatter.write_str("invalid retention pin"),
+            Self::TooManyRetentionPins => formatter.write_str("too many retention pins"),
+            Self::RetentionPinConflict { pin_id } => {
+                write!(formatter, "retention pin {pin_id} has conflicting content")
+            }
             Self::StaleSchemaVersion {
                 graph_id,
                 expected,

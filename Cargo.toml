@@ -5,6 +5,7 @@ members = [
     "crates/meta-node",
     "crates/shard-client",
     "crates/gateway-node",
+    "crates/controller",
     "crates/temporal-types",
     "crates/timestamp-oracle",
     "crates/txn-protocol",
