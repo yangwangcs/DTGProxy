@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::fs::File;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,14 +15,14 @@ use cluster_protocol::proto::{
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError, ShardRequestContext};
 use storage_api::{KeySpan, KeyValue, Keyspace, LogicalKey};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{Mutex, mpsc};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    DataNodeHost, EnsureReplicaOutcome, HostError, ReplicaKey, ReplicaRole, ReplicaSpec,
-    ReplicaStatus,
+    ChunkAppendOutcome, DataNodeHost, EnsureReplicaOutcome, HostError, MigrationChunk, ReplicaKey,
+    ReplicaRole, ReplicaSpec, ReplicaStatus,
 };
 
 const READ_PLAN_MAGIC: [u8; 4] = *b"DTRK";
@@ -39,6 +40,10 @@ const MAX_SCAN_ROWS: usize = 65_536;
 const REPLICA_PROFILE_MAGIC: [u8; 4] = *b"DTRF";
 const MAX_PROFILE_VOTERS: usize = 64;
 const MAX_REPLICA_DIRECTORY_BYTES: usize = 255;
+const SNAPSHOT_INSTALL_STEP: u32 = 2;
+const SNAPSHOT_OUTCOME_MAGIC: [u8; 4] = *b"DTSO";
+const SNAPSHOT_OUTCOME_VERSION: u16 = 1;
+const SNAPSHOT_OUTCOME_BYTES: usize = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataOperation {
@@ -77,6 +82,7 @@ impl RequestAuthorizer for AllowAllAuthorizer {
 pub struct DataNodeGrpcService {
     host: Arc<DataNodeHost>,
     authorizer: Arc<dyn RequestAuthorizer>,
+    migration_gate: Arc<Mutex<()>>,
 }
 
 impl DataNodeGrpcService {
@@ -85,6 +91,7 @@ impl DataNodeGrpcService {
         Self {
             host,
             authorizer: Arc::new(AllowAllAuthorizer),
+            migration_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -93,7 +100,11 @@ impl DataNodeGrpcService {
         host: Arc<DataNodeHost>,
         authorizer: Arc<dyn RequestAuthorizer>,
     ) -> Self {
-        Self { host, authorizer }
+        Self {
+            host,
+            authorizer,
+            migration_gate: Arc::new(Mutex::new(())),
+        }
     }
 
     fn validate_common(
@@ -263,11 +274,139 @@ impl ShardService for DataNodeGrpcService {
 
     async fn install_snapshot(
         &self,
-        _request: Request<tonic::Streaming<SnapshotChunk>>,
+        request: Request<tonic::Streaming<SnapshotChunk>>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
-        Err(Status::unimplemented(
-            "snapshot stream activation is connected in the migration milestone",
-        ))
+        let _gate = self.migration_gate.lock().await;
+        let mut stream = request.into_inner();
+        let mut identity = None;
+        let mut completion = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if completion.is_some() {
+                return Err(Status::invalid_argument(
+                    "snapshot stream contains chunks after terminal chunk",
+                ));
+            }
+            let (context, key, _) = self.validate(chunk.context, DataOperation::InstallSnapshot)?;
+            validate_identifier(&chunk.migration_id, "migration ID")?;
+            let migration_id: [u8; 16] = chunk
+                .migration_id
+                .as_slice()
+                .try_into()
+                .expect("validated migration ID length");
+            let current = (key, context.placement_epoch(), migration_id);
+            if identity.is_some_and(|expected| expected != current) {
+                return Err(Status::invalid_argument(
+                    "snapshot stream changed Shard, epoch, or migration identity",
+                ));
+            }
+            identity = Some(current);
+            let content_digest = if chunk.terminal {
+                Some(chunk.manifest_digest.as_slice().try_into().map_err(|_| {
+                    Status::invalid_argument("terminal snapshot digest must contain 32 bytes")
+                })?)
+            } else {
+                if !chunk.manifest_digest.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "non-terminal snapshot chunk carries a digest",
+                    ));
+                }
+                None
+            };
+            let chunk = MigrationChunk::new_with_checksum(
+                migration_id,
+                chunk.ordinal,
+                chunk.payload,
+                chunk.checksum,
+                chunk.terminal,
+                content_digest,
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if let outcome @ ChunkAppendOutcome::Completed { .. } = self
+                .host
+                .append_migration_chunk(chunk)
+                .map_err(host_status)?
+            {
+                completion = Some(outcome);
+            }
+        }
+        let (key, placement_epoch, migration_id) =
+            identity.ok_or_else(|| Status::invalid_argument("snapshot stream is empty"))?;
+        let ChunkAppendOutcome::Completed {
+            archive_path,
+            content_digest,
+            duplicate: chunk_duplicate,
+        } = completion.ok_or_else(|| {
+            Status::invalid_argument("snapshot stream ended before a terminal chunk")
+        })?
+        else {
+            unreachable!("completion only stores terminal outcomes")
+        };
+        if let Some(receipt) = self
+            .host
+            .migration_receipt(migration_id, SNAPSHOT_INSTALL_STEP)
+            .map_err(host_status)?
+        {
+            if receipt.input_digest() != &content_digest {
+                return Err(Status::already_exists(
+                    "snapshot install receipt has another input digest",
+                ));
+            }
+            let installed_index = decode_snapshot_outcome(receipt.outcome())?;
+            return Ok(Response::new(InstallSnapshotResponse {
+                migration_id: migration_id.to_vec(),
+                installed_index,
+                content_digest: receipt.input_digest().to_vec(),
+                duplicate: true,
+            }));
+        }
+        let migration_root = self
+            .host
+            .data_directory()
+            .join("migration")
+            .join("snapshots")
+            .join(hex_identifier(migration_id));
+        let bundle_path = migration_root.join("bundle");
+        let installed_path = migration_root.join("installed");
+        std::fs::create_dir_all(&migration_root)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let manifest = if bundle_path.exists() {
+            replica_snapshot::open_snapshot_bundle(&bundle_path)
+        } else {
+            replica_snapshot::extract_snapshot_archive(
+                File::open(&archive_path).map_err(|error| Status::internal(error.to_string()))?,
+                &bundle_path,
+            )
+        }
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if manifest.shard_id != key.shard_id() || manifest.placement_epoch != placement_epoch {
+            return Err(Status::failed_precondition(
+                "snapshot manifest differs from requested Shard or placement epoch",
+            ));
+        }
+        let installed = if installed_path.exists() {
+            replica_snapshot::open_installed_snapshot(&installed_path).await
+        } else {
+            replica_snapshot::install_snapshot_bundle(&bundle_path, &installed_path).await
+        }
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let outcome = encode_snapshot_outcome(
+            installed.manifest.applied_index,
+            installed.manifest.checkpoint_digest,
+        );
+        self.host
+            .mark_learner_snapshot(key, placement_epoch, installed.manifest.applied_index)
+            .map_err(host_status)?;
+        let receipt_outcome = self
+            .host
+            .record_migration_receipt(migration_id, SNAPSHOT_INSTALL_STEP, content_digest, outcome)
+            .map_err(host_status)?;
+        Ok(Response::new(InstallSnapshotResponse {
+            migration_id: migration_id.to_vec(),
+            installed_index: installed.manifest.applied_index,
+            content_digest: content_digest.to_vec(),
+            duplicate: chunk_duplicate || receipt_outcome == crate::ReceiptWriteOutcome::Duplicate,
+        }))
     }
 
     async fn replica_status(
@@ -359,9 +498,30 @@ impl NodeAdminService for DataNodeGrpcService {
         let request = request.into_inner();
         self.validate_common(request.context, DataOperation::MigrationReceipt)?;
         validate_identifier(&request.migration_id, "migration ID")?;
-        Err(Status::unimplemented(
-            "durable migration receipts are connected in the migration milestone",
-        ))
+        if request.step == 0 {
+            return Err(Status::invalid_argument("migration step must be non-zero"));
+        }
+        let migration_id = request
+            .migration_id
+            .as_slice()
+            .try_into()
+            .expect("validated migration ID length");
+        let receipt = self
+            .host
+            .migration_receipt(migration_id, request.step)
+            .map_err(host_status)?;
+        Ok(Response::new(match receipt {
+            Some(receipt) => GetMigrationReceiptResponse {
+                present: true,
+                input_digest: receipt.input_digest().to_vec(),
+                outcome: receipt.outcome().to_vec(),
+            },
+            None => GetMigrationReceiptResponse {
+                present: false,
+                input_digest: Vec::new(),
+                outcome: Vec::new(),
+            },
+        }))
     }
 }
 
@@ -960,6 +1120,47 @@ fn validate_identifier(identifier: &[u8], name: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn encode_snapshot_outcome(installed_index: u64, checkpoint_digest: [u8; 32]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(SNAPSHOT_OUTCOME_BYTES);
+    encoded.extend_from_slice(&SNAPSHOT_OUTCOME_MAGIC);
+    encoded.extend_from_slice(&SNAPSHOT_OUTCOME_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&installed_index.to_be_bytes());
+    encoded.extend_from_slice(&checkpoint_digest);
+    encoded.extend_from_slice(&crc32fast::hash(&encoded).to_be_bytes());
+    encoded
+}
+
+fn decode_snapshot_outcome(encoded: &[u8]) -> Result<u64, Status> {
+    if encoded.len() != SNAPSHOT_OUTCOME_BYTES
+        || encoded[..4] != SNAPSHOT_OUTCOME_MAGIC
+        || u16::from_be_bytes(
+            encoded[4..6]
+                .try_into()
+                .expect("fixed snapshot outcome version"),
+        ) != SNAPSHOT_OUTCOME_VERSION
+        || crc32fast::hash(&encoded[..46])
+            != u32::from_be_bytes(
+                encoded[46..]
+                    .try_into()
+                    .expect("fixed snapshot outcome checksum"),
+            )
+    {
+        return Err(Status::internal("durable snapshot receipt is corrupt"));
+    }
+    Ok(u64::from_be_bytes(
+        encoded[6..14]
+            .try_into()
+            .expect("fixed installed snapshot index"),
+    ))
+}
+
+fn hex_identifier(identifier: [u8; 16]) -> String {
+    identifier
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn status_response(status: ReplicaStatus) -> ReplicaStatusResponse {
     let role = if status.is_leader() {
         WireReplicaRole::Leader
@@ -975,10 +1176,10 @@ fn status_response(status: ReplicaStatus) -> ReplicaStatusResponse {
         term: status.term(),
         commit_index: status.commit_index(),
         applied_index: status.applied_index(),
-        snapshot_index: 0,
+        snapshot_index: status.snapshot_index(),
         schema_version: status.schema_version(),
         backend_generation: status.backend_generation(),
-        ready: true,
+        ready: status.ready(),
     }
 }
 
@@ -1001,6 +1202,7 @@ fn host_status(error: HostError) -> Status {
         }
         HostError::RequestEnvelopeMismatch { .. } => Status::invalid_argument(error.to_string()),
         HostError::RequestMismatch { .. } => Status::already_exists(error.to_string()),
+        HostError::ReplicaNotReady { .. } => Status::failed_precondition(error.to_string()),
         HostError::LearnerNotYetSupported => Status::failed_precondition(error.to_string()),
         HostError::ActorStopped => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),

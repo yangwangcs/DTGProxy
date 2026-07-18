@@ -10,10 +10,43 @@ use raft_logstore::RocksRaftStorage;
 use replica_snapshot::{
     SnapshotError, SnapshotFailpoint, activate_published_local_snapshot,
     create_and_activate_local_snapshot_with_failpoint, create_snapshot_bundle,
-    create_snapshot_bundle_with_failpoint, install_received_snapshot_bundle,
-    install_snapshot_bundle, install_snapshot_bundle_with_failpoint, open_snapshot_bundle,
-    raft_snapshot,
+    create_snapshot_bundle_with_failpoint, extract_snapshot_archive,
+    install_received_snapshot_bundle, install_snapshot_bundle,
+    install_snapshot_bundle_with_failpoint, open_snapshot_bundle, raft_snapshot,
+    write_snapshot_archive,
 };
+
+#[test]
+fn snapshot_archive_round_trip_is_canonical_bounded_and_path_safe() {
+    let root = tempfile::tempdir().unwrap();
+    let source_path = root.path().join("source-archive");
+    let bundle_path = root.path().join("bundle-archive");
+    let extracted_path = root.path().join("extracted-archive");
+    let mut source = block_on(ShardStateMachine::open(
+        RocksAdapter::open(&source_path).unwrap(),
+        7,
+        9,
+    ))
+    .unwrap();
+    block_on(source.apply_noop_entry(1, 1)).unwrap();
+    let expected = create_snapshot_bundle(&source, &[1, 2, 3], &bundle_path).unwrap();
+    let mut archive = Vec::new();
+    let digest = write_snapshot_archive(&bundle_path, &mut archive).unwrap();
+    assert_eq!(digest, *blake3::hash(&archive).as_bytes());
+
+    let extracted = extract_snapshot_archive(archive.as_slice(), &extracted_path).unwrap();
+    assert_eq!(extracted, expected);
+    assert_eq!(open_snapshot_bundle(&extracted_path).unwrap(), expected);
+
+    let mut corrupt = archive;
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0x80;
+    assert!(matches!(
+        extract_snapshot_archive(corrupt.as_slice(), root.path().join("corrupt-archive")),
+        Err(SnapshotError::ArchiveFileDigestMismatch)
+            | Err(SnapshotError::CheckpointDigestMismatch)
+    ));
+}
 use shard_runtime::{DurableRaftReplica, DurableReplicaError, ShardStateMachine};
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter};
 use temporal_types::TransactionTime;

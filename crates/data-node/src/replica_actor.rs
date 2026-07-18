@@ -245,5 +245,7 @@ fn status(replica: &DurableRaftReplica, spec: &ReplicaSpec) -> ReplicaStatus {
         spec.role(),
         spec.schema_version(),
         spec.backend_generation(),
+        0,
+        true,
     )
 }

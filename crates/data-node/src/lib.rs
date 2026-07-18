@@ -5,6 +5,7 @@ mod file_config;
 mod host;
 mod identity;
 mod manifest;
+mod migration;
 mod raft_network;
 mod replica_actor;
 mod service;
@@ -17,6 +18,10 @@ pub use host::{
 };
 pub use identity::{NodeIdentity, NodeIdentityStore};
 pub use manifest::{ReplicaEntry, ReplicaManifest, ReplicaManifestStore, ReplicaRole};
+pub use migration::{
+    ChunkAppendOutcome, MigrationChunk, MigrationReceipt, MigrationReceiptStore,
+    MigrationStorageError, ReceiptWriteOutcome, SnapshotInbox,
+};
 pub use raft_network::{RaftDelivery, RaftNetworkError, SharedRaftTransport};
 pub use service::{
     DataNodeGrpcService, DataOperation, ReadCodecError, ReplicaProfileError, RequestAuthorizer,
@@ -50,6 +55,7 @@ pub enum StorageError {
     InvalidReplicaEpoch,
     InvalidReplicaVoters,
     InvalidReplicaGeneration,
+    InvalidReplicaSnapshotIndex,
     InvalidReplicaRole { actual: u8 },
     InvalidReplicaDirectory,
     ReplicaIdentityConflict { graph_id: u64, shard_id: u32 },
@@ -98,6 +104,9 @@ impl Display for StorageError {
             Self::InvalidReplicaVoters => formatter.write_str("invalid Replica voter set"),
             Self::InvalidReplicaGeneration => {
                 formatter.write_str("invalid Replica schema or backend generation")
+            }
+            Self::InvalidReplicaSnapshotIndex => {
+                formatter.write_str("invalid learner Replica snapshot index")
             }
             Self::InvalidReplicaRole { actual } => {
                 write!(formatter, "invalid Replica role {actual}")

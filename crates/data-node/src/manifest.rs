@@ -6,7 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use crate::StorageError;
 
 const RECORD_MAGIC: [u8; 4] = *b"DTRP";
-const MANIFEST_VERSION: u16 = 2;
+const LEGACY_MANIFEST_VERSION: u16 = 2;
+const MANIFEST_VERSION: u16 = 3;
 const RECORD_HEADER_BYTES: usize = 10;
 const CHECKSUM_BYTES: usize = 4;
 const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
@@ -47,6 +48,7 @@ pub struct ReplicaEntry {
     role: ReplicaRole,
     schema_version: u64,
     backend_generation: u64,
+    snapshot_index: u64,
     relative_directory: String,
 }
 
@@ -88,6 +90,7 @@ impl ReplicaEntry {
             role,
             schema_version,
             backend_generation,
+            snapshot_index: 0,
             relative_directory,
         })
     }
@@ -128,8 +131,21 @@ impl ReplicaEntry {
     }
 
     #[must_use]
+    pub const fn snapshot_index(&self) -> u64 {
+        self.snapshot_index
+    }
+
+    #[must_use]
     pub fn relative_directory(&self) -> &str {
         &self.relative_directory
+    }
+
+    pub(crate) fn with_snapshot_index(mut self, snapshot_index: u64) -> Result<Self, StorageError> {
+        if self.role != ReplicaRole::Learner || snapshot_index < self.snapshot_index {
+            return Err(StorageError::InvalidReplicaSnapshotIndex);
+        }
+        self.snapshot_index = snapshot_index;
+        Ok(self)
     }
 }
 
@@ -174,6 +190,30 @@ impl ReplicaManifest {
 
     pub fn replicas(&self) -> impl Iterator<Item = &ReplicaEntry> {
         self.replicas.values()
+    }
+
+    pub(crate) fn replace(&mut self, entry: ReplicaEntry) -> Result<(), StorageError> {
+        let key = (entry.graph_id, entry.shard_id);
+        let existing = self
+            .replicas
+            .get(&key)
+            .ok_or(StorageError::InvalidReplicaIdentity)?;
+        if existing.graph_id != entry.graph_id
+            || existing.shard_id != entry.shard_id
+            || existing.placement_epoch != entry.placement_epoch
+            || existing.voters != entry.voters
+            || existing.role != entry.role
+            || existing.schema_version != entry.schema_version
+            || existing.backend_generation != entry.backend_generation
+            || existing.relative_directory != entry.relative_directory
+        {
+            return Err(StorageError::ReplicaIdentityConflict {
+                graph_id: entry.graph_id,
+                shard_id: entry.shard_id,
+            });
+        }
+        self.replicas.insert(key, entry);
+        Ok(())
     }
 }
 
@@ -250,7 +290,7 @@ fn replay_and_repair_tail(file: &mut File) -> Result<ReplicaManifest, StorageErr
                 .try_into()
                 .expect("fixed version"),
         );
-        if version != MANIFEST_VERSION {
+        if !matches!(version, LEGACY_MANIFEST_VERSION | MANIFEST_VERSION) {
             return Err(StorageError::UnsupportedManifestVersion { actual: version });
         }
         let payload_length = u32::from_be_bytes(
@@ -277,7 +317,10 @@ fn replay_and_repair_tail(file: &mut File) -> Result<ReplicaManifest, StorageErr
         if crc32fast::hash(&bytes[offset..checksum_offset]) != expected_checksum {
             return Err(StorageError::ManifestChecksumMismatch);
         }
-        manifest = decode_manifest(&bytes[offset + RECORD_HEADER_BYTES..checksum_offset])?;
+        manifest = decode_manifest(
+            &bytes[offset + RECORD_HEADER_BYTES..checksum_offset],
+            version,
+        )?;
         offset += record_length;
     }
     if offset < bytes.len() {
@@ -306,6 +349,7 @@ fn encode_manifest(manifest: &ReplicaManifest) -> Result<Vec<u8>, StorageError> 
         encoded.push(entry.role.tag());
         encoded.extend_from_slice(&entry.schema_version.to_be_bytes());
         encoded.extend_from_slice(&entry.backend_generation.to_be_bytes());
+        encoded.extend_from_slice(&entry.snapshot_index.to_be_bytes());
         write_string(&mut encoded, &entry.relative_directory)?;
     }
     if encoded.len() > MAX_MANIFEST_BYTES {
@@ -314,7 +358,7 @@ fn encode_manifest(manifest: &ReplicaManifest) -> Result<Vec<u8>, StorageError> 
     Ok(encoded)
 }
 
-fn decode_manifest(encoded: &[u8]) -> Result<ReplicaManifest, StorageError> {
+fn decode_manifest(encoded: &[u8], version: u16) -> Result<ReplicaManifest, StorageError> {
     let mut decoder = Decoder::new(encoded);
     let count = decoder.read_u32()? as usize;
     if count > MAX_REPLICAS {
@@ -337,11 +381,16 @@ fn decode_manifest(encoded: &[u8]) -> Result<ReplicaManifest, StorageError> {
         let role = ReplicaRole::from_tag(decoder.read_u8()?)?;
         let schema_version = decoder.read_u64()?;
         let backend_generation = decoder.read_u64()?;
+        let snapshot_index = if version >= MANIFEST_VERSION {
+            decoder.read_u64()?
+        } else {
+            0
+        };
         let directory = decoder.read_string()?;
         if !directories.insert(directory.clone()) {
             return Err(StorageError::ReplicaDirectoryConflict { directory });
         }
-        manifest.insert(ReplicaEntry::new(
+        let entry = ReplicaEntry::new(
             graph_id,
             shard_id,
             placement_epoch,
@@ -350,7 +399,13 @@ fn decode_manifest(encoded: &[u8]) -> Result<ReplicaManifest, StorageError> {
             schema_version,
             backend_generation,
             directory,
-        )?)?;
+        )?;
+        let entry = if snapshot_index == 0 {
+            entry
+        } else {
+            entry.with_snapshot_index(snapshot_index)?
+        };
+        manifest.insert(entry)?;
     }
     if !decoder.is_finished() {
         return Err(StorageError::ManifestTrailingBytes);

@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use adapter_rocksdb::RocksAdapter;
@@ -26,6 +27,12 @@ const MANIFEST_FILE: &str = "manifest.dtg";
 const CHECKPOINT_DIRECTORY: &str = "checkpoint";
 const INSTALLED_ADAPTER_DIRECTORY: &str = "adapter";
 const INSTALLED_RAFT_DIRECTORY: &str = "raft";
+const ARCHIVE_MAGIC: [u8; 4] = *b"DTSA";
+const ARCHIVE_VERSION: u16 = 1;
+const MAX_ARCHIVE_FILES: usize = 1_048_576;
+const MAX_ARCHIVE_PATH_BYTES: usize = 1_024;
+const MAX_ARCHIVE_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +256,205 @@ pub fn open_snapshot_bundle(bundle: impl AsRef<Path>) -> Result<SnapshotManifest
     Ok(manifest)
 }
 
+pub fn write_snapshot_archive(
+    bundle: impl AsRef<Path>,
+    mut output: impl Write,
+) -> Result<[u8; 32], SnapshotError> {
+    let bundle = bundle.as_ref();
+    open_snapshot_bundle(bundle)?;
+    let mut files = Vec::new();
+    collect_files(bundle, bundle, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    if files.is_empty() || files.len() > MAX_ARCHIVE_FILES {
+        return Err(SnapshotError::ArchiveTooLarge);
+    }
+    let mut archive_hasher = blake3::Hasher::new();
+    write_archive_bytes(&mut output, &mut archive_hasher, &ARCHIVE_MAGIC)?;
+    write_archive_bytes(
+        &mut output,
+        &mut archive_hasher,
+        &ARCHIVE_VERSION.to_be_bytes(),
+    )?;
+    write_archive_bytes(
+        &mut output,
+        &mut archive_hasher,
+        &u32::try_from(files.len())
+            .map_err(|_| SnapshotError::ArchiveTooLarge)?
+            .to_be_bytes(),
+    )?;
+    let mut total = 10_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for (relative, path) in files {
+        validate_archive_path(&relative)?;
+        let relative_bytes = relative.as_bytes();
+        let path_length =
+            u16::try_from(relative_bytes.len()).map_err(|_| SnapshotError::InvalidArchivePath)?;
+        let file_length = std::fs::metadata(&path)?.len();
+        if file_length > MAX_ARCHIVE_FILE_BYTES {
+            return Err(SnapshotError::ArchiveTooLarge);
+        }
+        let file_digest = hash_file(&path)?;
+        for bytes in [
+            path_length.to_be_bytes().as_slice(),
+            file_length.to_be_bytes().as_slice(),
+            file_digest.as_slice(),
+            relative_bytes,
+        ] {
+            write_archive_bytes(&mut output, &mut archive_hasher, bytes)?;
+        }
+        let mut file = File::open(path)?;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            write_archive_bytes(&mut output, &mut archive_hasher, &buffer[..read])?;
+        }
+        total = total
+            .checked_add(2 + 8 + 32)
+            .and_then(|value| value.checked_add(u64::from(path_length)))
+            .and_then(|value| value.checked_add(file_length))
+            .ok_or(SnapshotError::ArchiveTooLarge)?;
+        if total > MAX_ARCHIVE_BYTES {
+            return Err(SnapshotError::ArchiveTooLarge);
+        }
+    }
+    output.flush()?;
+    Ok(*archive_hasher.finalize().as_bytes())
+}
+
+pub fn extract_snapshot_archive(
+    mut input: impl Read,
+    destination: impl AsRef<Path>,
+) -> Result<SnapshotManifestV1, SnapshotError> {
+    let destination = destination.as_ref();
+    let mut header = [0_u8; 10];
+    input.read_exact(&mut header)?;
+    if header[..4] != ARCHIVE_MAGIC {
+        return Err(SnapshotError::InvalidArchiveMagic);
+    }
+    let version = u16::from_be_bytes(header[4..6].try_into().expect("fixed archive version"));
+    if version != ARCHIVE_VERSION {
+        return Err(SnapshotError::UnsupportedArchiveVersion { version });
+    }
+    let file_count = usize::try_from(u32::from_be_bytes(
+        header[6..10].try_into().expect("fixed archive file count"),
+    ))
+    .map_err(|_| SnapshotError::ArchiveTooLarge)?;
+    if file_count == 0 || file_count > MAX_ARCHIVE_FILES {
+        return Err(SnapshotError::ArchiveTooLarge);
+    }
+    let staging = StagedDirectory::new(destination)?;
+    let mut paths = BTreeSet::new();
+    let mut total = 10_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for _ in 0..file_count {
+        let mut entry_header = [0_u8; 42];
+        input.read_exact(&mut entry_header)?;
+        let path_length = usize::from(u16::from_be_bytes(
+            entry_header[..2]
+                .try_into()
+                .expect("fixed archive path length"),
+        ));
+        let file_length = u64::from_be_bytes(
+            entry_header[2..10]
+                .try_into()
+                .expect("fixed archive file length"),
+        );
+        let expected_digest: [u8; 32] = entry_header[10..]
+            .try_into()
+            .expect("fixed archive file digest");
+        if path_length == 0
+            || path_length > MAX_ARCHIVE_PATH_BYTES
+            || file_length > MAX_ARCHIVE_FILE_BYTES
+        {
+            return Err(SnapshotError::ArchiveTooLarge);
+        }
+        let mut path_bytes = vec![0_u8; path_length];
+        input.read_exact(&mut path_bytes)?;
+        let relative =
+            String::from_utf8(path_bytes).map_err(|_| SnapshotError::InvalidArchivePath)?;
+        validate_archive_path(&relative)?;
+        if !paths.insert(relative.clone()) {
+            return Err(SnapshotError::DuplicateArchivePath);
+        }
+        let path = staging.path().join(&relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+        let mut remaining = file_length;
+        let mut file_hasher = blake3::Hasher::new();
+        while remaining > 0 {
+            let maximum = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| SnapshotError::ArchiveTooLarge)?;
+            input.read_exact(&mut buffer[..maximum])?;
+            file.write_all(&buffer[..maximum])?;
+            file_hasher.update(&buffer[..maximum]);
+            remaining -= maximum as u64;
+        }
+        file.sync_all()?;
+        if file_hasher.finalize().as_bytes() != &expected_digest {
+            return Err(SnapshotError::ArchiveFileDigestMismatch);
+        }
+        total = total
+            .checked_add(42)
+            .and_then(|value| value.checked_add(path_length as u64))
+            .and_then(|value| value.checked_add(file_length))
+            .ok_or(SnapshotError::ArchiveTooLarge)?;
+        if total > MAX_ARCHIVE_BYTES {
+            return Err(SnapshotError::ArchiveTooLarge);
+        }
+    }
+    let mut trailing = [0_u8; 1];
+    if input.read(&mut trailing)? != 0 {
+        return Err(SnapshotError::ArchiveTrailingBytes);
+    }
+    sync_tree(staging.path())?;
+    let manifest = open_snapshot_bundle(staging.path())?;
+    staging.publish(destination)?;
+    Ok(manifest)
+}
+
+fn write_archive_bytes(
+    output: &mut impl Write,
+    hasher: &mut blake3::Hasher,
+    bytes: &[u8],
+) -> Result<(), SnapshotError> {
+    output.write_all(bytes)?;
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> Result<[u8; 32], SnapshotError> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn validate_archive_path(relative: &str) -> Result<(), SnapshotError> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || relative.len() > MAX_ARCHIVE_PATH_BYTES
+        || relative.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(SnapshotError::InvalidArchivePath);
+    }
+    Ok(())
+}
+
 pub fn create_and_activate_local_snapshot(
     machine: &ShardStateMachine<RocksAdapter>,
     raft_storage: &RocksRaftStorage,
@@ -331,6 +537,39 @@ pub async fn install_snapshot_bundle(
     destination: impl AsRef<Path>,
 ) -> Result<InstalledSnapshot, SnapshotError> {
     install_snapshot_bundle_inner(bundle.as_ref(), destination.as_ref(), None, None).await
+}
+
+pub async fn open_installed_snapshot(
+    destination: impl AsRef<Path>,
+) -> Result<InstalledSnapshot, SnapshotError> {
+    let root = destination.as_ref().to_path_buf();
+    let manifest = read_manifest(&root)?;
+    let adapter_path = root.join(INSTALLED_ADAPTER_DIRECTORY);
+    let adapter = open_verified_checkpoint(&adapter_path, &manifest)?;
+    let machine = ShardStateMachine::open(adapter, manifest.shard_id, manifest.placement_epoch)
+        .await
+        .map_err(|error| SnapshotError::StateMachine(error.to_string()))?;
+    validate_machine_manifest(&machine, &manifest)?;
+    drop(machine);
+    let raft_wal_path = root.join(INSTALLED_RAFT_DIRECTORY);
+    let raft_storage = RocksRaftStorage::open(&raft_wal_path, &manifest.voters)?;
+    let raft_state = raft_storage
+        .initial_state()
+        .map_err(raft_logstore::RaftLogStoreError::from)?;
+    if raft_state.hard_state.commit < manifest.applied_index
+        || raft_storage
+            .term(manifest.applied_index)
+            .map_err(raft_logstore::RaftLogStoreError::from)?
+            != manifest.term
+    {
+        return Err(SnapshotError::RaftSnapshotPositionMismatch);
+    }
+    Ok(InstalledSnapshot {
+        root,
+        adapter_path,
+        raft_wal_path,
+        manifest,
+    })
 }
 
 pub async fn install_snapshot_bundle_with_failpoint(
@@ -675,6 +914,13 @@ pub enum SnapshotError {
     InvalidCheckpointPath,
     UnsupportedCheckpointEntry,
     CheckpointTooLarge,
+    InvalidArchiveMagic,
+    UnsupportedArchiveVersion { version: u16 },
+    InvalidArchivePath,
+    DuplicateArchivePath,
+    ArchiveTooLarge,
+    ArchiveFileDigestMismatch,
+    ArchiveTrailingBytes,
     RaftLogStore(raft_logstore::RaftLogStoreError),
     StateMachine(String),
     ReplicaMetadataMismatch,
@@ -720,6 +966,21 @@ impl Display for SnapshotError {
                 formatter.write_str("checkpoint contains a symlink or unsupported entry")
             }
             Self::CheckpointTooLarge => formatter.write_str("checkpoint size exceeds codec limits"),
+            Self::InvalidArchiveMagic => formatter.write_str("invalid snapshot archive magic"),
+            Self::UnsupportedArchiveVersion { version } => {
+                write!(formatter, "unsupported snapshot archive version {version}")
+            }
+            Self::InvalidArchivePath => formatter.write_str("invalid snapshot archive path"),
+            Self::DuplicateArchivePath => {
+                formatter.write_str("snapshot archive contains a duplicate path")
+            }
+            Self::ArchiveTooLarge => formatter.write_str("snapshot archive exceeds codec limits"),
+            Self::ArchiveFileDigestMismatch => {
+                formatter.write_str("snapshot archive file digest mismatch")
+            }
+            Self::ArchiveTrailingBytes => {
+                formatter.write_str("snapshot archive contains trailing bytes")
+            }
             Self::RaftLogStore(error) => write!(formatter, "Raft snapshot WAL error: {error}"),
             Self::StateMachine(error) => write!(formatter, "snapshot state-machine error: {error}"),
             Self::ReplicaMetadataMismatch => {

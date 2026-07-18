@@ -10,7 +10,9 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::replica_actor::{ActorCommand, ReplicaActorHandle};
 use crate::{
-    NodeConfig, NodeIdentityStore, ReplicaEntry, ReplicaManifestStore, ReplicaRole, StorageError,
+    ChunkAppendOutcome, MigrationChunk, MigrationReceipt, MigrationReceiptStore,
+    MigrationStorageError, NodeConfig, NodeIdentityStore, ReceiptWriteOutcome, ReplicaEntry,
+    ReplicaManifestStore, ReplicaRole, SnapshotInbox, StorageError,
 };
 
 const MAX_QUEUE_CAPACITY: usize = 65_536;
@@ -115,6 +117,11 @@ impl ReplicaSpec {
     }
 
     #[must_use]
+    pub const fn snapshot_index(&self) -> u64 {
+        self.entry.snapshot_index()
+    }
+
+    #[must_use]
     pub fn relative_directory(&self) -> &str {
         self.entry.relative_directory()
     }
@@ -141,6 +148,8 @@ pub struct ReplicaStatus {
     role: ReplicaRole,
     schema_version: u64,
     backend_generation: u64,
+    snapshot_index: u64,
+    ready: bool,
 }
 
 impl ReplicaStatus {
@@ -158,6 +167,8 @@ impl ReplicaStatus {
         role: ReplicaRole,
         schema_version: u64,
         backend_generation: u64,
+        snapshot_index: u64,
+        ready: bool,
     ) -> Self {
         Self {
             graph_id,
@@ -172,6 +183,8 @@ impl ReplicaStatus {
             role,
             schema_version,
             backend_generation,
+            snapshot_index,
+            ready,
         }
     }
 
@@ -234,6 +247,16 @@ impl ReplicaStatus {
     pub const fn backend_generation(self) -> u64 {
         self.backend_generation
     }
+
+    #[must_use]
+    pub const fn snapshot_index(self) -> u64 {
+        self.snapshot_index
+    }
+
+    #[must_use]
+    pub const fn ready(self) -> bool {
+        self.ready
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,7 +291,10 @@ pub struct DataNodeHost {
     config: NodeConfig,
     _identity_store: NodeIdentityStore,
     manifest_store: Mutex<ReplicaManifestStore>,
+    migration_receipts: Mutex<MigrationReceiptStore>,
+    snapshot_inbox: SnapshotInbox,
     replicas: RwLock<BTreeMap<ReplicaKey, ReplicaActorHandle>>,
+    dormant_learners: RwLock<BTreeMap<ReplicaKey, ReplicaSpec>>,
     ensure_gate: AsyncMutex<()>,
     queue_capacity: usize,
 }
@@ -286,15 +312,22 @@ impl DataNodeHost {
         let identity_store =
             NodeIdentityStore::open_or_create(config.data_directory(), config.identity().clone())?;
         let manifest_store = ReplicaManifestStore::open(config.data_directory())?;
+        let migration_receipts = MigrationReceiptStore::open(config.data_directory())?;
+        let snapshot_inbox = SnapshotInbox::open(config.data_directory())?;
         let entries = manifest_store
             .manifest()
             .replicas()
             .cloned()
             .collect::<Vec<_>>();
         let mut replicas = BTreeMap::new();
+        let mut dormant_learners = BTreeMap::new();
         for entry in entries {
             let spec = ReplicaSpec::from_entry(entry);
             validate_local_replica(config.identity().node_id(), &spec)?;
+            if spec.role() == ReplicaRole::Learner {
+                dormant_learners.insert(spec.key(), spec);
+                continue;
+            }
             let handle = ReplicaActorHandle::open(
                 config.identity().node_id(),
                 config.data_directory(),
@@ -308,10 +341,50 @@ impl DataNodeHost {
             config,
             _identity_store: identity_store,
             manifest_store: Mutex::new(manifest_store),
+            migration_receipts: Mutex::new(migration_receipts),
+            snapshot_inbox,
             replicas: RwLock::new(replicas),
+            dormant_learners: RwLock::new(dormant_learners),
             ensure_gate: AsyncMutex::new(()),
             queue_capacity,
         })
+    }
+
+    #[must_use]
+    pub fn data_directory(&self) -> &std::path::Path {
+        self.config.data_directory()
+    }
+
+    pub fn append_migration_chunk(
+        &self,
+        chunk: MigrationChunk,
+    ) -> Result<ChunkAppendOutcome, HostError> {
+        self.snapshot_inbox.append(chunk).map_err(HostError::from)
+    }
+
+    pub fn migration_receipt(
+        &self,
+        migration_id: [u8; 16],
+        step: u32,
+    ) -> Result<Option<MigrationReceipt>, HostError> {
+        self.migration_receipts
+            .lock()
+            .map_err(|_| HostError::LockPoisoned)
+            .map(|store| store.get(migration_id, step).cloned())
+    }
+
+    pub fn record_migration_receipt(
+        &self,
+        migration_id: [u8; 16],
+        step: u32,
+        input_digest: [u8; 32],
+        outcome: Vec<u8>,
+    ) -> Result<ReceiptWriteOutcome, HostError> {
+        self.migration_receipts
+            .lock()
+            .map_err(|_| HostError::LockPoisoned)?
+            .record(migration_id, step, input_digest, outcome)
+            .map_err(HostError::from)
     }
 
     pub async fn ensure_replica(
@@ -334,6 +407,35 @@ impl DataNodeHost {
                     shard_id: spec.shard_id(),
                 })
             };
+        }
+        if let Some(existing) = self
+            .dormant_learners
+            .read()
+            .map_err(|_| HostError::LockPoisoned)?
+            .get(&spec.key())
+        {
+            return if existing == &spec {
+                Ok(EnsureReplicaOutcome::Existing)
+            } else {
+                Err(HostError::ReplicaSpecConflict {
+                    graph_id: spec.graph_id(),
+                    shard_id: spec.shard_id(),
+                })
+            };
+        }
+        if spec.role() == ReplicaRole::Learner {
+            let mut store = self
+                .manifest_store
+                .lock()
+                .map_err(|_| HostError::LockPoisoned)?;
+            let mut manifest = store.manifest().clone();
+            manifest.insert(spec.entry().clone())?;
+            store.persist(&manifest)?;
+            self.dormant_learners
+                .write()
+                .map_err(|_| HostError::LockPoisoned)?
+                .insert(spec.key(), spec);
+            return Ok(EnsureReplicaOutcome::Created);
         }
         let handle = ReplicaActorHandle::open(
             self.config.identity().node_id(),
@@ -464,6 +566,14 @@ impl DataNodeHost {
     }
 
     pub async fn status(&self, key: ReplicaKey) -> Result<ReplicaStatus, HostError> {
+        if let Some(spec) = self
+            .dormant_learners
+            .read()
+            .map_err(|_| HostError::LockPoisoned)?
+            .get(&key)
+        {
+            return Ok(dormant_status(self.identity().node_id(), spec));
+        }
         let sender = self.sender(key)?;
         let (response, receiver) = oneshot::channel();
         sender
@@ -471,6 +581,46 @@ impl DataNodeHost {
             .await
             .map_err(|_| HostError::ActorStopped)?;
         receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    pub fn mark_learner_snapshot(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        snapshot_index: u64,
+    ) -> Result<ReplicaStatus, HostError> {
+        if snapshot_index == 0 {
+            return Err(HostError::InvalidSnapshotIndex);
+        }
+        let mut learners = self
+            .dormant_learners
+            .write()
+            .map_err(|_| HostError::LockPoisoned)?;
+        let current = learners.get(&key).ok_or(HostError::UnknownReplica {
+            graph_id: key.graph_id,
+            shard_id: key.shard_id,
+        })?;
+        if current.placement_epoch() != placement_epoch {
+            return Err(HostError::StaleEpoch {
+                expected: current.placement_epoch(),
+                actual: placement_epoch,
+            });
+        }
+        let entry = current
+            .entry()
+            .clone()
+            .with_snapshot_index(snapshot_index)?;
+        let spec = ReplicaSpec::from_entry(entry.clone());
+        let status = dormant_status(self.identity().node_id(), &spec);
+        let mut store = self
+            .manifest_store
+            .lock()
+            .map_err(|_| HostError::LockPoisoned)?;
+        let mut manifest = store.manifest().clone();
+        manifest.replace(entry)?;
+        store.persist(&manifest)?;
+        learners.insert(key, spec);
+        Ok(status)
     }
 
     pub async fn multi_get(
@@ -541,6 +691,17 @@ impl DataNodeHost {
         key: ReplicaKey,
     ) -> Result<(mpsc::Sender<ActorCommand>, u64), HostError> {
         let replicas = self.replicas.read().map_err(|_| HostError::LockPoisoned)?;
+        if self
+            .dormant_learners
+            .read()
+            .map_err(|_| HostError::LockPoisoned)?
+            .contains_key(&key)
+        {
+            return Err(HostError::ReplicaNotReady {
+                graph_id: key.graph_id,
+                shard_id: key.shard_id,
+            });
+        }
         let handle = replicas.get(&key).ok_or(HostError::UnknownReplica {
             graph_id: key.graph_id,
             shard_id: key.shard_id,
@@ -550,18 +711,35 @@ impl DataNodeHost {
 }
 
 fn validate_local_replica(node_id: u64, spec: &ReplicaSpec) -> Result<(), HostError> {
-    if spec.role() == ReplicaRole::Learner {
-        return Err(HostError::LearnerNotYetSupported);
-    }
     if !spec.voters().contains(&node_id) {
         return Err(HostError::LocalNodeNotVoter { node_id });
     }
     Ok(())
 }
 
+fn dormant_status(node_id: u64, spec: &ReplicaSpec) -> ReplicaStatus {
+    ReplicaStatus::new(
+        spec.graph_id(),
+        spec.shard_id(),
+        spec.placement_epoch(),
+        node_id,
+        false,
+        None,
+        0,
+        0,
+        spec.snapshot_index(),
+        spec.role(),
+        spec.schema_version(),
+        spec.backend_generation(),
+        spec.snapshot_index(),
+        spec.snapshot_index() > 0,
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostError {
     Storage(StorageError),
+    MigrationStorage(MigrationStorageError),
     Io(String),
     DurableReplica(String),
     Adapter(String),
@@ -569,8 +747,10 @@ pub enum HostError {
     InvalidReplicaKey,
     UnknownReplica { graph_id: u64, shard_id: u32 },
     ReplicaSpecConflict { graph_id: u64, shard_id: u32 },
+    ReplicaNotReady { graph_id: u64, shard_id: u32 },
     LocalNodeNotVoter { node_id: u64 },
     LearnerNotYetSupported,
+    InvalidSnapshotIndex,
     WrongCluster,
     WrongTarget { expected: u64, actual: u64 },
     RequestEnvelopeMismatch { expected: u128, actual: u128 },
@@ -610,6 +790,7 @@ impl Display for HostError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => write!(formatter, "node storage error: {error}"),
+            Self::MigrationStorage(error) => write!(formatter, "migration storage error: {error}"),
             Self::Io(message) => write!(formatter, "data node I/O error: {message}"),
             Self::DurableReplica(message) => write!(formatter, "durable Replica error: {message}"),
             Self::Adapter(message) => write!(formatter, "Adapter error: {message}"),
@@ -622,12 +803,16 @@ impl Display for HostError {
                 formatter,
                 "Replica ({graph_id}, {shard_id}) already has a different specification"
             ),
+            Self::ReplicaNotReady { graph_id, shard_id } => {
+                write!(formatter, "Replica ({graph_id}, {shard_id}) is not ready")
+            }
             Self::LocalNodeNotVoter { node_id } => {
                 write!(formatter, "local node {node_id} is not a voter")
             }
             Self::LearnerNotYetSupported => {
                 formatter.write_str("learner Replica hosting is not connected yet")
             }
+            Self::InvalidSnapshotIndex => formatter.write_str("invalid snapshot index"),
             Self::WrongCluster => formatter.write_str("routed Raft message has another cluster"),
             Self::WrongTarget { expected, actual } => write!(
                 formatter,
@@ -662,5 +847,11 @@ impl Error for HostError {}
 impl From<StorageError> for HostError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<MigrationStorageError> for HostError {
+    fn from(error: MigrationStorageError) -> Self {
+        Self::MigrationStorage(error)
     }
 }

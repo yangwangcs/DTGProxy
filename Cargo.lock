@@ -375,12 +375,15 @@ dependencies = [
 name = "data-node"
 version = "1.0.0"
 dependencies = [
+ "adapter-rocksdb",
+ "blake3",
  "cluster-protocol",
  "crc32fast",
  "fs2",
  "raft",
  "raft-command",
  "raft-transport",
+ "replica-snapshot",
  "serde",
  "serde_json",
  "shard-runtime",
