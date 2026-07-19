@@ -34,6 +34,18 @@ pub struct ParseError {
 }
 
 impl ParseError {
+    pub(crate) fn new(code: &'static str, span: SourceSpan, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            span,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn from_syntax(error: &crate::SyntaxError) -> Self {
+        Self::new(error.code(), error.span(), error.to_string())
+    }
+
     #[must_use]
     pub const fn code(&self) -> &'static str {
         self.code
@@ -87,6 +99,13 @@ pub fn parse_with_limits(query: &str, limits: SyntaxLimits) -> Result<ParsedQuer
     } else {
         Statement::Query(parser.parse_query()?)
     };
+    if ast_node_count(&statement) > limits.max_ast_nodes() {
+        return Err(parse_error(
+            "DTG-CYPHER-TOO-MANY-AST-NODES",
+            SourceSpan::new(0, query.len()),
+            "AST node count exceeds the configured limit",
+        ));
+    }
     Ok(ParsedQuery { profile, statement })
 }
 
@@ -414,9 +433,19 @@ fn clause_kind(tokens: &[Token], index: usize, word: &str) -> Option<(ClauseKind
 }
 
 fn parse_error(code: &'static str, span: SourceSpan, message: impl Into<String>) -> ParseError {
-    ParseError {
-        code,
-        span,
-        message: message.into(),
+    ParseError::new(code, span, message)
+}
+
+fn ast_node_count(statement: &Statement) -> usize {
+    match statement {
+        Statement::Query(query) => 1_usize
+            .saturating_add(query.clauses().len())
+            .saturating_add(usize::from(query.graph().is_some()))
+            .saturating_add(usize::from(query.temporal().valid_time().is_some()))
+            .saturating_add(usize::from(!matches!(
+                query.temporal().transaction_time(),
+                TransactionTimeScope::Current
+            ))),
+        Statement::Diff(diff) => 5_usize.saturating_add(diff.yield_items().len()),
     }
 }
