@@ -1,0 +1,15 @@
+[package]
+name = "bolt-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bolt-protocol = { path = "../bolt-protocol" }
+
+[dev-dependencies]
+tokio = { version = "=1.53.0", features = ["rt", "macros"] }
+
+[lints]
+workspace = true

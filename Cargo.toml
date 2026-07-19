@@ -32,6 +32,7 @@ members = [
     "crates/cypher-sema",
     "crates/cypher-compiler",
     "crates/bolt-protocol",
+    "crates/bolt-server",
     "crates/dtgproxy",
 ]
 resolver = "3"

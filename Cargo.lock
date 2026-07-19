@@ -225,6 +225,14 @@ name = "bolt-protocol"
 version = "1.0.0"
 
 [[package]]
+name = "bolt-server"
+version = "1.0.0"
+dependencies = [
+ "bolt-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
