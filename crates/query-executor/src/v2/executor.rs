@@ -28,17 +28,34 @@ impl BatchExecutor {
         &self,
         fragment: &PlanFragment,
         context: &ExecutionContext,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, RuntimeError> {
+        self.execute_operators(
+            fragment.operators(),
+            fragment.output(),
+            fragment.budget().memory_bytes(),
+            context,
+            batches,
+        )
+    }
+
+    pub(crate) fn execute_operators(
+        &self,
+        operators: &[PhysicalOperator],
+        output: &RowSchema,
+        memory_limit: u64,
+        context: &ExecutionContext,
         mut batches: Vec<RecordBatch>,
     ) -> Result<Vec<RecordBatch>, RuntimeError> {
         context.check_fences()?;
-        ensure_memory(&batches, fragment.budget().memory_bytes())?;
-        for operator in fragment.operators() {
+        ensure_memory(&batches, memory_limit)?;
+        for operator in operators {
             context.check_fences()?;
             batches = match operator {
                 PhysicalOperator::Argument => argument(batches)?,
                 PhysicalOperator::Filter(predicate) => filter(batches, predicate, context)?,
                 PhysicalOperator::Project { expressions } => {
-                    project(batches, expressions, fragment.output(), context)?
+                    project(batches, expressions, output, context)?
                 }
                 PhysicalOperator::Skip { count } => skip(batches, row_count(count, context)?)?,
                 PhysicalOperator::Limit { count } => limit(batches, row_count(count, context)?)?,
@@ -74,12 +91,9 @@ impl BatchExecutor {
                     return Err(RuntimeError::UnsupportedOperator("Procedure"));
                 }
             };
-            ensure_memory(&batches, fragment.budget().memory_bytes())?;
+            ensure_memory(&batches, memory_limit)?;
         }
-        if batches
-            .iter()
-            .any(|batch| batch.schema() != fragment.output())
-        {
+        if batches.iter().any(|batch| batch.schema() != output) {
             return Err(RuntimeError::OutputSchemaMismatch);
         }
         Ok(batches)

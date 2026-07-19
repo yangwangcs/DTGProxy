@@ -228,6 +228,27 @@ fn stale_writer_on_a_disjoint_valid_interval_can_commit() {
 }
 
 #[test]
+fn vertex_scan_views_preserve_labels_for_physical_label_scans() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let label = LabelId::new(11);
+    block_on(store.commit_vertex(
+        context(1, 0, 100),
+        VertexMutation::put(vertex(), label, interval(1, None), payload("visible")).unwrap(),
+    ))
+    .unwrap();
+
+    let current = block_on(store.scan_vertex_views_current(GraphId::new(1), valid(5))).unwrap();
+    let historical =
+        block_on(store.scan_vertex_views_as_of(GraphId::new(1), valid(5), tx(150))).unwrap();
+
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].element(), vertex());
+    assert_eq!(current[0].label(), label);
+    assert_eq!(current[0].payload(), &payload("visible"));
+    assert_eq!(historical, current);
+}
+
+#[test]
 fn as_of_seek_decodes_only_the_first_eligible_anchor() {
     let store = TemporalStore::new(MemoryAdapter::new());
     let label = LabelId::new(11);

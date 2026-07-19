@@ -7,7 +7,7 @@ use physical_plan::{
     ExchangeKind, JoinKind, MemoryBudget, PhysicalOperator, PhysicalPlan, PhysicalPlanBuilder,
     PhysicalPlanHeaderV1, Placement, WriteOperation,
 };
-use temporal_ir::v2::{LogicalOperator, LogicalPlan};
+use temporal_ir::v2::{LogicalNode, LogicalOperator, LogicalPlan};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeploymentMode {
@@ -119,11 +119,7 @@ fn optimize_primary(
     header: PhysicalPlanHeaderV1,
     budget: MemoryBudget,
 ) -> Result<OptimizedPlan, OptimizerError> {
-    let operators = logical
-        .nodes()
-        .iter()
-        .map(|node| physical(node.operator()))
-        .collect();
+    let operators = logical.nodes().iter().map(physical).collect();
     let mut builder = PhysicalPlanBuilder::new(header);
     let root = builder
         .add_fragment(
@@ -161,13 +157,13 @@ fn optimize_shared(
     }
     let shard_operators = logical.nodes()[..split]
         .iter()
-        .map(|node| physical(node.operator()))
+        .map(physical)
         .collect::<Vec<_>>();
     let shard_output = logical.nodes()[split - 1].output().clone();
     let coordinator_operators = if split < logical.nodes().len() {
         logical.nodes()[split..]
             .iter()
-            .map(|node| physical(node.operator()))
+            .map(physical)
             .collect::<Vec<_>>()
     } else {
         vec![PhysicalOperator::Finish]
@@ -216,11 +212,7 @@ fn optimize_coordinator_only(
     let root = builder
         .add_fragment(
             Placement::Coordinator,
-            logical
-                .nodes()
-                .iter()
-                .map(|node| physical(node.operator()))
-                .collect(),
+            logical.nodes().iter().map(physical).collect(),
             logical.output().clone(),
             budget,
         )
@@ -237,17 +229,20 @@ fn optimize_coordinator_only(
     })
 }
 
-fn physical(operator: &LogicalOperator) -> PhysicalOperator {
+fn physical(node: &LogicalNode) -> PhysicalOperator {
+    let operator = node.operator();
     match operator {
         LogicalOperator::Argument => PhysicalOperator::Argument,
         LogicalOperator::NodeScan { binding, labels } => PhysicalOperator::NodeScan {
             binding: *binding,
             labels: labels.clone(),
+            output: node.output().clone(),
         },
         LogicalOperator::RelationshipScan { binding, types } => {
             PhysicalOperator::RelationshipScan {
                 binding: *binding,
                 types: types.clone(),
+                output: node.output().clone(),
             }
         }
         LogicalOperator::Expand {
@@ -260,6 +255,7 @@ fn physical(operator: &LogicalOperator) -> PhysicalOperator {
             relationship: *relationship,
             destination: *destination,
             outgoing: *outgoing,
+            output: node.output().clone(),
         },
         LogicalOperator::Filter { predicate } => PhysicalOperator::Filter(predicate.clone()),
         LogicalOperator::Project { expressions } => PhysicalOperator::Project {

@@ -18,8 +18,8 @@ use temporal_ir::{
     TemporalSelector,
 };
 use temporal_storage::{
-    EdgeTypeId, EdgeView, ElementId, ElementKind, ElementRef, TemporalChange, TemporalChangeKind,
-    TemporalStore, TemporalStoreError,
+    EdgeTypeId, EdgeView, ElementId, ElementKind, ElementRef, LabelId, TemporalChange,
+    TemporalChangeKind, TemporalStore, TemporalStoreError, VertexView,
 };
 use temporal_types::{CanonicalElement, CodecError};
 
@@ -35,6 +35,7 @@ pub type ExecutorFuture<'a, T> =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VertexRecord {
     element: ElementRef,
+    label: Option<LabelId>,
     payload: CanonicalElement,
 }
 
@@ -45,8 +46,23 @@ impl VertexRecord {
     }
 
     #[must_use]
+    pub const fn label(&self) -> Option<LabelId> {
+        self.label
+    }
+
+    #[must_use]
     pub const fn payload(&self) -> &CanonicalElement {
         &self.payload
+    }
+}
+
+impl From<VertexView> for VertexRecord {
+    fn from(value: VertexView) -> Self {
+        Self {
+            element: value.element(),
+            label: Some(value.label()),
+            payload: value.payload().clone(),
+        }
     }
 }
 
@@ -350,7 +366,11 @@ where
                     .into_iter()
                     .take(limit)
                     .map(|(element, payload)| {
-                        QueryRecord::Vertex(VertexRecord { element, payload })
+                        QueryRecord::Vertex(VertexRecord {
+                            element,
+                            label: None,
+                            payload,
+                        })
                     })
                     .collect())
             }
@@ -399,7 +419,13 @@ where
                 };
                 Ok(payload
                     .into_iter()
-                    .map(|payload| QueryRecord::Vertex(VertexRecord { element, payload }))
+                    .map(|payload| {
+                        QueryRecord::Vertex(VertexRecord {
+                            element,
+                            label: None,
+                            payload,
+                        })
+                    })
                     .collect())
             }
             PointOperator::EdgeById(id) => {

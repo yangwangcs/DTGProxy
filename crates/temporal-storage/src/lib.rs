@@ -24,6 +24,6 @@ pub use record::{
 };
 pub use store::{
     CommitContext, EdgeMutation, EdgeView, PrepareContext, TemporalStore, TemporalStoreError,
-    TemporalStoreFuture, VertexMutation,
+    TemporalStoreFuture, VertexMutation, VertexView,
 };
 pub use transaction::{EndpointGuard, TemporalTransaction};

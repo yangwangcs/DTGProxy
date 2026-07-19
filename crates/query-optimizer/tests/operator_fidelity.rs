@@ -31,10 +31,12 @@ fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
                 PhysicalOperator::NodeScan {
                     binding: actual_binding,
                     labels: actual_labels,
+                    output,
                 },
             ) => {
                 assert_eq!(actual_binding, binding);
                 assert_eq!(actual_labels, labels);
+                assert_eq!(output, logical.output());
             }
             (
                 LogicalOperator::Expand {
@@ -48,12 +50,14 @@ fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
                     relationship: actual_relationship,
                     destination: actual_destination,
                     outgoing: actual_outgoing,
+                    output,
                 },
             ) => {
                 assert_eq!(actual_source, source);
                 assert_eq!(actual_relationship, relationship);
                 assert_eq!(actual_destination, destination);
                 assert_eq!(actual_outgoing, outgoing);
+                assert_eq!(output, logical.output());
             }
             (
                 LogicalOperator::Project { expressions },

@@ -243,6 +243,30 @@ impl EdgeMutation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VertexView {
+    element: ElementRef,
+    label: LabelId,
+    payload: CanonicalElement,
+}
+
+impl VertexView {
+    #[must_use]
+    pub const fn element(&self) -> ElementRef {
+        self.element
+    }
+
+    #[must_use]
+    pub const fn label(&self) -> LabelId {
+        self.label
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &CanonicalElement {
+        &self.payload
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeView {
     element: ElementRef,
     edge_type: EdgeTypeId,
@@ -748,6 +772,21 @@ where
         valid_time: ValidTime,
     ) -> TemporalStoreFuture<'a, Vec<(ElementRef, CanonicalElement)>> {
         Box::pin(async move {
+            Ok(self
+                .scan_vertex_views_current(graph, valid_time)
+                .await?
+                .into_iter()
+                .map(|view| (view.element, view.payload))
+                .collect())
+        })
+    }
+
+    pub fn scan_vertex_views_current<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+    ) -> TemporalStoreFuture<'a, Vec<VertexView>> {
+        Box::pin(async move {
             let entries = self
                 .adapter
                 .scan(&KeySpan::prefix(
@@ -762,7 +801,11 @@ where
                 };
                 let projection = ProjectionRecord::decode(entry.value())?;
                 if let Some(payload) = projection.visible_at(valid_time) {
-                    vertices.push((element, payload.clone()));
+                    let identity = self
+                        .load_vertex_identity(element)
+                        .await?
+                        .ok_or(TemporalStoreError::IdentityMismatch)?;
+                    vertices.push(vertex_view(identity, payload.clone()));
                 }
             }
             Ok(vertices)
@@ -776,6 +819,22 @@ where
         transaction_time: TransactionTime,
     ) -> TemporalStoreFuture<'a, Vec<(ElementRef, CanonicalElement)>> {
         Box::pin(async move {
+            Ok(self
+                .scan_vertex_views_as_of(graph, valid_time, transaction_time)
+                .await?
+                .into_iter()
+                .map(|view| (view.element, view.payload))
+                .collect())
+        })
+    }
+
+    pub fn scan_vertex_views_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<VertexView>> {
+        Box::pin(async move {
             let entries = self
                 .adapter
                 .scan(&KeySpan::prefix(
@@ -788,13 +847,17 @@ where
                 let GraphKey::VertexIdentity(element) = decode_graph_key(entry.key())? else {
                     return Err(TemporalStoreError::UnexpectedVertexIdentityKey);
                 };
+                let identity = VertexIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
                 if let Some(payload) = self
                     .load_projection_at(element, transaction_time)
                     .await?
                     .as_ref()
                     .and_then(|projection| projection.visible_at(valid_time))
                 {
-                    vertices.push((element, payload.clone()));
+                    vertices.push(vertex_view(identity, payload.clone()));
                 }
             }
             Ok(vertices)
@@ -1109,6 +1172,21 @@ where
             .pop()
             .flatten()
             .map(|bytes| EdgeIdentity::decode(&bytes).map_err(TemporalStoreError::from))
+            .transpose()
+    }
+
+    async fn load_vertex_identity(
+        &self,
+        element: ElementRef,
+    ) -> Result<Option<VertexIdentity>, TemporalStoreError> {
+        let mut values = self
+            .adapter
+            .multi_get(&[vertex_identity_key(element)])
+            .await?;
+        values
+            .pop()
+            .flatten()
+            .map(|bytes| VertexIdentity::decode(&bytes).map_err(Into::into))
             .transpose()
     }
 
@@ -1524,6 +1602,14 @@ fn edge_view(identity: EdgeIdentity, payload: CanonicalElement) -> EdgeView {
         edge_type: identity.edge_type(),
         source: identity.source_ref(),
         destination: identity.destination_ref(),
+        payload,
+    }
+}
+
+fn vertex_view(identity: VertexIdentity, payload: CanonicalElement) -> VertexView {
+    VertexView {
+        element: identity.element(),
+        label: identity.label(),
         payload,
     }
 }

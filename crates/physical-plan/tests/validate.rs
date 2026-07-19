@@ -27,6 +27,7 @@ fn validates_a_fragment_dag_with_bounded_exchange() {
             vec![PhysicalOperator::NodeScan {
                 binding: SlotId::new(0),
                 labels: vec![42],
+                output: schema(),
             }],
             schema(),
             MemoryBudget::new(64 * 1024 * 1024, 256 * 1024 * 1024).expect("budget"),

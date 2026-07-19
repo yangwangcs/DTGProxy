@@ -155,16 +155,19 @@ pub enum PhysicalOperator {
     NodeScan {
         binding: SlotId,
         labels: Vec<u32>,
+        output: RowSchema,
     },
     RelationshipScan {
         binding: SlotId,
         types: Vec<u32>,
+        output: RowSchema,
     },
     Expand {
         source: SlotId,
         relationship: SlotId,
         destination: SlotId,
         outgoing: bool,
+        output: RowSchema,
     },
     Filter(ScalarExpr),
     Project {
