@@ -62,6 +62,10 @@ impl BatchExecutor {
                 PhysicalOperator::Skip { count } => skip(batches, row_count(count, context)?)?,
                 PhysicalOperator::Limit { count } => limit(batches, row_count(count, context)?)?,
                 PhysicalOperator::Sort { keys } => sort(batches, keys)?,
+                PhysicalOperator::Aggregate {
+                    grouping,
+                    aggregates,
+                } => aggregate(batches, grouping, aggregates, output, context)?,
                 PhysicalOperator::TemporalSlice { .. } | PhysicalOperator::Finish => batches,
                 PhysicalOperator::NodeScan { .. } => {
                     return Err(RuntimeError::UnsupportedOperator("NodeScan"));
@@ -74,12 +78,6 @@ impl BatchExecutor {
                 }
                 PhysicalOperator::HashJoin { .. } => {
                     return Err(RuntimeError::UnsupportedOperator("HashJoin"));
-                }
-                PhysicalOperator::Aggregate { .. } => {
-                    return Err(RuntimeError::UnsupportedOperator("Aggregate"));
-                }
-                PhysicalOperator::Sort { .. } => {
-                    return Err(RuntimeError::UnsupportedOperator("Sort"));
                 }
                 PhysicalOperator::Union { .. } => {
                     return Err(RuntimeError::UnsupportedOperator("Union"));
@@ -133,6 +131,131 @@ fn sort(
             .unwrap_or(Ordering::Equal)
     });
     Ok(vec![RecordBatch::try_new(schema, rows)?])
+}
+
+fn aggregate(
+    batches: Vec<RecordBatch>,
+    grouping: &[temporal_ir::v2::SlotId],
+    aggregates: &[(temporal_ir::v2::SlotId, ScalarExpr)],
+    output: &RowSchema,
+    context: &ExecutionContext,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    if !grouping.is_empty() {
+        return Err(RuntimeError::UnsupportedOperator("grouped Aggregate"));
+    }
+    let schema = batches
+        .first()
+        .map_or_else(RowSchema::empty, |batch| batch.schema().clone());
+    let rows = batches
+        .into_iter()
+        .flat_map(RecordBatch::into_rows)
+        .collect::<Vec<_>>();
+    let mut values = Vec::with_capacity(aggregates.len());
+    for (_, expression) in aggregates {
+        values.push(aggregate_expression(expression, &schema, &rows, context)?);
+    }
+    let output_values = output
+        .columns()
+        .iter()
+        .map(|column| {
+            aggregates
+                .iter()
+                .position(|(slot, _)| *slot == column.slot())
+                .map(|index| values[index].clone())
+                .ok_or(RuntimeError::MissingSlot(column.slot()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(vec![RecordBatch::try_new(
+        output.clone(),
+        vec![output_values],
+    )?])
+}
+
+fn aggregate_expression(
+    expression: &ScalarExpr,
+    schema: &RowSchema,
+    rows: &[Vec<RuntimeValue>],
+    context: &ExecutionContext,
+) -> Result<RuntimeValue, RuntimeError> {
+    let ScalarExpr::Function {
+        function_id,
+        arguments,
+    } = expression
+    else {
+        return Err(RuntimeError::UnsupportedOperator("non-function Aggregate"));
+    };
+    if *function_id == function_id_for("count") {
+        let mut count = 0_i64;
+        for row in rows {
+            if arguments.is_empty()
+                || !matches!(
+                    expression::evaluate(&arguments[0], schema, row, context)?,
+                    RuntimeValue::Null
+                )
+            {
+                count = count
+                    .checked_add(1)
+                    .ok_or(RuntimeError::ArithmeticOverflow)?;
+            }
+        }
+        return Ok(RuntimeValue::Integer(count));
+    }
+    let mut values = rows
+        .iter()
+        .map(|row| {
+            arguments
+                .first()
+                .ok_or(RuntimeError::FunctionUnsupported(*function_id))
+                .and_then(|argument| expression::evaluate(argument, schema, row, context))
+        })
+        .filter_map(|value| match value {
+            Ok(RuntimeValue::Null) => None,
+            Ok(value) => Some(Ok(value)),
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Ok(RuntimeValue::Null);
+    }
+    if *function_id == function_id_for("sum") || *function_id == function_id_for("avg") {
+        let mut total = 0.0_f64;
+        for value in &values {
+            total += numeric_value(value)?;
+        }
+        if *function_id == function_id_for("avg") {
+            total /= values.len() as f64;
+        }
+        return Ok(RuntimeValue::FloatBits(total.to_bits()));
+    }
+    if *function_id == function_id_for("min") || *function_id == function_id_for("max") {
+        values.sort_by(compare_values);
+        return Ok(if *function_id == function_id_for("min") {
+            values.remove(0)
+        } else {
+            values.pop().expect("non-empty aggregate values")
+        });
+    }
+    Err(RuntimeError::FunctionUnsupported(*function_id))
+}
+
+fn numeric_value(value: &RuntimeValue) -> Result<f64, RuntimeError> {
+    match value {
+        RuntimeValue::Integer(value) => Ok(*value as f64),
+        RuntimeValue::FloatBits(value) => Ok(f64::from_bits(*value)),
+        value => Err(RuntimeError::TypeMismatch {
+            expected: temporal_ir::v2::ValueType::Float,
+            actual: value.kind(),
+        }),
+    }
+}
+
+fn function_id_for(name: &str) -> u32 {
+    let digest = blake3::hash(name.as_bytes());
+    u32::from_be_bytes(
+        digest.as_bytes()[..4]
+            .try_into()
+            .expect("digest has four bytes"),
+    )
 }
 
 fn compare_values(left: &RuntimeValue, right: &RuntimeValue) -> Ordering {

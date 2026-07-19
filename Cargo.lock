@@ -1705,6 +1705,7 @@ version = "1.0.0"
 dependencies = [
  "adapter-memory",
  "adapter-rocksdb",
+ "blake3",
  "physical-plan",
  "raft-command",
  "shard-runtime",

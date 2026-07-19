@@ -161,7 +161,16 @@ fn optimize_shared(
     let split = logical
         .nodes()
         .iter()
-        .position(|node| matches!(node.operator(), LogicalOperator::Project { .. }))
+        .position(|node| {
+            matches!(
+                node.operator(),
+                LogicalOperator::Project { .. }
+                    | LogicalOperator::Aggregate { .. }
+                    | LogicalOperator::Sort { .. }
+                    | LogicalOperator::Skip { .. }
+                    | LogicalOperator::Limit { .. }
+            )
+        })
         .unwrap_or(logical.nodes().len());
     if split == 0 {
         return optimize_coordinator_only(logical, header, budget);

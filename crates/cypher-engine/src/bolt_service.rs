@@ -85,6 +85,28 @@ impl BackendQueryResult {
 
 pub trait BoltQueryBackend: Send + Sync {
     fn execute<'a>(&'a self, request: BoltQueryRequest) -> BackendFuture<'a, BackendQueryResult>;
+
+    fn begin<'a>(&'a self, _extra: BTreeMap<String, Value>) -> BackendFuture<'a, TransactionId> {
+        Box::pin(async {
+            Err(ServiceError::new(
+                "Neo.ClientError.Transaction.TransactionStartFailed",
+                "explicit transactions are not supported by this backend",
+            ))
+        })
+    }
+
+    fn commit<'a>(&'a self, _transaction: TransactionId) -> BackendFuture<'a, String> {
+        Box::pin(async {
+            Err(ServiceError::new(
+                "Neo.ClientError.Transaction.InvalidBookmark",
+                "no explicit transaction is active",
+            ))
+        })
+    }
+
+    fn rollback<'a>(&'a self, _transaction: TransactionId) -> BackendFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 struct Cursor {
@@ -265,26 +287,16 @@ where
         })
     }
 
-    fn begin<'a>(&'a self, _extra: BTreeMap<String, Value>) -> ServiceFuture<'a, TransactionId> {
-        Box::pin(async move {
-            Err(ServiceError::new(
-                "Neo.ClientError.Transaction.TransactionStartFailed",
-                "explicit Bolt transactions are not enabled for this query backend",
-            ))
-        })
+    fn begin<'a>(&'a self, extra: BTreeMap<String, Value>) -> ServiceFuture<'a, TransactionId> {
+        Box::pin(async move { self.backend.begin(extra).await })
     }
 
-    fn commit<'a>(&'a self, _transaction: TransactionId) -> ServiceFuture<'a, String> {
-        Box::pin(async move {
-            Err(ServiceError::new(
-                "Neo.ClientError.Transaction.InvalidBookmark",
-                "no explicit Bolt transaction is active",
-            ))
-        })
+    fn commit<'a>(&'a self, transaction: TransactionId) -> ServiceFuture<'a, String> {
+        Box::pin(async move { self.backend.commit(transaction).await })
     }
 
-    fn rollback<'a>(&'a self, _transaction: TransactionId) -> ServiceFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
+    fn rollback<'a>(&'a self, transaction: TransactionId) -> ServiceFuture<'a, ()> {
+        Box::pin(async move { self.backend.rollback(transaction).await })
     }
 
     fn route<'a>(

@@ -11,6 +11,7 @@ shard-runtime = ["dep:shard-runtime"]
 rocksdb-tests = ["dep:adapter-rocksdb", "dep:tempfile"]
 
 [dependencies]
+blake3 = "=1.8.5"
 adapter-rocksdb = { path = "../adapter-rocksdb", optional = true }
 physical-plan = { path = "../physical-plan" }
 shard-runtime = { path = "../shard-runtime", optional = true }

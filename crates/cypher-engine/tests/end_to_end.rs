@@ -52,6 +52,43 @@ fn executes_parameterized_temporal_cypher_on_nonzero_primary_shard() {
 }
 
 #[test]
+fn executes_count_aggregate_after_temporal_scan() {
+    let security = [8; 32];
+    let store = TemporalStore::new(MemoryAdapter::new());
+    seed(&store);
+    let worker =
+        LocalFragmentWorker::new(42, 7, 3, 11, security, TemporalBatchExecutor::new(store));
+    let mut coordinator = DistributedCoordinator::new(4 << 20, 16).expect("coordinator");
+    coordinator.register(Arc::new(worker)).expect("worker");
+    let engine = CypherQueryEngine::new(
+        EngineConfig::new(
+            "accounts",
+            7,
+            3,
+            11,
+            DeploymentMode::PrimaryReplica,
+            vec![42],
+            ResourceLimits::new(1 << 20, 4 << 20, 256).expect("limits"),
+        )
+        .expect("engine config"),
+    );
+    let response = block_on(engine.execute(
+        &coordinator,
+        CypherQueryRequest::new(
+            "USE accounts AT VALID_TIME AS OF 5 MATCH (n) RETURN count(n)",
+            BTreeMap::new(),
+            ValidTime::from_micros(5),
+            TransactionTime::new(150, 0),
+            security,
+            now_ms() + 10_000,
+        ),
+    ))
+    .expect("count query");
+    assert_eq!(response.row_count(), 1);
+    assert_eq!(response.batches()[0].rows()[0][0], RuntimeValue::Integer(1));
+}
+
+#[test]
 fn gathers_shared_nothing_shards_under_one_temporal_snapshot() {
     let security = [7; 32];
     let mut coordinator = DistributedCoordinator::new(4 << 20, 16).expect("coordinator");
@@ -86,6 +123,44 @@ fn gathers_shared_nothing_shards_under_one_temporal_snapshot() {
         })
         .collect::<Vec<_>>();
     assert_eq!(ids, vec![ElementId::new(1), ElementId::new(2)]);
+}
+
+#[test]
+fn shared_nothing_aggregates_after_global_gather() {
+    let security = [6; 32];
+    let mut coordinator = DistributedCoordinator::new(4 << 20, 16).expect("coordinator");
+    coordinator
+        .register(Arc::new(worker(8, 2, security)))
+        .expect("worker 8");
+    coordinator
+        .register(Arc::new(worker(3, 1, security)))
+        .expect("worker 3");
+    let engine = CypherQueryEngine::new(
+        EngineConfig::new(
+            "accounts",
+            7,
+            3,
+            11,
+            DeploymentMode::SharedNothing,
+            vec![8, 3],
+            ResourceLimits::new(1 << 20, 4 << 20, 256).expect("limits"),
+        )
+        .expect("engine config"),
+    );
+    let response = block_on(engine.execute(
+        &coordinator,
+        CypherQueryRequest::new(
+            "MATCH (n) RETURN count(n)",
+            BTreeMap::new(),
+            ValidTime::from_micros(5),
+            TransactionTime::new(150, 0),
+            security,
+            now_ms() + 10_000,
+        ),
+    ))
+    .expect("distributed count query");
+    assert_eq!(response.row_count(), 1);
+    assert_eq!(response.batches()[0].rows()[0][0], RuntimeValue::Integer(2));
 }
 
 fn request(transaction_micros: i64, security: [u8; 32]) -> CypherQueryRequest {

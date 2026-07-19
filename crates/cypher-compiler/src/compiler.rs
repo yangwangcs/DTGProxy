@@ -599,6 +599,30 @@ impl Lowerer {
         }
         let output = RowSchema::new(columns)?;
         let input = self.ensure_root()?;
+        if expressions
+            .iter()
+            .any(|(_, expression)| is_aggregate_scalar(expression))
+        {
+            if expressions
+                .iter()
+                .any(|(_, expression)| !is_aggregate_scalar(expression))
+            {
+                return Err(CompileError::new(
+                    "DTG-CYPHER-MIXED-AGGREGATION",
+                    "aggregate and non-aggregate projections require an explicit grouping key",
+                ));
+            }
+            self.root = Some(self.builder.add(
+                LogicalOperator::Aggregate {
+                    grouping: Vec::new(),
+                    aggregates: expressions,
+                },
+                vec![input],
+                output.clone(),
+            )?);
+            self.schema = output;
+            return Ok(());
+        }
         self.root = Some(self.builder.add(
             LogicalOperator::Project { expressions },
             vec![input],
@@ -680,7 +704,8 @@ impl Lowerer {
                         .iter()
                         .map(|part| part.value())
                         .collect::<Vec<_>>()
-                        .join("."),
+                        .join(".")
+                        .to_ascii_lowercase(),
                 ),
                 arguments: arguments
                     .iter()
@@ -755,6 +780,19 @@ impl Lowerer {
         self.root = Some(root);
         Ok(root)
     }
+}
+
+fn is_aggregate_scalar(expression: &ScalarExpr) -> bool {
+    let ScalarExpr::Function {
+        function_id,
+        arguments: _,
+    } = expression
+    else {
+        return false;
+    };
+    ["count", "sum", "avg", "min", "max"]
+        .iter()
+        .any(|name| stable_id(name) == *function_id)
 }
 
 fn output_schema(analyzed: &AnalyzedQuery, next_slot: &mut u32) -> Result<RowSchema, CompileError> {

@@ -206,7 +206,10 @@ where
                         .await?;
                 }
                 _ => {
-                    let expected = if matches!(operator, PhysicalOperator::Project { .. }) {
+                    let expected = if matches!(
+                        operator,
+                        PhysicalOperator::Project { .. } | PhysicalOperator::Aggregate { .. }
+                    ) {
                         fragment.output().clone()
                     } else {
                         batches.first().map_or_else(

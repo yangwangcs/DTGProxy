@@ -64,10 +64,70 @@ pub(crate) fn evaluate(
         ScalarExpr::Divide(left, right) => {
             arithmetic(left, right, schema, row, context, Arithmetic::Divide)
         }
-        ScalarExpr::Function { function_id, .. } => {
-            Err(RuntimeError::FunctionUnsupported(*function_id))
-        }
+        ScalarExpr::Function {
+            function_id,
+            arguments,
+        } => function(*function_id, arguments, schema, row, context),
     }
+}
+
+fn function(
+    function_id: u32,
+    arguments: &[ScalarExpr],
+    schema: &RowSchema,
+    row: &[RuntimeValue],
+    context: &ExecutionContext,
+) -> Result<RuntimeValue, RuntimeError> {
+    if function_id == function_id_for("coalesce") {
+        for argument in arguments {
+            let value = evaluate(argument, schema, row, context)?;
+            if !matches!(value, RuntimeValue::Null) {
+                return Ok(value);
+            }
+        }
+        return Ok(RuntimeValue::Null);
+    }
+    let value = arguments
+        .first()
+        .map(|argument| evaluate(argument, schema, row, context))
+        .transpose()?;
+    if function_id == function_id_for("size") {
+        return match value.unwrap_or(RuntimeValue::Null) {
+            RuntimeValue::Null => Ok(RuntimeValue::Null),
+            RuntimeValue::String(value) => i64::try_from(value.chars().count())
+                .map(RuntimeValue::Integer)
+                .map_err(|_| RuntimeError::ArithmeticOverflow),
+            RuntimeValue::Bytes(value) => i64::try_from(value.len())
+                .map(RuntimeValue::Integer)
+                .map_err(|_| RuntimeError::ArithmeticOverflow),
+            RuntimeValue::List(value) => i64::try_from(value.len())
+                .map(RuntimeValue::Integer)
+                .map_err(|_| RuntimeError::ArithmeticOverflow),
+            value => Err(type_mismatch("LIST, STRING, or BYTES", value.kind())),
+        };
+    }
+    if function_id == function_id_for("tostring") {
+        return Ok(RuntimeValue::String(
+            match value.unwrap_or(RuntimeValue::Null) {
+                RuntimeValue::Null => "null".into(),
+                RuntimeValue::Boolean(value) => value.to_string(),
+                RuntimeValue::Integer(value) => value.to_string(),
+                RuntimeValue::FloatBits(value) => f64::from_bits(value).to_string(),
+                RuntimeValue::String(value) => value,
+                other => format!("<{}>", other.kind()),
+            },
+        ));
+    }
+    Err(RuntimeError::FunctionUnsupported(function_id))
+}
+
+fn function_id_for(name: &str) -> u32 {
+    let digest = blake3::hash(name.as_bytes());
+    u32::from_be_bytes(
+        digest.as_bytes()[..4]
+            .try_into()
+            .expect("digest has four bytes"),
+    )
 }
 
 fn property(value: &RuntimeValue, property_id: u32) -> Result<RuntimeValue, RuntimeError> {
