@@ -1,0 +1,13 @@
+[package]
+name = "analytics-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+analytics-api = { path = "../analytics-api" }
+temporal-types = { path = "../temporal-types" }
+
+[lints]
+workspace = true

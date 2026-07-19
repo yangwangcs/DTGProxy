@@ -37,6 +37,8 @@ members = [
     "crates/query-optimizer",
     "crates/distributed-query",
     "crates/cypher-engine",
+    "crates/analytics-api",
+    "crates/analytics-runtime",
     "crates/dtgproxy",
 ]
 resolver = "3"

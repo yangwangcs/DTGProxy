@@ -84,6 +84,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "analytics-api"
+version = "1.0.0"
+dependencies = [
+ "temporal-types",
+]
+
+[[package]]
+name = "analytics-runtime"
+version = "1.0.0"
+dependencies = [
+ "analytics-api",
+ "temporal-types",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
