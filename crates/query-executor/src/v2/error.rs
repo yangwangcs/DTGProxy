@@ -35,6 +35,8 @@ pub enum RuntimeError {
     OutputSchemaMismatch,
     FunctionUnsupported(u32),
     UnsupportedOperator(&'static str),
+    InvalidTemporalValue(&'static str),
+    InvalidTemporalInterval,
     Cancelled,
     DeadlineExceeded,
 }

@@ -4,6 +4,7 @@ use std::fmt::{self, Display, Formatter};
 
 use physical_plan::{PhysicalOperator, PlanFragment};
 use storage_api::StorageAdapter;
+use temporal_ir::v2::{RowSchema, ScalarExpr, TransactionTimeSpec, ValidTimeSpec};
 use temporal_storage::{EdgeView, GraphId, TemporalStore, TemporalStoreError};
 use temporal_types::{TransactionTime, ValidTime};
 
@@ -12,6 +13,97 @@ use crate::{EdgeRecord, VertexRecord};
 use super::{
     BatchExecutor, ExecutionContext, MAX_BATCH_ROWS, RecordBatch, RuntimeError, RuntimeValue,
 };
+
+use super::expression::evaluate;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedValidTime {
+    Point(ValidTime),
+    Interval { start: ValidTime, end: ValidTime },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedTemporalScope {
+    graph: GraphId,
+    valid_time: ResolvedValidTime,
+    transaction_time: TransactionTime,
+}
+
+impl ResolvedTemporalScope {
+    #[must_use]
+    pub const fn graph(&self) -> GraphId {
+        self.graph
+    }
+
+    #[must_use]
+    pub const fn valid_time(&self) -> ResolvedValidTime {
+        self.valid_time
+    }
+
+    #[must_use]
+    pub const fn transaction_time(&self) -> TransactionTime {
+        self.transaction_time
+    }
+
+    pub fn point_read(self) -> Result<TemporalRead, RuntimeError> {
+        match self.valid_time {
+            ResolvedValidTime::Point(valid_time) => Ok(TemporalRead::as_of(
+                self.graph,
+                valid_time,
+                self.transaction_time,
+            )),
+            ResolvedValidTime::Interval { .. } => Err(RuntimeError::UnsupportedOperator(
+                "valid-time interval execution",
+            )),
+        }
+    }
+}
+
+pub fn resolve_temporal_scope(
+    graph: GraphId,
+    valid_time: &ValidTimeSpec,
+    transaction_time: &TransactionTimeSpec,
+    current_valid_time: ValidTime,
+    current_transaction_time: TransactionTime,
+    context: &ExecutionContext,
+) -> Result<ResolvedTemporalScope, RuntimeError> {
+    context.check_fences()?;
+    let valid_time = match valid_time {
+        ValidTimeSpec::Current => ResolvedValidTime::Point(current_valid_time),
+        ValidTimeSpec::AsOf(expression) => ResolvedValidTime::Point(ValidTime::from_micros(
+            resolve_timestamp(expression, context)?,
+        )),
+        ValidTimeSpec::Between { start, end } => {
+            let start = ValidTime::from_micros(resolve_timestamp(start, context)?);
+            let end = ValidTime::from_micros(resolve_timestamp(end, context)?);
+            if start >= end {
+                return Err(RuntimeError::InvalidTemporalInterval);
+            }
+            ResolvedValidTime::Interval { start, end }
+        }
+    };
+    let transaction_time = match transaction_time {
+        TransactionTimeSpec::Current => current_transaction_time,
+        TransactionTimeSpec::AsOf(expression) => {
+            TransactionTime::new(resolve_timestamp(expression, context)?, u32::MAX)
+        }
+    };
+    Ok(ResolvedTemporalScope {
+        graph,
+        valid_time,
+        transaction_time,
+    })
+}
+
+fn resolve_timestamp(
+    expression: &ScalarExpr,
+    context: &ExecutionContext,
+) -> Result<i64, RuntimeError> {
+    match evaluate(expression, &RowSchema::empty(), &[], context)? {
+        RuntimeValue::TimestampMicros(value) => Ok(value),
+        value => Err(RuntimeError::InvalidTemporalValue(value.kind())),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionRead {

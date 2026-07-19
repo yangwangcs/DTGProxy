@@ -2,6 +2,19 @@ use super::{PlanHeaderV2, RowSchema, ScalarExpr, SlotId, V2_PLAN_VERSION, Valida
 
 pub const MAX_LOGICAL_NODES: usize = 250_000;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidTimeSpec {
+    Current,
+    AsOf(ScalarExpr),
+    Between { start: ScalarExpr, end: ScalarExpr },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionTimeSpec {
+    Current,
+    AsOf(ScalarExpr),
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LogicalNodeId(u32);
 
@@ -59,7 +72,10 @@ pub enum LogicalOperator {
     Union {
         all: bool,
     },
-    TemporalSlice,
+    TemporalSlice {
+        valid_time: ValidTimeSpec,
+        transaction_time: TransactionTimeSpec,
+    },
     Diff,
     Create,
     Merge,
@@ -324,6 +340,24 @@ fn validate_slots(
         }
         LogicalOperator::Skip { count } | LogicalOperator::Limit { count } => {
             count.visit_slots(&mut |slot| referenced.push(slot));
+        }
+        LogicalOperator::TemporalSlice {
+            valid_time,
+            transaction_time,
+        } => {
+            match valid_time {
+                ValidTimeSpec::Current => {}
+                ValidTimeSpec::AsOf(expression) => {
+                    expression.visit_slots(&mut |slot| referenced.push(slot));
+                }
+                ValidTimeSpec::Between { start, end } => {
+                    start.visit_slots(&mut |slot| referenced.push(slot));
+                    end.visit_slots(&mut |slot| referenced.push(slot));
+                }
+            }
+            if let TransactionTimeSpec::AsOf(expression) = transaction_time {
+                expression.visit_slots(&mut |slot| referenced.push(slot));
+            }
         }
         _ => {}
     }

@@ -71,8 +71,20 @@ fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
             (LogicalOperator::Filter { predicate }, PhysicalOperator::Filter(actual)) => {
                 assert_eq!(actual, predicate);
             }
-            (LogicalOperator::Argument, PhysicalOperator::Argument)
-            | (LogicalOperator::TemporalSlice, PhysicalOperator::TemporalSlice) => {}
+            (LogicalOperator::Argument, PhysicalOperator::Argument) => {}
+            (
+                LogicalOperator::TemporalSlice {
+                    valid_time,
+                    transaction_time,
+                },
+                PhysicalOperator::TemporalSlice {
+                    valid_time: actual_valid,
+                    transaction_time: actual_transaction,
+                },
+            ) => {
+                assert_eq!(actual_valid, valid_time);
+                assert_eq!(actual_transaction, transaction_time);
+            }
             (logical, physical) => panic!("operator lost information: {logical:?} -> {physical:?}"),
         }
     }

@@ -1,6 +1,8 @@
 use cypher_compiler::{CompileSession, CypherCompiler};
 use cypher_sema::QueryEffect;
-use temporal_ir::v2::{LanguageProfile, LogicalOperator};
+use temporal_ir::v2::{
+    LanguageProfile, LogicalOperator, ScalarExpr, TransactionTimeSpec, ValidTimeSpec,
+};
 
 fn session() -> CompileSession {
     CompileSession::new("accounts", 7, 3, 11).expect("session should be valid")
@@ -35,11 +37,13 @@ fn compiles_temporal_match_into_valid_ir_v2() {
         .iter()
         .map(|node| node.operator())
         .collect::<Vec<_>>();
-    assert!(
-        operators
-            .iter()
-            .any(|operator| matches!(operator, LogicalOperator::TemporalSlice))
-    );
+    assert!(operators.iter().any(|operator| matches!(
+        operator,
+        LogicalOperator::TemporalSlice { valid_time, transaction_time }
+            if valid_time == &ValidTimeSpec::AsOf(ScalarExpr::Parameter("valid".into()))
+                && transaction_time
+                    == &TransactionTimeSpec::AsOf(ScalarExpr::Parameter("tx".into()))
+    )));
     assert!(
         operators
             .iter()
@@ -56,6 +60,25 @@ fn compiles_temporal_match_into_valid_ir_v2() {
             .any(|operator| matches!(operator, LogicalOperator::Filter { .. }))
     );
     assert_eq!(compiled.result_schema().columns().len(), 3);
+}
+
+#[test]
+fn preserves_interval_and_current_transaction_time_in_ir() {
+    let compiled = CypherCompiler::new()
+        .compile(
+            "USE accounts AT VALID_TIME FROM $from TO $to MATCH (n) RETURN n",
+            &session(),
+        )
+        .expect("interval query should compile");
+
+    assert!(compiled.logical_plan().nodes().iter().any(|node| matches!(
+        node.operator(),
+        LogicalOperator::TemporalSlice { valid_time, transaction_time }
+            if valid_time == &ValidTimeSpec::Between {
+                start: ScalarExpr::Parameter("from".into()),
+                end: ScalarExpr::Parameter("to".into()),
+            } && transaction_time == &TransactionTimeSpec::Current
+    )));
 }
 
 #[test]

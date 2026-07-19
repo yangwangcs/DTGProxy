@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 
 use cypher_ast::{
     BinaryOperator, Clause, ClauseKind, CypherVersion, Expression, Pattern, Statement,
-    UnaryOperator,
+    TemporalContext, TransactionTimeScope, UnaryOperator, ValidTimeScope,
 };
 use cypher_sema::{AnalyzedQuery, CypherType, QueryEffect, SemanticAnalyzer};
 use cypher_syntax::{TokenKind, lex, parse, parse_expression, parse_pattern};
 use temporal_ir::v2::{
     Column, LanguageProfile, LogicalNodeId, LogicalOperator, LogicalPlan, LogicalPlanBuilder,
-    PlanHeaderV2, RowSchema, ScalarExpr, SlotId, ValueType,
+    PlanHeaderV2, RowSchema, ScalarExpr, SlotId, TransactionTimeSpec, ValidTimeSpec, ValueType,
 };
 use temporal_types::GraphValue;
 
@@ -179,7 +179,7 @@ fn lower(
                         ))
                     && !matches!(clause.kind(), ClauseKind::Match | ClauseKind::OptionalMatch)
                 {
-                    lowerer.temporal_slice()?;
+                    lowerer.temporal_slice(query.temporal())?;
                 }
                 lowerer.clause(clause, analyzed)?;
             }
@@ -190,7 +190,7 @@ fn lower(
                         cypher_ast::TransactionTimeScope::Current
                     ))
             {
-                lowerer.temporal_slice()?;
+                lowerer.temporal_slice(query.temporal())?;
             }
         }
     }
@@ -449,10 +449,27 @@ impl Lowerer {
         }
     }
 
-    fn temporal_slice(&mut self) -> Result<(), CompileError> {
+    fn temporal_slice(&mut self, context: &TemporalContext) -> Result<(), CompileError> {
+        let valid_time = match context.valid_time() {
+            None => ValidTimeSpec::Current,
+            Some(ValidTimeScope::AsOf(expression)) => ValidTimeSpec::AsOf(self.scalar(expression)?),
+            Some(ValidTimeScope::Between { start, end }) => ValidTimeSpec::Between {
+                start: self.scalar(start)?,
+                end: self.scalar(end)?,
+            },
+        };
+        let transaction_time = match context.transaction_time() {
+            TransactionTimeScope::Current => TransactionTimeSpec::Current,
+            TransactionTimeScope::AsOf(expression) => {
+                TransactionTimeSpec::AsOf(self.scalar(expression)?)
+            }
+        };
         let input = self.ensure_root()?;
         self.root = Some(self.builder.add(
-            LogicalOperator::TemporalSlice,
+            LogicalOperator::TemporalSlice {
+                valid_time,
+                transaction_time,
+            },
             vec![input],
             self.schema.clone(),
         )?);

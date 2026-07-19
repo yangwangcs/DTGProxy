@@ -286,7 +286,13 @@ fn physical(node: &LogicalNode) -> PhysicalOperator {
             keys: Vec::new(),
         },
         LogicalOperator::Union { all } => PhysicalOperator::Union { all: *all },
-        LogicalOperator::TemporalSlice => PhysicalOperator::TemporalSlice,
+        LogicalOperator::TemporalSlice {
+            valid_time,
+            transaction_time,
+        } => PhysicalOperator::TemporalSlice {
+            valid_time: valid_time.clone(),
+            transaction_time: transaction_time.clone(),
+        },
         LogicalOperator::Diff => PhysicalOperator::Diff,
         LogicalOperator::ProcedureCall { procedure_id } => PhysicalOperator::Procedure {
             procedure_id: *procedure_id,

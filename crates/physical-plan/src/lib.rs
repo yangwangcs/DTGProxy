@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use temporal_ir::v2::{RowSchema, ScalarExpr, SlotId};
+use temporal_ir::v2::{RowSchema, ScalarExpr, SlotId, TransactionTimeSpec, ValidTimeSpec};
 
 pub const PHYSICAL_PLAN_VERSION: u16 = 1;
 pub const MAX_FRAGMENTS: usize = 65_536;
@@ -194,7 +194,10 @@ pub enum PhysicalOperator {
     Union {
         all: bool,
     },
-    TemporalSlice,
+    TemporalSlice {
+        valid_time: ValidTimeSpec,
+        transaction_time: TransactionTimeSpec,
+    },
     Diff,
     Write {
         operation: WriteOperation,

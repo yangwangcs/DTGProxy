@@ -59,7 +59,7 @@ impl BatchExecutor {
                 }
                 PhysicalOperator::Skip { count } => skip(batches, row_count(count, context)?)?,
                 PhysicalOperator::Limit { count } => limit(batches, row_count(count, context)?)?,
-                PhysicalOperator::TemporalSlice | PhysicalOperator::Finish => batches,
+                PhysicalOperator::TemporalSlice { .. } | PhysicalOperator::Finish => batches,
                 PhysicalOperator::NodeScan { .. } => {
                     return Err(RuntimeError::UnsupportedOperator("NodeScan"));
                 }
