@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3 = "=1.8.5"
+bolt-protocol = { path = "../bolt-protocol" }
+bolt-server = { path = "../bolt-server" }
 cypher-compiler = { path = "../cypher-compiler" }
 distributed-query = { path = "../distributed-query" }
 query-executor = { path = "../query-executor", default-features = false }
@@ -16,6 +19,7 @@ temporal-types = { path = "../temporal-types" }
 
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }
+tokio = { version = "=1.53.0", features = ["rt", "macros"] }
 
 [lints]
 workspace = true

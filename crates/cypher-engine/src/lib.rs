@@ -16,6 +16,14 @@ use temporal_ir::v2::{LogicalOperator, RowSchema, TransactionTimeSpec, ValidTime
 use temporal_storage::GraphId;
 use temporal_types::{TransactionTime, ValidTime};
 
+mod bolt;
+mod bolt_service;
+
+pub use bolt::{BoltValueError, bolt_parameter_to_runtime, runtime_value_to_bolt};
+pub use bolt_service::{
+    BackendFuture, BackendQueryResult, BoltQueryBackend, BoltQueryRequest, CypherBoltService,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceLimits {
     memory_bytes: u64,

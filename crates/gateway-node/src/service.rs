@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,7 +14,8 @@ use cluster_protocol::proto::{
 use cluster_protocol::{CLUSTER_PROTOCOL_VERSION, CommonRequestContext, MAX_COMMAND_BYTES};
 use control_plane::GraphDefinition;
 use cypher_engine::{
-    CypherQueryEngine, CypherQueryRequest, DeploymentMode as QueryDeploymentMode, EngineConfig,
+    BackendFuture, BackendQueryResult, BoltQueryBackend, BoltQueryRequest, CypherQueryEngine,
+    CypherQueryRequest, CypherQueryResponse, DeploymentMode as QueryDeploymentMode, EngineConfig,
     ResourceLimits,
 };
 use distributed_query::{DistributedCoordinator, LocalFragmentWorker};
@@ -40,6 +42,7 @@ pub struct RemoteGatewayService {
     meta_endpoints: Arc<Vec<SocketAddr>>,
     admission: Arc<AdmissionController>,
     max_raft_ticks: usize,
+    bolt_request_sequence: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -104,6 +107,7 @@ impl RemoteGatewayService {
                     .map_err(|_| RemoteGatewayServiceError::InvalidConfiguration)?,
             ),
             max_raft_ticks,
+            bolt_request_sequence: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -269,6 +273,20 @@ impl RemoteGatewayService {
         routing: &GatewayRoutingState,
         text: &str,
     ) -> Result<Value, RemoteGatewayServiceError> {
+        let response = self
+            .execute_cypher_response(request_id, deadline_unix_ms, routing, text, BTreeMap::new())
+            .await?;
+        cypher_response_json(&response)
+    }
+
+    async fn execute_cypher_response(
+        &self,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        routing: &GatewayRoutingState,
+        text: &str,
+        parameters: BTreeMap<String, RuntimeValue>,
+    ) -> Result<CypherQueryResponse, RemoteGatewayServiceError> {
         let security_fingerprint = request_security_fingerprint(self.cluster_id, request_id);
         let shard_ids = routing
             .deployment
@@ -321,17 +339,16 @@ impl RemoteGatewayService {
             .await?;
         let request = CypherQueryRequest::new(
             text,
-            BTreeMap::new(),
+            parameters,
             ValidTime::from_micros(unix_time_micros()?),
             query_snapshot,
             security_fingerprint,
             deadline_unix_ms,
         );
-        let response = CypherQueryEngine::new(config)
+        CypherQueryEngine::new(config)
             .execute(&coordinator, request)
             .await
-            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
-        cypher_response_json(&response)
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))
     }
 
     async fn execute_legacy_query(
@@ -465,6 +482,77 @@ impl RemoteGatewayService {
             last_error.unwrap_or_else(|| "no Meta endpoint was reachable".into()),
         ))
     }
+}
+
+impl BoltQueryBackend for RemoteGatewayService {
+    fn execute<'a>(&'a self, request: BoltQueryRequest) -> BackendFuture<'a, BackendQueryResult> {
+        Box::pin(async move {
+            if request.transaction().is_some() {
+                return Err(bolt_server::ServiceError::new(
+                    "Neo.ClientError.Transaction.TransactionStartFailed",
+                    "explicit Bolt transactions are not enabled for Temporal Cypher yet",
+                ));
+            }
+            let sequence = self.bolt_request_sequence.fetch_add(1, Ordering::Relaxed);
+            if sequence == u64::MAX {
+                return Err(bolt_server::ServiceError::new(
+                    "Neo.TransientError.General.DatabaseUnavailable",
+                    "Bolt request identity space exhausted",
+                ));
+            }
+            let deadline = unix_time_ms()
+                .map_err(|error| {
+                    bolt_server::ServiceError::new(
+                        "Neo.TransientError.General.DatabaseUnavailable",
+                        error.to_string(),
+                    )
+                })?
+                .checked_add(30_000)
+                .ok_or_else(|| {
+                    bolt_server::ServiceError::new(
+                        "Neo.ClientError.Request.Invalid",
+                        "Bolt query deadline overflow",
+                    )
+                })?;
+            let routing = self.routing_snapshot().map_err(gateway_bolt_error)?;
+            let response = self
+                .execute_cypher_response(
+                    u128::from(sequence),
+                    deadline,
+                    &routing,
+                    request.query(),
+                    request.parameters().clone(),
+                )
+                .await
+                .map_err(gateway_bolt_error)?;
+            let fields = response
+                .schema()
+                .columns()
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect::<Vec<_>>();
+            let records = response
+                .batches()
+                .iter()
+                .flat_map(|batch| batch.rows().iter().cloned())
+                .collect::<Vec<_>>();
+            Ok(BackendQueryResult::new(
+                fields,
+                records,
+                BTreeMap::from([(
+                    "dtg_query_fingerprint".into(),
+                    bolt_protocol::Value::String(hex_bytes(&response.fingerprint())),
+                )]),
+            ))
+        })
+    }
+}
+
+fn gateway_bolt_error(error: RemoteGatewayServiceError) -> bolt_server::ServiceError {
+    bolt_server::ServiceError::new(
+        "Neo.ClientError.Statement.ExecutionFailed",
+        error.to_string(),
+    )
 }
 
 #[tonic::async_trait]

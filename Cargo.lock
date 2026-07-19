@@ -427,6 +427,9 @@ name = "cypher-engine"
 version = "1.0.0"
 dependencies = [
  "adapter-memory",
+ "blake3",
+ "bolt-protocol",
+ "bolt-server",
  "cypher-compiler",
  "distributed-query",
  "query-executor",
@@ -434,6 +437,7 @@ dependencies = [
  "temporal-ir",
  "temporal-storage",
  "temporal-types",
+ "tokio",
 ]
 
 [[package]]
@@ -720,6 +724,8 @@ dependencies = [
 name = "gateway-node"
 version = "1.0.0"
 dependencies = [
+ "bolt-protocol",
+ "bolt-server",
  "cluster-protocol",
  "control-plane",
  "crc32fast",
