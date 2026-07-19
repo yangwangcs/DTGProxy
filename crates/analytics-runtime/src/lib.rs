@@ -13,6 +13,10 @@ use temporal_storage::{GraphId, TemporalStore};
 use temporal_types::ValidTime;
 use temporal_types::{GraphValue, TransactionTime};
 
+mod provider;
+
+pub use provider::BuiltInProvider;
+
 pub async fn project_snapshot<A>(
     store: &TemporalStore<A>,
     graph: GraphId,

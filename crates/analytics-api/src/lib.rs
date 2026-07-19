@@ -310,3 +310,248 @@ impl Display for GraphProjectionError {
 }
 
 impl Error for GraphProjectionError {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GraphModel {
+    Snapshot,
+    Event,
+    Interval,
+    Delta,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlgorithmDescriptor {
+    name: String,
+    version: String,
+    graph_models: Vec<GraphModel>,
+    exact: bool,
+    deterministic: bool,
+    distributed: bool,
+    incremental: bool,
+}
+
+impl AlgorithmDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        graph_models: Vec<GraphModel>,
+        exact: bool,
+        deterministic: bool,
+        distributed: bool,
+        incremental: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            graph_models,
+            exact,
+            deterministic,
+            distributed,
+            incremental,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn graph_models(&self) -> &[GraphModel] {
+        &self.graph_models
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDescriptor {
+    name: String,
+    version: String,
+    distributed: bool,
+    native_isolation: bool,
+}
+
+impl ProviderDescriptor {
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        distributed: bool,
+        native_isolation: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            distributed,
+            native_isolation,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn distributed(&self) -> bool {
+        self.distributed
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectedGraph {
+    Snapshot(SnapshotGraph),
+    Event(EventGraph),
+}
+
+impl ProjectedGraph {
+    #[must_use]
+    pub const fn model(&self) -> GraphModel {
+        match self {
+            Self::Snapshot(_) => GraphModel::Snapshot,
+            Self::Event(_) => GraphModel::Event,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AlgorithmValue {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    FloatBits(u64),
+    String(String),
+    Vertex(VertexId),
+    Time(ValidTime),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlgorithmRequest {
+    algorithm: String,
+    graph: ProjectedGraph,
+    parameters: BTreeMap<String, AlgorithmValue>,
+}
+
+impl AlgorithmRequest {
+    pub fn new(
+        algorithm: impl Into<String>,
+        graph: ProjectedGraph,
+        parameters: BTreeMap<String, AlgorithmValue>,
+    ) -> Result<Self, ProviderError> {
+        let algorithm = algorithm.into();
+        if algorithm.is_empty() || algorithm.len() > 255 {
+            return Err(ProviderError::new(
+                "DTG-ANALYTICS-INVALID-ALGORITHM",
+                "algorithm name must be non-empty and at most 255 bytes",
+            ));
+        }
+        Ok(Self {
+            algorithm,
+            graph,
+            parameters,
+        })
+    }
+
+    #[must_use]
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
+    }
+
+    #[must_use]
+    pub const fn graph(&self) -> &ProjectedGraph {
+        &self.graph
+    }
+
+    #[must_use]
+    pub const fn parameters(&self) -> &BTreeMap<String, AlgorithmValue> {
+        &self.parameters
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlgorithmResult {
+    columns: Vec<String>,
+    rows: Vec<Vec<AlgorithmValue>>,
+    metadata: BTreeMap<String, AlgorithmValue>,
+}
+
+impl AlgorithmResult {
+    pub fn new(
+        columns: Vec<String>,
+        rows: Vec<Vec<AlgorithmValue>>,
+        metadata: BTreeMap<String, AlgorithmValue>,
+    ) -> Result<Self, ProviderError> {
+        if columns.is_empty()
+            || rows.iter().any(|row| row.len() != columns.len())
+            || columns.iter().any(String::is_empty)
+        {
+            return Err(ProviderError::new(
+                "DTG-ANALYTICS-INVALID-RESULT",
+                "algorithm result schema and row widths must agree",
+            ));
+        }
+        Ok(Self {
+            columns,
+            rows,
+            metadata,
+        })
+    }
+
+    #[must_use]
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<AlgorithmValue>] {
+        &self.rows
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> &BTreeMap<String, AlgorithmValue> {
+        &self.metadata
+    }
+}
+
+pub trait AnalyticsProvider: Send + Sync {
+    fn descriptor(&self) -> ProviderDescriptor;
+
+    fn algorithms(&self) -> Vec<AlgorithmDescriptor>;
+
+    fn execute(&self, request: AlgorithmRequest) -> Result<AlgorithmResult, ProviderError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderError {
+    code: String,
+    message: String,
+}
+
+impl ProviderError {
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl Display for ProviderError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl Error for ProviderError {}
