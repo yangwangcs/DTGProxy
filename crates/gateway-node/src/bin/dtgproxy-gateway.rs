@@ -3,13 +3,17 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bolt_server::{BoltConnectionConfig, serve_connection};
 use cluster_protocol::MAX_COMMAND_BYTES;
 use cluster_protocol::proto::gateway_service_server::GatewayServiceServer;
+use cypher_engine::CypherBoltService;
 use gateway_node::{
     GatewayCatalogRouter, GatewayNodeRuntimeConfig, GatewayTransportSecurity, RemoteGatewayService,
 };
 use shard_client::RemoteShardClient;
+use tokio::sync::Semaphore;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
@@ -49,6 +53,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.max_raft_ticks(),
     )?;
     let listener = tokio::net::TcpListener::bind(config.listen_address()).await?;
+    let bolt_listener = match config.bolt_listen_address() {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
     match config.transport_security() {
         GatewayTransportSecurity::LoopbackPlaintext => {}
     }
@@ -72,14 +80,27 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let _ = shutdown_sender.send(true);
         }
     });
+    let bolt_address = bolt_listener
+        .as_ref()
+        .map(|listener| listener.local_addr())
+        .transpose()?;
+    let bolt_server = bolt_listener.map(|listener| {
+        let gateway = gateway.clone();
+        let receiver = shutdown_receiver.clone();
+        let maximum_connections = config.maximum_inflight();
+        tokio::spawn(async move {
+            run_bolt_listener(listener, gateway, receiver, maximum_connections).await
+        })
+    });
 
     println!(
-        "DTGPROXY_GATEWAY_READY node={} graph={} revision={} address={} advertise={}",
+        "DTGPROXY_GATEWAY_READY node={} graph={} revision={} address={} advertise={} bolt={}",
         config.node_id(),
         config.graph_id(),
         gateway.catalog_revision()?,
         listener.local_addr()?,
-        config.advertise_address()
+        config.advertise_address(),
+        bolt_address.map_or_else(|| "disabled".into(), |address| address.to_string())
     );
     std::io::stdout().flush()?;
 
@@ -100,7 +121,54 @@ async fn run() -> Result<(), Box<dyn Error>> {
     tokio::time::timeout(config.shutdown_grace(), watcher)
         .await
         .map_err(|_| "Gateway Catalog watcher exceeded shutdown grace")??;
+    if let Some(bolt_server) = bolt_server {
+        tokio::time::timeout(config.shutdown_grace(), bolt_server)
+            .await
+            .map_err(|_| "Gateway Bolt server exceeded shutdown grace")??
+            .map_err(|error| format!("Gateway Bolt server failed: {error}"))?;
+    }
     server_result?;
+    Ok(())
+}
+
+async fn run_bolt_listener(
+    listener: tokio::net::TcpListener,
+    gateway: RemoteGatewayService,
+    mut shutdown: watch::Receiver<bool>,
+    maximum_connections: usize,
+) -> Result<(), String> {
+    let permits = Arc::new(Semaphore::new(maximum_connections));
+    let mut connections = JoinSet::new();
+    while !*shutdown.borrow() {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (mut socket, _) = accepted.map_err(|error| error.to_string())?;
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    continue;
+                };
+                let backend = Arc::new(gateway.clone());
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let Ok(service) = CypherBoltService::new(backend, 64) else {
+                        return;
+                    };
+                    let _ = serve_connection(
+                        &mut socket,
+                        Arc::new(service),
+                        BoltConnectionConfig::default(),
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     Ok(())
 }
 

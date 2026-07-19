@@ -29,6 +29,7 @@ pub struct GatewayNodeRuntimeConfig {
     node_id: u64,
     graph_id: u64,
     listen_address: SocketAddr,
+    bolt_listen_address: Option<SocketAddr>,
     advertise_address: SocketAddr,
     meta_seeds: Vec<SocketAddr>,
     data_nodes: BTreeMap<u64, SocketAddr>,
@@ -71,6 +72,11 @@ impl GatewayNodeRuntimeConfig {
     #[must_use]
     pub const fn listen_address(&self) -> SocketAddr {
         self.listen_address
+    }
+
+    #[must_use]
+    pub const fn bolt_listen_address(&self) -> Option<SocketAddr> {
+        self.bolt_listen_address
     }
 
     #[must_use]
@@ -122,6 +128,8 @@ struct RawGatewayConfig {
     node_id: u64,
     graph_id: u64,
     listen_address: SocketAddr,
+    #[serde(default)]
+    bolt_listen_address: Option<SocketAddr>,
     advertise_address: SocketAddr,
     meta_seeds: Vec<SocketAddr>,
     data_nodes: BTreeMap<u64, SocketAddr>,
@@ -144,6 +152,9 @@ impl RawGatewayConfig {
             return Err(GatewayConfigError::InvalidIdentity);
         }
         if self.listen_address.port() == 0
+            || self
+                .bolt_listen_address
+                .is_some_and(|address| address.port() == 0 || address == self.listen_address)
             || self.advertise_address.port() == 0
             || self.meta_seeds.iter().any(|address| address.port() == 0)
             || self.data_nodes.values().any(|address| address.port() == 0)
@@ -190,6 +201,9 @@ impl RawGatewayConfig {
         let transport_security = match self.security {
             RawSecurity::LoopbackPlaintext => {
                 if !self.listen_address.ip().is_loopback()
+                    || self
+                        .bolt_listen_address
+                        .is_some_and(|address| !address.ip().is_loopback())
                     || !self.advertise_address.ip().is_loopback()
                     || self
                         .meta_seeds
@@ -207,6 +221,7 @@ impl RawGatewayConfig {
             node_id: self.node_id,
             graph_id: self.graph_id,
             listen_address: self.listen_address,
+            bolt_listen_address: self.bolt_listen_address,
             advertise_address: self.advertise_address,
             meta_seeds: self.meta_seeds,
             data_nodes: self.data_nodes,

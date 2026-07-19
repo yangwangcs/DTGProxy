@@ -14,6 +14,7 @@ fn loads_a_bounded_loopback_gateway_configuration_without_a_data_directory() {
           "node_id": 31,
           "graph_id": 7,
           "listen_address": "127.0.0.1:7301",
+          "bolt_listen_address": "127.0.0.1:7687",
           "advertise_address": "127.0.0.1:7301",
           "meta_seeds": ["127.0.0.1:7001"],
           "data_nodes": {"10": "127.0.0.1:7100", "20": "127.0.0.1:7200"},
@@ -29,6 +30,10 @@ fn loads_a_bounded_loopback_gateway_configuration_without_a_data_directory() {
     let config = GatewayNodeRuntimeConfig::load(path).unwrap();
     assert_eq!(config.node_id(), 31);
     assert_eq!(config.graph_id(), 7);
+    assert_eq!(
+        config.bolt_listen_address(),
+        Some("127.0.0.1:7687".parse().unwrap())
+    );
     assert_eq!(config.data_nodes().len(), 2);
     assert_eq!(config.maximum_inflight(), 256);
     assert_eq!(config.max_raft_ticks(), 128);
