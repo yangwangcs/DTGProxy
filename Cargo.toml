@@ -29,6 +29,7 @@ members = [
     "crates/temporal-query",
     "crates/cypher-ast",
     "crates/cypher-syntax",
+    "crates/cypher-sema",
     "crates/dtgproxy",
 ]
 resolver = "3"

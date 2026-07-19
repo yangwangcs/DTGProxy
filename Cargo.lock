@@ -399,6 +399,14 @@ name = "cypher-ast"
 version = "1.0.0"
 
 [[package]]
+name = "cypher-sema"
+version = "1.0.0"
+dependencies = [
+ "cypher-ast",
+ "cypher-syntax",
+]
+
+[[package]]
 name = "cypher-syntax"
 version = "1.0.0"
 dependencies = [
