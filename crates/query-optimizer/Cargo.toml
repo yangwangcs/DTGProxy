@@ -1,0 +1,17 @@
+[package]
+name = "query-optimizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+physical-plan = { path = "../physical-plan" }
+temporal-ir = { path = "../temporal-ir" }
+temporal-types = { path = "../temporal-types" }
+
+[dev-dependencies]
+cypher-compiler = { path = "../cypher-compiler" }
+
+[lints]
+workspace = true

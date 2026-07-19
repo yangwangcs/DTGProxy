@@ -1367,6 +1367,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "physical-plan"
+version = "1.0.0"
+dependencies = [
+ "temporal-ir",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1646,6 +1653,16 @@ dependencies = [
  "tempfile",
  "temporal-ir",
  "temporal-storage",
+ "temporal-types",
+]
+
+[[package]]
+name = "query-optimizer"
+version = "1.0.0"
+dependencies = [
+ "cypher-compiler",
+ "physical-plan",
+ "temporal-ir",
  "temporal-types",
 ]
 

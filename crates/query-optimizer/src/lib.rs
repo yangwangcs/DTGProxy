@@ -1,0 +1,293 @@
+#![forbid(unsafe_code)]
+
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+
+use physical_plan::{
+    ExchangeKind, MemoryBudget, PhysicalOperator, PhysicalPlan, PhysicalPlanBuilder,
+    PhysicalPlanHeaderV1, Placement,
+};
+use temporal_ir::v2::{LogicalOperator, LogicalPlan};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeploymentMode {
+    PrimaryReplica,
+    SharedNothing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OptimizerContext {
+    mode: DeploymentMode,
+    shard_count: u32,
+    memory_bytes: u64,
+    spill_bytes: u64,
+}
+
+impl OptimizerContext {
+    pub fn new(
+        mode: DeploymentMode,
+        shard_count: u32,
+        memory_bytes: u64,
+        spill_bytes: u64,
+    ) -> Result<Self, OptimizerError> {
+        if shard_count == 0 || memory_bytes == 0 || spill_bytes == 0 {
+            return Err(OptimizerError::InvalidContext);
+        }
+        if mode == DeploymentMode::PrimaryReplica && shard_count != 1 {
+            return Err(OptimizerError::InvalidContext);
+        }
+        Ok(Self {
+            mode,
+            shard_count,
+            memory_bytes,
+            spill_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceEvent {
+    rule: &'static str,
+    detail: String,
+}
+
+impl TraceEvent {
+    #[must_use]
+    pub fn rule(&self) -> &str {
+        self.rule
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptimizedPlan {
+    plan: PhysicalPlan,
+    trace: Vec<TraceEvent>,
+}
+
+impl OptimizedPlan {
+    #[must_use]
+    pub const fn plan(&self) -> &PhysicalPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub fn trace(&self) -> &[TraceEvent] {
+        &self.trace
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Optimizer;
+
+impl Optimizer {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    pub fn optimize(
+        &self,
+        logical: &LogicalPlan,
+        context: OptimizerContext,
+    ) -> Result<OptimizedPlan, OptimizerError> {
+        logical
+            .validate()
+            .map_err(|error| OptimizerError::Logical(error.to_string()))?;
+        let header = PhysicalPlanHeaderV1::new(
+            logical.header().graph_id(),
+            logical.header().schema_version(),
+            logical.header().topology_epoch(),
+            logical.header().query_fingerprint(),
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+        let budget = MemoryBudget::new(context.memory_bytes, context.spill_bytes)
+            .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+        match context.mode {
+            DeploymentMode::PrimaryReplica => optimize_primary(logical, header, budget),
+            DeploymentMode::SharedNothing => optimize_shared(logical, header, budget, context),
+        }
+    }
+}
+
+fn optimize_primary(
+    logical: &LogicalPlan,
+    header: PhysicalPlanHeaderV1,
+    budget: MemoryBudget,
+) -> Result<OptimizedPlan, OptimizerError> {
+    let operators = logical
+        .nodes()
+        .iter()
+        .map(|node| physical(node.operator()))
+        .collect();
+    let mut builder = PhysicalPlanBuilder::new(header);
+    let root = builder
+        .add_fragment(
+            Placement::Shard(0),
+            operators,
+            logical.output().clone(),
+            budget,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let plan = builder
+        .finish(root)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    Ok(OptimizedPlan {
+        plan,
+        trace: vec![TraceEvent {
+            rule: "primary-replica-local-plan",
+            detail: "all operators execute on the primary shard".into(),
+        }],
+    })
+}
+
+fn optimize_shared(
+    logical: &LogicalPlan,
+    header: PhysicalPlanHeaderV1,
+    budget: MemoryBudget,
+    context: OptimizerContext,
+) -> Result<OptimizedPlan, OptimizerError> {
+    let split = logical
+        .nodes()
+        .iter()
+        .position(|node| matches!(node.operator(), LogicalOperator::Project { .. }))
+        .unwrap_or(logical.nodes().len());
+    if split == 0 {
+        return optimize_coordinator_only(logical, header, budget);
+    }
+    let shard_operators = logical.nodes()[..split]
+        .iter()
+        .map(|node| physical(node.operator()))
+        .collect::<Vec<_>>();
+    let shard_output = logical.nodes()[split - 1].output().clone();
+    let coordinator_operators = if split < logical.nodes().len() {
+        logical.nodes()[split..]
+            .iter()
+            .map(|node| physical(node.operator()))
+            .collect::<Vec<_>>()
+    } else {
+        vec![PhysicalOperator::Project]
+    };
+    let mut builder = PhysicalPlanBuilder::new(header);
+    let shard = builder
+        .add_fragment(
+            Placement::AllShards,
+            shard_operators,
+            shard_output.clone(),
+            budget,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let coordinator = builder
+        .add_fragment(
+            Placement::Coordinator,
+            coordinator_operators,
+            logical.output().clone(),
+            budget,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    builder
+        .add_exchange(shard, coordinator, ExchangeKind::Gather, shard_output, 8)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let plan = builder
+        .finish(coordinator)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    Ok(OptimizedPlan {
+        plan,
+        trace: vec![TraceEvent {
+            rule: "partition-local-graph-operators",
+            detail: format!(
+                "scan/expand/filter run on {} shards before bounded gather",
+                context.shard_count
+            ),
+        }],
+    })
+}
+
+fn optimize_coordinator_only(
+    logical: &LogicalPlan,
+    header: PhysicalPlanHeaderV1,
+    budget: MemoryBudget,
+) -> Result<OptimizedPlan, OptimizerError> {
+    let mut builder = PhysicalPlanBuilder::new(header);
+    let root = builder
+        .add_fragment(
+            Placement::Coordinator,
+            logical
+                .nodes()
+                .iter()
+                .map(|node| physical(node.operator()))
+                .collect(),
+            logical.output().clone(),
+            budget,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let plan = builder
+        .finish(root)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    Ok(OptimizedPlan {
+        plan,
+        trace: vec![TraceEvent {
+            rule: "coordinator-only-plan",
+            detail: "plan has no partition-local prefix".into(),
+        }],
+    })
+}
+
+fn physical(operator: &LogicalOperator) -> PhysicalOperator {
+    match operator {
+        LogicalOperator::Argument => PhysicalOperator::Argument,
+        LogicalOperator::NodeScan { labels, .. } => PhysicalOperator::NodeScan {
+            labels: labels.clone(),
+        },
+        LogicalOperator::RelationshipScan { types, .. } => PhysicalOperator::RelationshipScan {
+            types: types.clone(),
+        },
+        LogicalOperator::Expand { .. } => PhysicalOperator::Expand,
+        LogicalOperator::Filter { predicate } => PhysicalOperator::Filter(predicate.clone()),
+        LogicalOperator::Project { .. } => PhysicalOperator::Project,
+        LogicalOperator::Aggregate { .. } => PhysicalOperator::Aggregate,
+        LogicalOperator::Sort { .. } => PhysicalOperator::Sort,
+        LogicalOperator::Limit { count } => match count {
+            temporal_ir::v2::ScalarExpr::Literal(temporal_types::GraphValue::Integer(value)) => {
+                PhysicalOperator::TopN {
+                    limit: u64::try_from(*value).unwrap_or(0),
+                }
+            }
+            _ => PhysicalOperator::TopN { limit: 0 },
+        },
+        LogicalOperator::TemporalSlice => PhysicalOperator::TemporalSlice,
+        LogicalOperator::Diff => PhysicalOperator::Diff,
+        LogicalOperator::ProcedureCall { procedure_id } => PhysicalOperator::Procedure {
+            procedure_id: *procedure_id,
+        },
+        LogicalOperator::Finish => PhysicalOperator::Finish,
+        LogicalOperator::Create
+        | LogicalOperator::Merge
+        | LogicalOperator::Set
+        | LogicalOperator::Remove
+        | LogicalOperator::Delete { .. } => PhysicalOperator::Write,
+        LogicalOperator::Skip { .. }
+        | LogicalOperator::InnerJoin
+        | LogicalOperator::LeftJoin
+        | LogicalOperator::Union { .. } => PhysicalOperator::Project,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OptimizerError {
+    InvalidContext,
+    Logical(String),
+    Physical(String),
+}
+
+impl Display for OptimizerError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(formatter, "query optimization failed: {self:?}")
+    }
+}
+
+impl Error for OptimizerError {}

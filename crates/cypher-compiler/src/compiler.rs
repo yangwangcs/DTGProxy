@@ -389,7 +389,7 @@ impl Lowerer {
                 }),
             Expression::List(items) => items
                 .iter()
-                .map(|item| literal_value(item))
+                .map(literal_value)
                 .collect::<Result<Vec<_>, _>>()
                 .map(GraphValue::List)
                 .map(ScalarExpr::Literal),
