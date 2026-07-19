@@ -33,6 +33,7 @@ pub enum LogicalOperator {
         relationship: SlotId,
         destination: SlotId,
         outgoing: bool,
+        types: Vec<u32>,
     },
     Filter {
         predicate: ScalarExpr,

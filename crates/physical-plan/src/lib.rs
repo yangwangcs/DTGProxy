@@ -167,6 +167,7 @@ pub enum PhysicalOperator {
         relationship: SlotId,
         destination: SlotId,
         outgoing: bool,
+        types: Vec<u32>,
         output: RowSchema,
     },
     Filter(ScalarExpr),

@@ -691,6 +691,44 @@ where
         })
     }
 
+    pub fn vertex_view_current<'a>(
+        &'a self,
+        element: ElementRef,
+        valid_time: ValidTime,
+    ) -> TemporalStoreFuture<'a, Option<VertexView>> {
+        Box::pin(async move {
+            let Some(payload) = self.vertex_current(element, valid_time).await? else {
+                return Ok(None);
+            };
+            let identity = self
+                .load_vertex_identity(element)
+                .await?
+                .ok_or(TemporalStoreError::IdentityMismatch)?;
+            Ok(Some(vertex_view(identity, payload)))
+        })
+    }
+
+    pub fn vertex_view_as_of<'a>(
+        &'a self,
+        element: ElementRef,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Option<VertexView>> {
+        Box::pin(async move {
+            let Some(payload) = self
+                .vertex_as_of(element, valid_time, transaction_time)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let identity = self
+                .load_vertex_identity(element)
+                .await?
+                .ok_or(TemporalStoreError::IdentityMismatch)?;
+            Ok(Some(vertex_view(identity, payload)))
+        })
+    }
+
     pub fn edge_current<'a>(
         &'a self,
         element: ElementRef,

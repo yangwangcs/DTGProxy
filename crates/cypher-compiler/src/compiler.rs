@@ -299,19 +299,27 @@ impl Lowerer {
                 }
                 self.schema = RowSchema::new(columns)?;
                 let input = self.ensure_root()?;
-                self.root = Some(self.builder.add(
-                    LogicalOperator::Expand {
-                        source: current_source,
-                        relationship,
-                        destination,
-                        outgoing: !matches!(
-                            chain.relationship().direction(),
-                            cypher_ast::RelationshipDirection::Incoming
-                        ),
-                    },
-                    vec![input],
-                    self.schema.clone(),
-                )?);
+                self.root = Some(
+                    self.builder.add(
+                        LogicalOperator::Expand {
+                            source: current_source,
+                            relationship,
+                            destination,
+                            outgoing: !matches!(
+                                chain.relationship().direction(),
+                                cypher_ast::RelationshipDirection::Incoming
+                            ),
+                            types: chain
+                                .relationship()
+                                .types()
+                                .iter()
+                                .map(|relationship_type| stable_id(relationship_type.value()))
+                                .collect(),
+                        },
+                        vec![input],
+                        self.schema.clone(),
+                    )?,
+                );
                 current_source = destination;
             }
         }

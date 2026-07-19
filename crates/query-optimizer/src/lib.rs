@@ -250,11 +250,13 @@ fn physical(node: &LogicalNode) -> PhysicalOperator {
             relationship,
             destination,
             outgoing,
+            types,
         } => PhysicalOperator::Expand {
             source: *source,
             relationship: *relationship,
             destination: *destination,
             outgoing: *outgoing,
+            types: types.clone(),
             output: node.output().clone(),
         },
         LogicalOperator::Filter { predicate } => PhysicalOperator::Filter(predicate.clone()),

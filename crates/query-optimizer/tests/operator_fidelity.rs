@@ -44,12 +44,14 @@ fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
                     relationship,
                     destination,
                     outgoing,
+                    types,
                 },
                 PhysicalOperator::Expand {
                     source: actual_source,
                     relationship: actual_relationship,
                     destination: actual_destination,
                     outgoing: actual_outgoing,
+                    types: actual_types,
                     output,
                 },
             ) => {
@@ -57,6 +59,7 @@ fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
                 assert_eq!(actual_relationship, relationship);
                 assert_eq!(actual_destination, destination);
                 assert_eq!(actual_outgoing, outgoing);
+                assert_eq!(actual_types, types);
                 assert_eq!(output, logical.output());
             }
             (
