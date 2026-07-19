@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod distributed;
+#[cfg(feature = "shard-runtime")]
 mod shard_query;
+pub mod v2;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -24,6 +26,7 @@ use temporal_types::{CanonicalElement, CodecError};
 pub use distributed::{
     DistributedQueryError, ShardQueryBatch, SnapshotToken, merge_distributed_results,
 };
+#[cfg(feature = "shard-runtime")]
 pub use shard_query::{ShardQueryError, ShardQueryExecutor};
 
 pub type ExecutorFuture<'a, T> =

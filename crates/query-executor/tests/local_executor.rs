@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
+#[cfg(feature = "rocksdb-tests")]
 use adapter_rocksdb::RocksAdapter;
 use query_executor::{ExecutorError, LocalExecutor, QueryRecord};
 use temporal_ir::{
@@ -140,6 +141,7 @@ fn executor_validates_the_complete_plan_before_touching_storage() {
 }
 
 #[test]
+#[cfg(feature = "rocksdb-tests")]
 fn the_same_typed_plan_executes_against_a_rocksdb_checkpoint() {
     let source = tempfile::tempdir().unwrap();
     let checkpoint_root = tempfile::tempdir().unwrap();

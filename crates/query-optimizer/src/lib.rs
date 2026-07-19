@@ -4,8 +4,8 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use physical_plan::{
-    ExchangeKind, MemoryBudget, PhysicalOperator, PhysicalPlan, PhysicalPlanBuilder,
-    PhysicalPlanHeaderV1, Placement,
+    ExchangeKind, JoinKind, MemoryBudget, PhysicalOperator, PhysicalPlan, PhysicalPlanBuilder,
+    PhysicalPlanHeaderV1, Placement, WriteOperation,
 };
 use temporal_ir::v2::{LogicalOperator, LogicalPlan};
 
@@ -170,7 +170,7 @@ fn optimize_shared(
             .map(|node| physical(node.operator()))
             .collect::<Vec<_>>()
     } else {
-        vec![PhysicalOperator::Project]
+        vec![PhysicalOperator::Finish]
     };
     let mut builder = PhysicalPlanBuilder::new(header);
     let shard = builder
@@ -240,40 +240,75 @@ fn optimize_coordinator_only(
 fn physical(operator: &LogicalOperator) -> PhysicalOperator {
     match operator {
         LogicalOperator::Argument => PhysicalOperator::Argument,
-        LogicalOperator::NodeScan { labels, .. } => PhysicalOperator::NodeScan {
+        LogicalOperator::NodeScan { binding, labels } => PhysicalOperator::NodeScan {
+            binding: *binding,
             labels: labels.clone(),
         },
-        LogicalOperator::RelationshipScan { types, .. } => PhysicalOperator::RelationshipScan {
-            types: types.clone(),
-        },
-        LogicalOperator::Expand { .. } => PhysicalOperator::Expand,
-        LogicalOperator::Filter { predicate } => PhysicalOperator::Filter(predicate.clone()),
-        LogicalOperator::Project { .. } => PhysicalOperator::Project,
-        LogicalOperator::Aggregate { .. } => PhysicalOperator::Aggregate,
-        LogicalOperator::Sort { .. } => PhysicalOperator::Sort,
-        LogicalOperator::Limit { count } => match count {
-            temporal_ir::v2::ScalarExpr::Literal(temporal_types::GraphValue::Integer(value)) => {
-                PhysicalOperator::TopN {
-                    limit: u64::try_from(*value).unwrap_or(0),
-                }
+        LogicalOperator::RelationshipScan { binding, types } => {
+            PhysicalOperator::RelationshipScan {
+                binding: *binding,
+                types: types.clone(),
             }
-            _ => PhysicalOperator::TopN { limit: 0 },
+        }
+        LogicalOperator::Expand {
+            source,
+            relationship,
+            destination,
+            outgoing,
+        } => PhysicalOperator::Expand {
+            source: *source,
+            relationship: *relationship,
+            destination: *destination,
+            outgoing: *outgoing,
         },
+        LogicalOperator::Filter { predicate } => PhysicalOperator::Filter(predicate.clone()),
+        LogicalOperator::Project { expressions } => PhysicalOperator::Project {
+            expressions: expressions.clone(),
+        },
+        LogicalOperator::Aggregate {
+            grouping,
+            aggregates,
+        } => PhysicalOperator::Aggregate {
+            grouping: grouping.clone(),
+            aggregates: aggregates.clone(),
+        },
+        LogicalOperator::Sort { keys } => PhysicalOperator::Sort { keys: keys.clone() },
+        LogicalOperator::Skip { count } => PhysicalOperator::Skip {
+            count: count.clone(),
+        },
+        LogicalOperator::Limit { count } => PhysicalOperator::Limit {
+            count: count.clone(),
+        },
+        LogicalOperator::InnerJoin => PhysicalOperator::HashJoin {
+            kind: JoinKind::Inner,
+            keys: Vec::new(),
+        },
+        LogicalOperator::LeftJoin => PhysicalOperator::HashJoin {
+            kind: JoinKind::Left,
+            keys: Vec::new(),
+        },
+        LogicalOperator::Union { all } => PhysicalOperator::Union { all: *all },
         LogicalOperator::TemporalSlice => PhysicalOperator::TemporalSlice,
         LogicalOperator::Diff => PhysicalOperator::Diff,
         LogicalOperator::ProcedureCall { procedure_id } => PhysicalOperator::Procedure {
             procedure_id: *procedure_id,
         },
         LogicalOperator::Finish => PhysicalOperator::Finish,
-        LogicalOperator::Create
-        | LogicalOperator::Merge
-        | LogicalOperator::Set
-        | LogicalOperator::Remove
-        | LogicalOperator::Delete { .. } => PhysicalOperator::Write,
-        LogicalOperator::Skip { .. }
-        | LogicalOperator::InnerJoin
-        | LogicalOperator::LeftJoin
-        | LogicalOperator::Union { .. } => PhysicalOperator::Project,
+        LogicalOperator::Create => PhysicalOperator::Write {
+            operation: WriteOperation::Create,
+        },
+        LogicalOperator::Merge => PhysicalOperator::Write {
+            operation: WriteOperation::Merge,
+        },
+        LogicalOperator::Set => PhysicalOperator::Write {
+            operation: WriteOperation::Set,
+        },
+        LogicalOperator::Remove => PhysicalOperator::Write {
+            operation: WriteOperation::Remove,
+        },
+        LogicalOperator::Delete { detach } => PhysicalOperator::Write {
+            operation: WriteOperation::Delete { detach: *detach },
+        },
     }
 }
 

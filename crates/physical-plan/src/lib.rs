@@ -135,21 +135,69 @@ impl MemoryBudget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WriteOperation {
+    Create,
+    Merge,
+    Set,
+    Remove,
+    Delete { detach: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PhysicalOperator {
     Argument,
-    NodeScan { labels: Vec<u32> },
-    RelationshipScan { types: Vec<u32> },
-    Expand,
+    NodeScan {
+        binding: SlotId,
+        labels: Vec<u32>,
+    },
+    RelationshipScan {
+        binding: SlotId,
+        types: Vec<u32>,
+    },
+    Expand {
+        source: SlotId,
+        relationship: SlotId,
+        destination: SlotId,
+        outgoing: bool,
+    },
     Filter(ScalarExpr),
-    Project,
-    HashJoin { keys: Vec<SlotId> },
-    Aggregate,
-    Sort,
-    TopN { limit: u64 },
+    Project {
+        expressions: Vec<(SlotId, ScalarExpr)>,
+    },
+    HashJoin {
+        kind: JoinKind,
+        keys: Vec<SlotId>,
+    },
+    Aggregate {
+        grouping: Vec<SlotId>,
+        aggregates: Vec<(SlotId, ScalarExpr)>,
+    },
+    Sort {
+        keys: Vec<SlotId>,
+    },
+    Skip {
+        count: ScalarExpr,
+    },
+    Limit {
+        count: ScalarExpr,
+    },
+    Union {
+        all: bool,
+    },
     TemporalSlice,
     Diff,
-    Write,
-    Procedure { procedure_id: u32 },
+    Write {
+        operation: WriteOperation,
+    },
+    Procedure {
+        procedure_id: u32,
+    },
     Finish,
 }
 

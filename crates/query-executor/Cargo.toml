@@ -5,18 +5,28 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["shard-runtime"]
+shard-runtime = ["dep:shard-runtime"]
+rocksdb-tests = ["dep:adapter-rocksdb", "dep:tempfile"]
+
 [dependencies]
-shard-runtime = { path = "../shard-runtime" }
+adapter-rocksdb = { path = "../adapter-rocksdb", optional = true }
+physical-plan = { path = "../physical-plan" }
+shard-runtime = { path = "../shard-runtime", optional = true }
 storage-api = { path = "../storage-api" }
 temporal-ir = { path = "../temporal-ir" }
 temporal-storage = { path = "../temporal-storage" }
 temporal-types = { path = "../temporal-types" }
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }
-adapter-rocksdb = { path = "../adapter-rocksdb" }
 raft-command = { path = "../raft-command" }
-tempfile = "3"
+
+[[test]]
+name = "shard_read"
+required-features = ["shard-runtime"]
 
 [lints]
 workspace = true

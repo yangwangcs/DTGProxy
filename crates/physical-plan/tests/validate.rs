@@ -24,7 +24,10 @@ fn validates_a_fragment_dag_with_bounded_exchange() {
     let shard = builder
         .add_fragment(
             Placement::AllShards,
-            vec![PhysicalOperator::NodeScan { labels: vec![42] }],
+            vec![PhysicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: vec![42],
+            }],
             schema(),
             MemoryBudget::new(64 * 1024 * 1024, 256 * 1024 * 1024).expect("budget"),
         )
@@ -32,7 +35,12 @@ fn validates_a_fragment_dag_with_bounded_exchange() {
     let coordinator = builder
         .add_fragment(
             Placement::Coordinator,
-            vec![PhysicalOperator::Project],
+            vec![PhysicalOperator::Project {
+                expressions: vec![(
+                    SlotId::new(0),
+                    temporal_ir::v2::ScalarExpr::Slot(SlotId::new(0)),
+                )],
+            }],
             schema(),
             MemoryBudget::new(32 * 1024 * 1024, 64 * 1024 * 1024).expect("budget"),
         )
@@ -52,7 +60,12 @@ fn rejects_backward_exchange_edges() {
     let first = builder
         .add_fragment(
             Placement::Coordinator,
-            vec![PhysicalOperator::Project],
+            vec![PhysicalOperator::Project {
+                expressions: vec![(
+                    SlotId::new(0),
+                    temporal_ir::v2::ScalarExpr::Slot(SlotId::new(0)),
+                )],
+            }],
             schema(),
             MemoryBudget::new(1, 1).expect("budget"),
         )
@@ -60,7 +73,12 @@ fn rejects_backward_exchange_edges() {
     let second = builder
         .add_fragment(
             Placement::Coordinator,
-            vec![PhysicalOperator::Project],
+            vec![PhysicalOperator::Project {
+                expressions: vec![(
+                    SlotId::new(0),
+                    temporal_ir::v2::ScalarExpr::Slot(SlotId::new(0)),
+                )],
+            }],
             schema(),
             MemoryBudget::new(1, 1).expect("budget"),
         )

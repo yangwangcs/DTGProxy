@@ -42,6 +42,21 @@ impl CanonicalElement {
         }
     }
 
+    #[must_use]
+    pub const fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn properties(&self) -> &BTreeMap<u32, GraphValue> {
+        &self.properties
+    }
+
+    #[must_use]
+    pub fn property(&self, property_id: u32) -> Option<&GraphValue> {
+        self.properties.get(&property_id)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
