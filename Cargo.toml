@@ -27,6 +27,8 @@ members = [
     "crates/temporal-ir",
     "crates/query-executor",
     "crates/temporal-query",
+    "crates/cypher-ast",
+    "crates/cypher-syntax",
     "crates/dtgproxy",
 ]
 resolver = "3"
