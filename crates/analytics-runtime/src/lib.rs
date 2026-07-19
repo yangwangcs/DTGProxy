@@ -3,11 +3,13 @@
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use analytics_api::{EventGraph, GraphProjectionError, SnapshotEdge, SnapshotGraph, VertexId};
+use analytics_api::{
+    EventEdge, EventGraph, GraphProjectionError, SnapshotEdge, SnapshotGraph, VertexId,
+};
 use storage_api::StorageAdapter;
 use temporal_storage::{GraphId, TemporalStore};
 use temporal_types::ValidTime;
@@ -76,11 +78,72 @@ where
     Ok((vertices, edges))
 }
 
+pub async fn project_event<A>(
+    store: &TemporalStore<A>,
+    graph: GraphId,
+    transaction_time: TransactionTime,
+    event_time_property: Option<u32>,
+    duration_property: Option<u32>,
+    max_events: usize,
+) -> Result<EventGraph, ProjectionError>
+where
+    A: StorageAdapter,
+{
+    if max_events == 0 {
+        return Err(ProjectionError::InvalidEventLimit);
+    }
+    let history = store
+        .scan_edge_history_as_of(graph, transaction_time)
+        .await
+        .map_err(|error| ProjectionError::Storage(error.to_string()))?;
+    let mut vertices = BTreeSet::new();
+    let mut events = Vec::new();
+    for (identity, version) in history {
+        let Some(payload) = version.replacement() else {
+            continue;
+        };
+        let event_time = event_time_property
+            .and_then(|property| payload.property(property))
+            .and_then(|value| match value {
+                GraphValue::TimestampMicros(value) => Some(ValidTime::from_micros(*value)),
+                GraphValue::Integer(value) => Some(ValidTime::from_micros(*value)),
+                _ => None,
+            })
+            .unwrap_or_else(|| ValidTime::from_micros(version.changed_valid().start().as_micros()));
+        let duration = duration_property
+            .and_then(|property| payload.property(property))
+            .and_then(|value| match value {
+                GraphValue::Integer(value) => u64::try_from(*value)
+                    .ok()
+                    .and_then(|value| i64::try_from(value).ok()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        vertices.insert(VertexId::new(identity.source().value()));
+        vertices.insert(VertexId::new(identity.destination().value()));
+        events.push(
+            EventEdge::new(
+                VertexId::new(identity.source().value()),
+                VertexId::new(identity.destination().value()),
+                event_time,
+                duration,
+                1.0,
+            )
+            .map_err(ProjectionError::Graph)?,
+        );
+        if events.len() >= max_events {
+            break;
+        }
+    }
+    EventGraph::new(vertices.into_iter().collect(), events).map_err(ProjectionError::Graph)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectionError {
     Storage(String),
     Graph(GraphProjectionError),
     InvalidWeightProperty,
+    InvalidEventLimit,
 }
 
 impl Display for ProjectionError {

@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bolt_protocol::ClientMessage;
+use bolt_server::{BoltMachine, ServerMessage};
 use cluster_protocol::CLUSTER_PROTOCOL_VERSION;
 use cluster_protocol::proto::gateway_service_client::GatewayServiceClient;
 use cluster_protocol::proto::gateway_service_server::GatewayServiceServer;
@@ -12,6 +14,7 @@ use cluster_protocol::proto::{GatewaySubmitRequest, ProposeRequest, RequestConte
 use control_plane::{
     BackendProfile, CatalogCommand, DeploymentMode, GraphDefinition, Placement, TopologyDefinition,
 };
+use cypher_engine::CypherBoltService;
 use data_node::{
     DataNodeGrpcService, DataNodeHost, NodeConfig, NodeIdentity, ReplicaKey, ReplicaRole,
     ReplicaSpec, TransportSecurity,
@@ -236,6 +239,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_address = gateway_listener.local_addr().unwrap();
     let (gateway_shutdown, gateway_shutdown_rx) = tokio::sync::oneshot::channel();
+    let bolt_gateway = gateway.clone();
     let gateway_server = tokio::spawn(
         Server::builder()
             .add_service(GatewayServiceServer::new(gateway))
@@ -358,6 +362,59 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     assert_eq!(analytics["result"]["kind"], "analytics_result");
     assert_eq!(analytics["result"]["columns"][0], "vertexId");
     assert!(analytics["result"]["rows"].as_array().unwrap().len() >= 2);
+
+    let bolt_service = Arc::new(CypherBoltService::new(Arc::new(bolt_gateway), 16).unwrap());
+    let mut bolt = BoltMachine::new(bolt_service);
+    assert!(matches!(
+        bolt.handle(ClientMessage::Hello(BTreeMap::new()))
+            .await
+            .as_slice(),
+        [ServerMessage::Success(_)]
+    ));
+    assert!(matches!(
+        bolt.handle(ClientMessage::Begin(BTreeMap::new()))
+            .await
+            .as_slice(),
+        [ServerMessage::Success(_)]
+    ));
+    let staged = bolt
+        .handle(ClientMessage::Run {
+            query: "CREATE (rolled_back:Person {name: 'Rollback'})".into(),
+            parameters: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        })
+        .await;
+    assert!(matches!(staged.as_slice(), [ServerMessage::Success(_)]));
+    let _ = bolt
+        .handle(ClientMessage::Pull {
+            n: -1,
+            query_id: None,
+        })
+        .await;
+    assert!(matches!(
+        bolt.handle(ClientMessage::Rollback).await.as_slice(),
+        [ServerMessage::Success(_)]
+    ));
+    let committed = bolt.handle(ClientMessage::Begin(BTreeMap::new())).await;
+    assert!(matches!(committed.as_slice(), [ServerMessage::Success(_)]));
+    let staged = bolt
+        .handle(ClientMessage::Run {
+            query: "CREATE (committed:Person {name: 'Committed'})".into(),
+            parameters: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        })
+        .await;
+    assert!(matches!(staged.as_slice(), [ServerMessage::Success(_)]));
+    let _ = bolt
+        .handle(ClientMessage::Discard {
+            n: -1,
+            query_id: None,
+        })
+        .await;
+    assert!(matches!(
+        bolt.handle(ClientMessage::Commit).await.as_slice(),
+        [ServerMessage::Success(_)]
+    ));
 
     drop(client);
     gateway_shutdown.send(()).unwrap();

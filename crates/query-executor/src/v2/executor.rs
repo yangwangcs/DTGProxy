@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use physical_plan::{PhysicalOperator, PlanFragment};
 use temporal_ir::v2::{RowSchema, ScalarExpr};
 
@@ -59,6 +61,7 @@ impl BatchExecutor {
                 }
                 PhysicalOperator::Skip { count } => skip(batches, row_count(count, context)?)?,
                 PhysicalOperator::Limit { count } => limit(batches, row_count(count, context)?)?,
+                PhysicalOperator::Sort { keys } => sort(batches, keys)?,
                 PhysicalOperator::TemporalSlice { .. } | PhysicalOperator::Finish => batches,
                 PhysicalOperator::NodeScan { .. } => {
                     return Err(RuntimeError::UnsupportedOperator("NodeScan"));
@@ -97,6 +100,59 @@ impl BatchExecutor {
             return Err(RuntimeError::OutputSchemaMismatch);
         }
         Ok(batches)
+    }
+}
+
+fn sort(
+    batches: Vec<RecordBatch>,
+    keys: &[temporal_ir::v2::SlotId],
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema().clone();
+    let key_indices = keys
+        .iter()
+        .map(|slot| {
+            schema
+                .columns()
+                .iter()
+                .position(|column| column.slot() == *slot)
+                .ok_or(RuntimeError::MissingSlot(*slot))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows = batches
+        .into_iter()
+        .flat_map(RecordBatch::into_rows)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        key_indices
+            .iter()
+            .map(|index| compare_values(&left[*index], &right[*index]))
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    });
+    Ok(vec![RecordBatch::try_new(schema, rows)?])
+}
+
+fn compare_values(left: &RuntimeValue, right: &RuntimeValue) -> Ordering {
+    use RuntimeValue as Value;
+    match (left, right) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
+        (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+        (Value::FloatBits(left), Value::FloatBits(right)) => {
+            f64::from_bits(*left).total_cmp(&f64::from_bits(*right))
+        }
+        (Value::String(left), Value::String(right)) => left.cmp(right),
+        (Value::TimestampMicros(left), Value::TimestampMicros(right)) => left.cmp(right),
+        (Value::Node(left), Value::Node(right)) => left.element().cmp(&right.element()),
+        (Value::Relationship(left), Value::Relationship(right)) => {
+            left.element().cmp(&right.element())
+        }
+        (left, right) => left.kind().cmp(right.kind()),
     }
 }
 

@@ -971,6 +971,36 @@ where
         })
     }
 
+    pub fn scan_edge_history_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<(EdgeIdentity, HistoryEntry)>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Identity,
+                    edge_identity_graph_prefix(graph),
+                ))
+                .await?;
+            let mut history = Vec::new();
+            for entry in entries {
+                let GraphKey::EdgeIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedEdgeIdentityKey);
+                };
+                let identity = EdgeIdentity::decode(entry.value())?;
+                for version in self
+                    .load_history_chain_at(element, transaction_time)
+                    .await?
+                {
+                    history.push((identity.clone(), version));
+                }
+            }
+            Ok(history)
+        })
+    }
+
     pub fn expand_out_current<'a>(
         &'a self,
         graph: GraphId,

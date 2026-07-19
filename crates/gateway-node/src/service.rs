@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use analytics_api::{
@@ -49,6 +49,7 @@ pub struct RemoteGatewayService {
     admission: Arc<AdmissionController>,
     max_raft_ticks: usize,
     bolt_request_sequence: Arc<AtomicU64>,
+    bolt_transactions: Arc<Mutex<BTreeMap<u64, PendingBoltTransaction>>>,
 }
 
 #[derive(Clone)]
@@ -56,6 +57,19 @@ struct GatewayRoutingState {
     revision: u64,
     graph: GraphDefinition,
     deployment: Arc<DeploymentConfig>,
+}
+
+struct PreparedCypherWrite {
+    context: TransactionContext,
+    scoped: Vec<dtgproxy::ScopedTemporalTransaction>,
+    bindings: Map<String, Value>,
+    fingerprint: [u8; 32],
+}
+
+struct PendingBoltTransaction {
+    routing: GatewayRoutingState,
+    deadline_unix_ms: u64,
+    writes: Vec<PreparedCypherWrite>,
 }
 
 impl RemoteGatewayService {
@@ -114,6 +128,7 @@ impl RemoteGatewayService {
             ),
             max_raft_ticks,
             bolt_request_sequence: Arc::new(AtomicU64::new(1)),
+            bolt_transactions: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -316,6 +331,21 @@ impl RemoteGatewayService {
         compiled: &cypher_compiler::CompiledQuery,
         parameters: BTreeMap<String, RuntimeValue>,
     ) -> Result<Value, RemoteGatewayServiceError> {
+        let prepared = self
+            .prepare_cypher_write(request_id, deadline_unix_ms, routing, compiled, parameters)
+            .await?;
+        self.commit_prepared_cypher_write(routing, deadline_unix_ms, prepared)
+            .await
+    }
+
+    async fn prepare_cypher_write(
+        &self,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        routing: &GatewayRoutingState,
+        compiled: &cypher_compiler::CompiledQuery,
+        parameters: BTreeMap<String, RuntimeValue>,
+    ) -> Result<PreparedCypherWrite, RemoteGatewayServiceError> {
         let (start_ts, commit_ts) = self
             .allocate_transaction_timestamps(request_id, deadline_unix_ms)
             .await?;
@@ -369,6 +399,20 @@ impl RemoteGatewayService {
             60_000_000,
         )
         .map_err(|error| RemoteGatewayServiceError::Transaction(error.to_string()))?;
+        Ok(PreparedCypherWrite {
+            context,
+            scoped,
+            bindings,
+            fingerprint: compiled.fingerprint(),
+        })
+    }
+
+    async fn commit_prepared_cypher_write(
+        &self,
+        routing: &GatewayRoutingState,
+        deadline_unix_ms: u64,
+        prepared: PreparedCypherWrite,
+    ) -> Result<Value, RemoteGatewayServiceError> {
         let client: Arc<dyn ShardClient> = self.shard_client.clone();
         let receipt = TransactionCoordinator::remote(self.max_raft_ticks)
             .commit_temporal_remote(
@@ -376,21 +420,21 @@ impl RemoteGatewayService {
                 &routing.deployment,
                 routing.graph.graph_id(),
                 deadline_unix_ms,
-                context,
-                scoped,
+                prepared.context,
+                prepared.scoped,
             )
             .await
             .map_err(|error| RemoteGatewayServiceError::Transaction(error.to_string()))?;
         Ok(json!({
             "kind": "cypher_write",
-            "query_fingerprint": hex_bytes(&compiled.fingerprint()),
+            "query_fingerprint": hex_bytes(&prepared.fingerprint),
             "transaction_id": receipt.transaction_id().value().to_string(),
             "start_ts": timestamp_json(receipt.start_ts()),
             "commit_ts": timestamp_json(receipt.commit_ts()),
             "home_shard": receipt.home().shard_id(),
             "participants": receipt.participants().iter().map(|participant| participant.shard_id()).collect::<Vec<_>>(),
             "single_shard_fast_path": receipt.single_shard_fast_path(),
-            "bindings": bindings,
+            "bindings": prepared.bindings,
         }))
     }
 
@@ -685,12 +729,6 @@ impl RemoteGatewayService {
 impl BoltQueryBackend for RemoteGatewayService {
     fn execute<'a>(&'a self, request: BoltQueryRequest) -> BackendFuture<'a, BackendQueryResult> {
         Box::pin(async move {
-            if request.transaction().is_some() {
-                return Err(bolt_server::ServiceError::new(
-                    "Neo.ClientError.Transaction.TransactionStartFailed",
-                    "explicit Bolt transactions are not enabled for Temporal Cypher yet",
-                ));
-            }
             let sequence = self.bolt_request_sequence.fetch_add(1, Ordering::Relaxed);
             if sequence == u64::MAX {
                 return Err(bolt_server::ServiceError::new(
@@ -712,7 +750,27 @@ impl BoltQueryBackend for RemoteGatewayService {
                         "Bolt query deadline overflow",
                     )
                 })?;
-            let routing = self.routing_snapshot().map_err(gateway_bolt_error)?;
+            let transaction = request.transaction();
+            let routing = if let Some(transaction) = transaction {
+                self.bolt_transactions
+                    .lock()
+                    .map_err(|_| {
+                        bolt_server::ServiceError::new(
+                            "Neo.DatabaseError.General.UnknownError",
+                            "Bolt transaction state lock is poisoned",
+                        )
+                    })?
+                    .get(&transaction.value())
+                    .map(|pending| pending.routing.clone())
+                    .ok_or_else(|| {
+                        bolt_server::ServiceError::new(
+                            "Neo.ClientError.Transaction.TransactionNotFound",
+                            "Bolt transaction is no longer active",
+                        )
+                    })?
+            } else {
+                self.routing_snapshot().map_err(gateway_bolt_error)?
+            };
             let compiled = compile_cypher(&routing, request.query()).map_err(gateway_bolt_error)?;
             if compiled.is_procedure() {
                 let result = self
@@ -732,6 +790,49 @@ impl BoltQueryBackend for RemoteGatewayService {
                 ));
             }
             if !compiled.is_read_only() {
+                if compiled.is_procedure() {
+                    return Err(bolt_server::ServiceError::new(
+                        "Neo.ClientError.Statement.ExecutionFailed",
+                        "analytics procedures cannot run inside a write transaction",
+                    ));
+                }
+                if let Some(transaction) = transaction {
+                    let prepared = self
+                        .prepare_cypher_write(
+                            u128::from(sequence),
+                            deadline,
+                            &routing,
+                            &compiled,
+                            request.parameters().clone(),
+                        )
+                        .await
+                        .map_err(gateway_bolt_error)?;
+                    self.bolt_transactions
+                        .lock()
+                        .map_err(|_| {
+                            bolt_server::ServiceError::new(
+                                "Neo.DatabaseError.General.UnknownError",
+                                "Bolt transaction state lock is poisoned",
+                            )
+                        })?
+                        .get_mut(&transaction.value())
+                        .ok_or_else(|| {
+                            bolt_server::ServiceError::new(
+                                "Neo.ClientError.Transaction.TransactionNotFound",
+                                "Bolt transaction is no longer active",
+                            )
+                        })?
+                        .writes
+                        .push(prepared);
+                    return Ok(BackendQueryResult::new(
+                        Vec::new(),
+                        Vec::new(),
+                        BTreeMap::from([(
+                            "dtg_transaction_state".into(),
+                            bolt_protocol::Value::String("staged".into()),
+                        )]),
+                    ));
+                }
                 let summary = self
                     .execute_cypher_write(
                         u128::from(sequence),
@@ -792,6 +893,120 @@ impl BoltQueryBackend for RemoteGatewayService {
                     bolt_protocol::Value::String(hex_bytes(&response.fingerprint())),
                 )]),
             ))
+        })
+    }
+
+    fn begin<'a>(
+        &'a self,
+        _extra: BTreeMap<String, bolt_protocol::Value>,
+    ) -> BackendFuture<'a, bolt_server::TransactionId> {
+        Box::pin(async move {
+            let id = self.bolt_request_sequence.fetch_add(1, Ordering::Relaxed);
+            if id == u64::MAX {
+                return Err(bolt_server::ServiceError::new(
+                    "Neo.TransientError.General.DatabaseUnavailable",
+                    "Bolt transaction identity space exhausted",
+                ));
+            }
+            let routing = self.routing_snapshot().map_err(gateway_bolt_error)?;
+            let deadline = unix_time_ms()
+                .map_err(|error| {
+                    bolt_server::ServiceError::new(
+                        "Neo.ClientError.Request.Invalid",
+                        error.to_string(),
+                    )
+                })?
+                .checked_add(30_000)
+                .ok_or_else(|| {
+                    bolt_server::ServiceError::new(
+                        "Neo.ClientError.Request.Invalid",
+                        "Bolt transaction deadline overflow",
+                    )
+                })?;
+            let mut transactions = self.bolt_transactions.lock().map_err(|_| {
+                bolt_server::ServiceError::new(
+                    "Neo.DatabaseError.General.UnknownError",
+                    "Bolt transaction state lock is poisoned",
+                )
+            })?;
+            if transactions
+                .insert(
+                    id,
+                    PendingBoltTransaction {
+                        routing,
+                        deadline_unix_ms: deadline,
+                        writes: Vec::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(bolt_server::ServiceError::new(
+                    "Neo.TransientError.General.DatabaseUnavailable",
+                    "Bolt transaction identity collision",
+                ));
+            }
+            Ok(bolt_server::TransactionId::new(id))
+        })
+    }
+
+    fn commit<'a>(&'a self, transaction: bolt_server::TransactionId) -> BackendFuture<'a, String> {
+        Box::pin(async move {
+            let pending = self
+                .bolt_transactions
+                .lock()
+                .map_err(|_| {
+                    bolt_server::ServiceError::new(
+                        "Neo.DatabaseError.General.UnknownError",
+                        "Bolt transaction state lock is poisoned",
+                    )
+                })?
+                .remove(&transaction.value())
+                .ok_or_else(|| {
+                    bolt_server::ServiceError::new(
+                        "Neo.ClientError.Transaction.TransactionNotFound",
+                        "Bolt transaction is no longer active",
+                    )
+                })?;
+            let mut bookmark = String::new();
+            for prepared in pending.writes {
+                let result = self
+                    .commit_prepared_cypher_write(
+                        &pending.routing,
+                        pending.deadline_unix_ms,
+                        prepared,
+                    )
+                    .await
+                    .map_err(gateway_bolt_error)?;
+                bookmark = result
+                    .get("commit_ts")
+                    .map(Value::to_string)
+                    .unwrap_or_default();
+            }
+            if bookmark.is_empty() {
+                bookmark = format!("dtg:tx:{}", transaction.value());
+            }
+            Ok(bookmark)
+        })
+    }
+
+    fn rollback<'a>(&'a self, transaction: bolt_server::TransactionId) -> BackendFuture<'a, ()> {
+        Box::pin(async move {
+            self.bolt_transactions
+                .lock()
+                .map_err(|_| {
+                    bolt_server::ServiceError::new(
+                        "Neo.DatabaseError.General.UnknownError",
+                        "Bolt transaction state lock is poisoned",
+                    )
+                })?
+                .remove(&transaction.value())
+                .ok_or_else(|| {
+                    bolt_server::ServiceError::new(
+                        "Neo.ClientError.Transaction.TransactionNotFound",
+                        "Bolt transaction is no longer active",
+                    )
+                })?;
+            Ok(())
         })
     }
 }

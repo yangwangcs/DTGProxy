@@ -404,6 +404,39 @@ impl Lowerer {
             ClauseKind::Delete { detach } => {
                 self.simple_unary(LogicalOperator::Delete { detach })?;
             }
+            ClauseKind::OrderBy => {
+                let keys = split_top_level(clause_body(clause)?)?
+                    .into_iter()
+                    .map(parse_expression)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|expression| match expression {
+                        Expression::Identifier(identifier) => self
+                            .variables
+                            .get(identifier.value())
+                            .copied()
+                            .ok_or_else(|| {
+                                CompileError::new(
+                                    "DTG-CYPHER-UNBOUND-VARIABLE",
+                                    format!("variable {} has no slot", identifier.value()),
+                                )
+                            }),
+                        _ => Err(CompileError::new(
+                            "DTG-CYPHER-ORDER-BY-EXPRESSION",
+                            "ORDER BY currently requires bound variables",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.simple_unary(LogicalOperator::Sort { keys })?;
+            }
+            ClauseKind::Skip | ClauseKind::Offset => {
+                let count = self.scalar(&parse_expression(clause_body(clause)?)?)?;
+                self.simple_unary(LogicalOperator::Skip { count })?;
+            }
+            ClauseKind::Limit => {
+                let count = self.scalar(&parse_expression(clause_body(clause)?)?)?;
+                self.simple_unary(LogicalOperator::Limit { count })?;
+            }
             ClauseKind::Call => self.simple_unary(LogicalOperator::ProcedureCall {
                 procedure_id: stable_id(clause_body(clause)?),
             })?,
@@ -416,11 +449,7 @@ impl Lowerer {
             | ClauseKind::For
             | ClauseKind::Union { .. }
             | ClauseKind::Next
-            | ClauseKind::When
-            | ClauseKind::OrderBy
-            | ClauseKind::Skip
-            | ClauseKind::Offset
-            | ClauseKind::Limit => {}
+            | ClauseKind::When => {}
         }
         Ok(())
     }

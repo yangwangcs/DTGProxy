@@ -466,6 +466,16 @@ impl HistoryEntry {
         }
     }
 
+    #[must_use]
+    pub fn replacement(&self) -> Option<&CanonicalElement> {
+        match self {
+            Self::Anchor(anchor) => anchor
+                .projection()
+                .visible_at(anchor.changed_valid().start()),
+            Self::Delta(delta) => delta.replacement(),
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
         match self {
             Self::Anchor(anchor) => anchor.encode(),

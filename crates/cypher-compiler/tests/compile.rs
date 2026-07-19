@@ -63,6 +63,27 @@ fn compiles_temporal_match_into_valid_ir_v2() {
 }
 
 #[test]
+fn lowers_order_skip_and_limit_into_temporal_ir() {
+    let session = CompileSession::new("accounts", 7, 3, 11).unwrap();
+    let compiled = CypherCompiler::new()
+        .compile("MATCH (n) RETURN n ORDER BY n SKIP 1 LIMIT 2", &session)
+        .unwrap();
+    let operators = compiled.logical_plan().nodes();
+    assert!(operators.iter().any(|node| matches!(
+        node.operator(),
+        temporal_ir::v2::LogicalOperator::Sort { .. }
+    )));
+    assert!(operators.iter().any(|node| matches!(
+        node.operator(),
+        temporal_ir::v2::LogicalOperator::Skip { .. }
+    )));
+    assert!(operators.iter().any(|node| matches!(
+        node.operator(),
+        temporal_ir::v2::LogicalOperator::Limit { .. }
+    )));
+}
+
+#[test]
 fn preserves_interval_and_current_transaction_time_in_ir() {
     let compiled = CypherCompiler::new()
         .compile(
