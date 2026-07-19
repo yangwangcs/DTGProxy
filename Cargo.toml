@@ -35,6 +35,7 @@ members = [
     "crates/bolt-server",
     "crates/physical-plan",
     "crates/query-optimizer",
+    "crates/distributed-query",
     "crates/dtgproxy",
 ]
 resolver = "3"

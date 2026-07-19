@@ -488,6 +488,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "distributed-query"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "physical-plan",
+ "temporal-types",
+]
+
+[[package]]
 name = "dtgproxy"
 version = "1.0.0"
 dependencies = [
