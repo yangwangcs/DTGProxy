@@ -10,6 +10,7 @@ blake3 = "=1.8.5"
 bolt-protocol = { path = "../bolt-protocol" }
 bolt-server = { path = "../bolt-server" }
 cypher-compiler = { path = "../cypher-compiler" }
+cypher-ast = { path = "../cypher-ast" }
 distributed-query = { path = "../distributed-query" }
 query-executor = { path = "../query-executor", default-features = false }
 query-optimizer = { path = "../query-optimizer" }

@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use cypher_compiler::{CompileSession, CypherCompiler};
+use cypher_compiler::{CompileSession, CompiledQuery, CypherCompiler};
 use distributed_query::{DistributedCoordinator, SnapshotTokenV2};
 use query_executor::v2::{
-    ExecutionContext, MAX_BATCH_ROWS, RecordBatch, ResolvedValidTime, RuntimeValue,
-    resolve_temporal_scope,
+    ExecutionContext, MAX_BATCH_ROWS, RecordBatch, ResolvedTemporalScope, ResolvedValidTime,
+    RuntimeValue, resolve_temporal_scope,
 };
 pub use query_optimizer::DeploymentMode;
 use query_optimizer::{Optimizer, OptimizerContext};
@@ -18,10 +18,15 @@ use temporal_types::{TransactionTime, ValidTime};
 
 mod bolt;
 mod bolt_service;
+mod write;
 
 pub use bolt::{BoltValueError, bolt_parameter_to_runtime, runtime_value_to_bolt};
 pub use bolt_service::{
     BackendFuture, BackendQueryResult, BoltQueryBackend, BoltQueryRequest, CypherBoltService,
+};
+pub use write::{
+    MaterializedElement, MaterializedElementKind, MaterializedWriteSet, ScopedWrite, WriteContext,
+    WriteMaterializationError, materialize_write, schema_id,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,6 +261,25 @@ impl CypherQueryEngine {
                 .collect(),
         })
     }
+}
+
+pub fn resolve_compiled_temporal_scope(
+    compiled: &CompiledQuery,
+    graph_id: u64,
+    current_valid_time: ValidTime,
+    current_transaction_time: TransactionTime,
+    parameters: BTreeMap<String, RuntimeValue>,
+) -> Result<ResolvedTemporalScope, EngineError> {
+    let (valid_time, transaction_time) = temporal_spec(compiled.logical_plan())?;
+    resolve_temporal_scope(
+        GraphId::new(graph_id),
+        &valid_time,
+        &transaction_time,
+        current_valid_time,
+        current_transaction_time,
+        &ExecutionContext::new(parameters),
+    )
+    .map_err(|error| EngineError::Temporal(error.to_string()))
 }
 
 fn temporal_spec(

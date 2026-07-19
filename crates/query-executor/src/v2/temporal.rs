@@ -100,7 +100,7 @@ fn resolve_timestamp(
     context: &ExecutionContext,
 ) -> Result<i64, RuntimeError> {
     match evaluate(expression, &RowSchema::empty(), &[], context)? {
-        RuntimeValue::TimestampMicros(value) => Ok(value),
+        RuntimeValue::TimestampMicros(value) | RuntimeValue::Integer(value) => Ok(value),
         value => Err(RuntimeError::InvalidTemporalValue(value.kind())),
     }
 }

@@ -74,6 +74,19 @@ impl TemporalTransaction {
             .collect()
     }
 
+    #[must_use]
+    pub fn created_vertex_intervals(&self) -> Vec<(ElementRef, Interval<ValidTime>)> {
+        self.operations
+            .iter()
+            .filter_map(|operation| match operation {
+                TemporalOperation::Vertex(mutation) if mutation.replacement.is_some() => {
+                    Some((mutation.element, mutation.valid))
+                }
+                TemporalOperation::Vertex(_) | TemporalOperation::Edge(_) => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn into_operations(self) -> Vec<TemporalOperation> {
         self.operations
     }

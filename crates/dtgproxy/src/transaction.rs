@@ -735,6 +735,10 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             return Err(TransactionCoordinatorError::EmptyWriteSet);
         }
         let context = self.begin(schema_version, isolation, ttl_micros)?;
+        let created_vertices = transactions
+            .iter()
+            .flat_map(|transaction| transaction.transaction.created_vertex_intervals())
+            .collect::<Vec<_>>();
         let mut grouped = BTreeMap::<ShardEpoch, TemporalTransaction>::new();
         let mut endpoint_guards = Vec::new();
         for scoped in transactions {
@@ -746,7 +750,13 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             }
             let placement = runtime.config().route_scope(scoped.scope);
             let participant = ShardEpoch::new(placement.shard_id(), placement.placement_epoch())?;
-            endpoint_guards.extend(scoped.transaction.remote_endpoint_guards());
+            endpoint_guards.extend(
+                scoped
+                    .transaction
+                    .remote_endpoint_guards()
+                    .into_iter()
+                    .filter(|guard| !endpoint_satisfied_by_overlay(*guard, &created_vertices)),
+            );
             grouped
                 .entry(participant)
                 .or_default()
@@ -858,6 +868,10 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         let namespace = u64::try_from(context.transaction_id.value() & u128::from(u64::MAX))
             .expect("masked transaction namespace fits u64")
             .max(1);
+        let created_vertices = transactions
+            .iter()
+            .flat_map(|transaction| transaction.transaction.created_vertex_intervals())
+            .collect::<Vec<_>>();
         let mut grouped = BTreeMap::<ShardEpoch, TemporalTransaction>::new();
         let mut endpoint_guards = Vec::new();
         for scoped in transactions {
@@ -870,7 +884,13 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             }
             let placement = deployment.route_scope(scoped.scope);
             let participant = ShardEpoch::new(placement.shard_id(), placement.placement_epoch())?;
-            endpoint_guards.extend(scoped.transaction.remote_endpoint_guards());
+            endpoint_guards.extend(
+                scoped
+                    .transaction
+                    .remote_endpoint_guards()
+                    .into_iter()
+                    .filter(|guard| !endpoint_satisfied_by_overlay(*guard, &created_vertices)),
+            );
             grouped
                 .entry(participant)
                 .or_default()
@@ -1257,6 +1277,24 @@ fn route_operation(
         placement.shard_id(),
         placement.placement_epoch(),
     )?)
+}
+
+fn endpoint_satisfied_by_overlay(
+    guard: temporal_storage::EndpointGuard,
+    created_vertices: &[(
+        temporal_storage::ElementRef,
+        temporal_types::Interval<temporal_types::ValidTime>,
+    )],
+) -> bool {
+    created_vertices.iter().any(|(vertex, valid)| {
+        *vertex == guard.vertex()
+            && valid.start() <= guard.valid().start()
+            && match (valid.end(), guard.valid().end()) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(created_end), Some(guard_end)) => created_end >= guard_end,
+            }
+    })
 }
 
 fn route_operation_with_config(

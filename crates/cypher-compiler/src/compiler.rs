@@ -57,6 +57,7 @@ pub struct CompiledQuery {
     result_schema: RowSchema,
     effect: QueryEffect,
     logical_plan: LogicalPlan,
+    mutation_plan: MutationPlan,
 }
 
 impl CompiledQuery {
@@ -83,6 +84,64 @@ impl CompiledQuery {
     #[must_use]
     pub const fn logical_plan(&self) -> &LogicalPlan {
         &self.logical_plan
+    }
+
+    #[must_use]
+    pub const fn mutation_plan(&self) -> &MutationPlan {
+        &self.mutation_plan
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationPlan {
+    mutations: Vec<CompiledMutation>,
+}
+
+impl MutationPlan {
+    #[must_use]
+    pub fn mutations(&self) -> &[CompiledMutation] {
+        &self.mutations
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompiledMutation {
+    Create(Pattern),
+    Merge(Pattern),
+    SetProperty {
+        target: PropertyTarget,
+        value: Expression,
+    },
+    RemoveProperty(PropertyTarget),
+    Delete {
+        variables: Vec<String>,
+        detach: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyTarget {
+    variable: String,
+    property: String,
+}
+
+impl PropertyTarget {
+    #[must_use]
+    pub fn new(variable: impl Into<String>, property: impl Into<String>) -> Self {
+        Self {
+            variable: variable.into(),
+            property: property.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn variable(&self) -> &str {
+        &self.variable
+    }
+
+    #[must_use]
+    pub fn property(&self) -> &str {
+        &self.property
     }
 }
 
@@ -133,14 +192,111 @@ impl CypherCompiler {
             fingerprint,
         )?;
         let logical_plan = lower(parsed.statement(), &analyzed, header)?;
+        let mutation_plan = compile_mutations(parsed.statement())?;
         let result_schema = logical_plan.output().clone();
         Ok(CompiledQuery {
             fingerprint,
             result_schema,
             effect: analyzed.effect(),
             logical_plan,
+            mutation_plan,
         })
     }
+}
+
+fn compile_mutations(statement: &Statement) -> Result<MutationPlan, CompileError> {
+    let mut mutations = Vec::new();
+    let Statement::Query(query) = statement else {
+        return Ok(MutationPlan { mutations });
+    };
+    for clause in query.clauses() {
+        match clause.kind() {
+            ClauseKind::Create => {
+                mutations.push(CompiledMutation::Create(parse_pattern(clause_body(
+                    clause,
+                )?)?));
+            }
+            ClauseKind::Merge => {
+                mutations.push(CompiledMutation::Merge(parse_pattern(clause_body(
+                    clause,
+                )?)?));
+            }
+            ClauseKind::Set => {
+                for assignment in split_top_level(clause_body(clause)?)? {
+                    let (target, value) = split_assignment(assignment)?;
+                    mutations.push(CompiledMutation::SetProperty {
+                        target: property_target(parse_expression(target)?)?,
+                        value: parse_expression(value)?,
+                    });
+                }
+            }
+            ClauseKind::Remove => {
+                for target in split_top_level(clause_body(clause)?)? {
+                    mutations.push(CompiledMutation::RemoveProperty(property_target(
+                        parse_expression(target)?,
+                    )?));
+                }
+            }
+            ClauseKind::Delete { detach } => {
+                let variables = split_top_level(clause_body(clause)?)?
+                    .into_iter()
+                    .map(|source| match parse_expression(source)? {
+                        Expression::Identifier(identifier) => Ok(identifier.value().to_owned()),
+                        _ => Err(CompileError::new(
+                            "DTG-CYPHER-INVALID-DELETE-TARGET",
+                            "DELETE currently requires a bound node or relationship variable",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                mutations.push(CompiledMutation::Delete { variables, detach });
+            }
+            _ => {}
+        }
+    }
+    Ok(MutationPlan { mutations })
+}
+
+fn split_assignment(source: &str) -> Result<(&str, &str), CompileError> {
+    let lexed = lex(source)
+        .map_err(|error| CompileError::new("DTG-CYPHER-INVALID-SET", error.to_string()))?;
+    let mut depth = 0_usize;
+    for token in lexed.tokens() {
+        match token.kind() {
+            TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => depth += 1,
+            TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                depth = depth.saturating_sub(1);
+            }
+            TokenKind::Equal if depth == 0 => {
+                let left = source[..token.span().start()].trim();
+                let right = source[token.span().end()..].trim();
+                if left.is_empty() || right.is_empty() {
+                    break;
+                }
+                return Ok((left, right));
+            }
+            _ => {}
+        }
+    }
+    Err(CompileError::new(
+        "DTG-CYPHER-INVALID-SET",
+        "SET requires a property assignment",
+    ))
+}
+
+fn property_target(expression: Expression) -> Result<PropertyTarget, CompileError> {
+    let Expression::Property { value, property } = expression else {
+        return Err(CompileError::new(
+            "DTG-CYPHER-INVALID-SET-TARGET",
+            "property update target must have the form variable.property",
+        ));
+    };
+    let Expression::Identifier(variable) = *value else {
+        return Err(CompileError::new(
+            "DTG-CYPHER-INVALID-SET-TARGET",
+            "property update target must have the form variable.property",
+        ));
+    };
+    Ok(PropertyTarget::new(variable.value(), property.value()))
 }
 
 fn query_fingerprint(text: &str, baseline: &str, schema_version: u64) -> [u8; 32] {
@@ -230,8 +386,14 @@ impl Lowerer {
                 )?);
             }
             ClauseKind::Return => self.project(clause_body(clause)?, analyzed)?,
-            ClauseKind::Create => self.simple_unary(LogicalOperator::Create)?,
-            ClauseKind::Merge => self.simple_unary(LogicalOperator::Merge)?,
+            ClauseKind::Create => {
+                self.bind_write_pattern(&parse_pattern(clause_body(clause)?)?)?;
+                self.simple_unary(LogicalOperator::Create)?;
+            }
+            ClauseKind::Merge => {
+                self.bind_write_pattern(&parse_pattern(clause_body(clause)?)?)?;
+                self.simple_unary(LogicalOperator::Merge)?;
+            }
             ClauseKind::Set => self.simple_unary(LogicalOperator::Set)?,
             ClauseKind::Remove => self.simple_unary(LogicalOperator::Remove)?,
             ClauseKind::Delete { detach } => {
@@ -329,6 +491,46 @@ impl Lowerer {
             }
         }
         Ok(())
+    }
+
+    fn bind_write_pattern(&mut self, pattern: &Pattern) -> Result<(), CompileError> {
+        let mut columns = self.schema.columns().to_vec();
+        for path in pattern.paths() {
+            self.bind_write_element(
+                path.start().variable().map(cypher_ast::Identifier::value),
+                ValueType::Node,
+                &mut columns,
+            );
+            for chain in path.chains() {
+                self.bind_write_element(
+                    chain
+                        .relationship()
+                        .variable()
+                        .map(cypher_ast::Identifier::value),
+                    ValueType::Relationship,
+                    &mut columns,
+                );
+                self.bind_write_element(
+                    chain.node().variable().map(cypher_ast::Identifier::value),
+                    ValueType::Node,
+                    &mut columns,
+                );
+            }
+        }
+        self.schema = RowSchema::new(columns)?;
+        Ok(())
+    }
+
+    fn bind_write_element(
+        &mut self,
+        name: Option<&str>,
+        value_type: ValueType,
+        columns: &mut Vec<Column>,
+    ) {
+        let (slot, column) = self.binding(name, value_type);
+        if !columns.iter().any(|existing| existing.slot() == slot) {
+            columns.push(column);
+        }
     }
 
     fn project(&mut self, source: &str, analyzed: &AnalyzedQuery) -> Result<(), CompileError> {

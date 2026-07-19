@@ -12,6 +12,7 @@ crc32fast = "=1.5.0"
 bolt-protocol = { path = "../bolt-protocol" }
 bolt-server = { path = "../bolt-server" }
 cypher-engine = { path = "../cypher-engine" }
+cypher-compiler = { path = "../cypher-compiler" }
 distributed-query = { path = "../distributed-query" }
 dtgproxy = { path = "../dtgproxy" }
 query-executor = { path = "../query-executor" }

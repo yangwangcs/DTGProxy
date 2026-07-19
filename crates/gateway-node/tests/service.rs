@@ -319,6 +319,31 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         );
     }
 
+    let cypher_write = GatewayRequest {
+        version: GATEWAY_API_VERSION,
+        request_id: "cypher-write".into(),
+        operation: GatewayOperation::Query {
+            text: "USE social AT VALID_TIME AS OF 1000 CREATE (a:Person {name: 'Ada'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET a.status = 'active'".into(),
+        },
+    };
+    let written = submit(&mut client, 204, &cypher_write).await;
+    assert_eq!(written["ok"], true, "{written}");
+    assert_eq!(written["result"]["kind"], "cypher_write");
+    assert_eq!(written["result"]["bindings"]["a"]["kind"], "vertex");
+    assert_eq!(written["result"]["bindings"]["r"]["kind"], "relationship");
+    assert!(written["result"]["commit_ts"].is_object());
+
+    let cypher_read = GatewayRequest {
+        version: GATEWAY_API_VERSION,
+        request_id: "cypher-read-after-write".into(),
+        operation: GatewayOperation::Query {
+            text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:Person) RETURN n".into(),
+        },
+    };
+    let queried = submit(&mut client, 205, &cypher_read).await;
+    assert_eq!(queried["ok"], true, "{queried}");
+    assert_eq!(queried["result"]["row_count"], 2);
+
     drop(client);
     gateway_shutdown.send(()).unwrap();
     gateway_server.await.unwrap().unwrap();

@@ -13,10 +13,12 @@ use cluster_protocol::proto::{
 };
 use cluster_protocol::{CLUSTER_PROTOCOL_VERSION, CommonRequestContext, MAX_COMMAND_BYTES};
 use control_plane::GraphDefinition;
+use cypher_compiler::{CompileSession, CypherCompiler};
 use cypher_engine::{
     BackendFuture, BackendQueryResult, BoltQueryBackend, BoltQueryRequest, CypherQueryEngine,
     CypherQueryRequest, CypherQueryResponse, DeploymentMode as QueryDeploymentMode, EngineConfig,
-    ResourceLimits,
+    MaterializedElement, MaterializedElementKind, ResourceLimits, WriteContext, materialize_write,
+    resolve_compiled_temporal_scope,
 };
 use distributed_query::{DistributedCoordinator, LocalFragmentWorker};
 use dtgproxy::gateway::{GATEWAY_API_VERSION, GatewayOperation, GatewayRequest};
@@ -27,7 +29,7 @@ use serde_json::{Map, Value, json};
 use shard_client::{RemoteShardClient, ShardClient, ShardClientStorageAdapter};
 use temporal_ir::PlanBody;
 use temporal_storage::TemporalStore;
-use temporal_types::{TransactionTime, ValidTime};
+use temporal_types::{Interval, TransactionTime, ValidTime};
 use timestamp_oracle::advance_timestamp;
 use tonic::{Request, Response, Status};
 use txn_protocol::IsolationLevel;
@@ -273,10 +275,108 @@ impl RemoteGatewayService {
         routing: &GatewayRoutingState,
         text: &str,
     ) -> Result<Value, RemoteGatewayServiceError> {
+        let compiled = compile_cypher(routing, text)?;
+        if !compiled.is_read_only() {
+            return self
+                .execute_cypher_write(
+                    request_id,
+                    deadline_unix_ms,
+                    routing,
+                    &compiled,
+                    BTreeMap::new(),
+                )
+                .await;
+        }
         let response = self
             .execute_cypher_response(request_id, deadline_unix_ms, routing, text, BTreeMap::new())
             .await?;
         cypher_response_json(&response)
+    }
+
+    async fn execute_cypher_write(
+        &self,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        routing: &GatewayRoutingState,
+        compiled: &cypher_compiler::CompiledQuery,
+        parameters: BTreeMap<String, RuntimeValue>,
+    ) -> Result<Value, RemoteGatewayServiceError> {
+        let (start_ts, commit_ts) = self
+            .allocate_transaction_timestamps(request_id, deadline_unix_ms)
+            .await?;
+        let current_valid_time = ValidTime::from_micros(unix_time_micros()?);
+        let resolved = resolve_compiled_temporal_scope(
+            compiled,
+            routing.graph.graph_id(),
+            current_valid_time,
+            start_ts,
+            parameters.clone(),
+        )
+        .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let valid = match resolved.valid_time() {
+            query_executor::v2::ResolvedValidTime::Point(value) => Interval::forever_from(value),
+            query_executor::v2::ResolvedValidTime::Interval { start, end } => {
+                Interval::new(start, Some(end))
+                    .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?
+            }
+        };
+        let materialized = materialize_write(
+            compiled,
+            &WriteContext::new(
+                routing.graph.graph_id(),
+                routing.graph.schema_version(),
+                routing.deployment.virtual_partitions(),
+                request_security_fingerprint(self.cluster_id, request_id),
+                valid,
+                parameters,
+            )
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?,
+        )
+        .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let bindings = materialized
+            .bindings()
+            .iter()
+            .map(|(name, element)| Ok((name.clone(), materialized_element_json(element)?)))
+            .collect::<Result<Map<_, _>, RemoteGatewayServiceError>>()?;
+        let scoped = materialized
+            .into_scoped_transactions()
+            .into_iter()
+            .map(|write| {
+                let (scope, transaction) = write.into_parts();
+                dtgproxy::ScopedTemporalTransaction::new(scope, transaction)
+            })
+            .collect();
+        let context = TransactionContext::from_allocated(
+            start_ts,
+            commit_ts,
+            routing.graph.schema_version(),
+            IsolationLevel::TemporalSnapshot,
+            60_000_000,
+        )
+        .map_err(|error| RemoteGatewayServiceError::Transaction(error.to_string()))?;
+        let client: Arc<dyn ShardClient> = self.shard_client.clone();
+        let receipt = TransactionCoordinator::remote(self.max_raft_ticks)
+            .commit_temporal_remote(
+                client,
+                &routing.deployment,
+                routing.graph.graph_id(),
+                deadline_unix_ms,
+                context,
+                scoped,
+            )
+            .await
+            .map_err(|error| RemoteGatewayServiceError::Transaction(error.to_string()))?;
+        Ok(json!({
+            "kind": "cypher_write",
+            "query_fingerprint": hex_bytes(&compiled.fingerprint()),
+            "transaction_id": receipt.transaction_id().value().to_string(),
+            "start_ts": timestamp_json(receipt.start_ts()),
+            "commit_ts": timestamp_json(receipt.commit_ts()),
+            "home_shard": receipt.home().shard_id(),
+            "participants": receipt.participants().iter().map(|participant| participant.shard_id()).collect::<Vec<_>>(),
+            "single_shard_fast_path": receipt.single_shard_fast_path(),
+            "bindings": bindings,
+        }))
     }
 
     async fn execute_cypher_response(
@@ -515,6 +615,39 @@ impl BoltQueryBackend for RemoteGatewayService {
                     )
                 })?;
             let routing = self.routing_snapshot().map_err(gateway_bolt_error)?;
+            let compiled = compile_cypher(&routing, request.query()).map_err(gateway_bolt_error)?;
+            if !compiled.is_read_only() {
+                let summary = self
+                    .execute_cypher_write(
+                        u128::from(sequence),
+                        deadline,
+                        &routing,
+                        &compiled,
+                        request.parameters().clone(),
+                    )
+                    .await
+                    .map_err(gateway_bolt_error)?;
+                let transaction_id = summary
+                    .get("transaction_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                return Ok(BackendQueryResult::new(
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::from([
+                        ("type".into(), bolt_protocol::Value::String("w".into())),
+                        (
+                            "dtg_transaction_id".into(),
+                            bolt_protocol::Value::String(transaction_id),
+                        ),
+                        (
+                            "dtg_write_summary".into(),
+                            bolt_protocol::Value::String(summary.to_string()),
+                        ),
+                    ]),
+                ));
+            }
             let response = self
                 .execute_cypher_response(
                     u128::from(sequence),
@@ -553,6 +686,51 @@ fn gateway_bolt_error(error: RemoteGatewayServiceError) -> bolt_server::ServiceE
         "Neo.ClientError.Statement.ExecutionFailed",
         error.to_string(),
     )
+}
+
+fn compile_cypher(
+    routing: &GatewayRoutingState,
+    text: &str,
+) -> Result<cypher_compiler::CompiledQuery, RemoteGatewayServiceError> {
+    let session = CompileSession::new(
+        routing.graph.name(),
+        routing.graph.graph_id(),
+        routing.graph.schema_version(),
+        routing.graph.topology().epoch(),
+    )
+    .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+    CypherCompiler::new()
+        .compile(text, &session)
+        .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))
+}
+
+fn materialized_element_json(
+    element: &MaterializedElement,
+) -> Result<Value, RemoteGatewayServiceError> {
+    let endpoint_json = |endpoint: temporal_storage::ElementRef| {
+        json!({
+            "partition": endpoint.partition().value(),
+            "element_id": endpoint.id().value().to_string(),
+        })
+    };
+    Ok(json!({
+        "kind": match element.kind() {
+            MaterializedElementKind::Vertex => "vertex",
+            MaterializedElementKind::Relationship => "relationship",
+        },
+        "partition": element.element().partition().value(),
+        "element_id": element.element().id().value().to_string(),
+        "type_id": element.type_id(),
+        "payload_dtp1": hex_bytes(
+            &element
+                .payload()
+                .encode()
+                .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?,
+        ),
+        "source": element.source().map(endpoint_json),
+        "destination": element.destination().map(endpoint_json),
+        "deleted": element.deleted(),
+    }))
 }
 
 #[tonic::async_trait]
@@ -676,6 +854,7 @@ fn cypher_response_json(
         "version": 2,
         "query_fingerprint": hex_bytes(&response.fingerprint()),
         "columns": columns,
+        "row_count": response.row_count(),
         "rows": rows,
         "optimizer_trace": response.optimizer_trace(),
     }))
