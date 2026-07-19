@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use physical_plan::{Placement, PlanFragment};
@@ -9,6 +11,21 @@ use temporal_storage::GraphId;
 use temporal_types::ValidTime;
 
 use crate::{DistributedQueryError, FragmentRequest};
+
+pub type WorkerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<WorkerBatch>, DistributedQueryError>> + Send + 'a>>;
+
+pub trait FragmentWorker: Send + Sync {
+    fn shard_id(&self) -> u32;
+
+    fn execute_fragment<'a>(
+        &'a self,
+        request: &'a FragmentRequest,
+        fragment: &'a PlanFragment,
+        valid_time: ValidTime,
+        context: &'a ExecutionContext,
+    ) -> WorkerFuture<'a>;
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerBatch {
@@ -38,6 +55,14 @@ impl WorkerBatch {
     #[must_use]
     pub const fn batch(&self) -> &RecordBatch {
         &self.batch
+    }
+
+    pub(crate) const fn snapshot_fingerprint(&self) -> [u8; 32] {
+        self.snapshot_fingerprint
+    }
+
+    pub(crate) fn into_batch(self) -> RecordBatch {
+        self.batch
     }
 }
 
@@ -154,6 +179,25 @@ where
             return Err(DistributedQueryError::InvalidRequest);
         }
         Ok(())
+    }
+}
+
+impl<A> FragmentWorker for LocalFragmentWorker<A>
+where
+    A: StorageAdapter + 'static,
+{
+    fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+
+    fn execute_fragment<'a>(
+        &'a self,
+        request: &'a FragmentRequest,
+        fragment: &'a PlanFragment,
+        valid_time: ValidTime,
+        context: &'a ExecutionContext,
+    ) -> WorkerFuture<'a> {
+        Box::pin(self.execute(request, fragment, valid_time, context))
     }
 }
 

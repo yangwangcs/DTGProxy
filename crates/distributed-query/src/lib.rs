@@ -6,9 +6,11 @@ use std::fmt::{self, Display, Formatter};
 
 use temporal_types::TransactionTime;
 
+mod coordinator;
 mod worker;
 
-pub use worker::{LocalFragmentWorker, WorkerBatch};
+pub use coordinator::DistributedCoordinator;
+pub use worker::{FragmentWorker, LocalFragmentWorker, WorkerBatch, WorkerFuture};
 
 pub const DISTRIBUTED_QUERY_PROTOCOL_VERSION: u16 = 1;
 
@@ -286,6 +288,10 @@ pub enum DistributedQueryError {
     FragmentMismatch,
     DeadlineExceeded,
     Execution(String),
+    InvalidCoordinator,
+    DuplicateWorker(u32),
+    CreditExhausted,
+    UnsupportedExchange,
 }
 
 impl Display for DistributedQueryError {
