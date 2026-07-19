@@ -6,6 +6,10 @@ use std::fmt::{self, Display, Formatter};
 
 use temporal_types::TransactionTime;
 
+mod worker;
+
+pub use worker::{LocalFragmentWorker, WorkerBatch};
+
 pub const DISTRIBUTED_QUERY_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +126,21 @@ impl FragmentRequest {
     #[must_use]
     pub const fn snapshot(&self) -> &SnapshotTokenV2 {
         &self.snapshot
+    }
+
+    #[must_use]
+    pub const fn deadline_unix_ms(&self) -> u64 {
+        self.deadline_unix_ms
+    }
+
+    #[must_use]
+    pub const fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    #[must_use]
+    pub const fn batch_rows(&self) -> u32 {
+        self.batch_rows
     }
 }
 
@@ -263,6 +282,10 @@ pub enum DistributedQueryError {
     PayloadLimit,
     SequenceExhausted,
     IncompleteShards(Vec<u32>),
+    WorkerIdentityMismatch,
+    FragmentMismatch,
+    DeadlineExceeded,
+    Execution(String),
 }
 
 impl Display for DistributedQueryError {

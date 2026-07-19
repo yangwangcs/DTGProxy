@@ -491,8 +491,13 @@ dependencies = [
 name = "distributed-query"
 version = "1.0.0"
 dependencies = [
+ "adapter-memory",
  "blake3",
  "physical-plan",
+ "query-executor",
+ "storage-api",
+ "temporal-ir",
+ "temporal-storage",
  "temporal-types",
 ]
 

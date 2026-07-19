@@ -9,6 +9,7 @@ pub enum RuntimeError {
         max: usize,
         actual: usize,
     },
+    InvalidBatchRows(usize),
     RowWidth {
         expected: usize,
         actual: usize,

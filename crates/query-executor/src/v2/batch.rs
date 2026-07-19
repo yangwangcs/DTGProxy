@@ -178,6 +178,19 @@ impl RecordBatch {
         self.estimated_bytes
     }
 
+    pub fn rechunk(self, max_rows: usize) -> Result<Vec<Self>, RuntimeError> {
+        if max_rows == 0 || max_rows > MAX_BATCH_ROWS {
+            return Err(RuntimeError::InvalidBatchRows(max_rows));
+        }
+        if self.rows.is_empty() {
+            return Ok(vec![self]);
+        }
+        self.rows
+            .chunks(max_rows)
+            .map(|rows| Self::try_new(self.schema.clone(), rows.to_vec()))
+            .collect()
+    }
+
     pub(crate) fn into_rows(self) -> Vec<Vec<RuntimeValue>> {
         self.rows
     }
