@@ -399,6 +399,18 @@ name = "cypher-ast"
 version = "1.0.0"
 
 [[package]]
+name = "cypher-compiler"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "cypher-ast",
+ "cypher-sema",
+ "cypher-syntax",
+ "temporal-ir",
+ "temporal-types",
+]
+
+[[package]]
 name = "cypher-sema"
 version = "1.0.0"
 dependencies = [
