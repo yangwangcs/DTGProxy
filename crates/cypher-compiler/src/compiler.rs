@@ -82,6 +82,11 @@ impl CompiledQuery {
     }
 
     #[must_use]
+    pub const fn is_procedure(&self) -> bool {
+        matches!(self.effect, QueryEffect::Procedure)
+    }
+
+    #[must_use]
     pub const fn logical_plan(&self) -> &LogicalPlan {
         &self.logical_plan
     }

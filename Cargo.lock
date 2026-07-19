@@ -743,6 +743,8 @@ dependencies = [
 name = "gateway-node"
 version = "1.0.0"
 dependencies = [
+ "analytics-api",
+ "analytics-runtime",
  "bolt-protocol",
  "bolt-server",
  "cluster-protocol",

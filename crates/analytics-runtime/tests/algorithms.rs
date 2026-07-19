@@ -1,7 +1,8 @@
 use analytics_api::{EventEdge, EventGraph, SnapshotEdge, SnapshotGraph, VertexId};
 use analytics_runtime::{
-    TemporalPathRequest, TimeOrder, WaitingPolicy, bfs, degree_centrality, earliest_arrival,
-    page_rank, scc, sssp, wcc,
+    TemporalPathRequest, TimeOrder, WaitingPolicy, bfs, clustering_coefficient, degree_centrality,
+    earliest_arrival, k_core, label_propagation, latest_departure, min_hop_temporal_path,
+    page_rank, scc, sssp, temporal_reachability, triangle_count, wcc,
 };
 use temporal_types::ValidTime;
 
@@ -95,6 +96,44 @@ fn earliest_arrival_obeys_time_order_waiting_and_window() {
     assert_eq!(
         strict.arrival(VertexId::new(3)),
         Some(ValidTime::from_micros(17))
+    );
+}
+
+#[test]
+fn snapshot_structural_algorithms_are_available() {
+    let graph = SnapshotGraph::new(
+        ids(&[1, 2, 3]),
+        vec![edge(1, 2), edge(2, 3), edge(1, 3)],
+        false,
+    )
+    .expect("graph");
+    assert_eq!(triangle_count(&graph), 1);
+    assert_eq!(clustering_coefficient(&graph)[&VertexId::new(1)], 1.0);
+    assert_eq!(k_core(&graph, 2).len(), 3);
+    assert_eq!(label_propagation(&graph, 20).unwrap().len(), 3);
+}
+
+#[test]
+fn temporal_reachability_and_path_objectives_are_available() {
+    let graph = EventGraph::new(ids(&[1, 2, 3]), vec![event(1, 2, 1, 2), event(2, 3, 4, 1)])
+        .expect("event graph");
+    let request = TemporalPathRequest::new(
+        VertexId::new(1),
+        ValidTime::from_micros(0),
+        ValidTime::from_micros(10),
+        TimeOrder::NonDecreasing,
+        WaitingPolicy::Allowed,
+    )
+    .expect("request");
+    assert!(temporal_reachability(&graph, request).unwrap()[&VertexId::new(3)]);
+    assert_eq!(
+        min_hop_temporal_path(&graph, request).unwrap()[&VertexId::new(3)],
+        2
+    );
+    assert_eq!(
+        latest_departure(&graph, VertexId::new(3), ValidTime::from_micros(10)).unwrap()
+            [&VertexId::new(1)],
+        ValidTime::from_micros(1)
     );
 }
 

@@ -344,6 +344,21 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     assert_eq!(queried["ok"], true, "{queried}");
     assert_eq!(queried["result"]["row_count"], 2);
 
+    let analytics_call = GatewayRequest {
+        version: GATEWAY_API_VERSION,
+        request_id: "analytics-degree".into(),
+        operation: GatewayOperation::Query {
+            text:
+                "USE social AT VALID_TIME AS OF 1000 CALL dtg.graph.degree() YIELD vertexId, degree"
+                    .into(),
+        },
+    };
+    let analytics = submit(&mut client, 206, &analytics_call).await;
+    assert_eq!(analytics["ok"], true, "{analytics}");
+    assert_eq!(analytics["result"]["kind"], "analytics_result");
+    assert_eq!(analytics["result"]["columns"][0], "vertexId");
+    assert!(analytics["result"]["rows"].as_array().unwrap().len() >= 2);
+
     drop(client);
     gateway_shutdown.send(()).unwrap();
     gateway_server.await.unwrap().unwrap();

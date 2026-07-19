@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use analytics_api::{
+    AlgorithmRequest, AlgorithmValue, AnalyticsProvider, ProjectedGraph, SnapshotGraph, VertexId,
+};
+use analytics_runtime::{BuiltInProvider, project_snapshot_parts};
 use cluster_protocol::proto::gateway_service_server::GatewayService;
 use cluster_protocol::proto::meta_service_client::MetaServiceClient;
 use cluster_protocol::proto::{
@@ -276,6 +280,17 @@ impl RemoteGatewayService {
         text: &str,
     ) -> Result<Value, RemoteGatewayServiceError> {
         let compiled = compile_cypher(routing, text)?;
+        if compiled.is_procedure() {
+            return self
+                .execute_analytics_call(
+                    request_id,
+                    deadline_unix_ms,
+                    routing,
+                    text,
+                    BTreeMap::new(),
+                )
+                .await;
+        }
         if !compiled.is_read_only() {
             return self
                 .execute_cypher_write(
@@ -376,6 +391,89 @@ impl RemoteGatewayService {
             "participants": receipt.participants().iter().map(|participant| participant.shard_id()).collect::<Vec<_>>(),
             "single_shard_fast_path": receipt.single_shard_fast_path(),
             "bindings": bindings,
+        }))
+    }
+
+    async fn execute_analytics_call(
+        &self,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        routing: &GatewayRoutingState,
+        text: &str,
+        parameters: BTreeMap<String, RuntimeValue>,
+    ) -> Result<Value, RemoteGatewayServiceError> {
+        let compiled = compile_cypher(routing, text)?;
+        let (start_ts, _) = self
+            .allocate_transaction_timestamps(request_id, deadline_unix_ms)
+            .await?;
+        let resolved = resolve_compiled_temporal_scope(
+            &compiled,
+            routing.graph.graph_id(),
+            ValidTime::from_micros(unix_time_micros()?),
+            start_ts,
+            parameters.clone(),
+        )
+        .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let valid_time = match resolved.valid_time() {
+            query_executor::v2::ResolvedValidTime::Point(value) => value,
+            query_executor::v2::ResolvedValidTime::Interval { .. } => {
+                return Err(RemoteGatewayServiceError::Query(
+                    "analytics CALL currently requires a point valid-time scope".into(),
+                ));
+            }
+        };
+        let client: Arc<dyn ShardClient> = self.shard_client.clone();
+        let mut vertices = Vec::new();
+        let mut edges = Vec::new();
+        for placement in routing.deployment.all_shards() {
+            let adapter = ShardClientStorageAdapter::new(
+                Arc::clone(&client),
+                routing.graph.graph_id(),
+                placement.shard_id(),
+                placement.placement_epoch(),
+                deadline_unix_ms,
+                request_namespace(request_id, placement.shard_id()),
+            )
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+            let (fragment_vertices, fragment_edges) = project_snapshot_parts(
+                &TemporalStore::new(adapter),
+                temporal_storage::GraphId::new(routing.graph.graph_id()),
+                valid_time,
+                resolved.transaction_time(),
+                None,
+            )
+            .await
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+            vertices.extend(fragment_vertices);
+            edges.extend(fragment_edges);
+        }
+        vertices.sort_unstable();
+        vertices.dedup();
+        edges.sort_by_key(|edge| (edge.source(), edge.destination(), edge.weight().to_bits()));
+        edges.dedup_by(|left, right| {
+            left.source() == right.source()
+                && left.destination() == right.destination()
+                && left.weight().to_bits() == right.weight().to_bits()
+        });
+        let graph = SnapshotGraph::new(vertices, edges, true)
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let (algorithm, call_parameters) = parse_algorithm_call(text, parameters)?;
+        let request =
+            AlgorithmRequest::new(algorithm, ProjectedGraph::Snapshot(graph), call_parameters)
+                .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let result = BuiltInProvider::new()
+            .execute(request)
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        Ok(json!({
+            "version": 1,
+            "kind": "analytics_result",
+            "columns": result.columns(),
+            "rows": result.rows().iter().map(|row| row.iter().map(algorithm_value_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "metadata": result
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key.clone(), algorithm_value_json(value)))
+                .collect::<Map<_, _>>(),
         }))
     }
 
@@ -616,6 +714,23 @@ impl BoltQueryBackend for RemoteGatewayService {
                 })?;
             let routing = self.routing_snapshot().map_err(gateway_bolt_error)?;
             let compiled = compile_cypher(&routing, request.query()).map_err(gateway_bolt_error)?;
+            if compiled.is_procedure() {
+                let result = self
+                    .execute_analytics_call(
+                        u128::from(sequence),
+                        deadline,
+                        &routing,
+                        request.query(),
+                        request.parameters().clone(),
+                    )
+                    .await
+                    .map_err(gateway_bolt_error)?;
+                return Ok(BackendQueryResult::new(
+                    vec!["result".into()],
+                    vec![vec![RuntimeValue::String(result.to_string())]],
+                    BTreeMap::new(),
+                ));
+            }
             if !compiled.is_read_only() {
                 let summary = self
                     .execute_cypher_write(
@@ -731,6 +846,126 @@ fn materialized_element_json(
         "destination": element.destination().map(endpoint_json),
         "deleted": element.deleted(),
     }))
+}
+
+fn parse_algorithm_call(
+    text: &str,
+    parameters: BTreeMap<String, RuntimeValue>,
+) -> Result<(String, BTreeMap<String, AlgorithmValue>), RemoteGatewayServiceError> {
+    let call = text
+        .find("CALL")
+        .ok_or_else(|| RemoteGatewayServiceError::Query("CALL keyword is required".into()))?;
+    let body = text[call + 4..].trim_start();
+    let open = body.find('(').ok_or_else(|| {
+        RemoteGatewayServiceError::Query("procedure call requires parentheses".into())
+    })?;
+    let name = body[..open].trim().to_owned();
+    if !name.starts_with("dtg.") {
+        return Err(RemoteGatewayServiceError::Query(
+            "only dtg.* procedures are exposed by this gateway".into(),
+        ));
+    }
+    let close = body[open + 1..]
+        .find(')')
+        .map(|offset| open + 1 + offset)
+        .ok_or_else(|| {
+            RemoteGatewayServiceError::Query("procedure call has no closing parenthesis".into())
+        })?;
+    let argument_source = body[open + 1..close].trim();
+    let mut result = BTreeMap::new();
+    if !argument_source.is_empty() {
+        let source = argument_source
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+            .ok_or_else(|| {
+                RemoteGatewayServiceError::Query("procedure arguments must be a map".into())
+            })?;
+        for item in source.split(',') {
+            let (key, value) = item.split_once(':').ok_or_else(|| {
+                RemoteGatewayServiceError::Query("procedure map argument requires key:value".into())
+            })?;
+            let key = key.trim().to_owned();
+            let value = value.trim();
+            let parsed = if let Some(name) = value.strip_prefix('$') {
+                parameters
+                    .get(name)
+                    .ok_or_else(|| {
+                        RemoteGatewayServiceError::Query(format!(
+                            "missing procedure parameter ${name}"
+                        ))
+                    })
+                    .and_then(runtime_algorithm_value)
+            } else if let Ok(integer) = value.parse::<i64>() {
+                if matches!(key.as_str(), "source" | "destination") {
+                    Ok(AlgorithmValue::Vertex(VertexId::new(integer as u128)))
+                } else {
+                    Ok(AlgorithmValue::Integer(integer))
+                }
+            } else if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
+                Ok(AlgorithmValue::Boolean(value.eq_ignore_ascii_case("true")))
+            } else {
+                Ok(AlgorithmValue::String(value.trim_matches('\'').to_owned()))
+            }?;
+            let normalized = normalize_algorithm_parameter(&name, &key, parsed);
+            result.insert(key, normalized);
+        }
+    }
+    Ok((name, result))
+}
+
+fn normalize_algorithm_parameter(name: &str, key: &str, value: AlgorithmValue) -> AlgorithmValue {
+    if matches!(key, "source" | "destination") {
+        return match value {
+            AlgorithmValue::Integer(integer) if integer >= 0 => {
+                AlgorithmValue::Vertex(VertexId::new(integer as u128))
+            }
+            other => other,
+        };
+    }
+    if matches!(key, "validFrom" | "validTo" | "deadline") {
+        return match value {
+            AlgorithmValue::Integer(integer) => {
+                AlgorithmValue::Time(ValidTime::from_micros(integer))
+            }
+            other => other,
+        };
+    }
+    let _ = name;
+    value
+}
+
+fn runtime_algorithm_value(
+    value: &RuntimeValue,
+) -> Result<AlgorithmValue, RemoteGatewayServiceError> {
+    match value {
+        RuntimeValue::Null => Ok(AlgorithmValue::Null),
+        RuntimeValue::Boolean(value) => Ok(AlgorithmValue::Boolean(*value)),
+        RuntimeValue::Integer(value) => Ok(AlgorithmValue::Integer(*value)),
+        RuntimeValue::FloatBits(value) => Ok(AlgorithmValue::FloatBits(*value)),
+        RuntimeValue::String(value) => Ok(AlgorithmValue::String(value.clone())),
+        RuntimeValue::TimestampMicros(value) => {
+            Ok(AlgorithmValue::Time(ValidTime::from_micros(*value)))
+        }
+        _ => Err(RemoteGatewayServiceError::Query(
+            "unsupported runtime value in analytics procedure parameter".into(),
+        )),
+    }
+}
+
+fn algorithm_value_json(value: &AlgorithmValue) -> Value {
+    match value {
+        AlgorithmValue::Null => Value::Null,
+        AlgorithmValue::Boolean(value) => json!(value),
+        AlgorithmValue::Integer(value) => json!(value),
+        AlgorithmValue::FloatBits(value) => {
+            json!({"type": "float", "bits": format!("{value:016x}")})
+        }
+        AlgorithmValue::String(value) => json!(value),
+        AlgorithmValue::Vertex(value) => json!({"type": "vertex", "id": value.value().to_string()}),
+        AlgorithmValue::Time(value) => {
+            json!({"type": "timestamp", "micros": value.as_micros().to_string()})
+        }
+    }
 }
 
 #[tonic::async_trait]

@@ -13,8 +13,10 @@ use temporal_storage::{GraphId, TemporalStore};
 use temporal_types::ValidTime;
 use temporal_types::{GraphValue, TransactionTime};
 
+mod jobs;
 mod provider;
 
+pub use jobs::{AnalyticsJobId, AnalyticsJobManager, JobCheckpoint, JobError, JobState, JobStatus};
 pub use provider::BuiltInProvider;
 
 pub async fn project_snapshot<A>(
@@ -25,6 +27,21 @@ pub async fn project_snapshot<A>(
     directed: bool,
     weight_property: Option<u32>,
 ) -> Result<SnapshotGraph, ProjectionError>
+where
+    A: StorageAdapter,
+{
+    let (vertices, edges) =
+        project_snapshot_parts(store, graph, valid_time, transaction_time, weight_property).await?;
+    SnapshotGraph::new(vertices, edges, directed).map_err(ProjectionError::Graph)
+}
+
+pub async fn project_snapshot_parts<A>(
+    store: &TemporalStore<A>,
+    graph: GraphId,
+    valid_time: ValidTime,
+    transaction_time: TransactionTime,
+    weight_property: Option<u32>,
+) -> Result<(Vec<VertexId>, Vec<SnapshotEdge>), ProjectionError>
 where
     A: StorageAdapter,
 {
@@ -56,7 +73,7 @@ where
             .map_err(ProjectionError::Graph)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    SnapshotGraph::new(vertices, edges, directed).map_err(ProjectionError::Graph)
+    Ok((vertices, edges))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,6 +272,173 @@ pub fn degree_centrality(graph: &SnapshotGraph) -> BTreeMap<VertexId, DegreeCent
         }
     }
     result
+}
+
+#[must_use]
+pub fn triangle_count(graph: &SnapshotGraph) -> usize {
+    let neighbors = graph
+        .vertices()
+        .iter()
+        .copied()
+        .map(|vertex| {
+            (
+                vertex,
+                graph
+                    .outgoing(vertex)
+                    .iter()
+                    .map(|edge| edge.destination())
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut count = 0_usize;
+    for (index, left) in graph.vertices().iter().enumerate() {
+        for middle in graph.vertices().iter().skip(index + 1) {
+            if !neighbors[left].contains(middle) {
+                continue;
+            }
+            for right in graph
+                .vertices()
+                .iter()
+                .skip_while(|vertex| **vertex <= *middle)
+            {
+                if neighbors[left].contains(right) && neighbors[middle].contains(right) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+    }
+    count
+}
+
+#[must_use]
+pub fn clustering_coefficient(graph: &SnapshotGraph) -> BTreeMap<VertexId, f64> {
+    graph
+        .vertices()
+        .iter()
+        .copied()
+        .map(|vertex| {
+            let neighbors = graph
+                .outgoing(vertex)
+                .iter()
+                .map(|edge| edge.destination())
+                .collect::<std::collections::BTreeSet<_>>();
+            let degree = neighbors.len();
+            let links = neighbors
+                .iter()
+                .enumerate()
+                .flat_map(|(index, left)| {
+                    neighbors
+                        .iter()
+                        .skip(index + 1)
+                        .map(move |right| (*left, *right))
+                })
+                .filter(|(left, right)| {
+                    graph
+                        .outgoing(*left)
+                        .iter()
+                        .any(|edge| edge.destination() == *right)
+                        || (!graph.directed()
+                            && graph
+                                .outgoing(*right)
+                                .iter()
+                                .any(|edge| edge.destination() == *left))
+                })
+                .count();
+            let coefficient = if degree < 2 {
+                0.0
+            } else {
+                2.0 * links as f64 / (degree * (degree - 1)) as f64
+            };
+            (vertex, coefficient)
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn k_core(graph: &SnapshotGraph, k: usize) -> BTreeMap<VertexId, usize> {
+    let mut degrees = graph
+        .vertices()
+        .iter()
+        .copied()
+        .map(|vertex| (vertex, graph.outgoing(vertex).len()))
+        .collect::<BTreeMap<_, _>>();
+    let mut removed = std::collections::BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for (vertex, degree) in &degrees {
+        if *degree < k {
+            queue.push_back(*vertex);
+        }
+    }
+    while let Some(vertex) = queue.pop_front() {
+        if !removed.insert(vertex) {
+            continue;
+        }
+        for edge in graph.outgoing(vertex) {
+            if let Some(degree) = degrees.get_mut(&edge.destination()) {
+                *degree = degree.saturating_sub(1);
+                if *degree < k {
+                    queue.push_back(edge.destination());
+                }
+            }
+        }
+    }
+    graph
+        .vertices()
+        .iter()
+        .copied()
+        .filter(|vertex| !removed.contains(vertex))
+        .map(|vertex| (vertex, degrees[&vertex]))
+        .collect()
+}
+
+pub fn label_propagation(
+    graph: &SnapshotGraph,
+    max_iterations: usize,
+) -> Result<BTreeMap<VertexId, VertexId>, AlgorithmError> {
+    if max_iterations == 0 {
+        return Err(AlgorithmError::InvalidLabelPropagationConfiguration);
+    }
+    let mut labels = graph
+        .vertices()
+        .iter()
+        .copied()
+        .map(|vertex| (vertex, vertex))
+        .collect::<BTreeMap<_, _>>();
+    for _ in 0..max_iterations {
+        let mut changed = false;
+        let previous = labels.clone();
+        for vertex in graph.vertices() {
+            let mut counts = BTreeMap::<VertexId, usize>::new();
+            for edge in graph.outgoing(*vertex) {
+                *counts.entry(previous[&edge.destination()]).or_default() += 1;
+            }
+            if !graph.directed() {
+                for candidate in graph.vertices() {
+                    if graph
+                        .outgoing(*candidate)
+                        .iter()
+                        .any(|edge| edge.destination() == *vertex)
+                    {
+                        *counts.entry(previous[candidate]).or_default() += 1;
+                    }
+                }
+            }
+            #[allow(clippy::collapsible_if)]
+            if let Some(label) = counts
+                .into_iter()
+                .max_by_key(|(label, count)| (*count, std::cmp::Reverse(*label)))
+            {
+                if labels.insert(*vertex, label.0) != Some(label.0) {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(labels)
 }
 
 #[must_use]
@@ -550,6 +734,85 @@ pub fn earliest_arrival(
     })
 }
 
+pub fn temporal_reachability(
+    graph: &EventGraph,
+    request: TemporalPathRequest,
+) -> Result<BTreeMap<VertexId, bool>, AlgorithmError> {
+    let arrivals = earliest_arrival(graph, request)?.arrivals;
+    Ok(graph
+        .vertices()
+        .iter()
+        .copied()
+        .map(|vertex| (vertex, arrivals.contains_key(&vertex)))
+        .collect())
+}
+
+pub fn min_hop_temporal_path(
+    graph: &EventGraph,
+    request: TemporalPathRequest,
+) -> Result<BTreeMap<VertexId, u64>, AlgorithmError> {
+    ensure_vertex(graph.vertices(), request.source)?;
+    let mut hops = BTreeMap::from([(request.source, 0_u64)]);
+    let mut frontier = VecDeque::from([(request.source, request.valid_from)]);
+    while let Some((vertex, arrival)) = frontier.pop_front() {
+        let next_hop = hops[&vertex].saturating_add(1);
+        for event in graph.outgoing(vertex) {
+            if event.event_time() < request.valid_from
+                || event.event_time() > request.valid_to
+                || event.event_time() < arrival
+            {
+                continue;
+            }
+            if let Some(previous) = hops.get(&event.destination())
+                && *previous <= next_hop
+            {
+                continue;
+            }
+            let next_arrival = event
+                .arrival_time()
+                .map_err(|_| AlgorithmError::TimeOverflow)?;
+            if next_arrival > request.valid_to {
+                continue;
+            }
+            hops.insert(event.destination(), next_hop);
+            frontier.push_back((event.destination(), next_arrival));
+        }
+    }
+    Ok(hops)
+}
+
+pub fn latest_departure(
+    graph: &EventGraph,
+    destination: VertexId,
+    deadline: ValidTime,
+) -> Result<BTreeMap<VertexId, ValidTime>, AlgorithmError> {
+    ensure_vertex(graph.vertices(), destination)?;
+    let mut latest = BTreeMap::from([(destination, deadline)]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for event in graph.events().iter().rev() {
+            let Some(destination_latest) = latest.get(&event.destination()).copied() else {
+                continue;
+            };
+            let arrival = event
+                .arrival_time()
+                .map_err(|_| AlgorithmError::TimeOverflow)?;
+            if arrival > destination_latest {
+                continue;
+            }
+            if latest
+                .get(&event.source())
+                .is_none_or(|current| event.event_time() > *current)
+            {
+                latest.insert(event.source(), event.event_time());
+                changed = true;
+            }
+        }
+    }
+    Ok(latest)
+}
+
 fn ensure_vertex(vertices: &[VertexId], vertex: VertexId) -> Result<(), AlgorithmError> {
     if vertices.binary_search(&vertex).is_err() {
         return Err(AlgorithmError::UnknownSource(vertex));
@@ -565,6 +828,7 @@ pub enum AlgorithmError {
     NegativeWeight,
     InvalidTemporalSemantics,
     TimeOverflow,
+    InvalidLabelPropagationConfiguration,
 }
 
 impl Display for AlgorithmError {

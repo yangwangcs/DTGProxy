@@ -7,8 +7,9 @@ use analytics_api::{
 };
 
 use crate::{
-    TemporalPathRequest, TimeOrder, WaitingPolicy, bfs, degree_centrality, earliest_arrival,
-    page_rank, scc, sssp, wcc,
+    TemporalPathRequest, TimeOrder, WaitingPolicy, bfs, clustering_coefficient, degree_centrality,
+    earliest_arrival, k_core, label_propagation, latest_departure, min_hop_temporal_path,
+    page_rank, scc, sssp, temporal_reachability, triangle_count, wcc,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,7 +40,14 @@ impl AnalyticsProvider for BuiltInProvider {
             ("dtg.graph.scc", GraphModel::Snapshot),
             ("dtg.graph.pageRank", GraphModel::Snapshot),
             ("dtg.graph.degree", GraphModel::Snapshot),
+            ("dtg.graph.triangleCount", GraphModel::Snapshot),
+            ("dtg.graph.clusteringCoefficient", GraphModel::Snapshot),
+            ("dtg.graph.kCore", GraphModel::Snapshot),
+            ("dtg.graph.labelPropagation", GraphModel::Snapshot),
             ("dtg.temporal.earliestArrival", GraphModel::Event),
+            ("dtg.temporal.reachability", GraphModel::Event),
+            ("dtg.temporal.minHop", GraphModel::Event),
+            ("dtg.temporal.latestDeparture", GraphModel::Event),
         ]
         .into_iter()
         .map(|(name, model)| {
@@ -75,7 +83,14 @@ impl AnalyticsProvider for BuiltInProvider {
             "dtg.graph.scc" => run_components(&request, true),
             "dtg.graph.pageRank" => run_page_rank(&request),
             "dtg.graph.degree" => run_degree(&request),
+            "dtg.graph.triangleCount" => run_triangle_count(&request),
+            "dtg.graph.clusteringCoefficient" => run_clustering(&request),
+            "dtg.graph.kCore" => run_k_core(&request),
+            "dtg.graph.labelPropagation" => run_label_propagation(&request),
             "dtg.temporal.earliestArrival" => run_earliest(&request),
+            "dtg.temporal.reachability" => run_reachability(&request),
+            "dtg.temporal.minHop" => run_min_hop(&request),
+            "dtg.temporal.latestDeparture" => run_latest_departure(&request),
             _ => Err(error("DTG-ANALYTICS-UNKNOWN", "unknown algorithm")),
         }
     }
@@ -215,6 +230,59 @@ fn run_degree(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderErr
     )
 }
 
+fn run_triangle_count(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
+    table(
+        &["triangleCount"],
+        vec![vec![integer(triangle_count(snapshot(request)?) as u64)]],
+    )
+}
+
+fn run_clustering(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
+    table(
+        &["vertexId", "coefficient"],
+        clustering_coefficient(snapshot(request)?)
+            .into_iter()
+            .map(|(vertex, value)| {
+                vec![
+                    AlgorithmValue::Vertex(vertex),
+                    AlgorithmValue::FloatBits(value.to_bits()),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn run_k_core(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
+    let k = positive_integer(request, "k", 2)?;
+    let k = usize::try_from(k).map_err(|_| error("DTG-ANALYTICS-PARAMETER", "k is too large"))?;
+    table(
+        &["vertexId", "core"],
+        k_core(snapshot(request)?, k)
+            .into_iter()
+            .map(|(vertex, core)| vec![AlgorithmValue::Vertex(vertex), integer(core as u64)])
+            .collect(),
+    )
+}
+
+fn run_label_propagation(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
+    let iterations = positive_integer(request, "maxIterations", 20)?;
+    let iterations = usize::try_from(iterations)
+        .map_err(|_| error("DTG-ANALYTICS-PARAMETER", "maxIterations is too large"))?;
+    table(
+        &["vertexId", "label"],
+        label_propagation(snapshot(request)?, iterations)
+            .map_err(execution_error)?
+            .into_iter()
+            .map(|(vertex, label)| {
+                vec![
+                    AlgorithmValue::Vertex(vertex),
+                    AlgorithmValue::Vertex(label),
+                ]
+            })
+            .collect(),
+    )
+}
+
 fn run_earliest(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
     let time_order = match request.parameters().get("timeOrder") {
         None => TimeOrder::NonDecreasing,
@@ -259,6 +327,65 @@ fn run_earliest(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderE
                         .map_or(AlgorithmValue::Null, AlgorithmValue::Vertex),
                 ]
             })
+            .collect(),
+    )
+}
+
+fn temporal_request(request: &AlgorithmRequest) -> Result<TemporalPathRequest, ProviderError> {
+    TemporalPathRequest::new(
+        source(request)?,
+        time_parameter(request, "validFrom")?,
+        time_parameter(request, "validTo")?,
+        TimeOrder::NonDecreasing,
+        WaitingPolicy::Allowed,
+    )
+    .map_err(execution_error)
+}
+
+fn run_reachability(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
+    table(
+        &["vertexId", "reachable"],
+        temporal_reachability(event(request)?, temporal_request(request)?)
+            .map_err(execution_error)?
+            .into_iter()
+            .map(|(vertex, reachable)| {
+                vec![
+                    AlgorithmValue::Vertex(vertex),
+                    AlgorithmValue::Boolean(reachable),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn run_min_hop(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
+    table(
+        &["vertexId", "hops"],
+        min_hop_temporal_path(event(request)?, temporal_request(request)?)
+            .map_err(execution_error)?
+            .into_iter()
+            .map(|(vertex, hops)| vec![AlgorithmValue::Vertex(vertex), integer(hops)])
+            .collect(),
+    )
+}
+
+fn run_latest_departure(request: &AlgorithmRequest) -> Result<AlgorithmResult, ProviderError> {
+    let destination = match request.parameters().get("destination") {
+        Some(AlgorithmValue::Vertex(vertex)) => *vertex,
+        _ => {
+            return Err(error(
+                "DTG-ANALYTICS-PARAMETER",
+                "destination must be a Vertex",
+            ));
+        }
+    };
+    let deadline = time_parameter(request, "deadline")?;
+    table(
+        &["vertexId", "latestDeparture"],
+        latest_departure(event(request)?, destination, deadline)
+            .map_err(execution_error)?
+            .into_iter()
+            .map(|(vertex, time)| vec![AlgorithmValue::Vertex(vertex), AlgorithmValue::Time(time)])
             .collect(),
     )
 }

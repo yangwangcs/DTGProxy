@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 cluster-protocol = { path = "../cluster-protocol" }
+analytics-api = { path = "../analytics-api" }
+analytics-runtime = { path = "../analytics-runtime" }
 control-plane = { path = "../control-plane" }
 crc32fast = "=1.5.0"
 bolt-protocol = { path = "../bolt-protocol" }
