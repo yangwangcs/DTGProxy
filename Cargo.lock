@@ -94,7 +94,10 @@ dependencies = [
 name = "analytics-runtime"
 version = "1.0.0"
 dependencies = [
+ "adapter-memory",
  "analytics-api",
+ "storage-api",
+ "temporal-storage",
  "temporal-types",
 ]
 

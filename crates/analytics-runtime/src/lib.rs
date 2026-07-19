@@ -1,13 +1,74 @@
 #![forbid(unsafe_code)]
 
+use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use analytics_api::{EventGraph, SnapshotGraph, VertexId};
+use analytics_api::{EventGraph, GraphProjectionError, SnapshotEdge, SnapshotGraph, VertexId};
+use storage_api::StorageAdapter;
+use temporal_storage::{GraphId, TemporalStore};
 use temporal_types::ValidTime;
+use temporal_types::{GraphValue, TransactionTime};
+
+pub async fn project_snapshot<A>(
+    store: &TemporalStore<A>,
+    graph: GraphId,
+    valid_time: ValidTime,
+    transaction_time: TransactionTime,
+    directed: bool,
+    weight_property: Option<u32>,
+) -> Result<SnapshotGraph, ProjectionError>
+where
+    A: StorageAdapter,
+{
+    let vertices = store
+        .scan_vertex_views_as_of(graph, valid_time, transaction_time)
+        .await
+        .map_err(|error| ProjectionError::Storage(error.to_string()))?
+        .into_iter()
+        .map(|vertex| VertexId::new(vertex.element().id().value()))
+        .collect::<Vec<_>>();
+    let edges = store
+        .scan_edges_as_of(graph, valid_time, transaction_time)
+        .await
+        .map_err(|error| ProjectionError::Storage(error.to_string()))?
+        .into_iter()
+        .map(|edge| {
+            let weight =
+                match weight_property.and_then(|property| edge.payload().property(property)) {
+                    None => 1.0,
+                    Some(GraphValue::Integer(value)) => *value as f64,
+                    Some(GraphValue::FloatBits(value)) => f64::from_bits(*value),
+                    Some(_) => return Err(ProjectionError::InvalidWeightProperty),
+                };
+            SnapshotEdge::new(
+                VertexId::new(edge.source().value()),
+                VertexId::new(edge.destination().value()),
+                weight,
+            )
+            .map_err(ProjectionError::Graph)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    SnapshotGraph::new(vertices, edges, directed).map_err(ProjectionError::Graph)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectionError {
+    Storage(String),
+    Graph(GraphProjectionError),
+    InvalidWeightProperty,
+}
+
+impl Display for ProjectionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(formatter, "analytics storage projection failed: {self:?}")
+    }
+}
+
+impl Error for ProjectionError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BfsResult {
@@ -48,6 +109,220 @@ pub fn bfs(graph: &SnapshotGraph, source: VertexId) -> Result<BfsResult, Algorit
         distances,
         predecessors,
     })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SsspResult {
+    distances: BTreeMap<VertexId, f64>,
+    predecessors: BTreeMap<VertexId, VertexId>,
+}
+
+impl SsspResult {
+    #[must_use]
+    pub fn distance(&self, vertex: VertexId) -> Option<f64> {
+        self.distances.get(&vertex).copied()
+    }
+
+    #[must_use]
+    pub fn predecessor(&self, vertex: VertexId) -> Option<VertexId> {
+        self.predecessors.get(&vertex).copied()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WeightedFrontier {
+    distance: f64,
+    vertex: VertexId,
+}
+
+impl Eq for WeightedFrontier {}
+
+impl Ord for WeightedFrontier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .distance
+            .total_cmp(&self.distance)
+            .then_with(|| other.vertex.cmp(&self.vertex))
+    }
+}
+
+impl PartialOrd for WeightedFrontier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub fn sssp(graph: &SnapshotGraph, source: VertexId) -> Result<SsspResult, AlgorithmError> {
+    ensure_vertex(graph.vertices(), source)?;
+    if graph.edges().iter().any(|edge| edge.weight() < 0.0) {
+        return Err(AlgorithmError::NegativeWeight);
+    }
+    let mut distances = BTreeMap::from([(source, 0.0)]);
+    let mut predecessors = BTreeMap::new();
+    let mut frontier = BinaryHeap::from([WeightedFrontier {
+        distance: 0.0,
+        vertex: source,
+    }]);
+    while let Some(current) = frontier.pop() {
+        if distances
+            .get(&current.vertex)
+            .is_none_or(|distance| *distance != current.distance)
+        {
+            continue;
+        }
+        for edge in graph.outgoing(current.vertex) {
+            let next = current.distance + edge.weight();
+            if !next.is_finite() {
+                return Err(AlgorithmError::DistanceOverflow);
+            }
+            let destination = edge.destination();
+            if distances
+                .get(&destination)
+                .is_none_or(|distance| next < *distance)
+            {
+                distances.insert(destination, next);
+                predecessors.insert(destination, current.vertex);
+                frontier.push(WeightedFrontier {
+                    distance: next,
+                    vertex: destination,
+                });
+            }
+        }
+    }
+    Ok(SsspResult {
+        distances,
+        predecessors,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DegreeCentrality {
+    incoming: u64,
+    outgoing: u64,
+}
+
+impl DegreeCentrality {
+    #[must_use]
+    pub const fn incoming(self) -> u64 {
+        self.incoming
+    }
+
+    #[must_use]
+    pub const fn outgoing(self) -> u64 {
+        self.outgoing
+    }
+
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.incoming.saturating_add(self.outgoing)
+    }
+}
+
+#[must_use]
+pub fn degree_centrality(graph: &SnapshotGraph) -> BTreeMap<VertexId, DegreeCentrality> {
+    let mut result = graph
+        .vertices()
+        .iter()
+        .copied()
+        .map(|vertex| {
+            (
+                vertex,
+                DegreeCentrality {
+                    incoming: 0,
+                    outgoing: 0,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for edge in graph.edges() {
+        let source = result.get_mut(&edge.source()).expect("validated source");
+        source.outgoing = source.outgoing.saturating_add(1);
+        let destination = result
+            .get_mut(&edge.destination())
+            .expect("validated destination");
+        destination.incoming = destination.incoming.saturating_add(1);
+        if !graph.directed() && edge.source() != edge.destination() {
+            let destination = result
+                .get_mut(&edge.destination())
+                .expect("validated destination");
+            destination.outgoing = destination.outgoing.saturating_add(1);
+            let source = result.get_mut(&edge.source()).expect("validated source");
+            source.incoming = source.incoming.saturating_add(1);
+        }
+    }
+    result
+}
+
+#[must_use]
+pub fn scc(graph: &SnapshotGraph) -> BTreeMap<VertexId, VertexId> {
+    let mut seen = BTreeMap::<VertexId, ()>::new();
+    let mut order = Vec::with_capacity(graph.vertices().len());
+    for start in graph.vertices() {
+        if seen.contains_key(start) {
+            continue;
+        }
+        let mut stack = vec![(*start, false)];
+        while let Some((vertex, expanded)) = stack.pop() {
+            if expanded {
+                order.push(vertex);
+                continue;
+            }
+            if seen.insert(vertex, ()).is_some() {
+                continue;
+            }
+            stack.push((vertex, true));
+            for edge in graph.outgoing(vertex).iter().rev() {
+                if !seen.contains_key(&edge.destination()) {
+                    stack.push((edge.destination(), false));
+                }
+            }
+        }
+    }
+    let mut incoming = graph
+        .vertices()
+        .iter()
+        .copied()
+        .map(|vertex| (vertex, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    for edge in graph.edges() {
+        incoming
+            .get_mut(&edge.destination())
+            .expect("validated destination")
+            .push(edge.source());
+        if !graph.directed() && edge.source() != edge.destination() {
+            incoming
+                .get_mut(&edge.source())
+                .expect("validated source")
+                .push(edge.destination());
+        }
+    }
+    let mut assigned = BTreeMap::new();
+    while let Some(start) = order.pop() {
+        if assigned.contains_key(&start) {
+            continue;
+        }
+        let mut members = Vec::new();
+        let mut stack = vec![start];
+        assigned.insert(start, start);
+        while let Some(vertex) = stack.pop() {
+            members.push(vertex);
+            for predecessor in &incoming[&vertex] {
+                if !assigned.contains_key(predecessor) {
+                    assigned.insert(*predecessor, start);
+                    stack.push(*predecessor);
+                }
+            }
+        }
+        let component = members
+            .iter()
+            .copied()
+            .min()
+            .expect("component is non-empty");
+        for member in members {
+            assigned.insert(member, component);
+        }
+    }
+    assigned
 }
 
 #[must_use]
@@ -283,6 +558,7 @@ pub enum AlgorithmError {
     UnknownSource(VertexId),
     DistanceOverflow,
     InvalidPageRankConfiguration,
+    NegativeWeight,
     InvalidTemporalSemantics,
     TimeOverflow,
 }

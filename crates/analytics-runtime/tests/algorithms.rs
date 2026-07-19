@@ -1,6 +1,7 @@
 use analytics_api::{EventEdge, EventGraph, SnapshotEdge, SnapshotGraph, VertexId};
 use analytics_runtime::{
-    TemporalPathRequest, TimeOrder, WaitingPolicy, bfs, earliest_arrival, page_rank, wcc,
+    TemporalPathRequest, TimeOrder, WaitingPolicy, bfs, degree_centrality, earliest_arrival,
+    page_rank, scc, sssp, wcc,
 };
 use temporal_types::ValidTime;
 
@@ -20,6 +21,35 @@ fn runs_deterministic_snapshot_algorithms() {
     let total = ranks.values().sum::<f64>();
     assert!((total - 1.0).abs() < 1e-9);
     assert!(ranks[&VertexId::new(3)] > ranks[&VertexId::new(1)]);
+}
+
+#[test]
+fn runs_weighted_shortest_paths_scc_and_degree() {
+    let graph = SnapshotGraph::new(
+        ids(&[1, 2, 3, 4]),
+        vec![
+            SnapshotEdge::new(VertexId::new(1), VertexId::new(2), 5.0).expect("edge"),
+            SnapshotEdge::new(VertexId::new(1), VertexId::new(3), 1.0).expect("edge"),
+            SnapshotEdge::new(VertexId::new(3), VertexId::new(2), 1.0).expect("edge"),
+            SnapshotEdge::new(VertexId::new(2), VertexId::new(1), 1.0).expect("edge"),
+        ],
+        true,
+    )
+    .expect("graph");
+    let shortest = sssp(&graph, VertexId::new(1)).expect("SSSP");
+    assert_eq!(shortest.distance(VertexId::new(2)), Some(2.0));
+    assert_eq!(
+        shortest.predecessor(VertexId::new(2)),
+        Some(VertexId::new(3))
+    );
+
+    let components = scc(&graph);
+    assert_eq!(components[&VertexId::new(1)], components[&VertexId::new(3)]);
+    assert_ne!(components[&VertexId::new(1)], components[&VertexId::new(4)]);
+
+    let degree = degree_centrality(&graph);
+    assert_eq!(degree[&VertexId::new(1)].outgoing(), 2);
+    assert_eq!(degree[&VertexId::new(1)].incoming(), 1);
 }
 
 #[test]
