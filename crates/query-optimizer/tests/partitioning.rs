@@ -69,3 +69,18 @@ fn primary_replica_uses_one_local_fragment_without_exchange() {
     );
     assert!(optimized.plan().exchanges().is_empty());
 }
+
+#[test]
+fn primary_replica_preserves_catalog_shard_identity() {
+    let context = OptimizerContext::new(DeploymentMode::PrimaryReplica, 1, 64 << 20, 256 << 20)
+        .expect("context")
+        .with_primary_shard(42);
+    let optimized = Optimizer::new()
+        .optimize(&logical(), context)
+        .expect("optimize");
+
+    assert_eq!(
+        optimized.plan().fragments()[0].placement(),
+        Placement::Shard(42)
+    );
+}

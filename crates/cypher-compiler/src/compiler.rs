@@ -76,6 +76,11 @@ impl CompiledQuery {
     }
 
     #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        matches!(self.effect, QueryEffect::ReadOnly)
+    }
+
+    #[must_use]
     pub const fn logical_plan(&self) -> &LogicalPlan {
         &self.logical_plan
     }

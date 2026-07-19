@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
@@ -11,14 +12,20 @@ use cluster_protocol::proto::{
 };
 use cluster_protocol::{CLUSTER_PROTOCOL_VERSION, CommonRequestContext, MAX_COMMAND_BYTES};
 use control_plane::GraphDefinition;
+use cypher_engine::{
+    CypherQueryEngine, CypherQueryRequest, DeploymentMode as QueryDeploymentMode, EngineConfig,
+    ResourceLimits,
+};
+use distributed_query::{DistributedCoordinator, LocalFragmentWorker};
 use dtgproxy::gateway::{GATEWAY_API_VERSION, GatewayOperation, GatewayRequest};
-use dtgproxy::{DeploymentConfig, TransactionContext, TransactionCoordinator};
+use dtgproxy::{DeploymentConfig, DeploymentMode, TransactionContext, TransactionCoordinator};
+use query_executor::v2::{RuntimeValue, TemporalBatchExecutor};
 use query_executor::{LocalExecutor, ShardQueryBatch, SnapshotToken, merge_distributed_results};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use shard_client::{RemoteShardClient, ShardClient, ShardClientStorageAdapter};
 use temporal_ir::PlanBody;
 use temporal_storage::TemporalStore;
-use temporal_types::TransactionTime;
+use temporal_types::{TransactionTime, ValidTime};
 use timestamp_oracle::advance_timestamp;
 use tonic::{Request, Response, Status};
 use txn_protocol::IsolationLevel;
@@ -246,6 +253,94 @@ impl RemoteGatewayService {
         routing: &GatewayRoutingState,
         text: &str,
     ) -> Result<Value, RemoteGatewayServiceError> {
+        if is_legacy_query(text) {
+            return self
+                .execute_legacy_query(request_id, deadline_unix_ms, routing, text)
+                .await;
+        }
+        self.execute_cypher_query(request_id, deadline_unix_ms, routing, text)
+            .await
+    }
+
+    async fn execute_cypher_query(
+        &self,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        routing: &GatewayRoutingState,
+        text: &str,
+    ) -> Result<Value, RemoteGatewayServiceError> {
+        let security_fingerprint = request_security_fingerprint(self.cluster_id, request_id);
+        let shard_ids = routing
+            .deployment
+            .all_shards()
+            .iter()
+            .map(|placement| placement.shard_id())
+            .collect::<Vec<_>>();
+        let mode = match routing.deployment.mode() {
+            DeploymentMode::PrimaryReplica => QueryDeploymentMode::PrimaryReplica,
+            DeploymentMode::SharedNothing => QueryDeploymentMode::SharedNothing,
+        };
+        let limits = ResourceLimits::new(64 << 20, 256 << 20, 1_024)
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let config = EngineConfig::new(
+            routing.graph.name(),
+            routing.graph.graph_id(),
+            routing.graph.schema_version(),
+            routing.graph.topology().epoch(),
+            mode,
+            shard_ids,
+            limits,
+        )
+        .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let mut coordinator = DistributedCoordinator::new(64 << 20, 64)
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        let client: Arc<dyn ShardClient> = self.shard_client.clone();
+        for placement in routing.deployment.all_shards() {
+            let adapter = ShardClientStorageAdapter::new(
+                Arc::clone(&client),
+                routing.graph.graph_id(),
+                placement.shard_id(),
+                placement.placement_epoch(),
+                deadline_unix_ms,
+                request_namespace(request_id, placement.shard_id()),
+            )
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+            coordinator
+                .register(Arc::new(LocalFragmentWorker::new(
+                    placement.shard_id(),
+                    routing.graph.graph_id(),
+                    routing.graph.schema_version(),
+                    routing.graph.topology().epoch(),
+                    security_fingerprint,
+                    TemporalBatchExecutor::new(TemporalStore::new(adapter)),
+                )))
+                .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        }
+        let (query_snapshot, _) = self
+            .allocate_transaction_timestamps(request_id, deadline_unix_ms)
+            .await?;
+        let request = CypherQueryRequest::new(
+            text,
+            BTreeMap::new(),
+            ValidTime::from_micros(unix_time_micros()?),
+            query_snapshot,
+            security_fingerprint,
+            deadline_unix_ms,
+        );
+        let response = CypherQueryEngine::new(config)
+            .execute(&coordinator, request)
+            .await
+            .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+        cypher_response_json(&response)
+    }
+
+    async fn execute_legacy_query(
+        &self,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        routing: &GatewayRoutingState,
+        text: &str,
+    ) -> Result<Value, RemoteGatewayServiceError> {
         let plan = temporal_query::parse(text)
             .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
         if plan.scope().graph().value() != routing.graph.graph_id() {
@@ -446,6 +541,125 @@ fn request_namespace(request_id: u128, shard_id: u32) -> u64 {
     (low ^ u64::from(shard_id)).max(1)
 }
 
+fn is_legacy_query(text: &str) -> bool {
+    let mut words = text
+        .split_ascii_whitespace()
+        .map(|word| word.to_ascii_uppercase());
+    match words.next().as_deref() {
+        Some("VERTEX" | "EDGE" | "SCAN") => true,
+        Some("DIFF") => matches!(words.next().as_deref(), Some("VERTEX" | "EDGE")),
+        _ => false,
+    }
+}
+
+fn request_security_fingerprint(cluster_id: [u8; 16], request_id: u128) -> [u8; 32] {
+    let mut fingerprint = [0; 32];
+    fingerprint[..16].copy_from_slice(&cluster_id);
+    fingerprint[16..].copy_from_slice(&request_id.to_be_bytes());
+    fingerprint
+}
+
+fn cypher_response_json(
+    response: &cypher_engine::CypherQueryResponse,
+) -> Result<Value, RemoteGatewayServiceError> {
+    let columns = response
+        .schema()
+        .columns()
+        .iter()
+        .map(|column| {
+            json!({
+                "name": column.name(),
+                "type": format!("{:?}", column.value_type()),
+                "nullable": column.nullable(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows = response
+        .batches()
+        .iter()
+        .flat_map(|batch| batch.rows())
+        .map(|row| {
+            row.iter()
+                .map(runtime_value_json)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "version": 2,
+        "query_fingerprint": hex_bytes(&response.fingerprint()),
+        "columns": columns,
+        "rows": rows,
+        "optimizer_trace": response.optimizer_trace(),
+    }))
+}
+
+fn runtime_value_json(value: &RuntimeValue) -> Result<Value, RemoteGatewayServiceError> {
+    match value {
+        RuntimeValue::Null => Ok(Value::Null),
+        RuntimeValue::Boolean(value) => Ok(Value::Bool(*value)),
+        RuntimeValue::Integer(value) => Ok(json!(value)),
+        RuntimeValue::FloatBits(bits) => Ok(json!({
+            "type": "float",
+            "bits": format!("{bits:016x}"),
+        })),
+        RuntimeValue::String(value) => Ok(Value::String(value.clone())),
+        RuntimeValue::Bytes(value) => Ok(json!({"type": "bytes", "hex": hex_bytes(value)})),
+        RuntimeValue::TimestampMicros(value) => {
+            Ok(json!({"type": "timestamp", "micros": value.to_string()}))
+        }
+        RuntimeValue::List(values) => values
+            .iter()
+            .map(runtime_value_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        RuntimeValue::Map(values) => {
+            let values = values
+                .iter()
+                .map(|(key, value)| Ok((key.to_string(), runtime_value_json(value)?)))
+                .collect::<Result<Map<_, _>, RemoteGatewayServiceError>>()?;
+            Ok(Value::Object(values))
+        }
+        RuntimeValue::Node(node) => {
+            let element = node.element();
+            Ok(json!({
+                "type": "node",
+                "graph_id": element.graph().value(),
+                "partition_id": element.partition().value(),
+                "element_id": element.id().value().to_string(),
+                "label_id": node.label().map(|label| label.value()),
+                "payload_dtp1": hex_bytes(&node.payload().encode().map_err(|error| {
+                    RemoteGatewayServiceError::Query(error.to_string())
+                })?),
+            }))
+        }
+        RuntimeValue::Relationship(relationship) => {
+            let element = relationship.element();
+            Ok(json!({
+                "type": "relationship",
+                "graph_id": element.graph().value(),
+                "partition_id": element.partition().value(),
+                "element_id": element.id().value().to_string(),
+                "relationship_type_id": relationship.edge_type().value(),
+                "source_id": relationship.source().value().to_string(),
+                "destination_id": relationship.destination().value().to_string(),
+                "payload_dtp1": hex_bytes(&relationship.payload().encode().map_err(|error| {
+                    RemoteGatewayServiceError::Query(error.to_string())
+                })?),
+            }))
+        }
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
 fn timestamp_json(timestamp: TransactionTime) -> Value {
     json!({
         "physical_micros": timestamp.physical_micros(),
@@ -459,6 +673,15 @@ fn unix_time_ms() -> Result<u64, Status> {
         .map_err(|_| Status::internal("system clock is before Unix epoch"))?
         .as_millis();
     u64::try_from(millis).map_err(|_| Status::internal("system clock overflow"))
+}
+
+fn unix_time_micros() -> Result<i64, RemoteGatewayServiceError> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| RemoteGatewayServiceError::Query("system clock is before Unix epoch".into()))?
+        .as_micros();
+    i64::try_from(micros)
+        .map_err(|_| RemoteGatewayServiceError::Query("system clock overflow".into()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -485,3 +708,23 @@ impl Display for RemoteGatewayServiceError {
 }
 
 impl Error for RemoteGatewayServiceError {}
+
+#[cfg(test)]
+mod tests {
+    use query_executor::v2::RuntimeValue;
+    use serde_json::json;
+
+    use super::runtime_value_json;
+
+    #[test]
+    fn cypher_json_keeps_temporal_and_binary_values_typed() {
+        assert_eq!(
+            runtime_value_json(&RuntimeValue::TimestampMicros(123)).expect("timestamp"),
+            json!({"type": "timestamp", "micros": "123"})
+        );
+        assert_eq!(
+            runtime_value_json(&RuntimeValue::Bytes(vec![0, 15, 255])).expect("bytes"),
+            json!({"type": "bytes", "hex": "000fff"})
+        );
+    }
+}

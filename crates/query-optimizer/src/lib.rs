@@ -19,6 +19,7 @@ pub enum DeploymentMode {
 pub struct OptimizerContext {
     mode: DeploymentMode,
     shard_count: u32,
+    primary_shard_id: u32,
     memory_bytes: u64,
     spill_bytes: u64,
 }
@@ -39,9 +40,16 @@ impl OptimizerContext {
         Ok(Self {
             mode,
             shard_count,
+            primary_shard_id: 0,
             memory_bytes,
             spill_bytes,
         })
+    }
+
+    #[must_use]
+    pub const fn with_primary_shard(mut self, shard_id: u32) -> Self {
+        self.primary_shard_id = shard_id;
+        self
     }
 }
 
@@ -108,7 +116,9 @@ impl Optimizer {
         let budget = MemoryBudget::new(context.memory_bytes, context.spill_bytes)
             .map_err(|error| OptimizerError::Physical(error.to_string()))?;
         match context.mode {
-            DeploymentMode::PrimaryReplica => optimize_primary(logical, header, budget),
+            DeploymentMode::PrimaryReplica => {
+                optimize_primary(logical, header, budget, context.primary_shard_id)
+            }
             DeploymentMode::SharedNothing => optimize_shared(logical, header, budget, context),
         }
     }
@@ -118,12 +128,13 @@ fn optimize_primary(
     logical: &LogicalPlan,
     header: PhysicalPlanHeaderV1,
     budget: MemoryBudget,
+    primary_shard_id: u32,
 ) -> Result<OptimizedPlan, OptimizerError> {
     let operators = logical.nodes().iter().map(physical).collect();
     let mut builder = PhysicalPlanBuilder::new(header);
     let root = builder
         .add_fragment(
-            Placement::Shard(0),
+            Placement::Shard(primary_shard_id),
             operators,
             logical.output().clone(),
             budget,

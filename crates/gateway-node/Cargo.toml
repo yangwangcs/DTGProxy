@@ -9,6 +9,8 @@ license.workspace = true
 cluster-protocol = { path = "../cluster-protocol" }
 control-plane = { path = "../control-plane" }
 crc32fast = "=1.5.0"
+cypher-engine = { path = "../cypher-engine" }
+distributed-query = { path = "../distributed-query" }
 dtgproxy = { path = "../dtgproxy" }
 query-executor = { path = "../query-executor" }
 serde = { version = "=1.0.228", features = ["derive"] }

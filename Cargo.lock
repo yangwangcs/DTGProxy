@@ -423,6 +423,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cypher-engine"
+version = "1.0.0"
+dependencies = [
+ "adapter-memory",
+ "cypher-compiler",
+ "distributed-query",
+ "query-executor",
+ "query-optimizer",
+ "temporal-ir",
+ "temporal-storage",
+ "temporal-types",
+]
+
+[[package]]
 name = "cypher-sema"
 version = "1.0.0"
 dependencies = [
@@ -709,7 +723,9 @@ dependencies = [
  "cluster-protocol",
  "control-plane",
  "crc32fast",
+ "cypher-engine",
  "data-node",
+ "distributed-query",
  "dtgproxy",
  "meta-node",
  "query-executor",

@@ -1,0 +1,21 @@
+[package]
+name = "cypher-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cypher-compiler = { path = "../cypher-compiler" }
+distributed-query = { path = "../distributed-query" }
+query-executor = { path = "../query-executor", default-features = false }
+query-optimizer = { path = "../query-optimizer" }
+temporal-ir = { path = "../temporal-ir" }
+temporal-storage = { path = "../temporal-storage" }
+temporal-types = { path = "../temporal-types" }
+
+[dev-dependencies]
+adapter-memory = { path = "../adapter-memory" }
+
+[lints]
+workspace = true
