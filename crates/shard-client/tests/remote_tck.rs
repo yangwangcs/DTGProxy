@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cluster_protocol::proto::shard_service_server::ShardServiceServer;
 use data_node::{
@@ -124,7 +124,7 @@ fn generic_delete_command(request_id: u128) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn remote_reads_retry_another_replica_when_catalog_leader_is_stale() {
+async fn remote_execute_retries_until_a_campaigning_catalog_leader_is_ready() {
     let temporary = tempdir().unwrap();
     let follower_config = NodeConfig::new(
         NodeIdentity::new([0x74; 16], 7).unwrap(),
@@ -161,11 +161,6 @@ async fn remote_reads_retry_another_replica_when_catalog_leader_is_stale() {
         )
         .await
         .unwrap();
-    leader
-        .campaign(ReplicaKey::new(1, 11).unwrap())
-        .await
-        .unwrap();
-
     let follower_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let follower_address = follower_listener.local_addr().unwrap();
     let (follower_shutdown, follower_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -205,11 +200,25 @@ async fn remote_reads_retry_another_replica_when_catalog_leader_is_stale() {
         )],
     )
     .unwrap();
-    let client = RemoteShardClient::new_loopback_plaintext([0x74; 16], topology).unwrap();
-    client
-        .execute(ExecuteCommand::new(context(601), command(601)).unwrap())
+    let client = Arc::new(RemoteShardClient::new_loopback_plaintext([0x74; 16], topology).unwrap());
+    let execute = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            client
+                .execute(ExecuteCommand::new(context(601), command(601)).unwrap())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !execute.is_finished(),
+        "remote execute must keep retrying while the catalog leader is campaigning"
+    );
+    leader
+        .campaign(ReplicaKey::new(1, 11).unwrap())
         .await
         .unwrap();
+    execute.await.unwrap().unwrap();
     let key = LogicalKey::in_keyspace(Keyspace::Current, b"vertex/remote".to_vec());
     assert_eq!(
         client

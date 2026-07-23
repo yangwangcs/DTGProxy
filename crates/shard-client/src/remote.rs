@@ -42,6 +42,7 @@ use crate::{
 const MAXIMUM_SCAN_BATCH_BYTES: u32 = 4 * 1024 * 1024;
 const MAXIMUM_RETRY_ATTEMPTS: usize = 3;
 const MAXIMUM_READ_RETRY_ATTEMPTS: usize = 64;
+const MAXIMUM_WRITE_RETRY_ATTEMPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteReplica {
@@ -322,8 +323,14 @@ impl ShardClient for RemoteShardClient {
             let (_, route) = self.route(context)?;
             let payload = request.command().to_vec();
             let mut last_error = None;
-            for replica in Self::candidates(&route) {
+            let candidates = Self::candidates(&route);
+            for attempt in 0..MAXIMUM_WRITE_RETRY_ATTEMPTS {
                 validate_deadline(context)?;
+                let replica = candidates.get(attempt % candidates.len()).copied().ok_or(
+                    ShardClientError::NoLeader {
+                        shard_id: context.shard_id(),
+                    },
+                )?;
                 let channel = self.channel(replica)?;
                 let mut client = ShardServiceClient::new(channel);
                 let wire = WireExecuteRequest {
@@ -341,6 +348,9 @@ impl ShardClient for RemoteShardClient {
                             return Err(error);
                         }
                         last_error = Some(error);
+                        if attempt + 1 < MAXIMUM_WRITE_RETRY_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
                     }
                 }
             }
