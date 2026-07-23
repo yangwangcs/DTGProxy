@@ -109,7 +109,7 @@ fn executes_count_aggregate_after_temporal_scan() {
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME AS OF 5 MATCH (n) RETURN count(n)",
+            "USE accounts FOR VALID_TIME AS OF 5 MATCH (n) RETURN count(n)",
             BTreeMap::new(),
             ValidTime::from_micros(5),
             TransactionTime::new(150, 0),
@@ -146,7 +146,7 @@ fn executes_valid_time_interval_by_returning_elements_intersecting_the_window() 
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME FROM $from TO $to MATCH (n) RETURN n",
+            "USE accounts FOR VALID_TIME BETWEEN $from AND $to MATCH (n) RETURN n",
             BTreeMap::from([
                 ("from".into(), RuntimeValue::TimestampMicros(0)),
                 ("to".into(), RuntimeValue::TimestampMicros(5)),
@@ -201,7 +201,7 @@ fn interval_query_rejects_a_nonempty_transaction_overlay_instead_of_omitting_it(
         engine.execute(
             &coordinator,
             CypherQueryRequest::new(
-                "USE accounts AT VALID_TIME FROM 1 TO 5 MATCH (n) RETURN n",
+                "USE accounts FOR VALID_TIME BETWEEN 1 AND 5 MATCH (n) RETURN n",
                 BTreeMap::new(),
                 ValidTime::from_micros(999),
                 TransactionTime::new(150, 0),
@@ -242,7 +242,7 @@ fn fixed_transaction_rejects_an_explicit_transaction_time_override() {
         engine.execute(
             &coordinator,
             CypherQueryRequest::new(
-                "USE accounts AT TRANSACTION_TIME AS OF 200 MATCH (n) RETURN n",
+                "USE accounts FOR SYSTEM_TIME AS OF 200 MATCH (n) RETURN n",
                 BTreeMap::new(),
                 ValidTime::from_micros(5),
                 TransactionTime::new(150, 0),
@@ -282,7 +282,7 @@ fn interval_query_returns_a_middle_segment_with_its_temporal_region() {
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME FROM 0 TO 5 MATCH (n) RETURN n",
+            "USE accounts FOR VALID_TIME BETWEEN 0 AND 5 MATCH (n) RETURN n",
             BTreeMap::new(),
             ValidTime::from_micros(999),
             TransactionTime::new(150, 0),
@@ -328,7 +328,7 @@ fn interval_cypher_aggregate_returns_piecewise_temporal_counts() {
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME FROM 0 TO 5 MATCH (n) RETURN count(n)",
+            "USE accounts FOR VALID_TIME BETWEEN 0 AND 5 MATCH (n) RETURN count(n)",
             BTreeMap::new(),
             ValidTime::from_micros(999),
             TransactionTime::new(150, 0),
@@ -1059,7 +1059,7 @@ fn interval_union_deduplicates_identical_regions_from_two_branches() {
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME FROM 0 TO 5 \
+            "USE accounts FOR VALID_TIME BETWEEN 0 AND 5 \
              MATCH (n) RETURN n UNION MATCH (m) RETURN m AS n",
             BTreeMap::new(),
             ValidTime::from_micros(999),
@@ -1099,7 +1099,7 @@ fn interval_union_all_preserves_branch_multiplicity() {
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME FROM 0 TO 5 \
+            "USE accounts FOR VALID_TIME BETWEEN 0 AND 5 \
              MATCH (n) RETURN n UNION ALL MATCH (m) RETURN m AS n",
             BTreeMap::new(),
             ValidTime::from_micros(999),
@@ -1139,7 +1139,7 @@ fn interval_union_with_and_unwind_preserve_regions_and_exact_multiplicity() {
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME FROM 0 TO 5 \
+            "USE accounts FOR VALID_TIME BETWEEN 0 AND 5 \
              MATCH (n) WITH [n, n] AS nodes UNWIND nodes AS value RETURN value \
              UNION MATCH (m) WITH [m] AS nodes UNWIND nodes AS value RETURN value",
             BTreeMap::new(),
@@ -1259,7 +1259,7 @@ fn gathers_interval_rows_from_all_shards_without_losing_regions() {
     let response = block_on(engine.execute(
         &coordinator,
         CypherQueryRequest::new(
-            "USE accounts AT VALID_TIME FROM 0 TO 5 MATCH (n) RETURN n",
+            "USE accounts FOR VALID_TIME BETWEEN 0 AND 5 MATCH (n) RETURN n",
             BTreeMap::new(),
             ValidTime::from_micros(999),
             TransactionTime::new(150, 0),
@@ -1380,8 +1380,8 @@ fn graph_source_with_pipeline_is_canonical_across_deployment_modes() {
 
 fn request(transaction_micros: i64, security: [u8; 32]) -> CypherQueryRequest {
     CypherQueryRequest::new(
-        "USE accounts AT VALID_TIME AS OF $valid \
-         AT TRANSACTION_TIME AS OF $tx MATCH (n) RETURN n",
+        "USE accounts FOR VALID_TIME AS OF $valid \
+         FOR SYSTEM_TIME AS OF $tx MATCH (n) RETURN n",
         BTreeMap::from([
             ("valid".into(), RuntimeValue::TimestampMicros(5)),
             (

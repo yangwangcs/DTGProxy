@@ -2,16 +2,16 @@ use cypher_sema::{CypherType, QueryEffect, SemanticAnalyzer};
 use cypher_syntax::parse;
 
 #[test]
-fn diff_has_a_stable_four_column_schema() {
+fn changes_is_a_read_only_query_with_the_declared_projection() {
     let query = parse(
-        "DIFF GRAPH accounts AT VALID_TIME AS OF $a AND AS OF $b \
-         AT TRANSACTION_TIME AS OF $tx \
-         YIELD element, changeType, before, after",
+        "USE accounts CHANGES FOR VALID_TIME BETWEEN $a AND $b \
+         FOR SYSTEM_TIME AS OF $tx \
+         MATCH (n) RETURN n",
     )
-    .expect("DIFF should parse");
+    .expect("CHANGES should parse");
     let analyzed = SemanticAnalyzer::new()
         .analyze(&query)
-        .expect("DIFF should analyze");
+        .expect("CHANGES should analyze");
 
     assert_eq!(analyzed.effect(), QueryEffect::ReadOnly);
     assert_eq!(
@@ -20,19 +20,14 @@ fn diff_has_a_stable_four_column_schema() {
             .iter()
             .map(|field| (field.name(), field.cypher_type()))
             .collect::<Vec<_>>(),
-        vec![
-            ("element", &CypherType::Any),
-            ("changeType", &CypherType::Any),
-            ("before", &CypherType::Any),
-            ("after", &CypherType::Any),
-        ]
+        vec![("n", &CypherType::Node)]
     );
 }
 
 #[test]
 fn backdated_valid_time_update_is_allowed() {
     let query = parse(
-        "AT VALID_TIME AS OF $business_time \
+        "FOR VALID_TIME AS OF $business_time \
          MATCH (n) SET n.status = 'corrected' RETURN n",
     )
     .expect("query should parse");

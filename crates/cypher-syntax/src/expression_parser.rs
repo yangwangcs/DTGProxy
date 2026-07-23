@@ -200,12 +200,7 @@ impl<'tokens> ExpressionParser<'tokens> {
             ));
         }
         let parsed = parse_with_limits(source, self.limits)?;
-        let cypher_ast::Statement::Query(query) = parsed.statement() else {
-            return Err(self.error_here(
-                "DTG-CYPHER-SUBQUERY-STATEMENT",
-                "subquery expression must contain a Cypher query",
-            ));
-        };
+        let cypher_ast::Statement::Query(query) = parsed.statement();
         self.position = close + 1;
         Ok(if exists {
             Expression::ExistsSubquery(Box::new(query.clone()))

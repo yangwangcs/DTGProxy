@@ -526,7 +526,7 @@ async fn gateway_process_restart_recovers_an_inflight_analytics_job() {
         &mut client,
         302,
         "create-graph",
-        "USE process_graph AT VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)",
+        "USE process_graph FOR VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)",
     )
     .await;
     assert_eq!(created["ok"], true, "{created}");
@@ -534,7 +534,7 @@ async fn gateway_process_restart_recovers_an_inflight_analytics_job() {
         &mut client,
         303,
         "submit-degree",
-        "USE process_graph AT VALID_TIME AS OF 1000 \
+        "USE process_graph FOR VALID_TIME AS OF 1000 \
          CALL dtg.analytics.submit({algorithm: 'dtg.graph.degree', parameters: {}}) \
          YIELD jobId RETURN jobId",
     )
@@ -972,7 +972,7 @@ async fn meta_leader_change_does_not_interrupt_an_inflight_analytics_job() {
         &mut client,
         1_102,
         "create-before-meta-failover",
-        "USE process_graph AT VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)",
+        "USE process_graph FOR VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)",
     )
     .await;
     assert_eq!(created["ok"], true, "{created}");
@@ -980,7 +980,7 @@ async fn meta_leader_change_does_not_interrupt_an_inflight_analytics_job() {
         &mut client,
         1_103,
         "submit-before-meta-failover",
-        "USE process_graph AT VALID_TIME AS OF 1000 \
+        "USE process_graph FOR VALID_TIME AS OF 1000 \
          CALL dtg.analytics.submit({algorithm: 'dtg.graph.degree', parameters: {}}) \
          YIELD jobId RETURN jobId",
     )

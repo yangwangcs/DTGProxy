@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use analytics_api::AlgorithmType;
 use cypher_ast::{
     BinaryOperator, Clause, ClauseKind, CypherProfile, Expression, NodePattern, Pattern,
-    ProcedureYield, RelationshipPattern, Statement, TransactionTimeScope, UnaryOperator,
+    ProcedureYield, RelationshipPattern, Statement, TemporalAxis, UnaryOperator,
 };
 use cypher_syntax::{ParsedQuery, TokenKind, lex, parse_expression, parse_pattern};
 use procedure_runtime::{
@@ -239,18 +239,6 @@ impl SemanticAnalyzer {
         access: &ProcedureAccess,
     ) -> Result<AnalyzedQuery, SemanticError> {
         match statement {
-            Statement::Diff(_) => Ok(AnalyzedQuery {
-                output: ["element", "changeType", "before", "after"]
-                    .into_iter()
-                    .map(|name| OutputField {
-                        name: name.into(),
-                        cypher_type: CypherType::Any,
-                    })
-                    .collect(),
-                effect: QueryEffect::ReadOnly,
-                procedures: Vec::new(),
-                subqueries: Vec::new(),
-            }),
             Statement::Query(query) => {
                 let inference = InferenceContext {
                     analyzer: self,
@@ -449,10 +437,7 @@ impl SemanticAnalyzer {
                     ));
                 }
                 if effect == QueryEffect::Write
-                    && matches!(
-                        query.temporal().transaction_time(),
-                        TransactionTimeScope::AsOf(_)
-                    )
+                    && query.temporal().scope(TemporalAxis::SystemTime).is_some()
                 {
                     return Err(SemanticError::new(
                         "DTG-TEMPORAL-HISTORICAL-WRITE",

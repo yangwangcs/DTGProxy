@@ -7,7 +7,7 @@ fn compiler_preserves_structured_write_clauses() {
     let session = CompileSession::new("accounts", 7, 3, 11).unwrap();
     let compiled = CypherCompiler::new()
         .compile(
-            "USE accounts AT VALID_TIME AS OF $valid CREATE (a:Person {name: $name})-[r:KNOWS {since: 2024}]->(b:Person) SET a.status = 'active' REMOVE b.legacy DETACH DELETE r RETURN a",
+            "USE accounts FOR VALID_TIME AS OF $valid CREATE (a:Person {name: $name})-[r:KNOWS {since: 2024}]->(b:Person) SET a.status = 'active' REMOVE b.legacy DETACH DELETE r RETURN a",
             &session,
         )
         .unwrap();

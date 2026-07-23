@@ -3,10 +3,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use cypher_ast::{
-    CallSubquery, Clause, ClauseKind, CypherProfile, DEFAULT_SUBQUERY_BATCH_ROWS, DiffStatement,
-    Expression, Identifier, InTransactions, ProcedureCall, ProcedureYield, QueryStatement,
-    Statement, SubqueryErrorPolicy, TemporalContext, TextSpan, TransactionTimeScope,
-    ValidTimeScope, YieldItem,
+    CallSubquery, Clause, ClauseKind, CypherProfile, DEFAULT_SUBQUERY_BATCH_ROWS, Expression,
+    Identifier, InTransactions, ProcedureCall, ProcedureYield, QueryStatement, Statement,
+    SubqueryErrorPolicy, TemporalAxis, TemporalContext, TemporalMode, TemporalScope, TextSpan,
+    YieldItem,
 };
 
 use crate::{
@@ -100,11 +100,13 @@ pub fn parse_with_limits(query: &str, limits: SyntaxLimits) -> Result<ParsedQuer
         position: 0,
         limits,
     };
-    let statement = if parser.at_word("DIFF") {
-        Statement::Diff(parser.parse_diff()?)
-    } else {
-        Statement::Query(parser.parse_query()?)
-    };
+    if parser.at_word("AT") || parser.at_word("DIFF") {
+        return Err(parser.error_here(
+            "DTG-CYPHER-REMOVED-TEMPORAL-SYNTAX",
+            "use FOR VALID_TIME, FOR SYSTEM_TIME, or CHANGES",
+        ));
+    }
+    let statement = Statement::Query(parser.parse_query()?);
     if ast_node_count(&statement) > limits.max_ast_nodes() {
         return Err(parse_error(
             "DTG-CYPHER-TOO-MANY-AST-NODES",
@@ -128,33 +130,24 @@ impl Parser<'_, '_> {
         } else {
             None
         };
-        let mut valid_time = None;
-        let mut transaction_time = TransactionTimeScope::Current;
-        while self.consume_word("AT") {
-            if self.consume_word("VALID_TIME") {
-                if valid_time.is_some() {
-                    return Err(self.error_here(
-                        "DTG-CYPHER-DUPLICATE-TEMPORAL-SCOPE",
-                        "valid-time scope is already specified",
-                    ));
-                }
-                valid_time = Some(self.valid_time_scope()?);
-            } else if self.consume_word("TRANSACTION_TIME") {
-                if !matches!(transaction_time, TransactionTimeScope::Current) {
-                    return Err(self.error_here(
-                        "DTG-CYPHER-DUPLICATE-TEMPORAL-SCOPE",
-                        "transaction-time scope is already specified",
-                    ));
-                }
-                self.expect_word("AS")?;
-                self.expect_word("OF")?;
-                transaction_time = TransactionTimeScope::AsOf(self.expression()?);
-            } else {
+        let mut scopes = Vec::new();
+        loop {
+            let changes = self.consume_word("CHANGES");
+            if !changes && !self.at_temporal_for() {
+                break;
+            }
+            self.expect_word("FOR")?;
+            let axis = self.temporal_axis()?;
+            if scopes
+                .iter()
+                .any(|scope: &TemporalScope| scope.axis() == axis)
+            {
                 return Err(self.error_here(
-                    "DTG-CYPHER-EXPECTED-TIME-DIMENSION",
-                    "AT requires VALID_TIME or TRANSACTION_TIME",
+                    "DTG-CYPHER-DUPLICATE-TEMPORAL-SCOPE",
+                    "temporal axis is already specified",
                 ));
             }
+            scopes.push(self.temporal_scope(axis, changes)?);
         }
         let clauses = self.remaining_clauses()?;
         if clauses.is_empty() {
@@ -165,64 +158,71 @@ impl Parser<'_, '_> {
         }
         Ok(QueryStatement::new(
             graph,
-            TemporalContext::new(valid_time, transaction_time),
+            TemporalContext::new(scopes),
             clauses,
         ))
     }
 
-    fn valid_time_scope(&mut self) -> Result<ValidTimeScope, ParseError> {
-        if self.consume_word("AS") {
-            self.expect_word("OF")?;
-            Ok(ValidTimeScope::AsOf(self.expression()?))
-        } else if self.consume_word("FROM") {
-            let start = self.expression()?;
-            self.expect_word("TO")?;
-            let end = self.expression()?;
-            Ok(ValidTimeScope::Between { start, end })
+    fn at_temporal_for(&self) -> bool {
+        self.at_word("FOR")
+            && self
+                .lexed
+                .tokens()
+                .get(self.position + 1)
+                .is_some_and(|token| {
+                    matches!(token.kind(), TokenKind::Word(word) if word.eq_ignore_ascii_case("VALID_TIME") || word.eq_ignore_ascii_case("SYSTEM_TIME"))
+                })
+    }
+
+    fn temporal_axis(&mut self) -> Result<TemporalAxis, ParseError> {
+        if self.consume_word("VALID_TIME") {
+            Ok(TemporalAxis::ValidTime)
+        } else if self.consume_word("SYSTEM_TIME") {
+            Ok(TemporalAxis::SystemTime)
         } else {
             Err(self.error_here(
-                "DTG-CYPHER-EXPECTED-TEMPORAL-SELECTOR",
-                "VALID_TIME requires AS OF or FROM ... TO",
+                "DTG-CYPHER-EXPECTED-TIME-DIMENSION",
+                "FOR requires VALID_TIME or SYSTEM_TIME",
             ))
         }
     }
 
-    fn parse_diff(&mut self) -> Result<DiffStatement, ParseError> {
-        self.expect_word("DIFF")?;
-        self.expect_word("GRAPH")?;
-        let graph = self.identifier()?;
-        self.expect_word("AT")?;
-        self.expect_word("VALID_TIME")?;
-        self.expect_word("AS")?;
-        self.expect_word("OF")?;
-        let from = self.expression()?;
-        self.expect_word("AND")?;
-        self.expect_word("AS")?;
-        self.expect_word("OF")?;
-        let to = self.expression()?;
-        self.expect_word("AT")?;
-        self.expect_word("TRANSACTION_TIME")?;
-        self.expect_word("AS")?;
-        self.expect_word("OF")?;
-        let transaction = TransactionTimeScope::AsOf(self.expression()?);
-        self.expect_word("YIELD")?;
-        let mut yield_items = vec![self.identifier()?.value().to_owned()];
-        while self.consume_kind(&TokenKind::Comma) {
-            yield_items.push(self.identifier()?.value().to_owned());
-        }
-        if self.position != self.lexed.tokens().len() {
-            return Err(self.error_here(
-                "DTG-CYPHER-UNEXPECTED-TOKEN",
-                "unexpected token after DIFF YIELD list",
+    fn temporal_scope(
+        &mut self,
+        axis: TemporalAxis,
+        changes: bool,
+    ) -> Result<TemporalScope, ParseError> {
+        if changes {
+            self.expect_word("BETWEEN")?;
+            let start = self.expression()?;
+            self.expect_word("AND")?;
+            let end = self.expression()?;
+            return Ok(TemporalScope::between(
+                axis,
+                TemporalMode::ChangesBetween,
+                start,
+                end,
             ));
         }
-        Ok(DiffStatement::new(
-            graph,
-            from,
-            to,
-            transaction,
-            yield_items,
-        ))
+        if self.consume_word("AS") {
+            self.expect_word("OF")?;
+            Ok(TemporalScope::as_of(axis, self.expression()?))
+        } else if self.consume_word("BETWEEN") {
+            let start = self.expression()?;
+            self.expect_word("AND")?;
+            let end = self.expression()?;
+            Ok(TemporalScope::between(
+                axis,
+                TemporalMode::StateBetween,
+                start,
+                end,
+            ))
+        } else {
+            Err(self.error_here(
+                "DTG-CYPHER-EXPECTED-TEMPORAL-SELECTOR",
+                "temporal scope requires AS OF or BETWEEN ... AND",
+            ))
+        }
     }
 
     fn remaining_clauses(&mut self) -> Result<Vec<Clause>, ParseError> {
@@ -372,15 +372,6 @@ impl Parser<'_, '_> {
         })
     }
 
-    fn consume_kind(&mut self, expected: &TokenKind) -> bool {
-        if self.current().is_some_and(|token| token.kind() == expected) {
-            self.position += 1;
-            true
-        } else {
-            false
-        }
-    }
-
     fn current(&self) -> Option<&Token> {
         self.lexed.tokens().get(self.position)
     }
@@ -507,13 +498,7 @@ fn parse_subquery_call(
         ));
     }
     let parsed = parse_with_limits(body, limits)?;
-    let Statement::Query(query) = parsed.statement() else {
-        return Err(parse_error(
-            "DTG-CYPHER-SUBQUERY-STATEMENT",
-            open.span(),
-            "CALL subquery must contain a Cypher query",
-        ));
-    };
+    let Statement::Query(query) = parsed.statement();
     let query = query.clone();
     let exports = subquery_exports(&query)?;
 
@@ -938,7 +923,6 @@ fn parse_error(code: &'static str, span: SourceSpan, message: impl Into<String>)
 fn ast_node_count(statement: &Statement) -> usize {
     match statement {
         Statement::Query(query) => query_ast_node_count(query),
-        Statement::Diff(diff) => 5_usize.saturating_add(diff.yield_items().len()),
     }
 }
 
@@ -947,11 +931,7 @@ pub(crate) fn query_ast_node_count(query: &QueryStatement) -> usize {
         1_usize
             .saturating_add(query.clauses().len())
             .saturating_add(usize::from(query.graph().is_some()))
-            .saturating_add(usize::from(query.temporal().valid_time().is_some()))
-            .saturating_add(usize::from(!matches!(
-                query.temporal().transaction_time(),
-                TransactionTimeScope::Current
-            ))),
+            .saturating_add(query.temporal().scopes().len()),
         |count, clause| {
             count.saturating_add(
                 clause

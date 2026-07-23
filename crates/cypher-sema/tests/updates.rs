@@ -26,7 +26,7 @@ fn write_clauses_mark_the_query_as_writing() {
 #[test]
 fn historical_transaction_time_is_read_only() {
     let query = parse(
-        "AT TRANSACTION_TIME AS OF $historical \
+        "FOR SYSTEM_TIME AS OF $historical \
          MATCH (n) SET n.active = true RETURN n",
     )
     .expect("query should parse");

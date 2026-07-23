@@ -606,7 +606,7 @@ async fn run_live_full_stack_restart_certification(
     ));
     execute_write(
         &mut first_bolt,
-        "USE analytics AT VALID_TIME AS OF 1000 \
+        "USE analytics FOR VALID_TIME AS OF 1000 \
          CREATE (a:Person)-[:KNOWS]->(b:Person)",
     )
     .await;
@@ -1750,45 +1750,45 @@ async fn run_surface(
     ));
     let transaction_rows = execute_query(
         &mut bolt,
-        "USE analytics AT VALID_TIME AS OF 1000 MATCH (n:TransactionSeed) \
+        "USE analytics FOR VALID_TIME AS OF 1000 MATCH (n:TransactionSeed) \
          RETURN count(n) AS total",
     )
     .await;
     assert_eq!(transaction_rows, vec![vec![Value::Integer(2)]]);
     execute_write(
         &mut bolt,
-        "USE analytics AT VALID_TIME AS OF 1000 \
+        "USE analytics FOR VALID_TIME AS OF 1000 \
          MERGE (a:Person {fixtureId: 'person-a'})-[:KNOWS]->\
                (b:Person {fixtureId: 'person-b'})",
     )
     .await;
     let node_count = execute_query(
         &mut bolt,
-        "USE analytics AT VALID_TIME AS OF 1000 MATCH (n) RETURN count(n) AS total",
+        "USE analytics FOR VALID_TIME AS OF 1000 MATCH (n) RETURN count(n) AS total",
     )
     .await;
     let degree = execute_query(
         &mut bolt,
-        "USE analytics AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
+        "USE analytics FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
          YIELD degree RETURN degree ORDER BY degree",
     )
     .await;
     let interval = execute_query(
         &mut bolt,
-        "USE analytics AT VALID_TIME FROM 1000 TO 2000 \
+        "USE analytics FOR VALID_TIME BETWEEN 1000 AND 2000 \
          CALL dtg.temporal.intervalComponents({}) \
          YIELD componentId RETURN componentId ORDER BY componentId",
     )
     .await;
     execute_write(
         &mut bolt,
-        "USE analytics AT VALID_TIME AS OF 2000 \
+        "USE analytics FOR VALID_TIME AS OF 2000 \
          MERGE (:DeltaOnly {fixtureId: 'delta-only'})",
     )
     .await;
     let delta = execute_query(
         &mut bolt,
-        "USE analytics AT VALID_TIME FROM 1000 TO 2000 \
+        "USE analytics FOR VALID_TIME BETWEEN 1000 AND 2000 \
          CALL dtg.temporal.deltaSummary({}) \
          YIELD entityType, change, count \
          RETURN entityType, change, count ORDER BY entityType, change",
@@ -1796,13 +1796,13 @@ async fn run_surface(
     .await;
     let pagination = execute_paginated_query(
         &mut bolt,
-        "USE analytics AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
+        "USE analytics FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
          YIELD degree RETURN degree ORDER BY degree",
     )
     .await;
     let canonical_error = execute_failure(
         &mut bolt,
-        "USE analytics AT VALID_TIME AS OF 1000 MATCH (n) RETURN missing",
+        "USE analytics FOR VALID_TIME AS OF 1000 MATCH (n) RETURN missing",
     )
     .await;
 
@@ -2284,7 +2284,7 @@ where
     let run = bolt
         .handle(ClientMessage::Run {
             query: format!(
-                "USE analytics AT VALID_TIME AS OF 1000 \
+                "USE analytics FOR VALID_TIME AS OF 1000 \
                  CALL dtg.analytics.submit({{algorithm: '{algorithm}', parameters: {parameters}}}) \
                  YIELD jobId RETURN jobId"
             ),

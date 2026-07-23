@@ -34,7 +34,7 @@ async fn bolt_machine_runs_temporal_cypher_with_typed_parameters_and_cursor_pull
     machine.handle(ClientMessage::Hello(BTreeMap::new())).await;
     let run = machine
         .handle(ClientMessage::Run {
-            query: "AT VALID_TIME AS OF $valid MATCH (n) RETURN n".into(),
+            query: "FOR VALID_TIME AS OF $valid MATCH (n) RETURN n".into(),
             parameters: BTreeMap::from([(
                 "valid".into(),
                 Value::Structure {

@@ -177,7 +177,7 @@ async fn run_data_node_restart_fixture(mode: DeploymentMode) {
     ));
     let created = bolt
         .handle(ClientMessage::Run {
-            query: "USE analytics AT VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)"
+            query: "USE analytics FOR VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)"
                 .into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -333,7 +333,7 @@ async fn run_ordered_full_stack_restart_fixture(mode: DeploymentMode) {
     ));
     let created = first_bolt
         .handle(ClientMessage::Run {
-            query: "USE analytics AT VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)"
+            query: "USE analytics FOR VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)"
                 .into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -585,7 +585,7 @@ async fn run_degree_fixture(
     ));
     let created = bolt
         .handle(ClientMessage::Run {
-            query: "USE analytics AT VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)"
+            query: "USE analytics FOR VALID_TIME AS OF 1000 CREATE (a:Person)-[:KNOWS]->(b:Person)"
                 .into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -609,7 +609,7 @@ async fn run_degree_fixture(
     );
     let called = bolt
         .handle(ClientMessage::Run {
-            query: "USE analytics AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
+            query: "USE analytics FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
                     YIELD degree AS score RETURN score"
                 .into(),
             parameters: BTreeMap::new(),
@@ -686,7 +686,7 @@ where
     let submitted = bolt
         .handle(ClientMessage::Run {
             query: format!(
-                "USE analytics AT VALID_TIME AS OF 1000 \
+                "USE analytics FOR VALID_TIME AS OF 1000 \
                  CALL dtg.analytics.submit({{algorithm: '{algorithm}', parameters: {parameters}}}) \
                  YIELD jobId RETURN jobId"
             ),

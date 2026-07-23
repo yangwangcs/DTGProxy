@@ -14,7 +14,7 @@ use temporal_types::{CanonicalElement, GraphValue, Interval, ValidTime};
 fn create_and_set_are_folded_into_one_deterministic_overlay_write() {
     let compiled = CypherCompiler::new()
         .compile(
-            "USE accounts AT VALID_TIME AS OF $valid CREATE (a:Person {name: $name}) SET a.status = 'active' RETURN a",
+            "USE accounts FOR VALID_TIME AS OF $valid CREATE (a:Person {name: $name}) SET a.status = 'active' RETURN a",
             &CompileSession::new("accounts", 7, 3, 11).unwrap(),
         )
         .unwrap();

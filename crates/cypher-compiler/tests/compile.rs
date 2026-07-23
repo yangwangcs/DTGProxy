@@ -13,8 +13,8 @@ fn compiles_temporal_match_into_valid_ir() {
     let compiled = CypherCompiler::new()
         .compile(
             "CYPHER 25 USE accounts \
-             AT VALID_TIME AS OF $valid \
-             AT TRANSACTION_TIME AS OF $tx \
+             FOR VALID_TIME AS OF $valid \
+             FOR SYSTEM_TIME AS OF $tx \
              MATCH (a:Account)-[r:TRANSFER]->(b:Account) \
              WHERE a.active = true RETURN a, r, b",
             &session(),
@@ -90,7 +90,7 @@ fn lowers_order_skip_and_limit_into_temporal_ir() {
 fn preserves_interval_and_current_transaction_time_in_ir() {
     let compiled = CypherCompiler::new()
         .compile(
-            "USE accounts AT VALID_TIME FROM $from TO $to MATCH (n) RETURN n",
+            "USE accounts FOR VALID_TIME BETWEEN $from AND $to MATCH (n) RETURN n",
             &session(),
         )
         .expect("interval query should compile");
@@ -596,7 +596,7 @@ fn extracts_unwind_prefix_without_collapsing_its_rows() {
 fn extracts_standalone_merge_as_a_structured_match_prefix() {
     let compiled = CypherCompiler::new()
         .compile(
-            "USE accounts AT VALID_TIME AS OF 1000 MERGE (account:Account {id: 7})",
+            "USE accounts FOR VALID_TIME AS OF 1000 MERGE (account:Account {id: 7})",
             &session(),
         )
         .expect("MERGE should compile");

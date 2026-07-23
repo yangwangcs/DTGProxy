@@ -12,9 +12,7 @@ fn parses_nested_call_subquery_with_imports_and_batch_spec() {
          RETURN exported_value",
     )
     .expect("scoped nested CALL subquery should parse");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
     let call = query.clauses()[1]
         .call_subquery()
         .expect("structured CALL subquery");

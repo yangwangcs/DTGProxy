@@ -17,6 +17,6 @@ pub use pattern::{
     NodePattern, PathPattern, Pattern, PatternLength, RelationshipChain, RelationshipDirection,
     RelationshipPattern,
 };
-pub use statement::{DiffStatement, QueryStatement, Statement};
-pub use temporal::{TemporalContext, TransactionTimeScope, ValidTimeScope};
+pub use statement::{QueryStatement, Statement};
+pub use temporal::{TemporalAxis, TemporalContext, TemporalMode, TemporalScope};
 pub use version::{CypherProfile, CypherVersion};

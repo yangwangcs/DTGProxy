@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use cypher_ast::{
     BinaryOperator, CallSubquery, Clause, ClauseKind, CypherProfile, Expression, NodePattern,
-    Pattern, Statement, TemporalContext, TransactionTimeScope, UnaryOperator, ValidTimeScope,
+    Pattern, Statement, TemporalAxis, TemporalContext, TemporalMode, UnaryOperator,
 };
 use cypher_sema::{AnalyzedQuery, CypherType, QueryEffect, SemanticAnalyzer};
 use cypher_syntax::{TokenKind, lex, parse, parse_expression, parse_pattern};
@@ -414,8 +414,8 @@ impl CypherCompiler {
         access: &ProcedureAccess,
     ) -> Result<CompiledQuery, CompileError> {
         let parsed = parse(text)?;
-        if let Statement::Query(query) = parsed.statement()
-            && let Some(graph) = query.graph()
+        let Statement::Query(query) = parsed.statement();
+        if let Some(graph) = query.graph()
             && graph.value() != session.graph_name
         {
             return Err(CompileError::new(
@@ -468,9 +468,7 @@ fn compile_mutations(
     logical_plan: &LogicalPlan,
 ) -> Result<MutationPlan, CompileError> {
     let mut mutations = Vec::new();
-    let Statement::Query(query) = statement else {
-        return Ok(MutationPlan { mutations });
-    };
+    let Statement::Query(query) = statement;
     for clause in query.clauses() {
         match clause.kind() {
             ClauseKind::Create => {
@@ -724,19 +722,8 @@ fn lower(
         next_slot: 0,
         temporal_inserted: false,
     };
-    match statement {
-        Statement::Diff(_) => {
-            lowerer.schema = output_schema(analyzed, &mut lowerer.next_slot)?;
-            lowerer.root = Some(lowerer.builder.add(
-                LogicalOperator::Diff,
-                vec![],
-                lowerer.schema.clone(),
-            )?);
-        }
-        Statement::Query(query) => {
-            lowerer.clause_chain(query.clauses(), analyzed, Some(query.temporal()))?;
-        }
-    }
+    let Statement::Query(query) = statement;
+    lowerer.clause_chain(query.clauses(), analyzed, Some(query.temporal()))?;
     let root = lowerer.ensure_root()?;
     lowerer.builder.finish(root).map_err(Into::into)
 }
@@ -1759,19 +1746,24 @@ impl Lowerer<'_> {
     }
 
     fn temporal_slice(&mut self, context: &TemporalContext) -> Result<(), CompileError> {
-        let valid_time = match context.valid_time() {
+        let valid_time = match context.scope(TemporalAxis::ValidTime) {
             None => ValidTimeSpec::Current,
-            Some(ValidTimeScope::AsOf(expression)) => ValidTimeSpec::AsOf(self.scalar(expression)?),
-            Some(ValidTimeScope::Between { start, end }) => ValidTimeSpec::Between {
-                start: self.scalar(start)?,
-                end: self.scalar(end)?,
+            Some(scope) if scope.mode() == TemporalMode::StateAsOf => {
+                ValidTimeSpec::AsOf(self.scalar(scope.start())?)
+            }
+            Some(scope) => ValidTimeSpec::Between {
+                start: self.scalar(scope.start())?,
+                end: self.scalar(scope.end().ok_or_else(|| {
+                    CompileError::new(
+                        "DTG-CYPHER-TEMPORAL-END-MISSING",
+                        "BETWEEN temporal scope requires an end expression",
+                    )
+                })?)?,
             },
         };
-        let transaction_time = match context.transaction_time() {
-            TransactionTimeScope::Current => TransactionTimeSpec::Current,
-            TransactionTimeScope::AsOf(expression) => {
-                TransactionTimeSpec::AsOf(self.scalar(expression)?)
-            }
+        let transaction_time = match context.scope(TemporalAxis::SystemTime) {
+            None => TransactionTimeSpec::Current,
+            Some(scope) => TransactionTimeSpec::AsOf(self.scalar(scope.start())?),
         };
         let input = self.ensure_root()?;
         self.root = Some(self.builder.add(
@@ -1863,13 +1855,7 @@ impl Lowerer<'_> {
             )
         })?;
         let query = subquery.query();
-        if query.graph().is_some()
-            || query.temporal().valid_time().is_some()
-            || !matches!(
-                query.temporal().transaction_time(),
-                TransactionTimeScope::Current
-            )
-        {
+        if query.graph().is_some() || !query.temporal().scopes().is_empty() {
             return Err(CompileError::new(
                 "DTG-CYPHER-SUBQUERY-SCOPE",
                 "CALL subquery inherits the outer graph and temporal scope",
@@ -2108,21 +2094,6 @@ fn union_schemas_compatible(left: &RowSchema, right: &RowSchema) -> bool {
             })
 }
 
-fn output_schema(analyzed: &AnalyzedQuery, next_slot: &mut u32) -> Result<RowSchema, CompileError> {
-    let mut columns = Vec::with_capacity(analyzed.output().len());
-    for field in analyzed.output() {
-        let slot = SlotId::new(*next_slot);
-        *next_slot = next_slot.saturating_add(1);
-        columns.push(Column::new(
-            slot,
-            field.name(),
-            value_type(field.cypher_type()),
-            true,
-        ));
-    }
-    RowSchema::new(columns).map_err(Into::into)
-}
-
 fn value_type(cypher_type: &CypherType) -> ValueType {
     match cypher_type {
         CypherType::Any => ValueType::Any,
@@ -2178,8 +2149,7 @@ fn clause_body(clause: &Clause) -> Result<&str, CompileError> {
 }
 
 fn has_explicit_temporal_scope(context: &TemporalContext) -> bool {
-    context.valid_time().is_some()
-        || !matches!(context.transaction_time(), TransactionTimeScope::Current)
+    !context.scopes().is_empty()
 }
 
 fn projection_modifiers(source: &str) -> Result<(bool, &str), CompileError> {

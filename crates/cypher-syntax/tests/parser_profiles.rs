@@ -4,9 +4,7 @@ use cypher_syntax::parse;
 #[test]
 fn cypher_25_accepts_let_clause() {
     let parsed = parse("CYPHER 25 LET x = 1 RETURN x").expect("LET is a Cypher 25 clause");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
 
     assert_eq!(parsed.profile().version(), CypherVersion::V25);
     assert_eq!(query.clauses()[0].kind(), ClauseKind::Let);
@@ -22,9 +20,7 @@ fn recognizes_stable_standard_clause_families() {
          DETACH DELETE m CALL dtg.algo.list() YIELD name RETURN name",
     )
     .expect("standard clause families should parse");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
 
     assert_eq!(
         query
@@ -55,9 +51,7 @@ fn parses_call_yield_into_a_structured_procedure_descriptor() {
         "CALL dtg.graph.degree({weighted: true}) YIELD vertexId, degree AS score RETURN score",
     )
     .expect("CALL YIELD should parse");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
     let call = query.clauses()[0]
         .procedure()
         .expect("procedure descriptor");
@@ -76,9 +70,7 @@ fn parses_qualified_call_typed_arguments_yield_star_and_aliases() {
     let parsed =
         parse("CALL dtg.graph.degree({weighted: true, nested: [1, $limit]}, $fallback) YIELD *")
             .expect("structured CALL should parse");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
     let procedure = query.clauses()[0].procedure().expect("procedure call");
 
     assert_eq!(procedure.name(), "dtg.graph.degree");
@@ -94,9 +86,7 @@ fn parses_qualified_call_typed_arguments_yield_star_and_aliases() {
     let parsed =
         parse("CALL dtg.graph.degree({}) YIELD vertexId, degree AS score RETURN vertexId, score")
             .expect("explicit YIELD aliases should parse");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
     let procedure = query.clauses()[0].procedure().expect("procedure call");
     assert!(matches!(
         procedure.yield_selection(),
@@ -123,9 +113,7 @@ fn rejects_call_yield_after_nested_argument_and_duplicate_alias() {
 fn parses_mixed_case_call_keyword() {
     let parsed = parse("cAlL dtg.graph.degree() YIELD degree RETURN degree")
         .expect("Cypher keywords are case-insensitive");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
     assert_eq!(
         query.clauses()[0].procedure().unwrap().name(),
         "dtg.graph.degree"
@@ -136,9 +124,7 @@ fn parses_mixed_case_call_keyword() {
 fn parses_a_read_subquery_as_a_structured_call_clause() {
     let parsed = parse("CALL () { UNWIND [1, 2] AS value RETURN value } RETURN value")
         .expect("CALL subquery should parse");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
 
     assert_eq!(query.clauses()[0].kind(), ClauseKind::Call);
     let subquery = query.clauses()[0]
@@ -159,9 +145,7 @@ fn rejects_an_incomplete_yield_alias() {
 fn parses_escaped_yield_identifiers_and_aliases() {
     let parsed = parse("CALL dtg.graph.degree() YIELD degree AS `my score` RETURN `my score`")
         .expect("escaped Cypher identifiers are valid in YIELD");
-    let Statement::Query(query) = parsed.statement() else {
-        panic!("expected query statement");
-    };
+    let Statement::Query(query) = parsed.statement();
     let procedure = query.clauses()[0].procedure().expect("procedure call");
     let cypher_ast::ProcedureYield::Items(items) = procedure.yield_selection() else {
         panic!("explicit YIELD items");

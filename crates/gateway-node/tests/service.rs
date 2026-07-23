@@ -309,7 +309,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "query-cross-shard".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1 MATCH (n) RETURN n".into(),
+            text: "USE social FOR VALID_TIME AS OF 1 MATCH (n) RETURN n".into(),
         },
     };
     let queried = submit(&mut client, 202, &query).await;
@@ -320,7 +320,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "cypher-write".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 CREATE (a:Person {name: 'Ada'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET a.status = 'active'".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 CREATE (a:Person {name: 'Ada'})-[r:KNOWS]->(b:Person {name: 'Bob'}) SET a.status = 'active'".into(),
         },
     };
     let written = submit(&mut client, 204, &cypher_write).await;
@@ -334,7 +334,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "cypher-merge-created".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (g:Person {name: 'Grace'})".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (g:Person {name: 'Grace'})".into(),
         },
     };
     let merged_created = submit(&mut client, 2045, &merge_created).await;
@@ -350,7 +350,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "cypher-merge-same-constraint".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (g:Person {name: 'Grace'})".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (g:Person {name: 'Grace'})".into(),
         },
     };
     let merged_same_constraint = submit(&mut client, 2046, &merge_same_constraint).await;
@@ -371,7 +371,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: request_id.into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (c:Person {name: 'Concurrent'})"
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (c:Person {name: 'Concurrent'})"
                 .into(),
         },
     };
@@ -399,7 +399,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: request_id.into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (path_left:MergePath {name: 'Left'})-[path_edge:PATH_LINK]->(path_right:MergePath {name: 'Right'})".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (path_left:MergePath {name: 'Left'})-[path_edge:PATH_LINK]->(path_right:MergePath {name: 'Right'})".into(),
         },
     }
     };
@@ -426,7 +426,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-merge-path-nodes".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:MergePath) RETURN n".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:MergePath) RETURN n".into(),
             },
         },
     )
@@ -440,7 +440,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-merge-path-edges".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (:MergePath)-[r:PATH_LINK]->(:MergePath) RETURN r".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (:MergePath)-[r:PATH_LINK]->(:MergePath) RETURN r".into(),
             },
         },
     )
@@ -453,7 +453,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: request_id.into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (concurrent_left:ConcurrentPath {name: 'Left'})-[concurrent_edge:CONCURRENT_LINK]->(concurrent_right:ConcurrentPath {name: 'Right'})".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (concurrent_left:ConcurrentPath {name: 'Left'})-[concurrent_edge:CONCURRENT_LINK]->(concurrent_right:ConcurrentPath {name: 'Right'})".into(),
         },
     }
     };
@@ -493,7 +493,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: request_id.into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MATCH (a:MergePath {name: 'Left'})-[:PATH_LINK]->(b:MergePath {name: 'Right'}) MERGE (a)-[bound_edge:BOUND_LINK {kind: 'bound'}]->(b)".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MATCH (a:MergePath {name: 'Left'})-[:PATH_LINK]->(b:MergePath {name: 'Right'}) MERGE (a)-[bound_edge:BOUND_LINK {kind: 'bound'}]->(b)".into(),
         },
     }
     };
@@ -529,7 +529,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
                 request_id: format!("create-multi-endpoint-pair-{pair}"),
                 operation: GatewayOperation::Cypher {
                     text: format!(
-                        "USE social AT VALID_TIME AS OF 1000 CREATE (left_{pair}:MultiEndpoint {{pair: {pair}, side: 'left'}})-[pair_edge_{pair}:MULTI_PAIR]->(right_{pair}:MultiEndpoint {{pair: {pair}, side: 'right'}})"
+                        "USE social FOR VALID_TIME AS OF 1000 CREATE (left_{pair}:MultiEndpoint {{pair: {pair}, side: 'left'}})-[pair_edge_{pair}:MULTI_PAIR]->(right_{pair}:MultiEndpoint {{pair: {pair}, side: 'right'}})"
                     ),
                 },
             },
@@ -553,7 +553,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
                 request_id: format!("create-{token}"),
                 operation: GatewayOperation::Cypher {
                     text: format!(
-                        "USE social AT VALID_TIME AS OF 1000 MERGE (endpoint:RemoteEndpoint {{token: '{token}'}})"
+                        "USE social FOR VALID_TIME AS OF 1000 MERGE (endpoint:RemoteEndpoint {{token: '{token}'}})"
                     ),
                 },
             },
@@ -586,7 +586,8 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-multi-endpoint-nodes".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:MultiEndpoint) RETURN n".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:MultiEndpoint) RETURN n"
+                    .into(),
             },
         },
     )
@@ -600,7 +601,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-multi-endpoint-pairs".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (:MultiEndpoint)-[r:MULTI_PAIR]->(:MultiEndpoint) RETURN r".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (:MultiEndpoint)-[r:MULTI_PAIR]->(:MultiEndpoint) RETURN r".into(),
             },
         },
     )
@@ -614,7 +615,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-multi-endpoint-pairs-interval".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME FROM 999 TO 1001 \
+                text: "USE social FOR VALID_TIME BETWEEN 999 AND 1001 \
                        MATCH (:MultiEndpoint)-[r:MULTI_PAIR]->(:MultiEndpoint) RETURN r"
                     .into(),
             },
@@ -633,7 +634,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "write-in-transactions".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        UNWIND [1, 2, 3] AS value \
                        CALL (value) { CREATE (:BatchedItem {id: value}) } \
                        IN TRANSACTIONS OF 2 ROWS"
@@ -664,7 +665,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "write-in-transactions".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        UNWIND [1, 2, 3] AS value \
                        CALL (value) { CREATE (:BatchedItem {id: value}) } \
                        IN TRANSACTIONS OF 2 ROWS"
@@ -681,7 +682,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "read-in-transactions-results".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:BatchedItem) RETURN count(n)"
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:BatchedItem) RETURN count(n)"
                     .into(),
             },
         },
@@ -693,7 +694,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "write-in-transactions-partial-failure".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 \
+            text: "USE social FOR VALID_TIME AS OF 1000 \
                    UNWIND [1, 2, {bad: 3}] AS value \
                    CALL (value) { CREATE (:BatchPartial {id: value}) } \
                    IN TRANSACTIONS OF 2 ROWS"
@@ -723,7 +724,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "read-partial-batch-results".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:BatchPartial) RETURN count(n)"
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:BatchPartial) RETURN count(n)"
                     .into(),
             },
         },
@@ -736,7 +737,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: request_id.into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MATCH (a:MultiEndpoint)-[:MULTI_PAIR]->(b:MultiEndpoint) MERGE (a)-[row_edge:MULTI_BOUND]->(b)".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MATCH (a:MultiEndpoint)-[:MULTI_PAIR]->(b:MultiEndpoint) MERGE (a)-[row_edge:MULTI_BOUND]->(b)".into(),
         },
     }
     };
@@ -761,7 +762,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-multi-row-merge-edges".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (:MultiEndpoint)-[r:MULTI_BOUND]->(:MultiEndpoint) RETURN r".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (:MultiEndpoint)-[r:MULTI_BOUND]->(:MultiEndpoint) RETURN r".into(),
             },
         },
     )
@@ -777,7 +778,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: request_id.into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (:AnonymousFirst {id: 1}) MERGE (named_second:NamedSecond {id: 2})".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (:AnonymousFirst {id: 1}) MERGE (named_second:NamedSecond {id: 2})".into(),
         },
     }
     };
@@ -811,7 +812,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: request_id.into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (alias_a:AliasPerson {id: 1}) MERGE (alias_b:AliasPerson {id: 1})".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (alias_a:AliasPerson {id: 1}) MERGE (alias_b:AliasPerson {id: 1})".into(),
         },
     }
     };
@@ -847,7 +848,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-concurrent-path-nodes".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:ConcurrentPath) RETURN n"
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:ConcurrentPath) RETURN n"
                     .into(),
             },
         },
@@ -862,7 +863,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-concurrent-path-edges".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (:ConcurrentPath)-[r:CONCURRENT_LINK]->(:ConcurrentPath) RETURN r".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (:ConcurrentPath)-[r:CONCURRENT_LINK]->(:ConcurrentPath) RETURN r".into(),
             },
         },
     )
@@ -877,7 +878,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "cypher-empty-match-merge".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (missing:MissingEndpoint) MERGE (missing)-[never:NEVER_CREATED]->(other:NeverCreated)".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (missing:MissingEndpoint) MERGE (missing)-[never:NEVER_CREATED]->(other:NeverCreated)".into(),
             },
         },
     )
@@ -893,7 +894,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "cypher-merge-existing".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MERGE (m:Person {name: 'Ada'})".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MERGE (m:Person {name: 'Ada'})".into(),
         },
     };
     let merged = submit(&mut client, 2050, &merge_existing).await;
@@ -904,7 +905,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "cypher-read-after-write".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:Person) RETURN n".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:Person) RETURN n".into(),
         },
     };
     let queried = submit(&mut client, 205, &cypher_read).await;
@@ -915,7 +916,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "cypher-existing-update".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:Person) WHERE n.name = 'Ada' SET n.status = 'updated'".into(),
+            text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:Person) WHERE n.name = 'Ada' SET n.status = 'updated'".into(),
         },
     };
     let updated = submit(&mut client, 207, &existing_update).await;
@@ -926,7 +927,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         version: GATEWAY_API_VERSION,
         request_id: "analytics-degree".into(),
         operation: GatewayOperation::Cypher {
-            text: "USE social AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
+            text: "USE social FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
                  YIELD vertexId, degree AS score WITH vertexId, score \
                  WHERE score >= 0 RETURN vertexId, score"
                 .into(),
@@ -948,7 +949,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "analytics-interval-components".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME FROM 1000 TO 2000 \
+                text: "USE social FOR VALID_TIME BETWEEN 1000 AND 2000 \
                        CALL dtg.temporal.intervalComponents({}) \
                        YIELD vertexId, componentId RETURN vertexId, componentId"
                     .into(),
@@ -978,7 +979,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "analytics-delta-seed".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 2000 CREATE (:DeltaOnly)".into(),
+                text: "USE social FOR VALID_TIME AS OF 2000 CREATE (:DeltaOnly)".into(),
             },
         },
     )
@@ -991,7 +992,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "analytics-delta-summary".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME FROM 1000 TO 2000 \
+                text: "USE social FOR VALID_TIME BETWEEN 1000 AND 2000 \
                        CALL dtg.temporal.deltaSummary({}) \
                        YIELD entityType, change, count RETURN entityType, change, count"
                     .into(),
@@ -1013,7 +1014,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "analytics-job-submit".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        CALL dtg.analytics.submit({algorithm: 'dtg.graph.degree', parameters: {}}) \
                        YIELD jobId RETURN jobId"
                     .into(),
@@ -1033,7 +1034,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "analytics-job-submit".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        CALL dtg.analytics.submit({algorithm: 'dtg.graph.degree', parameters: {}}) \
                        YIELD jobId RETURN jobId"
                     .into(),
@@ -1185,25 +1186,25 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         (
             92061,
             "reject-write-before-procedure",
-            "USE social AT VALID_TIME AS OF 1000 CREATE (:MustNotCommitBefore) \
+            "USE social FOR VALID_TIME AS OF 1000 CREATE (:MustNotCommitBefore) \
              CALL dtg.graph.degree({}) YIELD degree RETURN degree",
         ),
         (
             92062,
             "reject-write-after-procedure",
-            "USE social AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) YIELD degree \
+            "USE social FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) YIELD degree \
              CREATE (:MustNotCommitAfter)",
         ),
         (
             92065,
             "reject-write-before-nested-procedure",
-            "USE social AT VALID_TIME AS OF 1000 CREATE (:MustNotCommitNestedBefore) \
+            "USE social FOR VALID_TIME AS OF 1000 CREATE (:MustNotCommitNestedBefore) \
              CALL () { CALL dtg.graph.degree({}) YIELD degree RETURN degree } RETURN degree",
         ),
         (
             92066,
             "reject-write-after-nested-procedure",
-            "USE social AT VALID_TIME AS OF 1000 \
+            "USE social FOR VALID_TIME AS OF 1000 \
              CALL () { CALL dtg.graph.degree({}) YIELD degree RETURN degree } \
              CREATE (:MustNotCommitNestedAfter)",
         ),
@@ -1240,7 +1241,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
                 request_id: format!("verify-{label}"),
                 operation: GatewayOperation::Cypher {
                     text: format!(
-                        "USE social AT VALID_TIME AS OF 1000 MATCH (n:{label}) RETURN count(n) AS total"
+                        "USE social FOR VALID_TIME AS OF 1000 MATCH (n:{label}) RETURN count(n) AS total"
                     ),
                 },
             },
@@ -1260,7 +1261,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "failed-write-subquery".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        UNWIND [1, {unsupported: 2}] AS value \
                        CALL (value) { CREATE (:AtomicSubquery {id: value}) }"
                     .into(),
@@ -1279,7 +1280,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "failed-write-subquery-visibility".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        MATCH (n:AtomicSubquery) RETURN count(n) AS total"
                     .into(),
             },
@@ -1298,7 +1299,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "successful-write-subquery".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        UNWIND [1, 2] AS value \
                        CALL (value) { CREATE (:AtomicSubquery {id: value}) }"
                     .into(),
@@ -1317,7 +1318,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "successful-write-subquery-visibility".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        MATCH (n:AtomicSubquery) RETURN count(n) AS total"
                     .into(),
             },
@@ -1337,7 +1338,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "child-match-write-seed".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        CREATE (:ChildReadSource {id: 1}), (:ChildReadSource {id: 2})"
                     .into(),
             },
@@ -1352,7 +1353,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "child-match-feeds-set-and-create".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        CALL () { \
                          MATCH (source:ChildReadSource) \
                          CREATE (:ChildMatchCreated {id: 1}) \
@@ -1368,12 +1369,12 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         (
             30_083,
             "verify-child-match-create",
-            "USE social AT VALID_TIME AS OF 1000 MATCH (n:ChildMatchCreated) RETURN count(n) AS total",
+            "USE social FOR VALID_TIME AS OF 1000 MATCH (n:ChildMatchCreated) RETURN count(n) AS total",
         ),
         (
             30_084,
             "verify-child-match-set",
-            "USE social AT VALID_TIME AS OF 1000 MATCH (n:ChildReadSource) WHERE n.state = 'seen' RETURN count(n) AS total",
+            "USE social FOR VALID_TIME AS OF 1000 MATCH (n:ChildReadSource) WHERE n.state = 'seen' RETURN count(n) AS total",
         ),
     ] {
         let verification = submit(
@@ -1397,7 +1398,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "child-unwind-multiple-rows-feed-create".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        CALL () { \
                          UNWIND [10, 20] AS value WITH value \
                          CREATE (:ChildUnwindCreated {id: value}) \
@@ -1415,7 +1416,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "verify-child-unwind-create".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        MATCH (n:ChildUnwindCreated) RETURN count(n) AS total"
                     .into(),
             },
@@ -1438,7 +1439,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "failed-child-local-prefix".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        CALL () { \
                          UNWIND [1, {unsupported: 2}] AS value \
                          CREATE (:ChildLocalAtomic {id: value}) \
@@ -1459,7 +1460,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "failed-child-local-prefix-visibility".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        MATCH (n:ChildLocalAtomic) RETURN count(n) AS total"
                     .into(),
             },
@@ -1482,7 +1483,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "cleanup-write-subquery".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        MATCH (n:AtomicSubquery) DETACH DELETE n"
                     .into(),
             },
@@ -1504,7 +1505,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
 
     let typed_call = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
+            query: "USE social FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
                     YIELD vertexId, degree AS score WITH vertexId, score RETURN vertexId, score"
                 .into(),
             parameters: BTreeMap::new(),
@@ -1529,7 +1530,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
 
     let latest_algorithm_call = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 CALL dtg.graph.louvain({}) \
+            query: "USE social FOR VALID_TIME AS OF 1000 CALL dtg.graph.louvain({}) \
                     YIELD vertexId, communityId RETURN vertexId, communityId"
                 .into(),
             parameters: BTreeMap::new(),
@@ -1557,7 +1558,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
 
     let parameterized_submit = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     CALL dtg.analytics.submit({algorithm: $algorithm, parameters: $parameters}) \
                     YIELD jobId RETURN jobId"
                 .into(),
@@ -1594,7 +1595,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     );
     let invalid_algorithm_type = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     CALL dtg.analytics.submit({algorithm: $algorithm, parameters: $parameters}) \
                     YIELD jobId RETURN jobId"
                 .into(),
@@ -1622,7 +1623,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     ));
     let unknown_parameterized_algorithm = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     CALL dtg.analytics.submit({algorithm: $algorithm, parameters: $parameters}) \
                     YIELD jobId RETURN jobId"
                 .into(),
@@ -1659,7 +1660,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "analytics-degree-before-explicit-transaction".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
+                text: "USE social FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
                        YIELD vertexId RETURN count(vertexId)"
                     .into(),
             },
@@ -1679,7 +1680,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     ));
     let illegal_batch = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     UNWIND [1, 2] AS value \
                     CALL (value) { CREATE (:IllegalBatch {id: value}) } \
                     IN TRANSACTIONS OF 1 ROWS"
@@ -1709,7 +1710,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     ));
     let staged_write_subquery = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     UNWIND [1, 2] AS value \
                     CALL (value) { CREATE (n:TransactionSubquery {id: value}) RETURN n } \
                     RETURN n"
@@ -1733,7 +1734,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     CALL () { \
                       MATCH (n:TransactionSubquery) \
                       SET n.state = 'seen-through-child-prefix' \
@@ -1754,7 +1755,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     MATCH (n:TransactionSubquery) \
                     WHERE n.state = 'seen-through-child-prefix' \
                     RETURN count(n)"
@@ -1782,7 +1783,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     );
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     CALL () { MATCH (n:TransactionSubquery) RETURN n } \
                     RETURN count(n)"
                 .into(),
@@ -1814,7 +1815,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "late-snapshot-create".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 CREATE (late_snapshot_seed:LateSnapshot {name: 'late'})".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 CREATE (late_snapshot_seed:LateSnapshot {name: 'late'})".into(),
             },
         },
     )
@@ -1822,7 +1823,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     assert_eq!(late_commit["ok"], true, "{late_commit}");
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     CALL () { \
                       MATCH (:LateSnapshot) \
                       CREATE (:LateSnapshotChildLeak) \
@@ -1843,7 +1844,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     let procedure_overlay_write = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 CREATE (:ProcedureOverlay)".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 CREATE (:ProcedureOverlay)".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -1863,7 +1864,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
+            query: "USE social FOR VALID_TIME AS OF 1000 CALL dtg.graph.degree({}) \
                     YIELD vertexId RETURN count(vertexId)"
                 .into(),
             parameters: BTreeMap::new(),
@@ -1891,7 +1892,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     );
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     CALL () { MATCH (n:LateSnapshot) RETURN n } RETURN n"
                 .into(),
             parameters: BTreeMap::new(),
@@ -1924,7 +1925,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "rolled-back-write-subquery".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        MATCH (n:TransactionSubquery) RETURN count(n) AS total"
                     .into(),
             },
@@ -1944,7 +1945,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "fixed-child-prefix-visibility".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 \
+                text: "USE social FOR VALID_TIME AS OF 1000 \
                        MATCH (n:LateSnapshotChildLeak) RETURN count(n) AS total"
                     .into(),
             },
@@ -1968,7 +1969,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "committed-overlay-target".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 CREATE (overlay_committed_seed:OverlayCommitted {state: 'old'})".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 CREATE (overlay_committed_seed:OverlayCommitted {state: 'old'})".into(),
             },
         },
     )
@@ -1985,7 +1986,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     ));
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) WHERE n.state = 'old' SET n.state = 'new'".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) WHERE n.state = 'old' SET n.state = 'new'".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2001,7 +2002,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     let updated_count_run = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) WHERE n.state = 'new' RETURN count(n)".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) WHERE n.state = 'new' RETURN count(n)".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2022,7 +2023,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     );
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) WHERE n.state = 'new' DELETE n".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) WHERE n.state = 'new' DELETE n".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2038,8 +2039,9 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) RETURN count(n)"
-                .into(),
+            query:
+                "USE social FOR VALID_TIME AS OF 1000 MATCH (n:OverlayCommitted) RETURN count(n)"
+                    .into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2073,7 +2075,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     let staged_remote_edge = bolt
         .handle(ClientMessage::Run {
             query: format!(
-                "USE social AT VALID_TIME AS OF 1000 MERGE (a:RemoteEndpoint {{token: '{remote_left}'}}) MERGE (b:RemoteEndpoint {{token: '{remote_right}'}}) MERGE (a)-[explicit_edge:REMOTE_EXPLICIT]->(b)"
+                "USE social FOR VALID_TIME AS OF 1000 MERGE (a:RemoteEndpoint {{token: '{remote_left}'}}) MERGE (b:RemoteEndpoint {{token: '{remote_right}'}}) MERGE (a)-[explicit_edge:REMOTE_EXPLICIT]->(b)"
             ),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -2097,7 +2099,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             let run = bolt
                 .handle(ClientMessage::Run {
                     query: format!(
-                        "USE social AT VALID_TIME AS OF {valid_time} MATCH {pattern} RETURN count(r)"
+                        "USE social FOR VALID_TIME AS OF {valid_time} MATCH {pattern} RETURN count(r)"
                     ),
                     parameters: BTreeMap::new(),
                     extra: BTreeMap::new(),
@@ -2175,7 +2177,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     let staged = bolt
         .handle(ClientMessage::Run {
             query:
-                "USE social AT VALID_TIME AS OF 1000 CREATE (committed:Person {name: 'Committed'})"
+                "USE social FOR VALID_TIME AS OF 1000 CREATE (committed:Person {name: 'Committed'})"
                     .into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -2190,7 +2192,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     let staged_update = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (committed:Person) WHERE committed.name = 'Committed' SET committed.status = 'active'".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (committed:Person) WHERE committed.name = 'Committed' SET committed.status = 'active'".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2207,7 +2209,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     let staged_later_update = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 2000 MATCH (committed:Person) WHERE committed.name = 'Committed' SET committed.status = 'later'".into(),
+            query: "USE social FOR VALID_TIME AS OF 2000 MATCH (committed:Person) WHERE committed.name = 'Committed' SET committed.status = 'later'".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2253,7 +2255,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     ));
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:Person) RETURN n".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:Person) RETURN n".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2379,7 +2381,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     ));
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 CREATE (n:AliasOriginal {name: 'local'})"
+            query: "USE social FOR VALID_TIME AS OF 1000 CREATE (n:AliasOriginal {name: 'local'})"
                 .into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
@@ -2396,7 +2398,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:AliasOriginal) WITH n AS rebound SET rebound.with_value = 'yes'".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:AliasOriginal) WITH n AS rebound SET rebound.with_value = 'yes'".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2412,7 +2414,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:AliasDifferent) WHERE n.name = 'missing' SET n.leaked = 'yes'".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:AliasDifferent) WHERE n.name = 'missing' SET n.leaked = 'yes'".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2428,7 +2430,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await;
     assert!(matches!(
         bolt.handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 MATCH (n:AliasOriginal) WHERE n.leaked = 'yes' RETURN count(n)".into(),
+            query: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:AliasOriginal) WHERE n.leaked = 'yes' RETURN count(n)".into(),
             parameters: BTreeMap::new(),
             extra: BTreeMap::new(),
         })
@@ -2459,7 +2461,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     ));
     let unwind_write = bolt
         .handle(ClientMessage::Run {
-            query: "USE social AT VALID_TIME AS OF 1000 \
+            query: "USE social FOR VALID_TIME AS OF 1000 \
                     UNWIND [[1, 2], [3]] AS group_values \
                     WITH group_values AS items UNWIND items AS item \
                     CREATE (unwind_created:UnwindCreated)"
@@ -2489,7 +2491,8 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-unwind-created".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:UnwindCreated) RETURN n".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:UnwindCreated) RETURN n"
+                    .into(),
             },
         },
     )
@@ -2501,8 +2504,8 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
         .await
         .expect("direct transaction begin");
     for query in [
-        "USE social AT VALID_TIME AS OF 1000 CREATE (atomic_first:AtomicCommitted {name: 'first'})",
-        "USE social AT VALID_TIME AS OF 1000 CREATE (atomic_second:AtomicCommitted {name: 'second'})",
+        "USE social FOR VALID_TIME AS OF 1000 CREATE (atomic_first:AtomicCommitted {name: 'first'})",
+        "USE social FOR VALID_TIME AS OF 1000 CREATE (atomic_second:AtomicCommitted {name: 'second'})",
     ] {
         BoltQueryBackend::execute(
             &bolt_gateway,
@@ -2519,7 +2522,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     let failed_multi_row = BoltQueryBackend::execute(
         &bolt_gateway,
         BoltQueryRequest::new(
-            "USE social AT VALID_TIME AS OF 1000 \
+            "USE social FOR VALID_TIME AS OF 1000 \
              UNWIND [[1], [2]] AS group_values WITH group_values AS items \
              UNWIND items AS item CREATE (bad:AtomicFailed {value: item})"
                 .into(),
@@ -2536,7 +2539,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
     let visible_prior_overlay = BoltQueryBackend::execute(
         &bolt_gateway,
         BoltQueryRequest::new(
-            "USE social AT VALID_TIME AS OF 1000 MATCH (n:AtomicCommitted) RETURN count(n)".into(),
+            "USE social FOR VALID_TIME AS OF 1000 MATCH (n:AtomicCommitted) RETURN count(n)".into(),
             BTreeMap::new(),
             BTreeMap::new(),
             Some(atomic_transaction),
@@ -2558,7 +2561,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-atomic-committed".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:AtomicCommitted) RETURN n"
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:AtomicCommitted) RETURN n"
                     .into(),
             },
         },
@@ -2573,7 +2576,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             version: GATEWAY_API_VERSION,
             request_id: "query-atomic-failed".into(),
             operation: GatewayOperation::Cypher {
-                text: "USE social AT VALID_TIME AS OF 1000 MATCH (n:AtomicFailed) RETURN n".into(),
+                text: "USE social FOR VALID_TIME AS OF 1000 MATCH (n:AtomicFailed) RETURN n".into(),
             },
         },
     )
@@ -2588,7 +2591,7 @@ async fn remote_gateway_commits_and_queries_a_cross_shard_temporal_transaction()
             request_id: "query-atomic-history".into(),
             operation: GatewayOperation::Cypher {
                 text:
-                    "USE social AT VALID_TIME FROM 1000 TO 2000 MATCH (n:AtomicCommitted) RETURN n"
+                    "USE social FOR VALID_TIME BETWEEN 1000 AND 2000 MATCH (n:AtomicCommitted) RETURN n"
                         .into(),
             },
         },

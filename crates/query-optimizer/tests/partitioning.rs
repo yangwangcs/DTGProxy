@@ -5,7 +5,7 @@ use query_optimizer::{DeploymentMode, Optimizer, OptimizerContext};
 fn logical() -> temporal_ir::LogicalPlan {
     CypherCompiler::new()
         .compile(
-            "AT VALID_TIME AS OF $valid MATCH (a)-[r]->(b) WHERE a.active = true RETURN a, b",
+            "FOR VALID_TIME AS OF $valid MATCH (a)-[r]->(b) WHERE a.active = true RETURN a, b",
             &CompileSession::new("accounts", 7, 3, 11).expect("session"),
         )
         .expect("compile")
