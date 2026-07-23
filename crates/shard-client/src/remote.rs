@@ -42,7 +42,6 @@ use crate::{
 const MAXIMUM_SCAN_BATCH_BYTES: u32 = 4 * 1024 * 1024;
 const MAXIMUM_RETRY_ATTEMPTS: usize = 3;
 const MAXIMUM_READ_RETRY_ATTEMPTS: usize = 64;
-const MAXIMUM_WRITE_RETRY_ATTEMPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RemoteReplica {
@@ -322,15 +321,14 @@ impl ShardClient for RemoteShardClient {
             let context = request.context();
             let (_, route) = self.route(context)?;
             let payload = request.command().to_vec();
-            let mut last_error = None;
             let candidates = Self::candidates(&route);
-            for attempt in 0..MAXIMUM_WRITE_RETRY_ATTEMPTS {
+            if candidates.is_empty() {
+                return Err(ShardClientError::NoLeader {
+                    shard_id: context.shard_id(),
+                });
+            }
+            for replica in candidates.into_iter().cycle() {
                 validate_deadline(context)?;
-                let replica = candidates.get(attempt % candidates.len()).copied().ok_or(
-                    ShardClientError::NoLeader {
-                        shard_id: context.shard_id(),
-                    },
-                )?;
                 let channel = self.channel(replica)?;
                 let mut client = ShardServiceClient::new(channel);
                 let wire = WireExecuteRequest {
@@ -347,16 +345,11 @@ impl ShardClient for RemoteShardClient {
                         if !retryable(&error) {
                             return Err(error);
                         }
-                        last_error = Some(error);
-                        if attempt + 1 < MAXIMUM_WRITE_RETRY_ATTEMPTS {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
             }
-            Err(last_error.unwrap_or(ShardClientError::NoLeader {
-                shard_id: context.shard_id(),
-            }))
+            unreachable!("cycled remote Shard candidates are non-empty")
         })
     }
 
