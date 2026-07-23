@@ -44,6 +44,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+      - name: Install Protocol Buffers compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
       - name: Run all six temporal graph migration directions
         run: >-
           cargo test -p dtgproxy
@@ -104,6 +108,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+      - name: Install Protocol Buffers compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
       - name: Certify resumable analytics takeover and Artifact byte identity
         run: >-
           cargo test -p gateway-node
