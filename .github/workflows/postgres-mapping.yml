@@ -16,14 +16,14 @@ jobs:
           POSTGRES_DB: dtgproxy
           POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
         ports:
-          - 5432/tcp
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U dtgproxy -d dtgproxy"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
-      DTGPROXY_POSTGRES_URL: host=127.0.0.1 port=${{ job.services.postgres.ports[5432] }} user=dtgproxy password=dtgproxy-ci-password dbname=dtgproxy sslmode=disable
+      DTGPROXY_POSTGRES_URL: host=127.0.0.1 port=5432 user=dtgproxy password=dtgproxy-ci-password dbname=dtgproxy sslmode=disable
       CXX: clang++
     steps:
       - uses: actions/checkout@v4

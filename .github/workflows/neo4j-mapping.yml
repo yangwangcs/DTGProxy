@@ -13,15 +13,15 @@ jobs:
         env:
           NEO4J_AUTH: neo4j/dtgproxy-ci-password
         ports:
-          - 7474/tcp
-          - 7687/tcp
+          - 7474:7474
+          - 7687:7687
         options: >-
           --health-cmd "wget --quiet --spider http://localhost:7474 || exit 1"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 30
     env:
-      DTGPROXY_NEO4J_ENDPOINT: http://127.0.0.1:${{ job.services.neo4j.ports[7474] }}
+      DTGPROXY_NEO4J_ENDPOINT: http://127.0.0.1:7474
       DTGPROXY_NEO4J_USERNAME: neo4j
       DTGPROXY_NEO4J_PASSWORD: dtgproxy-ci-password
       DTGPROXY_NEO4J_DATABASE: neo4j
