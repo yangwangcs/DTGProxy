@@ -3,9 +3,9 @@ use storage_api::{Keyspace, LogicalKey, Mutation, MutationOperation, PreparedMut
 use temporal_types::TransactionTime;
 
 use crate::model::{
-    CommittedWrite, HomeTransactionRecord, IntentLock, IsolationLevel, ParticipantProof,
-    ParticipantRecord, PrewriteRequest, ShardEpoch, TransactionId, TransactionState,
-    TxnProtocolError,
+    CommittedWrite, ConstraintClaim, HomeTransactionRecord, IntentLock, IsolationLevel,
+    ParticipantProof, ParticipantRecord, PointReadVersion, PrewriteMetadata, PrewriteRequest,
+    RangeReadFingerprint, ShardEpoch, TransactionId, TransactionState, TxnProtocolError,
 };
 
 const PREWRITE_MAGIC: [u8; 4] = *b"DTPW";
@@ -255,6 +255,12 @@ fn encode_prewrite(request: &PrewriteRequest) -> wire::PrewriteRequest {
         isolation: u32::from(request.isolation() as u8),
         expires_at: Some(encode_time(request.expires_at())),
         batch: Some(encode_batch(request.batch())),
+        constraint_claims: request
+            .constraint_claims()
+            .iter()
+            .map(encode_constraint_claim)
+            .collect(),
+        metadata: Some(encode_prewrite_metadata(request.metadata())),
     }
 }
 
@@ -267,31 +273,139 @@ fn decode_prewrite(wire: wire::PrewriteRequest) -> Result<PrewriteRequest, TxnPr
     if participants.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(TxnProtocolError::NonCanonicalRecord);
     }
-    PrewriteRequest::new(
-        decode_id(&wire.transaction_id, "prewrite transaction ID")?,
-        decode_time(
-            wire.start_ts
-                .ok_or(TxnProtocolError::MissingField("prewrite start timestamp"))?,
-        )?,
+    let metadata = decode_prewrite_metadata(
+        wire.metadata
+            .ok_or(TxnProtocolError::MissingField("prewrite metadata"))?,
+    )?;
+    let transaction_id = decode_id(&wire.transaction_id, "prewrite transaction ID")?;
+    let start_ts = decode_time(
+        wire.start_ts
+            .ok_or(TxnProtocolError::MissingField("prewrite start timestamp"))?,
+    )?;
+    let participant = decode_shard(
+        wire.participant
+            .ok_or(TxnProtocolError::MissingField("prewrite participant"))?,
+    )?;
+    let home = decode_shard(
+        wire.home
+            .ok_or(TxnProtocolError::MissingField("prewrite Home participant"))?,
+    )?;
+    let expires_at = decode_time(
+        wire.expires_at
+            .ok_or(TxnProtocolError::MissingField("prewrite expiry"))?,
+    )?;
+    let batch = decode_batch(
+        wire.batch
+            .ok_or(TxnProtocolError::MissingField("prewrite mutation batch"))?,
+    )?;
+    let constraint_claims = wire
+        .constraint_claims
+        .into_iter()
+        .map(decode_constraint_claim)
+        .collect::<Result<Vec<_>, _>>()?;
+    let arguments = (
+        transaction_id,
+        start_ts,
         wire.schema_version,
-        decode_shard(
-            wire.participant
-                .ok_or(TxnProtocolError::MissingField("prewrite participant"))?,
-        )?,
-        decode_shard(
-            wire.home
-                .ok_or(TxnProtocolError::MissingField("prewrite Home participant"))?,
-        )?,
+        participant,
+        home,
         participants,
         decode_isolation(wire.isolation)?,
-        decode_time(
-            wire.expires_at
-                .ok_or(TxnProtocolError::MissingField("prewrite expiry"))?,
+        expires_at,
+        batch,
+        constraint_claims,
+    );
+    PrewriteRequest::new(
+        arguments.0,
+        arguments.1,
+        arguments.2,
+        arguments.3,
+        arguments.4,
+        arguments.5,
+        arguments.6,
+        arguments.7,
+        arguments.8,
+        arguments.9,
+        metadata,
+    )
+}
+
+fn encode_constraint_claim(claim: &ConstraintClaim) -> wire::ConstraintClaim {
+    wire::ConstraintClaim {
+        key: Some(encode_key(claim.key())),
+        value: claim.value().to_vec(),
+    }
+}
+
+fn decode_constraint_claim(
+    wire: wire::ConstraintClaim,
+) -> Result<ConstraintClaim, TxnProtocolError> {
+    ConstraintClaim::new(
+        decode_key(
+            wire.key
+                .ok_or(TxnProtocolError::MissingField("constraint claim key"))?,
         )?,
-        decode_batch(
-            wire.batch
-                .ok_or(TxnProtocolError::MissingField("prewrite mutation batch"))?,
-        )?,
+        wire.value,
+    )
+}
+
+fn encode_prewrite_metadata(metadata: &PrewriteMetadata) -> wire::PrewriteMetadata {
+    wire::PrewriteMetadata {
+        schema_version: metadata.schema_version(),
+        topology_epoch: metadata.topology_epoch(),
+        point_reads: metadata
+            .point_reads()
+            .iter()
+            .map(|read| wire::PointReadVersion {
+                key: Some(encode_key(read.key())),
+                observed_commit_ts: read.observed_commit_ts().map(encode_time),
+            })
+            .collect(),
+        range_reads: metadata
+            .range_reads()
+            .iter()
+            .map(|read| wire::RangeReadFingerprint {
+                keyspace: u32::from(read.keyspace().tag()),
+                prefix: read.prefix().to_vec(),
+                fingerprint: read.fingerprint().to_vec(),
+            })
+            .collect(),
+    }
+}
+
+fn decode_prewrite_metadata(
+    wire: wire::PrewriteMetadata,
+) -> Result<PrewriteMetadata, TxnProtocolError> {
+    let point_reads = wire
+        .point_reads
+        .into_iter()
+        .map(|read| {
+            PointReadVersion::new(
+                decode_key(
+                    read.key
+                        .ok_or(TxnProtocolError::MissingField("point read key"))?,
+                )?,
+                read.observed_commit_ts.map(decode_time).transpose()?,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let range_reads = wire
+        .range_reads
+        .into_iter()
+        .map(|read| {
+            let fingerprint: [u8; 32] = read.fingerprint.as_slice().try_into().map_err(|_| {
+                TxnProtocolError::InvalidDigestLength {
+                    actual: read.fingerprint.len(),
+                }
+            })?;
+            RangeReadFingerprint::new(decode_keyspace(read.keyspace)?, read.prefix, fingerprint)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    PrewriteMetadata::new(
+        wire.schema_version,
+        wire.topology_epoch,
+        point_reads,
+        range_reads,
     )
 }
 
@@ -426,7 +540,14 @@ fn encode_key(key: &LogicalKey) -> wire::LogicalKey {
 }
 
 fn decode_key(wire: wire::LogicalKey) -> Result<LogicalKey, TxnProtocolError> {
-    let keyspace = match wire.keyspace {
+    Ok(LogicalKey::in_keyspace(
+        decode_keyspace(wire.keyspace)?,
+        wire.key,
+    ))
+}
+
+fn decode_keyspace(tag: u32) -> Result<Keyspace, TxnProtocolError> {
+    Ok(match tag {
         0 => Keyspace::Meta,
         1 => Keyspace::Identity,
         2 => Keyspace::Current,
@@ -436,8 +557,7 @@ fn decode_key(wire: wire::LogicalKey) -> Result<LogicalKey, TxnProtocolError> {
         6 => Keyspace::TemporalIndex,
         7 => Keyspace::Txn,
         tag => return Err(TxnProtocolError::UnknownKeyspace { tag }),
-    };
-    Ok(LogicalKey::in_keyspace(keyspace, wire.key))
+    })
 }
 
 fn encode_shard(shard: ShardEpoch) -> wire::ShardEpoch {
@@ -608,6 +728,48 @@ mod wire {
         pub expires_at: Option<TransactionTime>,
         #[prost(message, optional, tag = "9")]
         pub batch: Option<PreparedMutationBatch>,
+        #[prost(message, repeated, tag = "10")]
+        pub constraint_claims: Vec<ConstraintClaim>,
+        #[prost(message, optional, tag = "11")]
+        pub metadata: Option<PrewriteMetadata>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct PrewriteMetadata {
+        #[prost(uint64, tag = "1")]
+        pub schema_version: u64,
+        #[prost(uint64, tag = "2")]
+        pub topology_epoch: u64,
+        #[prost(message, repeated, tag = "3")]
+        pub point_reads: Vec<PointReadVersion>,
+        #[prost(message, repeated, tag = "4")]
+        pub range_reads: Vec<RangeReadFingerprint>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct PointReadVersion {
+        #[prost(message, optional, tag = "1")]
+        pub key: Option<LogicalKey>,
+        #[prost(message, optional, tag = "2")]
+        pub observed_commit_ts: Option<TransactionTime>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct RangeReadFingerprint {
+        #[prost(uint32, tag = "1")]
+        pub keyspace: u32,
+        #[prost(bytes = "vec", tag = "2")]
+        pub prefix: Vec<u8>,
+        #[prost(bytes = "vec", tag = "3")]
+        pub fingerprint: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ConstraintClaim {
+        #[prost(message, optional, tag = "1")]
+        pub key: Option<LogicalKey>,
+        #[prost(bytes = "vec", tag = "2")]
+        pub value: Vec<u8>,
     }
 
     #[derive(Clone, PartialEq, Message)]

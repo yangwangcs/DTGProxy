@@ -6,12 +6,12 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
 use adapter_sidecar::{
-    HealthStatus, LoopbackTransport, Response, SidecarAdapter, SidecarClientError,
+    HealthStatus, LoopbackTransport, RemoteError, Response, SidecarAdapter, SidecarClientError,
     SidecarTransport, SidecarTransportFuture,
 };
 use storage_api::{
-    ApplyReceipt, CommittedMutationBatch, KeySpan, KeyValue, Keyspace, LogicalKey, Mutation,
-    StorageAdapter,
+    AdapterError, ApplyReceipt, CommittedMutationBatch, KeySpan, KeyValue, Keyspace, LogicalKey,
+    Mutation, StorageAdapter,
 };
 
 #[test]
@@ -79,6 +79,74 @@ fn client_rejects_invalid_counts_indices_and_scan_rows() {
         scan_error
             .to_string()
             .contains("outside the requested key span")
+    );
+}
+
+#[test]
+fn client_preserves_exact_remote_scan_byte_limit() {
+    let descriptor = MemoryAdapter::new().descriptor();
+    let transport = ScriptedTransport::new(vec![
+        Response::Descriptor(descriptor),
+        Response::Health(HealthStatus {
+            ready: true,
+            detail: "ready".to_owned(),
+        }),
+        Response::AppliedLogIndex(0),
+        Response::Error(RemoteError {
+            code: 9,
+            message: "scan requires 13 bytes".into(),
+            retryable: false,
+            scan_limit: Some(8),
+            scan_required: Some(13),
+            scan_response_limit: None,
+            scan_response_required: None,
+        }),
+    ]);
+    let adapter = block_on(SidecarAdapter::connect(transport)).unwrap();
+
+    assert_eq!(
+        block_on(
+            adapter.scan(
+                &KeySpan::prefix(Keyspace::Current, Vec::new())
+                    .with_max_bytes(8)
+                    .unwrap()
+            )
+        ),
+        Err(AdapterError::ScanByteLimit {
+            limit: 8,
+            required: 13,
+        })
+    );
+}
+
+#[test]
+fn client_preserves_exact_remote_scan_response_body_limit() {
+    let descriptor = MemoryAdapter::new().descriptor();
+    let transport = ScriptedTransport::new(vec![
+        Response::Descriptor(descriptor),
+        Response::Health(HealthStatus {
+            ready: true,
+            detail: "ready".to_owned(),
+        }),
+        Response::AppliedLogIndex(0),
+        Response::Error(RemoteError {
+            code: 10,
+            message: "scan response body requires 65 wire bytes".into(),
+            retryable: false,
+            scan_limit: None,
+            scan_required: None,
+            scan_response_limit: Some(64),
+            scan_response_required: Some(65),
+        }),
+    ]);
+    let adapter = block_on(SidecarAdapter::connect(transport)).unwrap();
+
+    assert_eq!(
+        block_on(adapter.scan(&KeySpan::prefix(Keyspace::Current, Vec::new()))),
+        Err(AdapterError::ScanResponseByteLimit {
+            limit: 64,
+            required: 65,
+        })
     );
 }
 

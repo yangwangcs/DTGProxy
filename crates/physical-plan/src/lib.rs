@@ -1,24 +1,31 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use temporal_ir::v2::{RowSchema, ScalarExpr, SlotId, TransactionTimeSpec, ValidTimeSpec};
+use temporal_ir::{
+    ApplyKind, ApplySlotMapping, ChildPlanId, Column, MAX_APPLY_DEPTH, MAX_APPLY_INVOCATIONS,
+    MAX_APPLY_OUTPUT_ROWS, MAX_BATCH_SUBTRANSACTION_ROWS, ProcedurePlacement, ResolvedProcedure,
+    RowSchema, ScalarExpr, SlotId, SortKey, TransactionTimeSpec, ValidTimeSpec,
+};
 
 pub const PHYSICAL_PLAN_VERSION: u16 = 1;
 pub const MAX_FRAGMENTS: usize = 65_536;
 pub const MAX_EXCHANGES: usize = 131_072;
+pub const MAX_RECURSIVE_PLAN_NODES: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalPlanHeaderV1 {
+pub struct PhysicalPlanHeader {
     version: u16,
     graph_id: u64,
     schema_version: u64,
     topology_epoch: u64,
     query_fingerprint: [u8; 32],
+    expected_shards: Vec<u32>,
 }
 
-impl PhysicalPlanHeaderV1 {
+impl PhysicalPlanHeader {
     pub fn new(
         graph_id: u64,
         schema_version: u64,
@@ -31,9 +38,22 @@ impl PhysicalPlanHeaderV1 {
             schema_version,
             topology_epoch,
             query_fingerprint,
+            expected_shards: vec![0],
         };
         header.validate()?;
         Ok(header)
+    }
+
+    pub fn with_expected_shards(
+        mut self,
+        expected_shards: Vec<u32>,
+    ) -> Result<Self, ValidationError> {
+        let unique = expected_shards.iter().copied().collect::<BTreeSet<_>>();
+        if expected_shards.is_empty() || unique.len() != expected_shards.len() {
+            return Err(ValidationError::InvalidExpectedShards);
+        }
+        self.expected_shards = expected_shards;
+        Ok(self)
     }
 
     fn validate(&self) -> Result<(), ValidationError> {
@@ -49,6 +69,14 @@ impl PhysicalPlanHeaderV1 {
             || self.query_fingerprint == [0; 32]
         {
             return Err(ValidationError::InvalidHeader);
+        }
+        let unique = self
+            .expected_shards
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if self.expected_shards.is_empty() || unique.len() != self.expected_shards.len() {
+            return Err(ValidationError::InvalidExpectedShards);
         }
         Ok(())
     }
@@ -71,6 +99,11 @@ impl PhysicalPlanHeaderV1 {
     #[must_use]
     pub const fn query_fingerprint(&self) -> [u8; 32] {
         self.query_fingerprint
+    }
+
+    #[must_use]
+    pub fn expected_shards(&self) -> &[u32] {
+        &self.expected_shards
     }
 }
 
@@ -151,7 +184,9 @@ pub enum WriteOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PhysicalOperator {
-    Argument,
+    Argument {
+        output: RowSchema,
+    },
     NodeScan {
         binding: SlotId,
         labels: Vec<u32>,
@@ -173,6 +208,12 @@ pub enum PhysicalOperator {
     Filter(ScalarExpr),
     Project {
         expressions: Vec<(SlotId, ScalarExpr)>,
+        output: RowSchema,
+    },
+    Unwind {
+        expression: ScalarExpr,
+        binding: SlotId,
+        output: RowSchema,
     },
     HashJoin {
         kind: JoinKind,
@@ -181,9 +222,10 @@ pub enum PhysicalOperator {
     Aggregate {
         grouping: Vec<SlotId>,
         aggregates: Vec<(SlotId, ScalarExpr)>,
+        output: RowSchema,
     },
     Sort {
-        keys: Vec<SlotId>,
+        keys: Vec<SortKey>,
     },
     Skip {
         count: ScalarExpr,
@@ -201,11 +243,108 @@ pub enum PhysicalOperator {
     Diff,
     Write {
         operation: WriteOperation,
+        output: RowSchema,
     },
     Procedure {
-        procedure_id: u32,
+        procedure: ResolvedProcedure,
+        output: RowSchema,
+    },
+    Apply {
+        apply: PhysicalApply,
+        output: RowSchema,
+    },
+    BatchSubtransaction {
+        apply: PhysicalApply,
+        batch_rows: u32,
+        output: RowSchema,
     },
     Finish,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalApply {
+    identity: ChildPlanId,
+    kind: ApplyKind,
+    imports: Vec<ApplySlotMapping>,
+    exports: Vec<ApplySlotMapping>,
+    child_input: RowSchema,
+    child_plan: Box<PhysicalPlan>,
+    max_invocations: u64,
+    max_output_rows: u64,
+    max_depth: u16,
+}
+
+impl PhysicalApply {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        identity: ChildPlanId,
+        kind: ApplyKind,
+        imports: Vec<ApplySlotMapping>,
+        exports: Vec<ApplySlotMapping>,
+        child_input: RowSchema,
+        child_plan: PhysicalPlan,
+        max_invocations: u64,
+        max_output_rows: u64,
+        max_depth: u16,
+    ) -> Self {
+        Self {
+            identity,
+            kind,
+            imports,
+            exports,
+            child_input,
+            child_plan: Box::new(child_plan),
+            max_invocations,
+            max_output_rows,
+            max_depth,
+        }
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> ChildPlanId {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ApplyKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn imports(&self) -> &[ApplySlotMapping] {
+        &self.imports
+    }
+
+    #[must_use]
+    pub fn exports(&self) -> &[ApplySlotMapping] {
+        &self.exports
+    }
+
+    #[must_use]
+    pub const fn child_input(&self) -> &RowSchema {
+        &self.child_input
+    }
+
+    #[must_use]
+    pub fn child_plan(&self) -> &PhysicalPlan {
+        &self.child_plan
+    }
+
+    #[must_use]
+    pub const fn max_invocations(&self) -> u64 {
+        self.max_invocations
+    }
+
+    #[must_use]
+    pub const fn max_output_rows(&self) -> u64 {
+        self.max_output_rows
+    }
+
+    #[must_use]
+    pub const fn max_depth(&self) -> u16 {
+        self.max_depth
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -296,7 +435,7 @@ impl Exchange {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalPlan {
-    header: PhysicalPlanHeaderV1,
+    header: PhysicalPlanHeader,
     fragments: Vec<PlanFragment>,
     exchanges: Vec<Exchange>,
     root: FragmentId,
@@ -324,15 +463,93 @@ impl PhysicalPlan {
             {
                 return Err(ValidationError::InvalidFragment(fragment.id));
             }
+            let incoming = self
+                .exchanges
+                .iter()
+                .filter(|exchange| exchange.to == fragment.id)
+                .collect::<Vec<_>>();
+            let mut current_schema = match incoming.as_slice() {
+                [] => RowSchema::empty(),
+                [exchange] => exchange.schema.clone(),
+                exchanges => match fragment.operators.first() {
+                    Some(PhysicalOperator::Union { .. }) => {
+                        let schema = exchanges[0].schema.clone();
+                        for exchange in &exchanges[1..] {
+                            if exchange.schema != schema {
+                                return Err(ValidationError::ExchangeSchemaMismatch(exchange.id));
+                            }
+                        }
+                        schema
+                    }
+                    Some(PhysicalOperator::HashJoin { kind, keys }) if exchanges.len() == 2 => {
+                        derive_hash_join_schema(
+                            fragment.id,
+                            kind,
+                            keys,
+                            &exchanges[0].schema,
+                            &exchanges[1].schema,
+                        )?
+                    }
+                    _ => return Err(ValidationError::InvalidFragment(fragment.id)),
+                },
+            };
+            for (operator_index, operator) in fragment.operators.iter().enumerate() {
+                match operator {
+                    PhysicalOperator::Argument { output } => current_schema = output.clone(),
+                    PhysicalOperator::NodeScan { output, .. }
+                    | PhysicalOperator::RelationshipScan { output, .. }
+                    | PhysicalOperator::Expand { output, .. }
+                    | PhysicalOperator::Project { output, .. }
+                    | PhysicalOperator::Unwind { output, .. }
+                    | PhysicalOperator::Aggregate { output, .. }
+                    | PhysicalOperator::Write { output, .. } => {
+                        current_schema = output.clone();
+                    }
+                    PhysicalOperator::Procedure { procedure, output } => {
+                        validate_procedure(fragment.placement, procedure, &current_schema, output)?;
+                        current_schema = output.clone();
+                    }
+                    PhysicalOperator::Apply { apply, output } => {
+                        validate_apply(&self.header, &current_schema, apply, output)?;
+                        current_schema = output.clone();
+                    }
+                    PhysicalOperator::BatchSubtransaction {
+                        apply,
+                        batch_rows,
+                        output,
+                    } => {
+                        if *batch_rows == 0
+                            || *batch_rows > MAX_BATCH_SUBTRANSACTION_ROWS
+                            || apply.kind() != ApplyKind::Inner
+                        {
+                            return Err(ValidationError::InvalidBatchSubtransaction);
+                        }
+                        validate_apply(&self.header, &current_schema, apply, output)?;
+                        current_schema = output.clone();
+                    }
+                    PhysicalOperator::HashJoin { .. }
+                        if operator_index != 0 || incoming.len() != 2 =>
+                    {
+                        return Err(ValidationError::HashJoinSchemaMismatch(fragment.id));
+                    }
+                    _ => {}
+                }
+            }
+            if current_schema != fragment.output {
+                return Err(ValidationError::FragmentOutputMismatch(fragment.id));
+            }
         }
         for exchange in &self.exchanges {
             validate_exchange(&self.fragments, exchange)?;
         }
+        let mut identities = BTreeSet::new();
+        let mut node_count = 0_usize;
+        validate_apply_tree(self, 0, &mut identities, &mut node_count)?;
         Ok(())
     }
 
     #[must_use]
-    pub const fn header(&self) -> &PhysicalPlanHeaderV1 {
+    pub const fn header(&self) -> &PhysicalPlanHeader {
         &self.header
     }
 
@@ -350,17 +567,330 @@ impl PhysicalPlan {
     pub const fn root(&self) -> FragmentId {
         self.root
     }
+
+    #[must_use]
+    pub fn output(&self) -> Option<&RowSchema> {
+        self.fragments
+            .get(usize::try_from(self.root.value()).unwrap_or(usize::MAX))
+            .map(PlanFragment::output)
+    }
+}
+
+fn validate_apply(
+    parent_header: &PhysicalPlanHeader,
+    parent_input: &RowSchema,
+    apply: &PhysicalApply,
+    output: &RowSchema,
+) -> Result<(), ValidationError> {
+    if apply.identity.value() == 0 {
+        return Err(ValidationError::InvalidApplyIdentity);
+    }
+    if apply.max_invocations == 0
+        || apply.max_invocations > MAX_APPLY_INVOCATIONS
+        || apply.max_output_rows == 0
+        || apply.max_output_rows > MAX_APPLY_OUTPUT_ROWS
+        || apply.max_depth == 0
+        || apply.max_depth > MAX_APPLY_DEPTH
+    {
+        return Err(ValidationError::InvalidApplyBudget);
+    }
+    apply.child_plan.validate()?;
+    validate_argument_source(apply.child_plan(), apply.child_input())?;
+    let child_header = apply.child_plan.header();
+    if child_header.graph_id() != parent_header.graph_id()
+        || child_header.schema_version() != parent_header.schema_version()
+        || child_header.topology_epoch() != parent_header.topology_epoch()
+        || child_header.expected_shards() != parent_header.expected_shards()
+        || child_header.query_fingerprint() == parent_header.query_fingerprint()
+    {
+        return Err(ValidationError::ApplyHeaderMismatch);
+    }
+    if output.columns().get(..parent_input.columns().len()) != Some(parent_input.columns())
+        || apply.child_input.columns().len() != apply.imports.len()
+    {
+        return Err(ValidationError::ApplySchemaMismatch);
+    }
+    let mut parent_imports = BTreeSet::new();
+    let mut child_imports = BTreeSet::new();
+    for mapping in &apply.imports {
+        if !parent_imports.insert(mapping.parent_slot())
+            || !child_imports.insert(mapping.child_slot())
+        {
+            return Err(ValidationError::ApplySchemaMismatch);
+        }
+        let parent = parent_input
+            .columns()
+            .iter()
+            .find(|column| column.slot() == mapping.parent_slot())
+            .ok_or(ValidationError::ApplySchemaMismatch)?;
+        let child = apply
+            .child_input
+            .columns()
+            .iter()
+            .find(|column| column.slot() == mapping.child_slot())
+            .ok_or(ValidationError::ApplySchemaMismatch)?;
+        if parent.name() != child.name()
+            || parent.value_type() != child.value_type()
+            || parent.nullable() != child.nullable()
+        {
+            return Err(ValidationError::ApplySchemaMismatch);
+        }
+    }
+    match apply.kind {
+        ApplyKind::Inner => {
+            if output.columns().len()
+                != parent_input
+                    .columns()
+                    .len()
+                    .saturating_add(apply.exports.len())
+            {
+                return Err(ValidationError::ApplySchemaMismatch);
+            }
+            let mut parent_exports = BTreeSet::new();
+            let mut child_exports = BTreeSet::new();
+            for mapping in &apply.exports {
+                if !parent_exports.insert(mapping.parent_slot())
+                    || !child_exports.insert(mapping.child_slot())
+                {
+                    return Err(ValidationError::ApplySchemaMismatch);
+                }
+                let parent = output
+                    .columns()
+                    .iter()
+                    .find(|column| column.slot() == mapping.parent_slot())
+                    .ok_or(ValidationError::ApplySchemaMismatch)?;
+                let child = apply
+                    .child_plan
+                    .output()
+                    .ok_or(ValidationError::ApplySchemaMismatch)?
+                    .columns()
+                    .iter()
+                    .find(|column| column.slot() == mapping.child_slot())
+                    .ok_or(ValidationError::ApplySchemaMismatch)?;
+                if parent.name() != child.name()
+                    || parent.value_type() != child.value_type()
+                    || parent.nullable() != child.nullable()
+                {
+                    return Err(ValidationError::ApplySchemaMismatch);
+                }
+            }
+        }
+        ApplyKind::Exists { output: result } | ApplyKind::Count { output: result } => {
+            if !apply.exports.is_empty()
+                || output.columns().len() != parent_input.columns().len() + 1
+            {
+                return Err(ValidationError::ApplySchemaMismatch);
+            }
+            let result_column = output
+                .columns()
+                .last()
+                .filter(|column| column.slot() == result)
+                .ok_or(ValidationError::ApplySchemaMismatch)?;
+            let expected = if matches!(apply.kind, ApplyKind::Exists { .. }) {
+                temporal_ir::ValueType::Boolean
+            } else {
+                temporal_ir::ValueType::Integer
+            };
+            if result_column.value_type() != &expected || result_column.nullable() {
+                return Err(ValidationError::ApplySchemaMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_apply_tree(
+    plan: &PhysicalPlan,
+    depth: u16,
+    identities: &mut BTreeSet<ChildPlanId>,
+    node_count: &mut usize,
+) -> Result<(), ValidationError> {
+    for fragment in plan.fragments() {
+        *node_count = node_count
+            .checked_add(fragment.operators().len())
+            .ok_or(ValidationError::RecursivePlanNodeLimit)?;
+        if *node_count > MAX_RECURSIVE_PLAN_NODES {
+            return Err(ValidationError::RecursivePlanNodeLimit);
+        }
+        for operator in fragment.operators() {
+            let apply = match operator {
+                PhysicalOperator::Apply { apply, .. }
+                | PhysicalOperator::BatchSubtransaction { apply, .. } => Some(apply),
+                _ => None,
+            };
+            if let Some(apply) = apply {
+                if depth >= MAX_APPLY_DEPTH || depth >= apply.max_depth {
+                    return Err(ValidationError::ApplyDepthExceeded);
+                }
+                if !identities.insert(apply.identity) {
+                    return Err(ValidationError::DuplicateChildPlanIdentity(apply.identity));
+                }
+                validate_apply_tree(&apply.child_plan, depth + 1, identities, node_count)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_argument_source(
+    plan: &PhysicalPlan,
+    child_input: &RowSchema,
+) -> Result<(), ValidationError> {
+    let arguments = plan
+        .fragments()
+        .iter()
+        .flat_map(|fragment| {
+            fragment
+                .operators()
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, operator)| match operator {
+                    PhysicalOperator::Argument { output } => Some((fragment, index, output)),
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    let [(fragment, 0, output)] = arguments.as_slice() else {
+        return Err(ValidationError::InvalidApplyArgumentSource);
+    };
+    if fragment.placement() != Placement::Coordinator
+        || plan
+            .exchanges()
+            .iter()
+            .any(|exchange| exchange.to() == fragment.id())
+        || *output != child_input
+    {
+        return Err(ValidationError::InvalidApplyArgumentSource);
+    }
+    Ok(())
+}
+
+fn derive_hash_join_schema(
+    fragment: FragmentId,
+    kind: &JoinKind,
+    keys: &[SlotId],
+    left: &RowSchema,
+    right: &RowSchema,
+) -> Result<RowSchema, ValidationError> {
+    let key_slots = keys.iter().copied().collect::<BTreeSet<_>>();
+    if key_slots.len() != keys.len() {
+        return Err(ValidationError::HashJoinSchemaMismatch(fragment));
+    }
+    for key in keys {
+        let left_column = left
+            .columns()
+            .iter()
+            .find(|column| column.slot() == *key)
+            .ok_or(ValidationError::HashJoinSchemaMismatch(fragment))?;
+        let right_column = right
+            .columns()
+            .iter()
+            .find(|column| column.slot() == *key)
+            .ok_or(ValidationError::HashJoinSchemaMismatch(fragment))?;
+        if left_column.value_type() != right_column.value_type() {
+            return Err(ValidationError::HashJoinSchemaMismatch(fragment));
+        }
+    }
+
+    let left_slots = left
+        .columns()
+        .iter()
+        .map(Column::slot)
+        .collect::<BTreeSet<_>>();
+    let mut columns = left.columns().to_vec();
+    for column in right.columns() {
+        if left_slots.contains(&column.slot()) {
+            if !key_slots.contains(&column.slot()) {
+                return Err(ValidationError::HashJoinSchemaMismatch(fragment));
+            }
+            continue;
+        }
+        columns.push(Column::new(
+            column.slot(),
+            column.name(),
+            column.value_type().clone(),
+            column.nullable() || matches!(kind, JoinKind::Left),
+        ));
+    }
+    RowSchema::new(columns).map_err(|_| ValidationError::HashJoinSchemaMismatch(fragment))
+}
+
+fn validate_procedure(
+    placement: Placement,
+    procedure: &ResolvedProcedure,
+    input: &RowSchema,
+    output: &RowSchema,
+) -> Result<(), ValidationError> {
+    if procedure.identity().authority_key() == [0; 32]
+        || procedure.identity().catalog_revision() == 0
+        || procedure.identity().procedure_revision() == 0
+        || procedure.name().is_empty()
+        || procedure.max_invocations() == 0
+        || procedure.max_input_rows() == 0
+        || procedure.max_output_rows() == 0
+        || procedure.max_value_bytes() == 0
+        || procedure.max_result_bytes() == 0
+    {
+        return Err(ValidationError::InvalidProcedure);
+    }
+    let placement_matches = matches!(
+        (procedure.placement(), placement),
+        (ProcedurePlacement::Coordinator, Placement::Coordinator)
+            | (
+                ProcedurePlacement::ShardLocal,
+                Placement::Shard(_) | Placement::AllShards
+            )
+    );
+    if !placement_matches {
+        return Err(ValidationError::ProcedurePlacementMismatch);
+    }
+    let mut argument_names = BTreeSet::new();
+    for argument in procedure.arguments() {
+        if argument.name().is_empty() || !argument_names.insert(argument.name()) {
+            return Err(ValidationError::InvalidProcedure);
+        }
+        let mut unknown_slot = false;
+        argument.expression().visit_slots(&mut |slot| {
+            unknown_slot |= !input.contains(slot);
+        });
+        if unknown_slot {
+            return Err(ValidationError::ProcedureSchemaMismatch);
+        }
+    }
+    if output.columns().len() != input.columns().len() + procedure.yields().len()
+        || output.columns().get(..input.columns().len()) != Some(input.columns())
+    {
+        return Err(ValidationError::ProcedureSchemaMismatch);
+    }
+    for (offset, binding) in procedure.yields().iter().enumerate() {
+        let source = procedure
+            .provider_output()
+            .columns()
+            .get(usize::try_from(binding.source_index()).unwrap_or(usize::MAX))
+            .ok_or(ValidationError::ProcedureSchemaMismatch)?;
+        let target = output
+            .columns()
+            .get(input.columns().len() + offset)
+            .ok_or(ValidationError::ProcedureSchemaMismatch)?;
+        if target.slot() != binding.output_slot()
+            || source.value_type() != target.value_type()
+            || source.nullable() != target.nullable()
+        {
+            return Err(ValidationError::ProcedureSchemaMismatch);
+        }
+    }
+    Ok(())
 }
 
 pub struct PhysicalPlanBuilder {
-    header: PhysicalPlanHeaderV1,
+    header: PhysicalPlanHeader,
     fragments: Vec<PlanFragment>,
     exchanges: Vec<Exchange>,
 }
 
 impl PhysicalPlanBuilder {
     #[must_use]
-    pub const fn new(header: PhysicalPlanHeaderV1) -> Self {
+    pub const fn new(header: PhysicalPlanHeader) -> Self {
         Self {
             header,
             fragments: Vec::new(),
@@ -463,6 +993,7 @@ fn validate_exchange(
 pub enum ValidationError {
     UnsupportedVersion { expected: u16, actual: u16 },
     InvalidHeader,
+    InvalidExpectedShards,
     InvalidMemoryBudget,
     InvalidFragmentCount,
     TooManyExchanges,
@@ -471,6 +1002,20 @@ pub enum ValidationError {
     InvalidExchangeDirection { from: FragmentId, to: FragmentId },
     InvalidExchangeCredit,
     ExchangeSchemaMismatch(ExchangeId),
+    HashJoinSchemaMismatch(FragmentId),
+    FragmentOutputMismatch(FragmentId),
+    InvalidProcedure,
+    ProcedurePlacementMismatch,
+    ProcedureSchemaMismatch,
+    InvalidApplyIdentity,
+    InvalidApplyBudget,
+    ApplyHeaderMismatch,
+    ApplySchemaMismatch,
+    ApplyDepthExceeded,
+    DuplicateChildPlanIdentity(ChildPlanId),
+    InvalidApplyArgumentSource,
+    InvalidBatchSubtransaction,
+    RecursivePlanNodeLimit,
 }
 
 impl Display for ValidationError {

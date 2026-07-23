@@ -1,6 +1,6 @@
 # DTGProxy Shard State Machine
 
-`ShardStateMachine` is the only Phase 2 component allowed to turn a committed Raft Entry into an
+`ShardStateMachine` is the only current-runtime component allowed to turn a committed Raft Entry into an
 Adapter write. It owns one `(shard_id, placement_epoch)` and applies entries strictly by
 `(term,index)`.
 
@@ -37,22 +37,23 @@ pre-write failure and an ambiguous response after a successful atomic write.
 
 ## Safe time
 
-Phase 2 has no distributed Intents. A committed ClosedTimestampTick advances `closed_ts` and
-`resolved_ts` together. `adapter_applied_ts` is monotonic and is advanced by applied commits and
-closed-time barriers. The public read frontier is:
+Distributed transactions register unresolved prewrite Intents. A committed
+`ClosedTimestampTick` advances `closed_ts` and recomputes `resolved_ts` from the oldest unresolved
+Intent. `adapter_applied_ts` is monotonic and is advanced by applied commits and closed-time
+barriers. The public read frontier is:
 
 ```text
 safe_ts = min(closed_ts, resolved_ts, adapter_applied_ts)
 ```
 
 A tick may trail a newer applied commit; in that case `safe_ts` advances only to the tick. An idle
-shard can advance all three components with a tick. Phase 3 replaces the `resolved_ts = closed_ts`
-shortcut with Intent-aware resolution.
+shard can advance all three components with a tick when there is no unresolved Intent; otherwise
+`resolved_ts` remains fenced before the oldest one.
 
 ## Durable metadata
 
 Replica records live under the reserved Meta prefix `0x01dtg/replica/v1/`. Position, timestamps,
 and per-entry digests use explicit big-endian, versioned, checksummed codecs. On open, the durable
 position must exactly equal the Adapter's applied log index. Missing, corrupted, wrong-shard, or
-wrong-epoch metadata fails closed. Per-entry digest records are retained until Phase 5 snapshot/log
+wrong-epoch metadata fails closed. Per-entry digest records are retained until snapshot/log
 compaction proves an equivalent checkpoint durable.

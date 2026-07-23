@@ -2,17 +2,17 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use adapter_memory::MemoryAdapter;
 use distributed_query::{
-    DistributedQueryError, FragmentRequest, LocalFragmentWorker, SnapshotTokenV2,
+    DistributedQueryError, FragmentRequest, LocalFragmentWorker, SnapshotToken,
 };
 use physical_plan::{
-    MemoryBudget, PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeaderV1, Placement,
+    MemoryBudget, PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeader, Placement,
 };
-use query_executor::v2::{ExecutionContext, RuntimeValue, TemporalBatchExecutor};
-use temporal_ir::v2::{Column, RowSchema, SlotId, ValueType};
+use query_executor::{ExecutionContext, RuntimeValue, TemporalBatchExecutor};
+use temporal_ir::{Column, RowSchema, SlotId, ValueType};
 use temporal_storage::{
     CommitContext, ElementId, ElementRef, GraphId, LabelId, PartitionId, TemporalStore,
     VertexMutation,
@@ -31,7 +31,7 @@ fn local_worker_validates_snapshot_identity_before_returning_bounded_batches() {
     )])
     .expect("schema");
     let mut builder =
-        PhysicalPlanBuilder::new(PhysicalPlanHeaderV1::new(1, 3, 11, [7; 32]).expect("header"));
+        PhysicalPlanBuilder::new(PhysicalPlanHeader::new(1, 3, 11, [7; 32]).expect("header"));
     let root = builder
         .add_fragment(
             Placement::Shard(0),
@@ -45,7 +45,7 @@ fn local_worker_validates_snapshot_identity_before_returning_bounded_batches() {
         )
         .expect("fragment");
     let plan = builder.finish(root).expect("plan");
-    let snapshot = SnapshotTokenV2::new(1, 3, 11, tx(150), [5; 32]).expect("snapshot");
+    let snapshot = SnapshotToken::new(1, 3, 11, tx(150), [5; 32]).expect("snapshot");
     let request =
         FragmentRequest::new(root, snapshot, now_ms() + 10_000, 1 << 20, 1).expect("request");
     let worker = LocalFragmentWorker::new(0, 1, 3, 11, [5; 32], TemporalBatchExecutor::new(store));
@@ -69,6 +69,55 @@ fn local_worker_validates_snapshot_identity_before_returning_bounded_batches() {
 }
 
 #[test]
+fn local_worker_streams_interval_rows_without_discarding_regions() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    seed(&store);
+    let schema = RowSchema::new(vec![Column::new(
+        SlotId::new(0),
+        "n",
+        ValueType::Node,
+        false,
+    )])
+    .expect("schema");
+    let mut builder =
+        PhysicalPlanBuilder::new(PhysicalPlanHeader::new(1, 3, 11, [9; 32]).expect("header"));
+    let root = builder
+        .add_fragment(
+            Placement::Shard(0),
+            vec![PhysicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: vec![11],
+                output: schema.clone(),
+            }],
+            schema,
+            MemoryBudget::new(1 << 20, 1 << 20).expect("budget"),
+        )
+        .expect("fragment");
+    let plan = builder.finish(root).expect("plan");
+    let snapshot = SnapshotToken::new(1, 3, 11, tx(150), [5; 32]).expect("snapshot");
+    let request =
+        FragmentRequest::new(root, snapshot, now_ms() + 10_000, 1 << 20, 1).expect("request");
+    let worker = LocalFragmentWorker::new(0, 1, 3, 11, [5; 32], TemporalBatchExecutor::new(store));
+
+    let batches = block_on(worker.execute_interval(
+        &request,
+        &plan.fragments()[0],
+        Interval::new(ValidTime::from_micros(1), Some(ValidTime::from_micros(10))).expect("window"),
+        &ExecutionContext::default(),
+    ))
+    .expect("execute interval");
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].sequence(), 0);
+    assert!(!batches[0].has_more());
+    assert_eq!(batches[0].batch().rows().len(), 1);
+    assert_eq!(
+        batches[0].batch().rows()[0].region().valid(),
+        Interval::new(ValidTime::from_micros(1), Some(ValidTime::from_micros(10))).expect("region")
+    );
+}
+
+#[test]
 fn local_worker_rejects_stale_topology_without_exposing_data() {
     let worker = LocalFragmentWorker::new(
         0,
@@ -78,7 +127,7 @@ fn local_worker_rejects_stale_topology_without_exposing_data() {
         [5; 32],
         TemporalBatchExecutor::new(TemporalStore::new(MemoryAdapter::new())),
     );
-    let snapshot = SnapshotTokenV2::new(1, 3, 11, tx(150), [5; 32]).expect("snapshot");
+    let snapshot = SnapshotToken::new(1, 3, 11, tx(150), [5; 32]).expect("snapshot");
     let request = FragmentRequest::new(
         physical_plan::FragmentId::new(0),
         snapshot,
@@ -89,11 +138,17 @@ fn local_worker_rejects_stale_topology_without_exposing_data() {
     .expect("request");
     let schema = RowSchema::empty();
     let mut builder =
-        PhysicalPlanBuilder::new(PhysicalPlanHeaderV1::new(1, 3, 11, [7; 32]).expect("header"));
+        PhysicalPlanBuilder::new(PhysicalPlanHeader::new(1, 3, 11, [7; 32]).expect("header"));
     let root = builder
         .add_fragment(
             Placement::Shard(0),
-            vec![PhysicalOperator::Finish],
+            vec![
+                PhysicalOperator::Project {
+                    expressions: Vec::new(),
+                    output: schema.clone(),
+                },
+                PhysicalOperator::Finish,
+            ],
             schema,
             MemoryBudget::new(1024, 1024).expect("budget"),
         )
@@ -108,6 +163,60 @@ fn local_worker_rejects_stale_topology_without_exposing_data() {
     ))
     .expect_err("stale topology");
     assert_eq!(error, DistributedQueryError::WorkerIdentityMismatch);
+}
+
+#[test]
+fn worker_never_widens_an_earlier_parent_deadline() {
+    let schema = RowSchema::new(vec![Column::new(
+        SlotId::new(0),
+        "n",
+        ValueType::Node,
+        false,
+    )])
+    .unwrap();
+    let mut builder = PhysicalPlanBuilder::new(PhysicalPlanHeader::new(1, 3, 11, [7; 32]).unwrap());
+    let root = builder
+        .add_fragment(
+            Placement::Shard(0),
+            vec![PhysicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: Vec::new(),
+                output: schema.clone(),
+            }],
+            schema,
+            MemoryBudget::new(1024, 1024).unwrap(),
+        )
+        .unwrap();
+    let plan = builder.finish(root).unwrap();
+    let request = FragmentRequest::new(
+        root,
+        SnapshotToken::new(1, 3, 11, tx(150), [5; 32]).unwrap(),
+        now_ms() + 10_000,
+        1024,
+        1,
+    )
+    .unwrap();
+    let worker = LocalFragmentWorker::new(
+        0,
+        1,
+        3,
+        11,
+        [5; 32],
+        TemporalBatchExecutor::new(TemporalStore::new(MemoryAdapter::new())),
+    );
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .unwrap();
+
+    let error = block_on(worker.execute(
+        &request,
+        &plan.fragments()[0],
+        ValidTime::from_micros(5),
+        &ExecutionContext::default().with_deadline(expired),
+    ))
+    .expect_err("request deadline must not widen the expired parent deadline");
+
+    assert_eq!(error, DistributedQueryError::DeadlineExceeded);
 }
 
 fn seed(store: &TemporalStore<MemoryAdapter>) {

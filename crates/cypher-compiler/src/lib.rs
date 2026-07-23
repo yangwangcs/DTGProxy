@@ -4,6 +4,7 @@ mod compiler;
 mod error;
 
 pub use compiler::{
-    CompileSession, CompiledMutation, CompiledQuery, CypherCompiler, MutationPlan, PropertyTarget,
+    CompileSession, CompiledMutation, CompiledQuery, CompiledSubqueryExport,
+    CompiledSubqueryMutation, CypherCompiler, MutationPlan, PropertyTarget,
 };
 pub use error::CompileError;

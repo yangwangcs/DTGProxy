@@ -1,11 +1,16 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use storage_api::{LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
+use storage_api::{Keyspace, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
 use temporal_types::TransactionTime;
 
 pub const MAX_TRANSACTION_PARTICIPANTS: usize = 64;
 pub const MAX_TRANSACTION_MUTATIONS: usize = 16_384;
+pub const MAX_TRANSACTION_CONSTRAINT_CLAIMS: usize = 1_024;
+pub const MAX_TRANSACTION_POINT_READS: usize = 16_384;
+pub const MAX_TRANSACTION_RANGE_READS: usize = 1_024;
+const MAX_CONSTRAINT_VALUE_BYTES: usize = 1_024;
+const MAX_RANGE_PREFIX_BYTES: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TransactionId(u128);
@@ -106,6 +111,185 @@ impl ParticipantProof {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConstraintClaim {
+    key: LogicalKey,
+    value: Vec<u8>,
+}
+
+impl ConstraintClaim {
+    pub fn new(key: LogicalKey, value: Vec<u8>) -> Result<Self, TxnProtocolError> {
+        if key.keyspace() != Keyspace::Txn || key.as_bytes().is_empty() {
+            return Err(TxnProtocolError::InvalidConstraintKey);
+        }
+        if value.is_empty() || value.len() > MAX_CONSTRAINT_VALUE_BYTES {
+            return Err(TxnProtocolError::InvalidConstraintValue {
+                max: MAX_CONSTRAINT_VALUE_BYTES,
+                actual: value.len(),
+            });
+        }
+        Ok(Self { key, value })
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> &LogicalKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PointReadVersion {
+    key: LogicalKey,
+    observed_commit_ts: Option<TransactionTime>,
+}
+
+impl PointReadVersion {
+    pub fn new(
+        key: LogicalKey,
+        observed_commit_ts: Option<TransactionTime>,
+    ) -> Result<Self, TxnProtocolError> {
+        if key.as_bytes().is_empty() {
+            return Err(TxnProtocolError::InvalidReadDependencyKey);
+        }
+        Ok(Self {
+            key,
+            observed_commit_ts,
+        })
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> &LogicalKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn observed_commit_ts(&self) -> Option<TransactionTime> {
+        self.observed_commit_ts
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeReadFingerprint {
+    keyspace: Keyspace,
+    prefix: Vec<u8>,
+    fingerprint: [u8; 32],
+}
+
+impl RangeReadFingerprint {
+    pub fn new(
+        keyspace: Keyspace,
+        prefix: Vec<u8>,
+        fingerprint: [u8; 32],
+    ) -> Result<Self, TxnProtocolError> {
+        if prefix.len() > MAX_RANGE_PREFIX_BYTES {
+            return Err(TxnProtocolError::InvalidRangePrefixLength {
+                max: MAX_RANGE_PREFIX_BYTES,
+                actual: prefix.len(),
+            });
+        }
+        Ok(Self {
+            keyspace,
+            prefix,
+            fingerprint,
+        })
+    }
+
+    #[must_use]
+    pub const fn keyspace(&self) -> Keyspace {
+        self.keyspace
+    }
+
+    #[must_use]
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrewriteMetadata {
+    schema_version: u64,
+    topology_epoch: u64,
+    point_reads: Vec<PointReadVersion>,
+    range_reads: Vec<RangeReadFingerprint>,
+}
+
+impl PrewriteMetadata {
+    pub fn new(
+        schema_version: u64,
+        topology_epoch: u64,
+        mut point_reads: Vec<PointReadVersion>,
+        mut range_reads: Vec<RangeReadFingerprint>,
+    ) -> Result<Self, TxnProtocolError> {
+        if schema_version == 0 || topology_epoch == 0 {
+            return Err(TxnProtocolError::InvalidMetadataFence);
+        }
+        if point_reads.len() > MAX_TRANSACTION_POINT_READS {
+            return Err(TxnProtocolError::InvalidPointReadCount {
+                max: MAX_TRANSACTION_POINT_READS,
+                actual: point_reads.len(),
+            });
+        }
+        if range_reads.len() > MAX_TRANSACTION_RANGE_READS {
+            return Err(TxnProtocolError::InvalidRangeReadCount {
+                max: MAX_TRANSACTION_RANGE_READS,
+                actual: range_reads.len(),
+            });
+        }
+        point_reads.sort_by(|left, right| left.key.cmp(&right.key));
+        if point_reads
+            .windows(2)
+            .any(|pair| pair[0].key == pair[1].key)
+        {
+            return Err(TxnProtocolError::DuplicatePointReadKey);
+        }
+        range_reads.sort_by(|left, right| {
+            (left.keyspace.tag(), &left.prefix).cmp(&(right.keyspace.tag(), &right.prefix))
+        });
+        if range_reads
+            .windows(2)
+            .any(|pair| pair[0].keyspace == pair[1].keyspace && pair[0].prefix == pair[1].prefix)
+        {
+            return Err(TxnProtocolError::DuplicateRangeRead);
+        }
+        Ok(Self {
+            schema_version,
+            topology_epoch,
+            point_reads,
+            range_reads,
+        })
+    }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub const fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
+    #[must_use]
+    pub fn point_reads(&self) -> &[PointReadVersion] {
+        &self.point_reads
+    }
+
+    #[must_use]
+    pub fn range_reads(&self) -> &[RangeReadFingerprint] {
+        &self.range_reads
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrewriteRequest {
     transaction_id: TransactionId,
     start_ts: TransactionTime,
@@ -116,6 +300,8 @@ pub struct PrewriteRequest {
     isolation: IsolationLevel,
     expires_at: TransactionTime,
     batch: PreparedMutationBatch,
+    constraint_claims: Vec<ConstraintClaim>,
+    metadata: PrewriteMetadata,
 }
 
 impl PrewriteRequest {
@@ -130,6 +316,8 @@ impl PrewriteRequest {
         isolation: IsolationLevel,
         expires_at: TransactionTime,
         batch: PreparedMutationBatch,
+        mut constraint_claims: Vec<ConstraintClaim>,
+        metadata: PrewriteMetadata,
     ) -> Result<Self, TxnProtocolError> {
         if transaction_id.value() == 0 {
             return Err(TxnProtocolError::InvalidTransactionId);
@@ -159,7 +347,30 @@ impl PrewriteRequest {
         if !participants.contains(&home) {
             return Err(TxnProtocolError::HomeParticipantMissing { home });
         }
-        validate_batch(transaction_id, participant, &batch)?;
+        validate_batch(
+            transaction_id,
+            participant,
+            &batch,
+            !constraint_claims.is_empty(),
+        )?;
+        if constraint_claims.len() > MAX_TRANSACTION_CONSTRAINT_CLAIMS {
+            return Err(TxnProtocolError::InvalidConstraintClaimCount {
+                max: MAX_TRANSACTION_CONSTRAINT_CLAIMS,
+                actual: constraint_claims.len(),
+            });
+        }
+        constraint_claims.sort_by(|left, right| left.key.cmp(&right.key));
+        if constraint_claims
+            .windows(2)
+            .any(|pair| pair[0].key == pair[1].key)
+        {
+            return Err(TxnProtocolError::DuplicateConstraintKey);
+        }
+        if metadata.schema_version != schema_version
+            || metadata.topology_epoch != participant.placement_epoch
+        {
+            return Err(TxnProtocolError::MetadataFenceMismatch);
+        }
         Ok(Self {
             transaction_id,
             start_ts,
@@ -170,6 +381,8 @@ impl PrewriteRequest {
             isolation,
             expires_at,
             batch,
+            constraint_claims,
+            metadata,
         })
     }
 
@@ -227,9 +440,19 @@ impl PrewriteRequest {
     }
 
     #[must_use]
+    pub fn constraint_claims(&self) -> &[ConstraintClaim] {
+        &self.constraint_claims
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> &PrewriteMetadata {
+        &self.metadata
+    }
+
+    #[must_use]
     pub fn intent_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"DTGProxy/PrewriteIntent/V1");
+        hasher.update(b"DTGProxy/PrewriteIntent");
         hasher.update(&self.transaction_id.value().to_be_bytes());
         hash_time(&mut hasher, self.start_ts);
         hasher.update(&self.schema_version.to_be_bytes());
@@ -265,6 +488,48 @@ impl PrewriteRequest {
                     hash_bytes(&mut hasher, key.as_bytes());
                 }
             }
+        }
+        hasher.update(
+            &u64::try_from(self.constraint_claims.len())
+                .expect("constraint claim count fits u64")
+                .to_be_bytes(),
+        );
+        for claim in &self.constraint_claims {
+            hasher.update(&[claim.key.keyspace().tag()]);
+            hash_bytes(&mut hasher, claim.key.as_bytes());
+            hash_bytes(&mut hasher, &claim.value);
+        }
+        let metadata = &self.metadata;
+        hasher.update(b"DTGProxy/PrewriteMetadata");
+        hasher.update(&metadata.schema_version.to_be_bytes());
+        hasher.update(&metadata.topology_epoch.to_be_bytes());
+        hasher.update(
+            &u64::try_from(metadata.point_reads.len())
+                .expect("point read count fits u64")
+                .to_be_bytes(),
+        );
+        for read in &metadata.point_reads {
+            hasher.update(&[read.key.keyspace().tag()]);
+            hash_bytes(&mut hasher, read.key.as_bytes());
+            match read.observed_commit_ts {
+                Some(timestamp) => {
+                    hasher.update(&[1]);
+                    hash_time(&mut hasher, timestamp);
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+        hasher.update(
+            &u64::try_from(metadata.range_reads.len())
+                .expect("range read count fits u64")
+                .to_be_bytes(),
+        );
+        for read in &metadata.range_reads {
+            hasher.update(&[read.keyspace.tag()]);
+            hash_bytes(&mut hasher, &read.prefix);
+            hasher.update(&read.fingerprint);
         }
         *hasher.finalize().as_bytes()
     }
@@ -444,6 +709,7 @@ fn validate_batch(
     transaction_id: TransactionId,
     participant: ShardEpoch,
     batch: &PreparedMutationBatch,
+    allow_empty: bool,
 ) -> Result<(), TxnProtocolError> {
     if batch.shard_id != participant.shard_id {
         return Err(TxnProtocolError::BatchShardMismatch {
@@ -454,7 +720,9 @@ fn validate_batch(
     if batch.txn_id != transaction_id.value() {
         return Err(TxnProtocolError::BatchTransactionMismatch);
     }
-    if batch.mutations.is_empty() || batch.mutations.len() > MAX_TRANSACTION_MUTATIONS {
+    if (batch.mutations.is_empty() && !allow_empty)
+        || batch.mutations.len() > MAX_TRANSACTION_MUTATIONS
+    {
         return Err(TxnProtocolError::InvalidMutationCount {
             max: MAX_TRANSACTION_MUTATIONS,
             actual: batch.mutations.len(),
@@ -561,6 +829,38 @@ pub enum TxnProtocolError {
         actual: u32,
     },
     DuplicateMutationKey,
+    InvalidConstraintClaimCount {
+        max: usize,
+        actual: usize,
+    },
+    InvalidConstraintKey,
+    InvalidConstraintValue {
+        max: usize,
+        actual: usize,
+    },
+    DuplicateConstraintKey,
+    InvalidReadDependencyKey,
+    InvalidRangePrefixLength {
+        max: usize,
+        actual: usize,
+    },
+    InvalidMetadataFence,
+    MetadataFenceMismatch,
+    InvalidPointReadCount {
+        max: usize,
+        actual: usize,
+    },
+    InvalidRangeReadCount {
+        max: usize,
+        actual: usize,
+    },
+    DuplicatePointReadKey,
+    DuplicateRangeRead,
+    ReadDependencyConflict {
+        key: LogicalKey,
+        expected: Option<TransactionTime>,
+        actual: Option<TransactionTime>,
+    },
     DuplicateParticipantProof,
     ParticipantProofSetMismatch,
     InvalidParticipantProof,
@@ -620,6 +920,9 @@ pub enum TxnProtocolError {
     WriteConflict {
         key: LogicalKey,
         committed_at: TransactionTime,
+    },
+    ConstraintConflict {
+        key: LogicalKey,
     },
     RequestReplayMismatch,
     MissingIntent,

@@ -1,11 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use analytics_ledger::{
+    AnalyticsJobId, GraphProjectionScope, JobCommand, JobSpec, JobState, ProjectionLimits,
+};
 use control_plane::{
     BackendProfile, CatalogCommand, DeploymentMode, GraphDefinition, Placement, TopologyDefinition,
 };
 use meta_node::MetaRaftReplica;
 use raft::eraftpb::Message;
 use storage_api::AdapterRequirement;
+use temporal_types::{TransactionTime, ValidTime};
 
 fn graph() -> GraphDefinition {
     GraphDefinition::new(
@@ -31,6 +35,30 @@ fn graph() -> GraphDefinition {
             1,
         )
         .unwrap(),
+    )
+    .unwrap()
+}
+
+fn analytics_job(job_id: u128) -> JobSpec {
+    JobSpec::new(
+        AnalyticsJobId::new(job_id).unwrap(),
+        job_id + 10_000,
+        7,
+        1,
+        1,
+        1,
+        1,
+        TransactionTime::new(1_000, 0),
+        GraphProjectionScope::Snapshot {
+            valid_time: ValidTime::from_micros(900),
+        },
+        "dtg.graph.pageRank",
+        "1.0.0",
+        "dtg.analytics-native",
+        "1.0.0",
+        Vec::new(),
+        [9; 32],
+        ProjectionLimits::new(100, 100, 1 << 20).unwrap(),
     )
     .unwrap()
 }
@@ -106,6 +134,20 @@ fn quorum_commit_leader_change_idempotence_and_minority_refusal() {
             .values()
             .all(|replica| replica.state().catalog().revision() == 1)
     );
+    let job_id = AnalyticsJobId::new(301).unwrap();
+    replicas
+        .get_mut(&1)
+        .unwrap()
+        .propose_analytics(JobCommand::submit(201, analytics_job(301), 1_100).unwrap())
+        .unwrap();
+    pump(&mut replicas, &no_blocks);
+    assert!(replicas.values().all(|replica| {
+        replica
+            .state()
+            .analytics()
+            .job(job_id)
+            .is_some_and(|record| record.state() == JobState::Queued)
+    }));
 
     let old_leader_isolated = isolate(1);
     for _ in 0..12 {
@@ -113,12 +155,39 @@ fn quorum_commit_leader_change_idempotence_and_minority_refusal() {
         replicas.get_mut(&3).unwrap().tick();
         pump(&mut replicas, &old_leader_isolated);
     }
-    if !replicas[&2].is_leader() {
+    if ![2_u64, 3]
+        .into_iter()
+        .any(|node_id| replicas[&node_id].is_leader())
+    {
         replicas.get_mut(&2).unwrap().campaign().unwrap();
+        pump(&mut replicas, &old_leader_isolated);
     }
+    let new_leader = [2_u64, 3]
+        .into_iter()
+        .find(|node_id| replicas[node_id].is_leader())
+        .expect("surviving Meta quorum must elect a replacement Leader");
+    replicas
+        .get_mut(&new_leader)
+        .unwrap()
+        .propose_analytics(JobCommand::claim(202, job_id, 1, 2, 1, 10_000).unwrap())
+        .unwrap();
     pump(&mut replicas, &old_leader_isolated);
-    assert!(replicas[&2].is_leader());
-    replicas.get_mut(&2).unwrap().propose(create).unwrap();
+    for replica in [&replicas[&2], &replicas[&3]] {
+        let lease = replica
+            .state()
+            .analytics()
+            .job(job_id)
+            .unwrap()
+            .lease()
+            .unwrap();
+        assert_eq!(lease.owner_gateway_id(), 2);
+        assert_eq!(lease.lease_epoch(), 1);
+    }
+    replicas
+        .get_mut(&new_leader)
+        .unwrap()
+        .propose(create)
+        .unwrap();
     pump(&mut replicas, &old_leader_isolated);
     assert_eq!(replicas[&2].state().catalog().revision(), 1);
     assert_eq!(replicas[&3].state().catalog().revision(), 1);
@@ -126,14 +195,18 @@ fn quorum_commit_leader_change_idempotence_and_minority_refusal() {
     let schema = CatalogCommand::publish_schema(102, 1, 7, 1, 2)
         .encode()
         .unwrap();
-    let new_leader_isolated = isolate(2);
-    replicas.get_mut(&2).unwrap().propose(schema).unwrap();
+    let new_leader_isolated = isolate(new_leader);
+    replicas
+        .get_mut(&new_leader)
+        .unwrap()
+        .propose(schema)
+        .unwrap();
     pump(&mut replicas, &new_leader_isolated);
     assert_eq!(replicas[&2].state().catalog().revision(), 1);
     assert_eq!(replicas[&3].state().catalog().revision(), 1);
 
     for _ in 0..8 {
-        replicas.get_mut(&2).unwrap().tick();
+        replicas.get_mut(&new_leader).unwrap().tick();
         pump(&mut replicas, &no_blocks);
     }
     assert!(
@@ -141,6 +214,14 @@ fn quorum_commit_leader_change_idempotence_and_minority_refusal() {
             .values()
             .all(|replica| replica.state().catalog().revision() == 2)
     );
+    assert!(replicas.values().all(|replica| {
+        replica
+            .state()
+            .analytics()
+            .job(job_id)
+            .and_then(|record| record.lease())
+            .is_some_and(|lease| lease.owner_gateway_id() == 2 && lease.lease_epoch() == 1)
+    }));
 }
 
 #[test]
@@ -166,6 +247,10 @@ fn local_snapshot_and_restart_restore_exact_catalog_and_continue() {
         )
         .unwrap();
     assert!(replica.drain_ready().unwrap().is_empty());
+    replica
+        .propose_analytics(JobCommand::submit(201, analytics_job(301), 1_100).unwrap())
+        .unwrap();
+    assert!(replica.drain_ready().unwrap().is_empty());
     let snapshot = replica.create_snapshot().unwrap();
     let applied = replica.state().applied_index();
     assert_eq!(snapshot.metadata.unwrap().index, applied);
@@ -174,6 +259,16 @@ fn local_snapshot_and_restart_restore_exact_catalog_and_continue() {
     let mut reopened = MetaRaftReplica::open(1, &[1], &raft, &state).unwrap();
     assert_eq!(reopened.state().applied_index(), applied);
     assert_eq!(reopened.state().catalog().revision(), 1);
+    assert_eq!(reopened.state().analytics().revision(), 1);
+    assert_eq!(
+        reopened
+            .state()
+            .analytics()
+            .job(AnalyticsJobId::new(301).unwrap())
+            .unwrap()
+            .state(),
+        JobState::Queued
+    );
     reopened.campaign().unwrap();
     for _ in 0..32 {
         assert!(reopened.drain_ready().unwrap().is_empty());

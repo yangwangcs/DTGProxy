@@ -7,7 +7,7 @@ use adapter_registry::MigrationStatus;
 use raft::eraftpb::Message;
 use raft_transport::RoutedRaftMessage;
 use shard_runtime::{BackendLifecycle, ReplicaMetadata};
-use storage_api::{KeySpan, KeyValue, LogicalKey};
+use storage_api::{AdapterError, KeySpan, KeyValue, LogicalKey};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::replica_actor::{ActorCommand, ReplicaActorHandle};
@@ -587,6 +587,50 @@ impl DataNodeHost {
             .await
             .map_err(|_| HostError::ActorStopped)?;
         receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    pub async fn leader_read_permit(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        request_id: u128,
+        deadline: tokio::time::Instant,
+    ) -> Result<u64, HostError> {
+        if request_id == 0 {
+            return Err(HostError::InvalidReadContext);
+        }
+        if deadline <= tokio::time::Instant::now() {
+            return Err(HostError::ReadBarrierDeadline { request_id });
+        }
+        let sender = self.sender(key)?;
+        let expected_epoch = self.status(key).await?.placement_epoch();
+        if placement_epoch != expected_epoch {
+            return Err(HostError::StaleEpoch {
+                expected: expected_epoch,
+                actual: placement_epoch,
+            });
+        }
+        let (response, receiver) = oneshot::channel();
+        match tokio::time::timeout_at(
+            deadline,
+            sender.send(ActorCommand::LeaderReadPermit {
+                placement_epoch,
+                request_id,
+                deadline,
+                response,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(HostError::ActorStopped),
+            Err(_) => return Err(HostError::ReadBarrierDeadline { request_id }),
+        }
+        match tokio::time::timeout_at(deadline, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(HostError::ActorStopped),
+            Err(_) => Err(HostError::ReadBarrierDeadline { request_id }),
+        }
     }
 
     pub async fn prepare_backend_target(
@@ -1211,6 +1255,8 @@ pub enum HostError {
     DurableReplica(String),
     Snapshot(String),
     Adapter(String),
+    AdapterUnavailable(String),
+    ScanByteLimit { limit: u64, required: u64 },
     InvalidQueueCapacity,
     InvalidReplicaKey,
     UnknownReplica { graph_id: u64, shard_id: u32 },
@@ -1229,6 +1275,12 @@ pub enum HostError {
     RequestEnvelopeMismatch { expected: u128, actual: u128 },
     RequestMismatch { request_id: u128 },
     ProposalPending { request_id: u128 },
+    InvalidReadContext,
+    DuplicateReadContext { request_id: u128 },
+    ReadBarrierDeadline { request_id: u128 },
+    ReadBarrierUnavailable { request_id: u128 },
+    ReadBarrierLimit,
+    ReadBarrierContextExhausted,
     StaleEpoch { expected: u64, actual: u64 },
     Overloaded { graph_id: u64, shard_id: u32 },
     OutboundOverloaded,
@@ -1244,11 +1296,19 @@ impl HostError {
     }
 
     pub(crate) fn from_durable(error: shard_runtime::DurableReplicaError) -> Self {
-        Self::DurableReplica(error.to_string())
+        match error {
+            shard_runtime::DurableReplicaError::TooManyPendingReadIndexRequests => {
+                Self::ReadBarrierLimit
+            }
+            other => Self::DurableReplica(other.to_string()),
+        }
     }
 
     pub(crate) fn from_runtime(error: shard_runtime::ShardRuntimeError) -> Self {
         match error {
+            shard_runtime::ShardRuntimeError::Adapter(AdapterError::Unavailable(message)) => {
+                Self::AdapterUnavailable(message)
+            }
             shard_runtime::ShardRuntimeError::RequestEnvelopeMismatch { expected, actual } => {
                 Self::RequestEnvelopeMismatch { expected, actual }
             }
@@ -1256,6 +1316,16 @@ impl HostError {
                 Self::RequestMismatch { request_id }
             }
             other => Self::DurableReplica(other.to_string()),
+        }
+    }
+
+    pub(crate) fn from_adapter(error: AdapterError) -> Self {
+        match error {
+            AdapterError::Unavailable(message) => Self::AdapterUnavailable(message),
+            AdapterError::ScanByteLimit { limit, required } => {
+                Self::ScanByteLimit { limit, required }
+            }
+            other => Self::Adapter(other.to_string()),
         }
     }
 }
@@ -1269,6 +1339,13 @@ impl Display for HostError {
             Self::DurableReplica(message) => write!(formatter, "durable Replica error: {message}"),
             Self::Snapshot(message) => write!(formatter, "snapshot error: {message}"),
             Self::Adapter(message) => write!(formatter, "Adapter error: {message}"),
+            Self::AdapterUnavailable(message) => {
+                write!(formatter, "Adapter unavailable: {message}")
+            }
+            Self::ScanByteLimit { limit, required } => write!(
+                formatter,
+                "scan requires {required} bytes, exceeding byte limit {limit}"
+            ),
             Self::InvalidQueueCapacity => formatter.write_str("invalid actor queue capacity"),
             Self::InvalidReplicaKey => formatter.write_str("invalid Replica key"),
             Self::UnknownReplica { graph_id, shard_id } => {
@@ -1322,6 +1399,29 @@ impl Display for HostError {
             ),
             Self::ProposalPending { request_id } => {
                 write!(formatter, "proposal {request_id} has not applied yet")
+            }
+            Self::InvalidReadContext => formatter.write_str("ReadIndex request ID cannot be zero"),
+            Self::DuplicateReadContext { request_id } => {
+                write!(
+                    formatter,
+                    "ReadIndex request {request_id} is already pending"
+                )
+            }
+            Self::ReadBarrierDeadline { request_id } => {
+                write!(
+                    formatter,
+                    "ReadIndex request {request_id} exceeded its deadline"
+                )
+            }
+            Self::ReadBarrierUnavailable { request_id } => {
+                write!(
+                    formatter,
+                    "ReadIndex request {request_id} could not be completed safely"
+                )
+            }
+            Self::ReadBarrierLimit => formatter.write_str("too many pending ReadIndex requests"),
+            Self::ReadBarrierContextExhausted => {
+                formatter.write_str("ReadIndex context sequence is exhausted")
             }
             Self::StaleEpoch { expected, actual } => write!(
                 formatter,

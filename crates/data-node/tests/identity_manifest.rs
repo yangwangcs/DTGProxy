@@ -148,6 +148,26 @@ fn identity_and_manifest_unknown_versions_fail_closed() {
 }
 
 #[test]
+fn predecessor_manifest_versions_are_rejected() {
+    for version in [2_u16, 3] {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("replicas.manifest.log");
+        let mut record = Vec::new();
+        record.extend_from_slice(b"DTRP");
+        record.extend_from_slice(&version.to_be_bytes());
+        record.extend_from_slice(&4_u32.to_be_bytes());
+        record.extend_from_slice(&0_u32.to_be_bytes());
+        record.extend_from_slice(&crc32fast::hash(&record).to_be_bytes());
+        fs::write(path, record).unwrap();
+
+        assert!(matches!(
+            ReplicaManifestStore::open(temporary.path()),
+            Err(StorageError::UnsupportedManifestVersion { actual }) if actual == version
+        ));
+    }
+}
+
+#[test]
 fn manifest_round_trips_active_and_dual_applying_backend_slots() {
     let temporary = tempdir().unwrap();
     let source = BackendProfile::new(

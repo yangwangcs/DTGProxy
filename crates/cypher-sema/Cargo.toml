@@ -6,8 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+analytics-api = { path = "../analytics-api" }
 cypher-ast = { path = "../cypher-ast" }
 cypher-syntax = { path = "../cypher-syntax" }
+procedure-runtime = { path = "../procedure-runtime" }
+temporal-ir = { path = "../temporal-ir" }
 
 [lints]
 workspace = true

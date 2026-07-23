@@ -1,4 +1,4 @@
-use crate::{EdgeMutation, ElementRef, GraphId, PartitionId, VertexMutation};
+use crate::{EdgeMutation, ElementRef, GraphId, PartitionId, TemporalStoreError, VertexMutation};
 use temporal_types::{Interval, ValidTime};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +22,7 @@ impl EndpointGuard {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TemporalTransaction {
     operations: Vec<TemporalOperation>,
+    allow_repeated_elements: bool,
 }
 
 impl TemporalTransaction {
@@ -29,6 +30,7 @@ impl TemporalTransaction {
     pub const fn new() -> Self {
         Self {
             operations: Vec::new(),
+            allow_repeated_elements: false,
         }
     }
 
@@ -54,6 +56,22 @@ impl TemporalTransaction {
 
     pub fn extend(&mut self, other: Self) {
         self.operations.extend(other.operations);
+    }
+
+    pub fn merge_overlay(&mut self, newer: Self) -> Result<(), TemporalStoreError> {
+        self.allow_repeated_elements = true;
+        for operation in newer.operations {
+            self.operations.retain(|previous| {
+                previous.element() != operation.element() || previous.valid() != operation.valid()
+            });
+            self.operations.push(operation);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn operation_count(&self) -> usize {
+        self.operations.len()
     }
 
     #[must_use]
@@ -90,6 +108,10 @@ impl TemporalTransaction {
     pub(crate) fn into_operations(self) -> Vec<TemporalOperation> {
         self.operations
     }
+
+    pub(crate) const fn allows_repeated_elements(&self) -> bool {
+        self.allow_repeated_elements
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +125,13 @@ impl TemporalOperation {
         match self {
             Self::Vertex(mutation) => mutation.element,
             Self::Edge(mutation) => mutation.element,
+        }
+    }
+
+    const fn valid(&self) -> Interval<ValidTime> {
+        match self {
+            Self::Vertex(mutation) => mutation.valid,
+            Self::Edge(mutation) => mutation.valid,
         }
     }
 }

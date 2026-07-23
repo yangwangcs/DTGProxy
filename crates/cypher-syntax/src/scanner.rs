@@ -51,7 +51,7 @@ impl Display for VersionScanError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} at byte {}: only Cypher 5 and Cypher 25 are supported",
+            "{} at byte {}: only Cypher 25 is supported",
             self.code, self.offset
         )
     }
@@ -77,7 +77,6 @@ pub fn scan_version(query: &str) -> Result<VersionScan<'_>, VersionScanError> {
         .unwrap_or(version_text.len());
     let version = &version_text[..version_end];
     let profile = match version {
-        "5" => CypherProfile::cypher_5(),
         "25" => CypherProfile::cypher_25(),
         _ => {
             return Err(VersionScanError {

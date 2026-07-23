@@ -1,0 +1,34 @@
+name: Neo4j Native Mapping
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  neo4j-mapping:
+    runs-on: ubuntu-24.04
+    services:
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/dtgproxy-ci-password
+        ports:
+          - 7474/tcp
+          - 7687/tcp
+        options: >-
+          --health-cmd "wget --quiet --spider http://localhost:7474 || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DTGPROXY_NEO4J_ENDPOINT: http://127.0.0.1:${{ job.services.neo4j.ports[7474] }}
+      DTGPROXY_NEO4J_USERNAME: neo4j
+      DTGPROXY_NEO4J_PASSWORD: dtgproxy-ci-password
+      DTGPROXY_NEO4J_DATABASE: neo4j
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+      - name: Run Neo4j Mapping certification
+        run: cargo test -p adapter-neo4j -- --test-threads=1

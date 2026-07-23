@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use bolt_protocol::Value;
 use cypher_engine::{BoltValueError, bolt_parameter_to_runtime, runtime_value_to_bolt};
-use query_executor::v2::RuntimeValue;
+use query_executor::RuntimeValue;
 
 #[test]
 fn converts_utc_datetime_parameters_to_exact_microseconds() {

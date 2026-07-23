@@ -15,6 +15,14 @@ use temporal_types::TransactionTime;
 
 const VOTERS: &[u64] = &[1, 2, 3];
 
+#[test]
+fn unsupported_membership_error_names_the_current_runtime() {
+    assert_eq!(
+        ReplicationError::UnsupportedEntryType.to_string(),
+        "dynamic Raft membership entry is not supported in the current runtime"
+    );
+}
+
 fn apply_command(
     shard_id: u32,
     epoch: u64,
@@ -76,6 +84,37 @@ fn three_replicas_elect_replicate_and_ack_only_after_leader_apply() {
         block_on(group.propose_and_wait(apply_command(7, 9, 101, 100, b"different-retry"), 1,)),
         Err(ReplicationError::RequestMismatch { request_id: 101 })
     ));
+}
+
+#[test]
+fn committed_rejection_is_reported_without_blocking_later_in_process_entries() {
+    let mut group = block_on(InProcessShardGroup::new(7, 9, VOTERS)).unwrap();
+    block_on(group.elect(1)).unwrap();
+    block_on(group.propose_and_wait(apply_command(7, 9, 110, 100, b"first"), 20)).unwrap();
+
+    assert!(matches!(
+        block_on(group.propose_and_wait(apply_command(7, 9, 111, 90, b"rejected"), 20,)),
+        Err(ReplicationError::StateMachine(
+            shard_runtime::ShardRuntimeError::CommittedRejection {
+                request_id: 111,
+                ..
+            }
+        ))
+    ));
+
+    let receipt =
+        block_on(group.propose_and_wait(apply_command(7, 9, 112, 200, b"after-rejection"), 20))
+            .unwrap();
+    for node_id in VOTERS {
+        assert_eq!(
+            read_current(&group, *node_id),
+            Some(b"after-rejection".to_vec())
+        );
+        assert_eq!(
+            group.replica_metadata(*node_id).unwrap().applied_index,
+            receipt.index
+        );
+    }
 }
 
 #[test]

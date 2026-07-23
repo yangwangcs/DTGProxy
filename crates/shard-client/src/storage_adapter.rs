@@ -7,7 +7,7 @@ use storage_api::{
     SnapshotCapability, StorageAdapter,
 };
 
-use crate::{ReadKeysRequest, ScanRequest, ShardClient, ShardRequestContext};
+use crate::{ReadKeysRequest, ScanRequest, ShardClient, ShardClientError, ShardRequestContext};
 
 pub struct ShardClientStorageAdapter {
     client: Arc<dyn ShardClient>,
@@ -68,6 +68,25 @@ impl ShardClientStorageAdapter {
         )
         .map_err(|error| AdapterError::Backend(error.to_string()))
     }
+
+    #[must_use]
+    pub const fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+}
+
+fn adapter_read_error(error: ShardClientError) -> AdapterError {
+    if matches!(
+        error,
+        ShardClientError::DeadlineExpired
+            | ShardClientError::NoLeader { .. }
+            | ShardClientError::NotLeader { .. }
+            | ShardClientError::Replication(_)
+            | ShardClientError::ReadBarrier(_)
+    ) {
+        return AdapterError::Unavailable(error.to_string());
+    }
+    AdapterError::Backend(error.to_string())
 }
 
 impl StorageAdapter for ShardClientStorageAdapter {
@@ -117,7 +136,7 @@ impl StorageAdapter for ShardClientStorageAdapter {
                         .map_err(|error| AdapterError::Backend(error.to_string()))?,
                 )
                 .await
-                .map_err(|error| AdapterError::Backend(error.to_string()))
+                .map_err(adapter_read_error)
         })
     }
 
@@ -127,7 +146,12 @@ impl StorageAdapter for ShardClientStorageAdapter {
             self.client
                 .scan(ScanRequest::new(context, span.clone()))
                 .await
-                .map_err(|error| AdapterError::Backend(error.to_string()))
+                .map_err(|error| match error {
+                    ShardClientError::ScanByteLimit { limit, required } => {
+                        AdapterError::ScanByteLimit { limit, required }
+                    }
+                    other => adapter_read_error(other),
+                })
         })
     }
 

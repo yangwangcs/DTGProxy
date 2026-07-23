@@ -1,10 +1,10 @@
 # DTGProxy Replica Snapshot
 
 `replica-snapshot` binds a local RocksDB checkpoint to the exact replicated state that produced it.
-The V1 manifest contains shard ID, placement epoch, Raft term/index, closed/resolved/Adapter-applied
+The current manifest contains shard ID, placement epoch, Raft term/index, closed/resolved/Adapter-applied
 timestamps, canonical voter IDs, and a 32-byte checkpoint digest.
 
-The manifest uses explicit big-endian fields, `DTSM` magic, version 1, bounded membership, and a
+The manifest uses explicit big-endian fields, `DTSM` magic, its current format version, bounded membership, and a
 CRC-32 checksum. Voter IDs must be nonzero, sorted, and unique. The checkpoint digest is BLAKE3 over
 the sorted relative path, length, and complete bytes of every regular file, with domain separation.
 Symlinks and other special entries are rejected.

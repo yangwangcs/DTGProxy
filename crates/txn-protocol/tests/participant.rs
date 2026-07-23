@@ -3,12 +3,18 @@ use std::collections::BTreeMap;
 use storage_api::{Keyspace, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
 use temporal_types::TransactionTime;
 use txn_protocol::{
-    HomeTransactionRecord, IsolationLevel, ParticipantEngine, ParticipantProof, PrewriteRequest,
-    RecoveryAction, ShardEpoch, TransactionId, TransactionState, TxnProtocolError, recovery_action,
+    ConstraintClaim, HomeTransactionRecord, IsolationLevel, ParticipantEngine, ParticipantProof,
+    PointReadVersion, PrewriteMetadata, PrewriteRequest, RangeReadFingerprint, RecoveryAction,
+    ShardEpoch, TransactionId, TransactionState, TxnProtocolError, recovery_action,
 };
 
 fn request() -> PrewriteRequest {
     request_with_id(77)
+}
+
+fn metadata(schema_version: u64, placement_epoch: u64) -> PrewriteMetadata {
+    PrewriteMetadata::new(schema_version, placement_epoch, Vec::new(), Vec::new())
+        .expect("current prewrite metadata")
 }
 
 fn request_with_id(transaction_id: u128) -> PrewriteRequest {
@@ -33,6 +39,8 @@ fn request_with_id(transaction_id: u128) -> PrewriteRequest {
                 b"value".to_vec(),
             )],
         },
+        Vec::new(),
+        metadata(5, 9),
     )
     .unwrap()
 }
@@ -52,6 +60,47 @@ fn apply_to_map(map: &mut BTreeMap<LogicalKey, Vec<u8>>, mutations: &[Mutation])
 
 fn values_for(map: &BTreeMap<LogicalKey, Vec<u8>>, keys: &[LogicalKey]) -> Vec<Option<Vec<u8>>> {
     keys.iter().map(|key| map.get(key).cloned()).collect()
+}
+
+fn request_with_constraint(transaction_id: u128, owner: &[u8]) -> PrewriteRequest {
+    let start = if transaction_id == 91 { 100 } else { 200 };
+    PrewriteRequest::new(
+        TransactionId::new(transaction_id),
+        TransactionTime::new(start, 0),
+        5,
+        ShardEpoch::new(20, 9).unwrap(),
+        ShardEpoch::new(10, 9).unwrap(),
+        vec![
+            ShardEpoch::new(10, 9).unwrap(),
+            ShardEpoch::new(20, 9).unwrap(),
+        ],
+        IsolationLevel::TemporalSnapshot,
+        TransactionTime::new(start + 100, 0),
+        PreparedMutationBatch {
+            shard_id: 20,
+            txn_id: transaction_id,
+            mutations: vec![Mutation::put(
+                0,
+                LogicalKey::in_keyspace(
+                    Keyspace::Current,
+                    format!("vertex/constraint-owner/{transaction_id}").into_bytes(),
+                ),
+                owner.to_vec(),
+            )],
+        },
+        vec![
+            ConstraintClaim::new(
+                LogicalKey::in_keyspace(
+                    Keyspace::Txn,
+                    b"dtg/constraint/v1/graph/7/name/ada".to_vec(),
+                ),
+                owner.to_vec(),
+            )
+            .unwrap(),
+        ],
+        metadata(5, 9),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -125,6 +174,184 @@ fn finalize_materializes_business_mutations_and_releases_locks() {
         finalize_keys[1..]
             .iter()
             .all(|key| !state.contains_key(key))
+    );
+}
+
+#[test]
+fn committed_constraint_claim_rejects_a_different_element_owner() {
+    let first = request_with_constraint(91, b"element-a");
+    let prewrite_keys = ParticipantEngine::prewrite_inspection_keys(&first).unwrap();
+    let prewrite = ParticipantEngine::prewrite(&first, &vec![None; prewrite_keys.len()]).unwrap();
+    let mut state = BTreeMap::new();
+    apply_to_map(&mut state, prewrite.mutations());
+
+    let finalize_keys = ParticipantEngine::finalize_inspection_keys(&first).unwrap();
+    let finalized = ParticipantEngine::finalize(
+        &first,
+        TransactionTime::new(150, 0),
+        &values_for(&state, &finalize_keys),
+    )
+    .unwrap();
+    apply_to_map(&mut state, finalized.mutations());
+
+    let second = request_with_constraint(92, b"element-b");
+    let second_keys = ParticipantEngine::prewrite_inspection_keys(&second).unwrap();
+    assert!(matches!(
+        ParticipantEngine::prewrite(&second, &values_for(&state, &second_keys)),
+        Err(TxnProtocolError::ConstraintConflict { .. })
+    ));
+}
+
+#[test]
+fn serializable_point_read_rejects_a_changed_committed_version() {
+    let first = request();
+    let first_keys = ParticipantEngine::prewrite_inspection_keys(&first).unwrap();
+    let prewrite = ParticipantEngine::prewrite(&first, &vec![None; first_keys.len()]).unwrap();
+    let mut state = BTreeMap::new();
+    apply_to_map(&mut state, prewrite.mutations());
+    let finalize_keys = ParticipantEngine::finalize_inspection_keys(&first).unwrap();
+    let finalized = ParticipantEngine::finalize(
+        &first,
+        TransactionTime::new(150, 0),
+        &values_for(&state, &finalize_keys),
+    )
+    .unwrap();
+    apply_to_map(&mut state, finalized.mutations());
+
+    let metadata = PrewriteMetadata::new(
+        5,
+        9,
+        vec![
+            PointReadVersion::new(
+                LogicalKey::in_keyspace(Keyspace::Current, b"vertex/77".to_vec()),
+                Some(TransactionTime::new(100, 0)),
+            )
+            .unwrap(),
+        ],
+        vec![RangeReadFingerprint::new(Keyspace::Current, b"vertex/".to_vec(), [7; 32]).unwrap()],
+    )
+    .unwrap();
+    let second = PrewriteRequest::new(
+        TransactionId::new(98),
+        TransactionTime::new(200, 0),
+        5,
+        ShardEpoch::new(20, 9).unwrap(),
+        ShardEpoch::new(10, 9).unwrap(),
+        vec![
+            ShardEpoch::new(10, 9).unwrap(),
+            ShardEpoch::new(20, 9).unwrap(),
+        ],
+        IsolationLevel::TemporalSerializable,
+        TransactionTime::new(300, 0),
+        PreparedMutationBatch {
+            shard_id: 20,
+            txn_id: 98,
+            mutations: vec![Mutation::put(
+                0,
+                LogicalKey::in_keyspace(Keyspace::Current, b"vertex/98".to_vec()),
+                b"value".to_vec(),
+            )],
+        },
+        Vec::new(),
+        metadata,
+    )
+    .unwrap();
+    let keys = ParticipantEngine::prewrite_inspection_keys(&second).unwrap();
+    assert!(matches!(
+        ParticipantEngine::prewrite(&second, &values_for(&state, &keys)),
+        Err(TxnProtocolError::ReadDependencyConflict { .. })
+    ));
+}
+
+#[test]
+fn constraint_only_participant_commits_its_durable_owner() {
+    let request = PrewriteRequest::new(
+        TransactionId::new(93),
+        TransactionTime::new(300, 0),
+        5,
+        ShardEpoch::new(20, 9).unwrap(),
+        ShardEpoch::new(20, 9).unwrap(),
+        vec![ShardEpoch::new(20, 9).unwrap()],
+        IsolationLevel::TemporalSnapshot,
+        TransactionTime::new(400, 0),
+        PreparedMutationBatch {
+            shard_id: 20,
+            txn_id: 93,
+            mutations: Vec::new(),
+        },
+        vec![
+            ConstraintClaim::new(
+                LogicalKey::in_keyspace(
+                    Keyspace::Txn,
+                    b"dtg/constraint/v1/graph/7/name/grace".to_vec(),
+                ),
+                b"element-grace".to_vec(),
+            )
+            .unwrap(),
+        ],
+        metadata(5, 9),
+    )
+    .unwrap();
+    let prewrite_keys = ParticipantEngine::prewrite_inspection_keys(&request).unwrap();
+    let prewrite = ParticipantEngine::prewrite(&request, &vec![None; prewrite_keys.len()]).unwrap();
+    let mut state = BTreeMap::new();
+    apply_to_map(&mut state, prewrite.mutations());
+
+    let finalize_keys = ParticipantEngine::finalize_inspection_keys(&request).unwrap();
+    let finalized = ParticipantEngine::finalize(
+        &request,
+        TransactionTime::new(350, 0),
+        &values_for(&state, &finalize_keys),
+    )
+    .unwrap();
+    apply_to_map(&mut state, finalized.mutations());
+    assert_eq!(
+        state.get(&LogicalKey::in_keyspace(
+            Keyspace::Txn,
+            b"dtg/constraint/v1/graph/7/name/grace".to_vec(),
+        )),
+        Some(&b"element-grace".to_vec())
+    );
+}
+
+#[test]
+fn committed_constraint_owner_is_visible_only_at_or_after_its_commit_timestamp() {
+    let request = request_with_constraint(91, b"element-a");
+    let prewrite_keys = ParticipantEngine::prewrite_inspection_keys(&request).unwrap();
+    let prewrite = ParticipantEngine::prewrite(&request, &vec![None; prewrite_keys.len()]).unwrap();
+    let mut state = BTreeMap::new();
+    apply_to_map(&mut state, prewrite.mutations());
+    let finalize_keys = ParticipantEngine::finalize_inspection_keys(&request).unwrap();
+    let finalized = ParticipantEngine::finalize(
+        &request,
+        TransactionTime::new(150, 0),
+        &values_for(&state, &finalize_keys),
+    )
+    .unwrap();
+    apply_to_map(&mut state, finalized.mutations());
+
+    let constraint = request.constraint_claims().first().unwrap().key();
+    let owner_keys =
+        ParticipantEngine::constraint_owner_read_keys(request.participant(), constraint).unwrap();
+    let owner_values = values_for(&state, &owner_keys);
+
+    assert_eq!(
+        ParticipantEngine::constraint_owner_at_snapshot(
+            owner_values[0].as_deref(),
+            owner_values[1].as_deref(),
+            TransactionTime::new(149, 0),
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        ParticipantEngine::constraint_owner_at_snapshot(
+            owner_values[0].as_deref(),
+            owner_values[1].as_deref(),
+            TransactionTime::new(150, 0),
+        )
+        .unwrap(),
+        Some(b"element-a".to_vec())
     );
 }
 

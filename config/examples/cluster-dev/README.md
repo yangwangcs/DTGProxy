@@ -1,6 +1,6 @@
 # DTGProxy local two-Data-node cluster
 
-These version-1 JSON files describe a loopback-only development cluster with one Meta node, two
+These JSON files describe a loopback-only development cluster with one Meta node, two
 Data nodes, one Gateway, and one reconciliation Controller. Replace every data directory before
 starting a second copy. Start Meta, both Data nodes, Gateway, then Controller.
 

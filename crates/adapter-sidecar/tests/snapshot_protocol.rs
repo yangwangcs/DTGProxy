@@ -170,9 +170,10 @@ fn feature_bits_and_remote_error_codes_are_stable() {
             RemoteErrorCode::RestoreAlreadyInProgress as u32,
             RemoteErrorCode::ServiceFaulted as u32,
             RemoteErrorCode::TargetRequestMismatch as u32,
+            RemoteErrorCode::MappingIncompatible as u32,
         ],
         [
-            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115
         ]
     );
 }

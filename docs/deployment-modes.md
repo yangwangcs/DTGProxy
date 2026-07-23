@@ -19,7 +19,7 @@ DTGProxy exposes two user-facing deployment modes over one Shard/Raft/temporal k
 - Shard IDs are arbitrary and do not need to equal logical partition IDs.
 - Adding a Shard either leaves a partition on its old Shard or moves it to the new Shard; it does not reshuffle a key between two existing Shards.
 - Point plans route to one Shard. Global scans and graph frontiers fan out only to required Shards and merge canonical ordered results.
-- Cross-Shard writes require the Phase 3 TSO + Intent + 2PC protocol. Until that protocol is complete, the implementation must reject—not weaken—multi-Shard atomicity requests.
+- Cross-Shard writes use the current TSO + Intent + 2PC protocol. Constraint-owner probes, epoch-fenced participant intents, durable Home decisions, and idempotent finalization preserve atomicity; an unresolved outcome remains recoverable rather than being exposed as a partial commit.
 
 ```mermaid
 flowchart LR

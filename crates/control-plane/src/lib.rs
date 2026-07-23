@@ -20,10 +20,6 @@ const SNAPSHOT_MAGIC: [u8; 4] = *b"DTCS";
 const LOG_MAGIC: [u8; 4] = *b"DTCL";
 const COMMAND_FORMAT_VERSION: u16 = 1;
 const LOG_FORMAT_VERSION: u16 = 1;
-const LEGACY_SNAPSHOT_FORMAT_VERSION: u16 = 1;
-const MIGRATION_SNAPSHOT_FORMAT_VERSION: u16 = 2;
-const LINEAGE_SNAPSHOT_FORMAT_VERSION: u16 = 3;
-const RETENTION_SNAPSHOT_FORMAT_VERSION: u16 = 4;
 const SNAPSHOT_FORMAT_VERSION: u16 = 5;
 const CHECKSUM_BYTES: usize = 4;
 const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
@@ -2197,62 +2193,29 @@ fn decode_map(
 }
 
 fn encode_snapshot(state: &CatalogState) -> Result<Vec<u8>, CatalogError> {
-    encode_snapshot_version(state, SNAPSHOT_FORMAT_VERSION)
-}
-
-fn encode_snapshot_version(state: &CatalogState, version: u16) -> Result<Vec<u8>, CatalogError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&SNAPSHOT_MAGIC);
-    bytes.extend_from_slice(&version.to_be_bytes());
+    bytes.extend_from_slice(&SNAPSHOT_FORMAT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&state.revision.to_be_bytes());
     write_count(&mut bytes, state.graphs.len())?;
     for graph in state.graphs.values() {
         encode_graph(&mut bytes, graph)?;
     }
-    match version {
-        LEGACY_SNAPSHOT_FORMAT_VERSION => {
-            if !state.migrations.is_empty()
-                || !state.lineages.is_empty()
-                || !state.retention_pins.is_empty()
-                || !state.backend_migrations.is_empty()
-            {
-                return Err(CatalogError::UnsupportedVersion);
-            }
-        }
-        MIGRATION_SNAPSHOT_FORMAT_VERSION
-        | LINEAGE_SNAPSHOT_FORMAT_VERSION
-        | RETENTION_SNAPSHOT_FORMAT_VERSION
-        | SNAPSHOT_FORMAT_VERSION => {
-            write_count(&mut bytes, state.migrations.len())?;
-            for migration in state.migrations.values() {
-                encode_migration_record(&mut bytes, migration)?;
-            }
-            if version >= LINEAGE_SNAPSHOT_FORMAT_VERSION {
-                write_count(&mut bytes, state.lineages.len())?;
-                for lineage in state.lineages.values() {
-                    encode_lineage(&mut bytes, lineage);
-                }
-            } else if !state.lineages.is_empty() {
-                return Err(CatalogError::UnsupportedVersion);
-            }
-            if version >= RETENTION_SNAPSHOT_FORMAT_VERSION {
-                write_count(&mut bytes, state.retention_pins.len())?;
-                for pin in state.retention_pins.values() {
-                    encode_retention_pin(&mut bytes, pin);
-                }
-            } else if !state.retention_pins.is_empty() {
-                return Err(CatalogError::UnsupportedVersion);
-            }
-            if version == SNAPSHOT_FORMAT_VERSION {
-                write_count(&mut bytes, state.backend_migrations.len())?;
-                for migration in state.backend_migrations.values() {
-                    encode_backend_migration_record(&mut bytes, migration)?;
-                }
-            } else if !state.backend_migrations.is_empty() {
-                return Err(CatalogError::UnsupportedVersion);
-            }
-        }
-        _ => return Err(CatalogError::UnsupportedVersion),
+    write_count(&mut bytes, state.migrations.len())?;
+    for migration in state.migrations.values() {
+        encode_migration_record(&mut bytes, migration)?;
+    }
+    write_count(&mut bytes, state.lineages.len())?;
+    for lineage in state.lineages.values() {
+        encode_lineage(&mut bytes, lineage);
+    }
+    write_count(&mut bytes, state.retention_pins.len())?;
+    for pin in state.retention_pins.values() {
+        encode_retention_pin(&mut bytes, pin);
+    }
+    write_count(&mut bytes, state.backend_migrations.len())?;
+    for migration in state.backend_migrations.values() {
+        encode_backend_migration_record(&mut bytes, migration)?;
     }
     write_count(&mut bytes, state.applied_commands.len())?;
     for (command_id, applied) in &state.applied_commands {
@@ -2275,14 +2238,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
     let mut reader = Reader::without_checksum(bytes)?;
     reader.expect_magic(SNAPSHOT_MAGIC)?;
     let version = reader.version()?;
-    if !matches!(
-        version,
-        LEGACY_SNAPSHOT_FORMAT_VERSION
-            | MIGRATION_SNAPSHOT_FORMAT_VERSION
-            | LINEAGE_SNAPSHOT_FORMAT_VERSION
-            | RETENTION_SNAPSHOT_FORMAT_VERSION
-            | SNAPSHOT_FORMAT_VERSION
-    ) {
+    if version != SNAPSHOT_FORMAT_VERSION {
         return Err(CatalogError::UnsupportedVersion);
     }
     let revision = reader.u64()?;
@@ -2296,113 +2252,104 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
     }
     let mut migrations = BTreeMap::new();
     let mut active_migrations = BTreeMap::new();
-    if version >= MIGRATION_SNAPSHOT_FORMAT_VERSION {
-        let migration_count = reader.count(MAX_MIGRATIONS)?;
-        for _ in 0..migration_count {
-            let migration = decode_migration_record(&mut reader)?;
-            let migration_id = migration.migration_id;
-            let graph = graphs
-                .get(&migration.graph_id)
-                .ok_or(CatalogError::NonCanonicalRecord)?;
-            if !graph
-                .topology
-                .placements
-                .iter()
-                .any(|placement| placement.shard_id == migration.shard_id)
-            {
-                return Err(CatalogError::NonCanonicalRecord);
-            }
-            if !migration.state.is_terminal()
-                && active_migrations
-                    .insert((migration.graph_id, migration.shard_id), migration_id)
-                    .is_some()
-            {
-                return Err(CatalogError::NonCanonicalRecord);
-            }
-            if migrations.insert(migration_id, migration).is_some() {
-                return Err(CatalogError::NonCanonicalRecord);
-            }
+    let migration_count = reader.count(MAX_MIGRATIONS)?;
+    for _ in 0..migration_count {
+        let migration = decode_migration_record(&mut reader)?;
+        let migration_id = migration.migration_id;
+        let graph = graphs
+            .get(&migration.graph_id)
+            .ok_or(CatalogError::NonCanonicalRecord)?;
+        if !graph
+            .topology
+            .placements
+            .iter()
+            .any(|placement| placement.shard_id == migration.shard_id)
+        {
+            return Err(CatalogError::NonCanonicalRecord);
+        }
+        if !migration.state.is_terminal()
+            && active_migrations
+                .insert((migration.graph_id, migration.shard_id), migration_id)
+                .is_some()
+        {
+            return Err(CatalogError::NonCanonicalRecord);
+        }
+        if migrations.insert(migration_id, migration).is_some() {
+            return Err(CatalogError::NonCanonicalRecord);
         }
     }
     let mut lineages = BTreeMap::new();
-    if version >= LINEAGE_SNAPSHOT_FORMAT_VERSION {
-        let lineage_count = reader.count(MAX_MIGRATIONS)?;
-        for _ in 0..lineage_count {
-            let lineage = decode_lineage(&mut reader)?;
-            let key = (lineage.graph_id, lineage.shard_id, lineage.source_epoch);
-            let migration = migrations
-                .get(&lineage.migration_id)
-                .ok_or(CatalogError::NonCanonicalRecord)?;
-            let graph = graphs
-                .get(&lineage.graph_id)
-                .ok_or(CatalogError::NonCanonicalRecord)?;
-            let target_matches = graph.topology.epoch >= lineage.target_epoch
-                && graph.topology.placements.iter().any(|placement| {
-                    placement.shard_id == lineage.shard_id
-                        && placement.epoch >= lineage.target_epoch
-                });
-            if migration.graph_id != lineage.graph_id
-                || migration.shard_id != lineage.shard_id
-                || migration.source_epoch != lineage.source_epoch
-                || migration.target_epoch != lineage.target_epoch
-                || migration.cutover_index != lineage.cutover_index
-                || !matches!(
-                    migration.state,
-                    MigrationState::Committed | MigrationState::Cleaning | MigrationState::Cleaned
-                )
-                || !target_matches
-                || lineages.insert(key, lineage).is_some()
-            {
-                return Err(CatalogError::NonCanonicalRecord);
-            }
+    let lineage_count = reader.count(MAX_MIGRATIONS)?;
+    for _ in 0..lineage_count {
+        let lineage = decode_lineage(&mut reader)?;
+        let key = (lineage.graph_id, lineage.shard_id, lineage.source_epoch);
+        let migration = migrations
+            .get(&lineage.migration_id)
+            .ok_or(CatalogError::NonCanonicalRecord)?;
+        let graph = graphs
+            .get(&lineage.graph_id)
+            .ok_or(CatalogError::NonCanonicalRecord)?;
+        let target_matches = graph.topology.epoch >= lineage.target_epoch
+            && graph.topology.placements.iter().any(|placement| {
+                placement.shard_id == lineage.shard_id && placement.epoch >= lineage.target_epoch
+            });
+        if migration.graph_id != lineage.graph_id
+            || migration.shard_id != lineage.shard_id
+            || migration.source_epoch != lineage.source_epoch
+            || migration.target_epoch != lineage.target_epoch
+            || migration.cutover_index != lineage.cutover_index
+            || !matches!(
+                migration.state,
+                MigrationState::Committed | MigrationState::Cleaning | MigrationState::Cleaned
+            )
+            || !target_matches
+            || lineages.insert(key, lineage).is_some()
+        {
+            return Err(CatalogError::NonCanonicalRecord);
         }
     }
     let mut retention_pins = BTreeMap::new();
-    if version >= RETENTION_SNAPSHOT_FORMAT_VERSION {
-        let pin_count = reader.count(MAX_RETENTION_PINS)?;
-        for _ in 0..pin_count {
-            let pin = decode_retention_pin(&mut reader)?;
-            let graph = graphs
-                .get(&pin.graph_id)
-                .ok_or(CatalogError::NonCanonicalRecord)?;
-            if !graph
-                .topology
-                .placements
-                .iter()
-                .any(|placement| placement.shard_id == pin.shard_id)
-                || retention_pins.insert(pin.pin_id, pin).is_some()
-            {
-                return Err(CatalogError::NonCanonicalRecord);
-            }
+    let pin_count = reader.count(MAX_RETENTION_PINS)?;
+    for _ in 0..pin_count {
+        let pin = decode_retention_pin(&mut reader)?;
+        let graph = graphs
+            .get(&pin.graph_id)
+            .ok_or(CatalogError::NonCanonicalRecord)?;
+        if !graph
+            .topology
+            .placements
+            .iter()
+            .any(|placement| placement.shard_id == pin.shard_id)
+            || retention_pins.insert(pin.pin_id, pin).is_some()
+        {
+            return Err(CatalogError::NonCanonicalRecord);
         }
     }
     let mut backend_migrations = BTreeMap::new();
     let mut active_backend_migrations = BTreeMap::new();
-    if version == SNAPSHOT_FORMAT_VERSION {
-        let migration_count = reader.count(MAX_BACKEND_MIGRATIONS)?;
-        for _ in 0..migration_count {
-            let migration = decode_backend_migration_record(&mut reader)?;
-            let graph = graphs
-                .get(&migration.graph_id())
-                .ok_or(CatalogError::NonCanonicalRecord)?;
-            migration.validate_recovered(graph.topology().placements())?;
-            let graph_matches = match migration.state() {
-                BackendMigrationState::Published | BackendMigrationState::SourceRetired => {
-                    graph.backend() == migration.target()
-                }
-                _ => graph.backend() == migration.source(),
-            };
-            if !graph_matches
-                || (!migration.state().is_terminal()
-                    && active_backend_migrations
-                        .insert(migration.graph_id(), migration.migration_id())
-                        .is_some())
-                || backend_migrations
-                    .insert(migration.migration_id(), migration)
-                    .is_some()
-            {
-                return Err(CatalogError::NonCanonicalRecord);
+    let migration_count = reader.count(MAX_BACKEND_MIGRATIONS)?;
+    for _ in 0..migration_count {
+        let migration = decode_backend_migration_record(&mut reader)?;
+        let graph = graphs
+            .get(&migration.graph_id())
+            .ok_or(CatalogError::NonCanonicalRecord)?;
+        migration.validate_recovered(graph.topology().placements())?;
+        let graph_matches = match migration.state() {
+            BackendMigrationState::Published | BackendMigrationState::SourceRetired => {
+                graph.backend() == migration.target()
             }
+            _ => graph.backend() == migration.source(),
+        };
+        if !graph_matches
+            || (!migration.state().is_terminal()
+                && active_backend_migrations
+                    .insert(migration.graph_id(), migration.migration_id())
+                    .is_some())
+            || backend_migrations
+                .insert(migration.migration_id(), migration)
+                .is_some()
+        {
+            return Err(CatalogError::NonCanonicalRecord);
         }
     }
     let applied_count = reader.count(MAX_GRAPHS.saturating_mul(16))?;
@@ -2439,7 +2386,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<CatalogState, CatalogError> {
         active_backend_migrations,
         applied_commands,
     };
-    if encode_snapshot_version(&state, version)? != bytes {
+    if encode_snapshot(&state)? != bytes {
         return Err(CatalogError::NonCanonicalRecord);
     }
     Ok(state)
@@ -2958,15 +2905,21 @@ impl From<MigrationError> for CatalogError {
 }
 
 #[cfg(test)]
-mod compatibility_tests {
+mod snapshot_format_tests {
     use super::*;
 
     #[test]
-    fn version_one_snapshot_remains_readable_after_migration_records_are_added() {
+    fn predecessor_snapshot_versions_are_rejected() {
         let state = CatalogState::new();
-        let legacy = encode_snapshot_version(&state, LEGACY_SNAPSHOT_FORMAT_VERSION).unwrap();
-        let decoded = CatalogState::decode_snapshot(&legacy).unwrap();
-        assert_eq!(decoded, state);
-        assert!(decoded.migrations().is_empty());
+        let mut predecessor = state.encode_snapshot().expect("current snapshot");
+        predecessor[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        let checksum_offset = predecessor.len() - CHECKSUM_BYTES;
+        let checksum = crc32fast::hash(&predecessor[..checksum_offset]).to_be_bytes();
+        predecessor[checksum_offset..].copy_from_slice(&checksum);
+
+        assert_eq!(
+            CatalogState::decode_snapshot(&predecessor),
+            Err(CatalogError::UnsupportedVersion)
+        );
     }
 }

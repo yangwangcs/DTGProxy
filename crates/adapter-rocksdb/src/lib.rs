@@ -15,12 +15,14 @@ use rocksdb::{
 };
 use storage_api::{
     ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
-    AdapterFuture, ApplyReceipt, BackendFamily, CommittedMutationBatch, Durability, KeySpan,
-    KeyValue, Keyspace, LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1,
-    LogicalSnapshotError, LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1,
-    LogicalSnapshotManifestV1, LogicalSnapshotReader, MutationOperation, SnapshotCapability,
-    StorageAdapter, adapter_log_fingerprint_key, adapter_mutation_fingerprint_key,
-    new_logical_snapshot_id,
+    AdapterFuture, ApplyReceipt, BackendFamily, CanonicalRestoreSession, CommittedMutationBatch,
+    Durability, KeySpan, KeyValue, Keyspace, LogicalKey, LogicalSnapshotAccumulator,
+    LogicalSnapshotChunkV1, LogicalSnapshotError, LogicalSnapshotExportRequest,
+    LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1, LogicalSnapshotReader,
+    MappingBackedAdapter, MappingCapabilities, MappingDescriptorV1, MappingFuture,
+    MappingRequirement, MutationOperation, PreparedMappingTransaction, SnapshotCapability,
+    StorageAdapter, TemporalBackendMapping, adapter_log_fingerprint_key,
+    adapter_mutation_fingerprint_key, new_logical_snapshot_id,
 };
 
 type RocksDb = DBWithThreadMode<MultiThreaded>;
@@ -32,13 +34,26 @@ impl AdapterFactory for RocksAdapterFactory {
         "rocksdb"
     }
 
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        Some(rocks_mapping_descriptor())
+    }
+
     fn open<'a>(&'a self, request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a> {
         Box::pin(async move {
             let path = request.parameter("path").ok_or_else(|| {
                 AdapterFactoryError::new("RocksDB Adapter requires the public parameter path")
             })?;
-            let adapter = RocksAdapter::open(path)
-                .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
+            let mapping = Arc::new(
+                RocksAdapter::open(path)
+                    .map_err(|error| AdapterFactoryError::new(error.to_string()))?,
+            );
+            let adapter = MappingBackedAdapter::with_runtime_identity(
+                "rocksdb",
+                env!("CARGO_PKG_VERSION"),
+                mapping,
+                MappingRequirement::HotPluggableReplica,
+            )
+            .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
             Ok(Arc::new(adapter) as Arc<dyn StorageAdapter>)
         })
     }
@@ -190,28 +205,25 @@ impl RocksAdapter {
             .unwrap_or(0))
     }
 
-    fn apply(&self, batch: CommittedMutationBatch) -> Result<ApplyReceipt, AdapterError> {
-        let _apply_guard = self
-            .apply_guard
-            .lock()
-            .map_err(|_| AdapterError::LockPoisoned)?;
+    fn validate_batch_for_prepare(
+        &self,
+        batch: &CommittedMutationBatch,
+    ) -> Result<Option<ApplyReceipt>, AdapterError> {
         let applied_log_index = self.current_applied_log_index()?;
         let batch_fingerprint = batch.fingerprint();
-
         if batch.log_index <= applied_log_index {
             let stored =
                 self.read_u64(Keyspace::Txn, &adapter_log_fingerprint_key(batch.log_index))?;
             return match stored {
-                Some(fingerprint) if fingerprint == batch_fingerprint => Ok(ApplyReceipt {
+                Some(fingerprint) if fingerprint == batch_fingerprint => Ok(Some(ApplyReceipt {
                     applied_log_index,
                     duplicate: true,
-                }),
+                })),
                 _ => Err(AdapterError::CommittedLogReplayMismatch {
                     log_index: batch.log_index,
                 }),
             };
         }
-
         let expected = applied_log_index.saturating_add(1);
         if batch.log_index != expected {
             return Err(AdapterError::NonContiguousLogIndex {
@@ -219,17 +231,14 @@ impl RocksAdapter {
                 actual: batch.log_index,
             });
         }
-
-        let mut batch_sequences = BTreeSet::new();
-        let mut mutation_fingerprints = Vec::with_capacity(batch.mutations.len());
+        let mut sequences = BTreeSet::new();
         for mutation in &batch.mutations {
-            if !batch_sequences.insert(mutation.sequence) {
+            if !sequences.insert(mutation.sequence) {
                 return Err(AdapterError::DuplicateMutationSequence {
                     txn_id: batch.txn_id,
                     sequence: mutation.sequence,
                 });
             }
-
             let fingerprint = mutation.fingerprint();
             let metadata_key = adapter_mutation_fingerprint_key(batch.txn_id, mutation.sequence);
             if let Some(previous) = self.read_u64(Keyspace::Txn, &metadata_key)?
@@ -240,6 +249,24 @@ impl RocksAdapter {
                     sequence: mutation.sequence,
                 });
             }
+        }
+        Ok(None)
+    }
+
+    fn apply(&self, batch: CommittedMutationBatch) -> Result<ApplyReceipt, AdapterError> {
+        let _apply_guard = self
+            .apply_guard
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?;
+        if let Some(receipt) = self.validate_batch_for_prepare(&batch)? {
+            return Ok(receipt);
+        }
+        let batch_fingerprint = batch.fingerprint();
+
+        let mut mutation_fingerprints = Vec::with_capacity(batch.mutations.len());
+        for mutation in &batch.mutations {
+            let fingerprint = mutation.fingerprint();
+            let metadata_key = adapter_mutation_fingerprint_key(batch.txn_id, mutation.sequence);
             mutation_fingerprints.push((metadata_key, fingerprint));
         }
 
@@ -352,6 +379,272 @@ impl RocksAdapter {
             .write_opt(write_batch, &write_options)
             .map_err(backend_error)
     }
+
+    fn is_mapping_empty(&self) -> Result<bool, AdapterError> {
+        for keyspace in Keyspace::ALL {
+            let cf = self.cf(keyspace)?;
+            let mut iterator = self.db.iterator_cf(&cf, IteratorMode::Start);
+            if iterator
+                .next()
+                .transpose()
+                .map_err(backend_error)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn clear_mapping(&self) -> Result<(), AdapterError> {
+        let _guard = self
+            .apply_guard
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?;
+        let mut write_batch = WriteBatch::default();
+        let mut count = 0_usize;
+        for keyspace in Keyspace::ALL {
+            let cf = self.cf(keyspace)?;
+            for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
+                let (key, _) = entry.map_err(backend_error)?;
+                write_batch.delete_cf(&cf, key);
+                count = count.saturating_add(1);
+            }
+        }
+        if count != 0 {
+            self.write_sync(write_batch)?;
+        }
+        Ok(())
+    }
+}
+
+struct RocksPreparedMapping<'a> {
+    adapter: &'a RocksAdapter,
+    batch: CommittedMutationBatch,
+    applied: bool,
+}
+
+impl PreparedMappingTransaction for RocksPreparedMapping<'_> {
+    fn apply<'a>(&'a mut self) -> MappingFuture<'a, ()> {
+        Box::pin(async move {
+            if self.applied {
+                return Err(AdapterError::Backend(
+                    "RocksDB Mapping transaction was applied twice".into(),
+                ));
+            }
+            self.applied = true;
+            Ok(())
+        })
+    }
+
+    fn commit<'a>(&'a mut self) -> MappingFuture<'a, ApplyReceipt> {
+        Box::pin(async move {
+            if !self.applied {
+                return Err(AdapterError::Backend(
+                    "RocksDB Mapping transaction must be applied before commit".into(),
+                ));
+            }
+            self.adapter.apply(self.batch.clone())
+        })
+    }
+
+    fn abort<'a>(self: Box<Self>) -> MappingFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl TemporalBackendMapping for RocksAdapter {
+    fn describe_schema(&self) -> MappingDescriptorV1 {
+        rocks_mapping_descriptor()
+    }
+
+    fn validate_mapping(&self) -> Result<(), AdapterError> {
+        let mut expected = vec!["default".to_owned()];
+        expected.extend(
+            Keyspace::ALL
+                .into_iter()
+                .map(|keyspace| keyspace.column_family().to_owned()),
+        );
+        expected.sort();
+        let actual = self.column_family_names()?;
+        if actual != expected {
+            return Err(AdapterError::Backend(format!(
+                "RocksDB Mapping column families {actual:?} differ from expected {expected:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        batch: CommittedMutationBatch,
+    ) -> MappingFuture<'a, Box<dyn PreparedMappingTransaction + 'a>> {
+        Box::pin(async move {
+            let _guard = self
+                .apply_guard
+                .lock()
+                .map_err(|_| AdapterError::LockPoisoned)?;
+            self.validate_batch_for_prepare(&batch)?;
+            Ok(Box::new(RocksPreparedMapping {
+                adapter: self,
+                batch,
+                applied: false,
+            }) as Box<dyn PreparedMappingTransaction + 'a>)
+        })
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> MappingFuture<'a, Vec<Option<Vec<u8>>>> {
+        <Self as StorageAdapter>::multi_get(self, keys)
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> MappingFuture<'a, Vec<KeyValue>> {
+        <Self as StorageAdapter>::scan(self, span)
+    }
+
+    fn export_canonical<'a>(
+        &'a self,
+        request: LogicalSnapshotExportRequest,
+    ) -> MappingFuture<'a, Box<dyn LogicalSnapshotReader + 'a>> {
+        <Self as StorageAdapter>::begin_logical_export(self, request)
+    }
+
+    fn restore_canonical<'a>(
+        &'a self,
+        header: LogicalSnapshotHeaderV1,
+    ) -> MappingFuture<'a, Box<dyn CanonicalRestoreSession + 'a>> {
+        Box::pin(async move {
+            if !self.is_mapping_empty()? {
+                return Err(AdapterError::Backend(
+                    "RocksDB canonical restore target is not empty".into(),
+                ));
+            }
+            Ok(Box::new(RocksCanonicalRestoreSession {
+                adapter: self,
+                accumulator: LogicalSnapshotAccumulator::new(header.clone()),
+                header,
+                saw_applied_index_record: false,
+                last_chunk: None,
+                committed: false,
+            }) as Box<dyn CanonicalRestoreSession + 'a>)
+        })
+    }
+
+    fn create_physical_checkpoint(&self, destination: &Path) -> Result<(), AdapterError> {
+        self.checkpoint(destination)
+    }
+
+    fn applied_log_index(&self) -> Result<u64, AdapterError> {
+        self.current_applied_log_index()
+    }
+}
+
+struct RocksCanonicalRestoreSession<'a> {
+    adapter: &'a RocksAdapter,
+    header: LogicalSnapshotHeaderV1,
+    accumulator: LogicalSnapshotAccumulator,
+    saw_applied_index_record: bool,
+    last_chunk: Option<(u64, [u8; 32])>,
+    committed: bool,
+}
+
+impl CanonicalRestoreSession for RocksCanonicalRestoreSession<'_> {
+    fn write_chunk<'a>(&'a mut self, chunk: LogicalSnapshotChunkV1) -> MappingFuture<'a, ()> {
+        Box::pin(async move {
+            if self.committed {
+                return Err(AdapterError::Backend(
+                    "RocksDB canonical restore is already committed".into(),
+                ));
+            }
+            if self.last_chunk == Some((chunk.ordinal(), chunk.digest())) {
+                return Ok(());
+            }
+            let mut next = self.accumulator.clone();
+            next.observe(&chunk)?;
+            self.saw_applied_index_record |= self
+                .adapter
+                .restore_logical_entries(chunk.entries(), self.header.applied_log_index())?;
+            self.last_chunk = Some((chunk.ordinal(), chunk.digest()));
+            self.accumulator = next;
+            Ok(())
+        })
+    }
+
+    fn commit<'a>(&'a mut self, manifest: LogicalSnapshotManifestV1) -> MappingFuture<'a, ()> {
+        Box::pin(async move {
+            if self.committed {
+                return Err(AdapterError::Backend(
+                    "RocksDB canonical restore is already committed".into(),
+                ));
+            }
+            self.accumulator.clone().verify(&manifest)?;
+            if self.header.applied_log_index() != 0 && !self.saw_applied_index_record {
+                return Err(AdapterError::Backend(
+                    "canonical snapshot is missing its applied-index record".into(),
+                ));
+            }
+            self.adapter.publish_restored_applied_index(
+                self.header.applied_log_index(),
+                self.saw_applied_index_record,
+            )?;
+            self.committed = true;
+            Ok(())
+        })
+    }
+
+    fn abort<'a>(mut self: Box<Self>) -> MappingFuture<'a, ()>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            self.adapter.clear_mapping()?;
+            self.committed = true;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for RocksCanonicalRestoreSession<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.adapter.clear_mapping();
+        }
+    }
+}
+
+fn rocks_mapping_descriptor() -> MappingDescriptorV1 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"DTGProxy/RocksDBCanonicalMapping/1");
+    for keyspace in Keyspace::ALL {
+        hasher.update(&[keyspace.tag()]);
+        hasher.update(keyspace.column_family().as_bytes());
+    }
+    hasher.update(ADAPTER_META_APPLIED_LOG_INDEX_KEY);
+    MappingDescriptorV1::new(
+        "rocksdb-canonical",
+        "1.0.0",
+        BackendFamily::KeyValue,
+        *hasher.finalize().as_bytes(),
+        MappingCapabilities {
+            atomic_batch_lifecycle: true,
+            deterministic_mapping: true,
+            idempotent_replay: true,
+            canonical_multi_get: true,
+            canonical_ordered_scan: true,
+            durable_applied_index: true,
+            durability: Durability::Synchronous,
+            snapshot: SnapshotCapability::PhysicalCheckpoint,
+            canonical_export: true,
+            canonical_restore: true,
+            native_temporal_layout: true,
+            predicate_pushdown: false,
+            adjacency_pushdown: false,
+            change_feed: false,
+        },
+    )
+    .expect("static RocksDB Mapping descriptor is valid")
 }
 
 struct RocksRestoreSession {
@@ -432,8 +725,7 @@ impl AdapterRestoreSession for RocksRestoreSession {
                 .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
             let restored = RocksAdapter::open(&self.target_path)
                 .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
-            let actual_index = restored
-                .applied_log_index()
+            let actual_index = StorageAdapter::applied_log_index(&restored)
                 .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
             if actual_index != self.header.applied_log_index() {
                 return Err(AdapterFactoryError::new(format!(
@@ -506,12 +798,16 @@ impl StorageAdapter for RocksAdapter {
             "rocksdb",
             env!("CARGO_PKG_VERSION"),
             BackendFamily::KeyValue,
-            self.capabilities(),
+            StorageAdapter::capabilities(self),
         )
     }
 
     fn capabilities(&self) -> AdapterCapabilities {
-        self.capabilities()
+        RocksAdapter::capabilities(self)
+    }
+
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        Some(rocks_mapping_descriptor())
     }
 
     fn apply_committed<'a>(
@@ -548,11 +844,13 @@ impl StorageAdapter for RocksAdapter {
             let iterator =
                 snapshot.iterator_cf(&cf, IteratorMode::From(span.start(), Direction::Forward));
             let mut values = Vec::new();
+            let mut retained = 0_u64;
             for item in iterator {
                 let (key, value) = item.map_err(backend_error)?;
                 if !span.contains(&key) {
                     break;
                 }
+                retained = storage_api::charge_scan_entry(span, retained, &key, &value)?;
                 values.push(KeyValue::new(
                     LogicalKey::in_keyspace(span.keyspace(), key.into_vec()),
                     value.into_vec(),

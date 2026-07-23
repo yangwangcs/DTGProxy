@@ -35,11 +35,10 @@ use txn_protocol::IsolationLevel;
 use crate::config::{ConfigError, NodeConfig};
 use crate::{
     DeploymentConfig, DeploymentError, DeploymentMode, InProcessDeploymentRuntime,
-    RoutedRuntimeError, ScopedTemporalTransaction, TransactionCoordinator,
-    TransactionCoordinatorError,
+    ScopedTemporalTransaction, TransactionCoordinator, TransactionCoordinatorError,
 };
 
-pub const GATEWAY_API_VERSION: u16 = 1;
+pub const GATEWAY_API_VERSION: u16 = 2;
 pub const MAX_GATEWAY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const GATEWAY_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -456,37 +455,10 @@ impl GatewayService {
                 Ok(serde_json::to_value(self.status()?)
                     .expect("GatewayStatus is JSON serializable"))
             }
-            GatewayOperation::Query { text } => {
-                let plan = temporal_query::parse(&text)
-                    .map_err(|error| GatewayError::Query(error.to_string()))?;
-                if plan.scope().graph().value() != self.config.graph_id() {
-                    return Err(GatewayError::GraphMismatch {
-                        expected: self.config.graph_id(),
-                        actual: plan.scope().graph().value(),
-                    });
-                }
-                let result = if plan.is_global() {
-                    let topology_epoch = self
-                        .catalog
-                        .state()
-                        .graph(self.config.graph_id())
-                        .expect("Gateway graph remains present")
-                        .topology()
-                        .epoch();
-                    self.runtime
-                        .execute_global_leader(&plan, topology_epoch, self.config.max_raft_ticks())
-                        .await?
-                } else {
-                    self.runtime
-                        .execute_leader(&plan, self.config.max_raft_ticks())
-                        .await?
-                };
-                let canonical = result
-                    .to_canonical_json()
-                    .map_err(|error| GatewayError::Query(error.to_string()))?;
-                serde_json::from_str(&canonical)
-                    .map_err(|error| GatewayError::Query(error.to_string()))
-            }
+            GatewayOperation::Cypher { .. } => Err(GatewayError::Query(
+                "Cypher requests are served by gateway-node over Bolt or the cluster Gateway service"
+                    .into(),
+            )),
             GatewayOperation::Transaction {
                 schema_version,
                 ttl_micros,
@@ -724,7 +696,7 @@ pub struct GatewayRequest {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum GatewayOperation {
     Status,
-    Query {
+    Cypher {
         text: String,
     },
     Transaction {
@@ -1041,7 +1013,6 @@ pub enum GatewayError {
     Catalog(CatalogError),
     Deployment(DeploymentError),
     Runtime(shard_runtime::ReplicationError),
-    Routed(RoutedRuntimeError),
     Oracle(TimestampOracleError),
     Transaction(Box<TransactionCoordinatorError>),
     Temporal(temporal_storage::TemporalStoreError),
@@ -1068,7 +1039,6 @@ impl Display for GatewayError {
             Self::Catalog(error) => Display::fmt(error, formatter),
             Self::Deployment(error) => Display::fmt(error, formatter),
             Self::Runtime(error) => Display::fmt(error, formatter),
-            Self::Routed(error) => Display::fmt(error, formatter),
             Self::Oracle(error) => Display::fmt(error, formatter),
             Self::Transaction(error) => Display::fmt(error, formatter),
             Self::Temporal(error) => Display::fmt(error, formatter),
@@ -1116,7 +1086,6 @@ impl Error for GatewayError {
             Self::Catalog(error) => Some(error),
             Self::Deployment(error) => Some(error),
             Self::Runtime(error) => Some(error),
-            Self::Routed(error) => Some(error),
             Self::Oracle(error) => Some(error),
             Self::Transaction(error) => Some(error),
             Self::Temporal(error) => Some(error),
@@ -1159,12 +1128,6 @@ impl From<DeploymentError> for GatewayError {
 impl From<shard_runtime::ReplicationError> for GatewayError {
     fn from(value: shard_runtime::ReplicationError) -> Self {
         Self::Runtime(value)
-    }
-}
-
-impl From<RoutedRuntimeError> for GatewayError {
-    fn from(value: RoutedRuntimeError) -> Self {
-        Self::Routed(value)
     }
 }
 

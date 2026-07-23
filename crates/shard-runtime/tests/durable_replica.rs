@@ -231,6 +231,132 @@ fn durable_replica_aborts_a_prepared_target_before_begin_is_replicated() {
     assert_eq!(replica.metadata().backend_generation, 7);
 }
 
+#[test]
+fn rejected_committed_entry_does_not_block_the_following_entry_in_a_ready_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let mut replica = block_on(DurableRaftReplica::open(
+        1,
+        &[1],
+        7,
+        9,
+        root.path().join("raft"),
+        root.path().join("adapter"),
+    ))
+    .unwrap();
+    block_on(elect_and_drain(&mut replica));
+    let before = replica.metadata().applied_index;
+    let rejected = CommandEnvelopeV1::new(
+        7,
+        9,
+        730,
+        CommandBodyV1::CutoverBackend(CutoverBackendV1 {
+            source_generation: 2,
+            target_generation: 3,
+            target_profile_digest: [0x45; 32],
+        }),
+    )
+    .encode()
+    .unwrap();
+
+    replica.propose(730, rejected).unwrap();
+    replica
+        .propose(731, command(731, 730, b"after-rejection"))
+        .unwrap();
+    block_on(drain(&mut replica)).unwrap();
+
+    assert_eq!(replica.metadata().applied_index, before + 2);
+    assert_eq!(read_current(&replica), Some(b"after-rejection".to_vec()));
+    assert_eq!(replica.backend_slot().generation(), 1);
+}
+
+#[test]
+fn propose_rejects_request_id_that_differs_from_the_command_envelope() {
+    let root = tempfile::tempdir().unwrap();
+    let mut replica = block_on(DurableRaftReplica::open(
+        1,
+        &[1],
+        7,
+        9,
+        root.path().join("raft"),
+        root.path().join("adapter"),
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        replica.propose(999, command(731, 100, b"not-proposed")),
+        Err(DurableReplicaError::RequestEnvelopeMismatch {
+            expected: 999,
+            actual: 731,
+        })
+    ));
+    assert_eq!(replica.commit_index(), 0);
+    assert_eq!(replica.metadata().applied_index, 0);
+}
+
+#[test]
+fn single_replica_read_index_barrier_returns_a_nonzero_applied_index() {
+    let root = tempfile::tempdir().unwrap();
+    let mut replica = block_on(DurableRaftReplica::open(
+        1,
+        &[1],
+        7,
+        9,
+        root.path().join("raft"),
+        root.path().join("adapter"),
+    ))
+    .unwrap();
+    block_on(elect_and_drain(&mut replica));
+    let context = b"durable-read-index-1".to_vec();
+
+    replica.request_read_index(context.clone()).unwrap();
+    block_on(drain(&mut replica)).unwrap();
+
+    let (completed_context, read_index, leader_id, term) =
+        replica.take_completed_read_state().unwrap();
+    assert_eq!(completed_context, context);
+    assert_ne!(read_index, 0);
+    assert_eq!(leader_id, 1);
+    assert_eq!(term, replica.current_term());
+    assert!(replica.metadata().applied_index >= read_index);
+    assert!(replica.take_completed_read_state().is_none());
+}
+
+#[test]
+fn canceled_read_index_retains_its_context_until_the_late_ready_state_is_consumed() {
+    let root = tempfile::tempdir().unwrap();
+    let mut replica = block_on(DurableRaftReplica::open(
+        1,
+        &[1],
+        7,
+        9,
+        root.path().join("raft"),
+        root.path().join("adapter"),
+    ))
+    .unwrap();
+    block_on(elect_and_drain(&mut replica));
+    let canceled = b"canceled-read-index".to_vec();
+
+    replica.request_read_index(canceled.clone()).unwrap();
+    replica.cancel_read_index(&canceled);
+    assert!(matches!(
+        replica.request_read_index(canceled.clone()),
+        Err(DurableReplicaError::DuplicateReadIndexContext)
+    ));
+    let replacement = b"replacement-read-index".to_vec();
+    replica.request_read_index(replacement.clone()).unwrap();
+    block_on(drain(&mut replica)).unwrap();
+    let (context, read_index, _, _) = replica.take_completed_read_state().unwrap();
+    assert_eq!(context, replacement);
+    assert_ne!(read_index, 0);
+    assert!(replica.take_completed_read_state().is_none());
+
+    replica.request_read_index(canceled.clone()).unwrap();
+    block_on(drain(&mut replica)).unwrap();
+    let (context, read_index, _, _) = replica.take_completed_read_state().unwrap();
+    assert_eq!(context, canceled);
+    assert_ne!(read_index, 0);
+}
+
 struct MemoryFactory;
 
 impl AdapterFactory for MemoryFactory {

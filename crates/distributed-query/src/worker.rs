@@ -3,17 +3,21 @@ use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use physical_plan::{Placement, PlanFragment};
-use query_executor::v2::{
-    ExecutionContext, MAX_BATCH_ROWS, RecordBatch, TemporalBatchExecutor, TemporalRead,
+use query_executor::{
+    ExecutionContext, MAX_BATCH_ROWS, RecordBatch, RuntimeError, TemporalBatchExecutor,
+    TemporalExecutionError, TemporalRead, TemporalRecordBatch,
 };
 use storage_api::StorageAdapter;
 use temporal_storage::GraphId;
-use temporal_types::ValidTime;
+use temporal_types::{Interval, ValidTime};
 
 use crate::{DistributedQueryError, FragmentRequest};
 
 pub type WorkerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<WorkerBatch>, DistributedQueryError>> + Send + 'a>>;
+pub type TemporalWorkerFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<TemporalWorkerBatch>, DistributedQueryError>> + Send + 'a>,
+>;
 
 pub trait FragmentWorker: Send + Sync {
     fn shard_id(&self) -> u32;
@@ -25,6 +29,14 @@ pub trait FragmentWorker: Send + Sync {
         valid_time: ValidTime,
         context: &'a ExecutionContext,
     ) -> WorkerFuture<'a>;
+
+    fn execute_interval_fragment<'a>(
+        &'a self,
+        request: &'a FragmentRequest,
+        fragment: &'a PlanFragment,
+        window: Interval<ValidTime>,
+        context: &'a ExecutionContext,
+    ) -> TemporalWorkerFuture<'a>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +46,45 @@ pub struct WorkerBatch {
     has_more: bool,
     snapshot_fingerprint: [u8; 32],
     batch: RecordBatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalWorkerBatch {
+    shard_id: u32,
+    sequence: u64,
+    has_more: bool,
+    snapshot_fingerprint: [u8; 32],
+    batch: TemporalRecordBatch,
+}
+
+impl TemporalWorkerBatch {
+    #[must_use]
+    pub const fn shard_id(&self) -> u32 {
+        self.shard_id
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    #[must_use]
+    pub const fn batch(&self) -> &TemporalRecordBatch {
+        &self.batch
+    }
+
+    pub const fn snapshot_fingerprint(&self) -> [u8; 32] {
+        self.snapshot_fingerprint
+    }
+
+    pub fn into_batch(self) -> TemporalRecordBatch {
+        self.batch
+    }
 }
 
 impl WorkerBatch {
@@ -106,13 +157,7 @@ where
         context: &ExecutionContext,
     ) -> Result<Vec<WorkerBatch>, DistributedQueryError> {
         self.validate(request, fragment)?;
-        let remaining = request
-            .deadline_unix_ms()
-            .checked_sub(unix_ms()?)
-            .ok_or(DistributedQueryError::DeadlineExceeded)?;
-        let context = context
-            .clone()
-            .with_deadline(Instant::now() + Duration::from_millis(remaining));
+        let context = request_context(context, request.deadline_unix_ms(), self.shard_id)?;
         let read = TemporalRead::as_of(
             GraphId::new(request.snapshot().graph_id()),
             valid_time,
@@ -122,7 +167,7 @@ where
             .executor
             .execute_fragment(fragment, &context, read)
             .await
-            .map_err(|error| DistributedQueryError::Execution(error.to_string()))?;
+            .map_err(map_temporal_error)?;
         let max_rows = usize::try_from(request.batch_rows())
             .map_err(|_| DistributedQueryError::InvalidRequest)?;
         let batches = batches
@@ -150,6 +195,58 @@ where
             .collect()
     }
 
+    pub async fn execute_interval(
+        &self,
+        request: &FragmentRequest,
+        fragment: &PlanFragment,
+        window: Interval<ValidTime>,
+        context: &ExecutionContext,
+    ) -> Result<Vec<TemporalWorkerBatch>, DistributedQueryError> {
+        self.validate(request, fragment)?;
+        let context = request_context(context, request.deadline_unix_ms(), self.shard_id)?;
+        let rows = self
+            .executor
+            .execute_interval_fragment_rows(
+                fragment,
+                &context,
+                GraphId::new(request.snapshot().graph_id()),
+                window,
+                request.snapshot().transaction_time(),
+            )
+            .await
+            .map_err(map_temporal_error)?;
+        let max_rows = usize::try_from(request.batch_rows())
+            .map_err(|_| DistributedQueryError::InvalidRequest)?;
+        let chunks = if rows.is_empty() {
+            vec![TemporalRecordBatch::try_new(
+                fragment.output().clone(),
+                Vec::new(),
+            )]
+        } else {
+            rows.chunks(max_rows)
+                .map(|rows| TemporalRecordBatch::try_new(fragment.output().clone(), rows.to_vec()))
+                .collect()
+        }
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| DistributedQueryError::Execution(error.to_string()))?;
+        let count = chunks.len();
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, batch)| {
+                Ok(TemporalWorkerBatch {
+                    shard_id: self.shard_id,
+                    sequence: u64::try_from(index)
+                        .map_err(|_| DistributedQueryError::SequenceExhausted)?,
+                    has_more: index + 1 < count,
+                    snapshot_fingerprint: request.snapshot().fingerprint(),
+                    batch,
+                })
+            })
+            .collect()
+    }
+
     fn validate(
         &self,
         request: &FragmentRequest,
@@ -159,9 +256,11 @@ where
         if snapshot.graph_id() != self.graph_id
             || snapshot.schema_version() != self.schema_version
             || snapshot.topology_epoch() != self.topology_epoch
-            || snapshot.security_fingerprint() != self.security_fingerprint
         {
             return Err(DistributedQueryError::WorkerIdentityMismatch);
+        }
+        if snapshot.security_fingerprint() != self.security_fingerprint {
+            return Err(DistributedQueryError::SecurityMismatch);
         }
         if request.fragment_id() != fragment.id() {
             return Err(DistributedQueryError::FragmentMismatch);
@@ -199,6 +298,16 @@ where
     ) -> WorkerFuture<'a> {
         Box::pin(self.execute(request, fragment, valid_time, context))
     }
+
+    fn execute_interval_fragment<'a>(
+        &'a self,
+        request: &'a FragmentRequest,
+        fragment: &'a PlanFragment,
+        window: Interval<ValidTime>,
+        context: &'a ExecutionContext,
+    ) -> TemporalWorkerFuture<'a> {
+        Box::pin(self.execute_interval(request, fragment, window, context))
+    }
 }
 
 fn unix_ms() -> Result<u64, DistributedQueryError> {
@@ -207,4 +316,51 @@ fn unix_ms() -> Result<u64, DistributedQueryError> {
         .map_err(|_| DistributedQueryError::DeadlineExceeded)?
         .as_millis();
     u64::try_from(millis).map_err(|_| DistributedQueryError::DeadlineExceeded)
+}
+
+fn map_temporal_error(error: TemporalExecutionError) -> DistributedQueryError {
+    match error {
+        TemporalExecutionError::Runtime(RuntimeError::Cancelled) => {
+            DistributedQueryError::Cancelled
+        }
+        TemporalExecutionError::Runtime(RuntimeError::DeadlineExceeded) => {
+            DistributedQueryError::DeadlineExceeded
+        }
+        TemporalExecutionError::Runtime(RuntimeError::MemoryLimitExceeded { limit, required }) => {
+            DistributedQueryError::MemoryLimitExceeded { limit, required }
+        }
+        TemporalExecutionError::Runtime(RuntimeError::ApplyInvocationLimit { max }) => {
+            DistributedQueryError::ApplyInvocationLimit { max }
+        }
+        TemporalExecutionError::Runtime(RuntimeError::ApplyOutputRowLimit { max }) => {
+            DistributedQueryError::ApplyOutputRowLimit { max }
+        }
+        TemporalExecutionError::Storage(_) => DistributedQueryError::StorageFailure,
+        TemporalExecutionError::Runtime(RuntimeError::InvalidPhysicalPlan) => {
+            DistributedQueryError::FragmentMismatch
+        }
+        other => DistributedQueryError::Execution(other.to_string()),
+    }
+}
+
+fn request_context(
+    context: &ExecutionContext,
+    deadline_unix_ms: u64,
+    shard_id: u32,
+) -> Result<ExecutionContext, DistributedQueryError> {
+    let context = context.clone().for_shard(shard_id);
+    if deadline_unix_ms == u64::MAX {
+        return Ok(context);
+    }
+    let remaining = deadline_unix_ms
+        .checked_sub(unix_ms()?)
+        .ok_or(DistributedQueryError::DeadlineExceeded)?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(remaining))
+        .ok_or(DistributedQueryError::DeadlineExceeded)?;
+    if context.deadline().is_some_and(|parent| parent <= deadline) {
+        Ok(context)
+    } else {
+        Ok(context.with_deadline(deadline))
+    }
 }

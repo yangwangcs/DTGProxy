@@ -15,14 +15,14 @@ use crate::history::{MAX_CHAIN_ENTRIES, entry_for_commit, reconstruct};
 use crate::rewrite::rewrite_projection;
 use crate::transaction::TemporalOperation;
 use crate::{
-    EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryEntry,
-    KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError, TemporalTransaction,
-    VertexIdentity, cross_in_adjacency_key, cross_in_adjacency_prefix, cross_out_adjacency_key,
-    cross_out_adjacency_prefix, current_edge_graph_prefix, current_edge_key,
-    current_vertex_graph_prefix, current_vertex_key, decode_graph_key, edge_identity_graph_prefix,
-    edge_identity_key, edge_identity_prefix, history_anchor_key, history_prefix, in_adjacency_key,
-    in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix, vertex_identity_graph_prefix,
-    vertex_identity_key,
+    EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryAnchor,
+    HistoryEntry, KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError,
+    TemporalTransaction, VertexIdentity, cross_in_adjacency_key, cross_in_adjacency_prefix,
+    cross_out_adjacency_key, cross_out_adjacency_prefix, current_edge_graph_prefix,
+    current_edge_key, current_vertex_graph_prefix, current_vertex_key, decode_graph_key,
+    edge_identity_graph_prefix, edge_identity_key, edge_identity_prefix, history_anchor_key,
+    history_prefix, in_adjacency_key, in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix,
+    vertex_identity_graph_prefix, vertex_identity_key,
 };
 
 pub type TemporalStoreFuture<'a, T> =
@@ -249,6 +249,78 @@ pub struct VertexView {
     payload: CanonicalElement,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VertexTemporalSegment {
+    element: ElementRef,
+    label: LabelId,
+    valid: Interval<ValidTime>,
+    payload: CanonicalElement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EdgeTemporalSegment {
+    element: ElementRef,
+    edge_type: EdgeTypeId,
+    source: ElementRef,
+    destination: ElementRef,
+    valid: Interval<ValidTime>,
+    payload: CanonicalElement,
+}
+
+impl EdgeTemporalSegment {
+    #[must_use]
+    pub const fn element(&self) -> ElementRef {
+        self.element
+    }
+
+    #[must_use]
+    pub const fn edge_type(&self) -> EdgeTypeId {
+        self.edge_type
+    }
+
+    #[must_use]
+    pub const fn source_ref(&self) -> ElementRef {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn destination_ref(&self) -> ElementRef {
+        self.destination
+    }
+
+    #[must_use]
+    pub const fn valid(&self) -> Interval<ValidTime> {
+        self.valid
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &CanonicalElement {
+        &self.payload
+    }
+}
+
+impl VertexTemporalSegment {
+    #[must_use]
+    pub const fn element(&self) -> ElementRef {
+        self.element
+    }
+
+    #[must_use]
+    pub const fn label(&self) -> LabelId {
+        self.label
+    }
+
+    #[must_use]
+    pub const fn valid(&self) -> Interval<ValidTime> {
+        self.valid
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &CanonicalElement {
+        &self.payload
+    }
+}
+
 impl VertexView {
     #[must_use]
     pub const fn element(&self) -> ElementRef {
@@ -403,23 +475,30 @@ where
         if context.commit_ts <= context.read_ts {
             return Err(TemporalStoreError::InvalidCommitOrder);
         }
+        let allow_repeated_elements = transaction.allows_repeated_elements();
         let mut operations = transaction.into_operations();
         if operations.is_empty() {
             return Err(TemporalStoreError::EmptyTransaction);
         }
         operations.sort_by_key(TemporalOperation::element);
-        for pair in operations.windows(2) {
-            if pair[0].element() == pair[1].element() {
-                return Err(TemporalStoreError::DuplicateElementOperation {
-                    element: pair[0].element(),
-                });
-            }
+        let multi_operation_elements = operations
+            .windows(2)
+            .filter_map(|pair| {
+                (pair[0].element() == pair[1].element()).then_some(pair[0].element())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if !allow_repeated_elements && !multi_operation_elements.is_empty() {
+            return Err(TemporalStoreError::DuplicateElementOperation {
+                element: *multi_operation_elements
+                    .first()
+                    .expect("set was checked non-empty"),
+            });
         }
 
-        let mut staged_vertices = BTreeMap::new();
+        let mut staged_vertices = BTreeMap::<ElementRef, ProjectionRecord>::new();
         let mut guarded_vertices = BTreeMap::new();
         let mut endpoint_guards = BTreeMap::new();
-        let mut staged_edges = BTreeMap::new();
+        let mut staged_edges = BTreeMap::<ElementRef, ProjectionRecord>::new();
         let mut writes = Vec::new();
         for operation in operations {
             match operation {
@@ -427,15 +506,20 @@ where
                     let removes_valid_time = mutation.replacement.is_none();
                     let identity = VertexIdentity::new(mutation.element, mutation.label)?;
                     self.validate_vertex_identity(&identity).await?;
-                    let current = self.load_current_projection(mutation.element).await?;
+                    let stored_current = self.load_current_projection(mutation.element).await?;
                     self.validate_commit_frontier(
                         mutation.element,
-                        current.as_ref(),
+                        stored_current.as_ref(),
                         context,
                         mutation.valid,
                         replay_log_index,
                     )
                     .await?;
+                    let current = if let Some(projection) = staged_vertices.get(&mutation.element) {
+                        Some(projection.clone())
+                    } else {
+                        stored_current
+                    };
                     let recent_entries = self
                         .load_history_chain_at(mutation.element, context.commit_ts)
                         .await?;
@@ -446,13 +530,21 @@ where
                         mutation.valid,
                         mutation.replacement.clone(),
                     )?;
-                    let history = entry_for_commit(
-                        &recent_entries,
-                        context.commit_ts,
-                        mutation.valid,
-                        mutation.replacement,
-                        projection.clone(),
-                    )?;
+                    let history = if multi_operation_elements.contains(&mutation.element) {
+                        HistoryEntry::Anchor(HistoryAnchor::new(
+                            context.commit_ts,
+                            mutation.valid,
+                            projection.clone(),
+                        )?)
+                    } else {
+                        entry_for_commit(
+                            &recent_entries,
+                            context.commit_ts,
+                            mutation.valid,
+                            mutation.replacement,
+                            projection.clone(),
+                        )?
+                    };
                     writes.push(MutationOperation::Put {
                         key: vertex_identity_key(mutation.element),
                         value: identity.encode(),
@@ -478,15 +570,20 @@ where
                         mutation.destination,
                     )?;
                     self.validate_edge_identity(&identity).await?;
-                    let current = self.load_current_projection(mutation.element).await?;
+                    let stored_current = self.load_current_projection(mutation.element).await?;
                     self.validate_commit_frontier(
                         mutation.element,
-                        current.as_ref(),
+                        stored_current.as_ref(),
                         context,
                         mutation.valid,
                         replay_log_index,
                     )
                     .await?;
+                    let current = if let Some(projection) = staged_edges.get(&mutation.element) {
+                        Some(projection.clone())
+                    } else {
+                        stored_current
+                    };
                     if mutation.replacement.is_some() {
                         for endpoint in [mutation.source, mutation.destination]
                             .into_iter()
@@ -525,13 +622,21 @@ where
                         mutation.valid,
                         mutation.replacement.clone(),
                     )?;
-                    let history = entry_for_commit(
-                        &recent_entries,
-                        context.commit_ts,
-                        mutation.valid,
-                        mutation.replacement,
-                        projection.clone(),
-                    )?;
+                    let history = if multi_operation_elements.contains(&mutation.element) {
+                        HistoryEntry::Anchor(HistoryAnchor::new(
+                            context.commit_ts,
+                            mutation.valid,
+                            projection.clone(),
+                        )?)
+                    } else {
+                        entry_for_commit(
+                            &recent_entries,
+                            context.commit_ts,
+                            mutation.valid,
+                            mutation.replacement,
+                            projection.clone(),
+                        )?
+                    };
                     let projection_bytes = projection.encode()?;
                     let cross_partition =
                         mutation.source.partition() != mutation.destination.partition();
@@ -623,8 +728,19 @@ where
             });
         }
 
-        let mutations = writes
+        let writes = writes
             .into_iter()
+            .map(|operation| {
+                let key = match &operation {
+                    MutationOperation::Put { key, .. } | MutationOperation::Delete { key } => {
+                        key.clone()
+                    }
+                };
+                (key, operation)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mutations = writes
+            .into_values()
             .enumerate()
             .map(|(sequence, operation)| {
                 Ok(Mutation {
@@ -902,6 +1018,306 @@ where
         })
     }
 
+    pub fn scan_vertex_views_as_of_bounded<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+        max_entries: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<VertexView>, u64, usize)> {
+        Box::pin(async move {
+            let (entries, mut scanned_bytes) = self
+                .scan_identity_entries(vertex_identity_graph_prefix(graph), max_entries, max_bytes)
+                .await?;
+            let entry_count = entries.len();
+            let mut vertices = Vec::new();
+            for entry in entries {
+                let GraphKey::VertexIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedVertexIdentityKey);
+                };
+                let identity = VertexIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                if let Some(payload) = self
+                    .load_projection_at(element, transaction_time)
+                    .await?
+                    .as_ref()
+                    .and_then(|projection| projection.visible_at(valid_time))
+                {
+                    let payload_bytes = payload
+                        .encode()
+                        .map_err(|_| TemporalStoreError::ScanByteLimit)?
+                        .len();
+                    scanned_bytes = charge_scan_bytes(scanned_bytes, payload_bytes, max_bytes)?;
+                    vertices.push(vertex_view(identity, payload.clone()));
+                }
+            }
+            Ok((vertices, scanned_bytes, entry_count))
+        })
+    }
+
+    pub fn scan_vertex_segments_current<'a>(
+        &'a self,
+        graph: GraphId,
+        window: Interval<ValidTime>,
+    ) -> TemporalStoreFuture<'a, Vec<VertexTemporalSegment>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Current,
+                    current_vertex_graph_prefix(graph),
+                ))
+                .await?;
+            let mut segments = Vec::new();
+            for entry in entries {
+                let GraphKey::CurrentVertex(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedCurrentKey);
+                };
+                let projection = ProjectionRecord::decode(entry.value())?;
+                let identity = self
+                    .load_vertex_identity(element)
+                    .await?
+                    .ok_or(TemporalStoreError::IdentityMismatch)?;
+                append_vertex_segments(&mut segments, identity, &projection, window);
+            }
+            sort_vertex_segments(&mut segments);
+            Ok(segments)
+        })
+    }
+
+    pub fn scan_vertex_segments_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        window: Interval<ValidTime>,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<VertexTemporalSegment>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Identity,
+                    vertex_identity_graph_prefix(graph),
+                ))
+                .await?;
+            let mut segments = Vec::new();
+            for entry in entries {
+                let GraphKey::VertexIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedVertexIdentityKey);
+                };
+                let identity = VertexIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                if let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                {
+                    append_vertex_segments(&mut segments, identity, &projection, window);
+                }
+            }
+            sort_vertex_segments(&mut segments);
+            Ok(segments)
+        })
+    }
+
+    pub fn scan_vertex_segments_as_of_bounded<'a>(
+        &'a self,
+        graph: GraphId,
+        window: Interval<ValidTime>,
+        transaction_time: TransactionTime,
+        max_segments: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<VertexTemporalSegment>, u64, usize)> {
+        Box::pin(async move {
+            let (entries, mut scanned_bytes) = self
+                .scan_identity_entries(vertex_identity_graph_prefix(graph), max_segments, max_bytes)
+                .await?;
+            let entry_count = entries.len();
+            let mut segments = Vec::new();
+            for entry in entries {
+                let GraphKey::VertexIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedVertexIdentityKey);
+                };
+                let identity = VertexIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                else {
+                    continue;
+                };
+                for segment in projection.segments() {
+                    let Some(valid) = intersect_valid_intervals(segment.valid(), window) else {
+                        continue;
+                    };
+                    if segments.len() >= max_segments {
+                        return Err(TemporalStoreError::ScanEntryLimit);
+                    }
+                    scanned_bytes = charge_scan_bytes(
+                        scanned_bytes,
+                        segment
+                            .payload()
+                            .encode()
+                            .map_err(|_| TemporalStoreError::ScanByteLimit)?
+                            .len(),
+                        max_bytes,
+                    )?;
+                    segments.push(VertexTemporalSegment {
+                        element: identity.element(),
+                        label: identity.label(),
+                        valid,
+                        payload: segment.payload().clone(),
+                    });
+                }
+            }
+            sort_vertex_segments(&mut segments);
+            Ok((segments, scanned_bytes, entry_count))
+        })
+    }
+
+    pub fn vertex_segments_as_of<'a>(
+        &'a self,
+        element: ElementRef,
+        window: Interval<ValidTime>,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<VertexTemporalSegment>> {
+        Box::pin(async move {
+            require_vertex(element)?;
+            let Some(projection) = self.load_projection_at(element, transaction_time).await? else {
+                return Ok(Vec::new());
+            };
+            let identity = self
+                .load_vertex_identity(element)
+                .await?
+                .ok_or(TemporalStoreError::IdentityMismatch)?;
+            let mut segments = Vec::new();
+            append_vertex_segments(&mut segments, identity, &projection, window);
+            sort_vertex_segments(&mut segments);
+            Ok(segments)
+        })
+    }
+
+    pub fn scan_edge_segments_current<'a>(
+        &'a self,
+        graph: GraphId,
+        window: Interval<ValidTime>,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeTemporalSegment>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Current,
+                    current_edge_graph_prefix(graph),
+                ))
+                .await?;
+            let mut segments = Vec::new();
+            for entry in entries {
+                let GraphKey::CurrentEdge(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedCurrentKey);
+                };
+                let projection = ProjectionRecord::decode(entry.value())?;
+                let identity = self
+                    .load_edge_identity(element)
+                    .await?
+                    .ok_or(TemporalStoreError::MissingEdgeIdentity { edge: element })?;
+                append_edge_segments(&mut segments, identity, &projection, window);
+            }
+            sort_edge_segments(&mut segments);
+            Ok(segments)
+        })
+    }
+
+    pub fn scan_edge_segments_as_of<'a>(
+        &'a self,
+        graph: GraphId,
+        window: Interval<ValidTime>,
+        transaction_time: TransactionTime,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeTemporalSegment>> {
+        Box::pin(async move {
+            let entries = self
+                .adapter
+                .scan(&KeySpan::prefix(
+                    Keyspace::Identity,
+                    edge_identity_graph_prefix(graph),
+                ))
+                .await?;
+            let mut segments = Vec::new();
+            for entry in entries {
+                let GraphKey::EdgeIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedEdgeIdentityKey);
+                };
+                let identity = EdgeIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                if let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                {
+                    append_edge_segments(&mut segments, identity, &projection, window);
+                }
+            }
+            sort_edge_segments(&mut segments);
+            Ok(segments)
+        })
+    }
+
+    pub fn scan_edge_segments_as_of_bounded<'a>(
+        &'a self,
+        graph: GraphId,
+        window: Interval<ValidTime>,
+        transaction_time: TransactionTime,
+        max_segments: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<EdgeTemporalSegment>, u64, usize)> {
+        Box::pin(async move {
+            let (entries, mut scanned_bytes) = self
+                .scan_identity_entries(edge_identity_graph_prefix(graph), max_segments, max_bytes)
+                .await?;
+            let entry_count = entries.len();
+            let mut segments = Vec::new();
+            for entry in entries {
+                let GraphKey::EdgeIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedEdgeIdentityKey);
+                };
+                let identity = EdgeIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                else {
+                    continue;
+                };
+                for segment in projection.segments() {
+                    let Some(valid) = intersect_valid_intervals(segment.valid(), window) else {
+                        continue;
+                    };
+                    if segments.len() >= max_segments {
+                        return Err(TemporalStoreError::ScanEntryLimit);
+                    }
+                    scanned_bytes = charge_scan_bytes(
+                        scanned_bytes,
+                        segment
+                            .payload()
+                            .encode()
+                            .map_err(|_| TemporalStoreError::ScanByteLimit)?
+                            .len(),
+                        max_bytes,
+                    )?;
+                    segments.push(EdgeTemporalSegment {
+                        element: identity.element(),
+                        edge_type: identity.edge_type(),
+                        source: identity.source_ref(),
+                        destination: identity.destination_ref(),
+                        valid,
+                        payload: segment.payload().clone(),
+                    });
+                }
+            }
+            sort_edge_segments(&mut segments);
+            Ok((segments, scanned_bytes, entry_count))
+        })
+    }
+
     pub fn scan_edges_current<'a>(
         &'a self,
         graph: GraphId,
@@ -971,6 +1387,47 @@ where
         })
     }
 
+    pub fn scan_edges_as_of_bounded<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+        transaction_time: TransactionTime,
+        max_entries: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<EdgeView>, u64, usize)> {
+        Box::pin(async move {
+            let (entries, mut scanned_bytes) = self
+                .scan_identity_entries(edge_identity_graph_prefix(graph), max_entries, max_bytes)
+                .await?;
+            let entry_count = entries.len();
+            let mut edges = Vec::new();
+            for entry in entries {
+                let GraphKey::EdgeIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedEdgeIdentityKey);
+                };
+                let identity = EdgeIdentity::decode(entry.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
+                if let Some(payload) = self
+                    .load_projection_at(element, transaction_time)
+                    .await?
+                    .as_ref()
+                    .and_then(|projection| projection.visible_at(valid_time))
+                    .cloned()
+                {
+                    let payload_bytes = payload
+                        .encode()
+                        .map_err(|_| TemporalStoreError::ScanByteLimit)?
+                        .len();
+                    scanned_bytes = charge_scan_bytes(scanned_bytes, payload_bytes, max_bytes)?;
+                    edges.push(edge_view(identity, payload));
+                }
+            }
+            Ok((edges, scanned_bytes, entry_count))
+        })
+    }
+
     pub fn scan_edge_history_as_of<'a>(
         &'a self,
         graph: GraphId,
@@ -998,6 +1455,39 @@ where
                 }
             }
             Ok(history)
+        })
+    }
+
+    pub fn scan_edge_history_as_of_bounded<'a>(
+        &'a self,
+        graph: GraphId,
+        transaction_time: TransactionTime,
+        max_events: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<(EdgeIdentity, HistoryEntry)>, u64)> {
+        Box::pin(async move {
+            let (entries, mut scanned_bytes) = self
+                .scan_identity_entries(edge_identity_graph_prefix(graph), max_events, max_bytes)
+                .await?;
+            let mut history = Vec::new();
+            for entry in entries {
+                let GraphKey::EdgeIdentity(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedEdgeIdentityKey);
+                };
+                let identity = EdgeIdentity::decode(entry.value())?;
+                for version in self
+                    .load_history_chain_at(element, transaction_time)
+                    .await?
+                {
+                    if history.len() == max_events {
+                        return Err(TemporalStoreError::ScanEntryLimit);
+                    }
+                    scanned_bytes =
+                        charge_scan_bytes(scanned_bytes, version.encode()?.len(), max_bytes)?;
+                    history.push((identity.clone(), version));
+                }
+            }
+            Ok((history, scanned_bytes))
         })
     }
 
@@ -1499,6 +1989,68 @@ where
         Ok(chain)
     }
 
+    async fn scan_identity_entries(
+        &self,
+        prefix: Vec<u8>,
+        max_entries: usize,
+        max_bytes: u64,
+    ) -> Result<(Vec<storage_api::KeyValue>, u64), TemporalStoreError> {
+        if max_entries == 0 {
+            let span = KeySpan::prefix(Keyspace::Identity, prefix)
+                .with_limit(1)
+                .expect("identity emptiness probe limit is positive");
+            return if self.adapter.scan(&span).await?.is_empty() {
+                Ok((Vec::new(), 0))
+            } else {
+                Err(TemporalStoreError::ScanEntryLimit)
+            };
+        }
+        if max_bytes == 0 {
+            let span = KeySpan::prefix(Keyspace::Identity, prefix)
+                .with_limit(1)
+                .expect("identity emptiness probe limit is positive")
+                .with_max_bytes(1)
+                .expect("identity emptiness probe byte limit is positive");
+            return match self.adapter.scan(&span).await {
+                Ok(entries) if entries.is_empty() => Ok((Vec::new(), 0)),
+                Ok(_) | Err(AdapterError::ScanByteLimit { .. }) => {
+                    Err(TemporalStoreError::ScanByteLimit)
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
+        let limit = max_entries
+            .checked_add(1)
+            .ok_or(TemporalStoreError::InvalidScanBudget)?;
+        let span = KeySpan::prefix(Keyspace::Identity, prefix)
+            .with_limit(limit)
+            .expect("bounded identity scan limit is positive")
+            .with_max_bytes(max_bytes)
+            .expect("bounded identity scan byte limit is positive");
+        let entries = self.adapter.scan(&span).await?;
+        if entries.len() > max_entries {
+            return Err(TemporalStoreError::ScanEntryLimit);
+        }
+        let mut scanned_bytes = 0_u64;
+        for entry in &entries {
+            let entry_bytes = entry
+                .key()
+                .as_bytes()
+                .len()
+                .checked_add(entry.value().len())
+                .ok_or(TemporalStoreError::ScanByteLimit)?;
+            scanned_bytes = scanned_bytes
+                .checked_add(
+                    u64::try_from(entry_bytes).map_err(|_| TemporalStoreError::ScanByteLimit)?,
+                )
+                .ok_or(TemporalStoreError::ScanByteLimit)?;
+            if scanned_bytes > max_bytes {
+                return Err(TemporalStoreError::ScanByteLimit);
+            }
+        }
+        Ok((entries, scanned_bytes))
+    }
+
     async fn load_projection_at(
         &self,
         element: ElementRef,
@@ -1525,6 +2077,20 @@ where
     }
 }
 
+fn charge_scan_bytes(
+    current: u64,
+    additional: usize,
+    maximum: u64,
+) -> Result<u64, TemporalStoreError> {
+    let next = current
+        .checked_add(u64::try_from(additional).map_err(|_| TemporalStoreError::ScanByteLimit)?)
+        .ok_or(TemporalStoreError::ScanByteLimit)?;
+    if next > maximum {
+        return Err(TemporalStoreError::ScanByteLimit);
+    }
+    Ok(next)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TemporalStoreError {
     EmptyTransaction,
@@ -1536,6 +2102,9 @@ pub enum TemporalStoreError {
     WrongElementKind,
     InvalidEdgeEndpoints,
     DuplicateElementOperation {
+        element: ElementRef,
+    },
+    OverlayIntervalConflict {
         element: ElementRef,
     },
     EndpointNotPresent {
@@ -1556,6 +2125,13 @@ pub enum TemporalStoreError {
     MissingHistoryAnchor,
     HistoryChainTooDeep,
     InvalidDiffOrder,
+    InvalidScanBudget,
+    ScanEntryLimit,
+    ScanByteLimit,
+    ScanResponseByteLimit {
+        limit: u64,
+        required: u64,
+    },
     Adapter(AdapterError),
     Record(RecordCodecError),
     Key(KeyCodecError),
@@ -1588,6 +2164,12 @@ impl Display for TemporalStoreError {
                 write!(
                     formatter,
                     "temporal transaction repeats element {element:?}"
+                )
+            }
+            Self::OverlayIntervalConflict { element } => {
+                write!(
+                    formatter,
+                    "transaction overlay cannot merge distinct valid intervals for {element:?}"
                 )
             }
             Self::EndpointNotPresent { vertex } => {
@@ -1629,6 +2211,13 @@ impl Display for TemporalStoreError {
             Self::InvalidDiffOrder => {
                 formatter.write_str("DIFF start transaction must not follow its end")
             }
+            Self::InvalidScanBudget => formatter.write_str("scan budget must be positive"),
+            Self::ScanEntryLimit => formatter.write_str("scan exceeds its entry budget"),
+            Self::ScanByteLimit => formatter.write_str("scan exceeds its byte budget"),
+            Self::ScanResponseByteLimit { limit, required } => write!(
+                formatter,
+                "scan response body requires {required} wire bytes above limit {limit}"
+            ),
             Self::Adapter(error) => Display::fmt(error, formatter),
             Self::Record(error) => Display::fmt(error, formatter),
             Self::Key(error) => Display::fmt(error, formatter),
@@ -1640,7 +2229,13 @@ impl Error for TemporalStoreError {}
 
 impl From<AdapterError> for TemporalStoreError {
     fn from(value: AdapterError) -> Self {
-        Self::Adapter(value)
+        match value {
+            AdapterError::ScanByteLimit { .. } => Self::ScanByteLimit,
+            AdapterError::ScanResponseByteLimit { limit, required } => {
+                Self::ScanResponseByteLimit { limit, required }
+            }
+            value => Self::Adapter(value),
+        }
     }
 }
 
@@ -1680,6 +2275,67 @@ fn vertex_view(identity: VertexIdentity, payload: CanonicalElement) -> VertexVie
         label: identity.label(),
         payload,
     }
+}
+
+fn append_vertex_segments(
+    output: &mut Vec<VertexTemporalSegment>,
+    identity: VertexIdentity,
+    projection: &ProjectionRecord,
+    window: Interval<ValidTime>,
+) {
+    for segment in projection.segments() {
+        let Some(valid) = intersect_valid_intervals(segment.valid(), window) else {
+            continue;
+        };
+        output.push(VertexTemporalSegment {
+            element: identity.element(),
+            label: identity.label(),
+            valid,
+            payload: segment.payload().clone(),
+        });
+    }
+}
+
+fn append_edge_segments(
+    output: &mut Vec<EdgeTemporalSegment>,
+    identity: EdgeIdentity,
+    projection: &ProjectionRecord,
+    window: Interval<ValidTime>,
+) {
+    for segment in projection.segments() {
+        let Some(valid) = intersect_valid_intervals(segment.valid(), window) else {
+            continue;
+        };
+        output.push(EdgeTemporalSegment {
+            element: identity.element(),
+            edge_type: identity.edge_type(),
+            source: identity.source_ref(),
+            destination: identity.destination_ref(),
+            valid,
+            payload: segment.payload().clone(),
+        });
+    }
+}
+
+fn sort_vertex_segments(segments: &mut [VertexTemporalSegment]) {
+    segments.sort_by_key(|segment| (segment.element, segment.valid.start()));
+}
+
+fn sort_edge_segments(segments: &mut [EdgeTemporalSegment]) {
+    segments.sort_by_key(|segment| (segment.element, segment.valid.start()));
+}
+
+fn intersect_valid_intervals(
+    left: Interval<ValidTime>,
+    right: Interval<ValidTime>,
+) -> Option<Interval<ValidTime>> {
+    let start = left.start().max(right.start());
+    let end = match (left.end(), right.end()) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    };
+    Interval::new(start, end).ok()
 }
 
 fn require_edge(element: ElementRef) -> Result<(), TemporalStoreError> {

@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use query_executor::v2::{
+use query_executor::{
     ExecutionContext, ResolvedValidTime, RuntimeError, RuntimeValue, resolve_temporal_scope,
 };
-use temporal_ir::v2::{ScalarExpr, TransactionTimeSpec, ValidTimeSpec};
+use temporal_ir::{ScalarExpr, TransactionTimeSpec, ValidTimeSpec};
 use temporal_storage::GraphId;
 use temporal_types::{TransactionTime, ValidTime};
 

@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use bolt_protocol::Value;
-use query_executor::v2::RuntimeValue;
+use query_executor::RuntimeValue;
 
 const MAX_NESTING: usize = 64;
 const UTC_DATETIME_OFFSET: u8 = 0x49;

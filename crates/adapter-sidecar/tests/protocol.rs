@@ -57,6 +57,8 @@ fn every_request_round_trips_through_a_versioned_checksummed_frame() {
             KeySpan::prefix_from(Keyspace::AdjOut, b"vertex/".to_vec(), b"vertex/7".to_vec())
                 .unwrap()
                 .with_limit(99)
+                .unwrap()
+                .with_max_bytes(4096)
                 .unwrap(),
         ),
         Request::AppliedLogIndex,
@@ -94,6 +96,19 @@ fn every_response_round_trips_without_losing_empty_and_missing_values() {
             code: 503,
             message: "retry later".to_owned(),
             retryable: true,
+            scan_limit: Some(8),
+            scan_required: Some(13),
+            scan_response_limit: None,
+            scan_response_required: None,
+        }),
+        Response::Error(RemoteError {
+            code: 10,
+            message: "scan response body limit".to_owned(),
+            retryable: false,
+            scan_limit: None,
+            scan_required: None,
+            scan_response_limit: Some(64),
+            scan_response_required: Some(65),
         }),
     ];
     for (ordinal, response) in responses.into_iter().enumerate() {

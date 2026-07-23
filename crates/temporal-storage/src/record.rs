@@ -10,7 +10,7 @@ const PROJECTION_MAGIC: &[u8; 4] = b"DTGP";
 const ANCHOR_MAGIC: &[u8; 4] = b"DTGA";
 const DELTA_MAGIC: &[u8; 4] = b"DTGD";
 const FORMAT_VERSION: u16 = 1;
-const CROSS_PARTITION_EDGE_VERSION: u16 = 2;
+const EDGE_IDENTITY_FORMAT_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VertexIdentity {
@@ -133,21 +133,15 @@ impl EdgeIdentity {
 
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let cross_partition = self.source.partition() != self.destination.partition();
-        let version = if cross_partition {
-            CROSS_PARTITION_EDGE_VERSION
-        } else {
-            FORMAT_VERSION
-        };
-        let mut output = identity_header_version(ElementKind::Edge, self.element, version);
+        let mut output = identity_header_version(
+            ElementKind::Edge,
+            self.element,
+            EDGE_IDENTITY_FORMAT_VERSION,
+        );
         output.extend_from_slice(&self.edge_type.value().to_be_bytes());
-        if cross_partition {
-            output.extend_from_slice(&self.source.partition().value().to_be_bytes());
-        }
+        output.extend_from_slice(&self.source.partition().value().to_be_bytes());
         output.extend_from_slice(&self.source.id().value().to_be_bytes());
-        if cross_partition {
-            output.extend_from_slice(&self.destination.partition().value().to_be_bytes());
-        }
+        output.extend_from_slice(&self.destination.partition().value().to_be_bytes());
         output.extend_from_slice(&self.destination.id().value().to_be_bytes());
         append_checksum(&mut output);
         output
@@ -156,21 +150,13 @@ impl EdgeIdentity {
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordCodecError> {
         let mut decoder = IdentityDecoder::new(bytes, ElementKind::Edge)?;
         let edge_type = EdgeTypeId::new(decoder.decoder.read_u32()?);
-        let source_partition = if decoder.version == CROSS_PARTITION_EDGE_VERSION {
-            PartitionId::new(decoder.decoder.read_u32()?)
-        } else {
-            decoder.element.partition()
-        };
+        let source_partition = PartitionId::new(decoder.decoder.read_u32()?);
         let source = ElementRef::vertex(
             decoder.element.graph(),
             source_partition,
             ElementId::new(decoder.decoder.read_u128()?),
         );
-        let destination_partition = if decoder.version == CROSS_PARTITION_EDGE_VERSION {
-            PartitionId::new(decoder.decoder.read_u32()?)
-        } else {
-            decoder.element.partition()
-        };
+        let destination_partition = PartitionId::new(decoder.decoder.read_u32()?);
         let destination = ElementRef::vertex(
             decoder.element.graph(),
             destination_partition,
@@ -604,7 +590,6 @@ fn checksum(bytes: &[u8]) -> u64 {
 struct IdentityDecoder<'a> {
     decoder: Decoder<'a>,
     element: ElementRef,
-    version: u16,
 }
 
 impl<'a> IdentityDecoder<'a> {
@@ -620,8 +605,10 @@ impl<'a> IdentityDecoder<'a> {
         if kind != expected_kind {
             return Err(RecordCodecError::WrongElementKind);
         }
-        let supported = version == FORMAT_VERSION
-            || (kind == ElementKind::Edge && version == CROSS_PARTITION_EDGE_VERSION);
+        let supported = match kind {
+            ElementKind::Vertex => version == FORMAT_VERSION,
+            ElementKind::Edge => version == EDGE_IDENTITY_FORMAT_VERSION,
+        };
         if !supported {
             return Err(RecordCodecError::UnsupportedVersion(version));
         }
@@ -632,11 +619,7 @@ impl<'a> IdentityDecoder<'a> {
             ElementKind::Vertex => ElementRef::vertex(graph, partition, id),
             ElementKind::Edge => ElementRef::edge(graph, partition, id),
         };
-        Ok(Self {
-            decoder,
-            element,
-            version,
-        })
+        Ok(Self { decoder, element })
     }
 
     fn finish(&mut self) -> Result<(), RecordCodecError> {

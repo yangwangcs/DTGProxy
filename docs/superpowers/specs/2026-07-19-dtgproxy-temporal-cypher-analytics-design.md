@@ -4,7 +4,7 @@
 
 状态：设计已批准
 
-适用范围：DTGProxy Cypher/Bolt 前端、Temporal IR v2、分布式查询运行时、时态图分析运行时
+适用范围：DTGProxy Cypher/Bolt 前端、Temporal IR、分布式查询运行时、时态图分析运行时
 
 ## 1. 目标
 
@@ -12,7 +12,7 @@ DTGProxy 对外提供完整的 Cypher 查询、写入、过程调用和 Bolt Dri
 
 “完整兼容”在本规范中表示：
 
-- 支持 Cypher 5 冻结兼容档和版本化的 Cypher 25 兼容档。
+- 仅支持当前的 Cypher 25 兼容档，不维护旧语言档兼容路径。
 - 支持 Cypher 读写、子查询、函数、过程、事务及公开数据类型语义。
 - 支持 Bolt 握手、PackStream、认证、路由、结果流和事务状态机。
 - 标准 Cypher 在未使用 DTG 扩展时不改变语义。
@@ -38,7 +38,7 @@ openCypher Grammar/TCK ─┐
 Grafeo Parser/AST 候选 ─┼─> DTG Binder/Type/Temporal Semantics
 Bolt Specification ─────┘                    │
                                              v
-                                      Temporal IR v2
+                                      Temporal IR
                                              │
                           ┌──────────────────┴─────────────────┐
                           v                                    v
@@ -63,12 +63,7 @@ Bolt Specification ─────┘                    │
 
 ### 3.1 版本选择
 
-支持：
-
-```cypher
-CYPHER 5
-MATCH (n) RETURN n
-```
+支持默认或显式选择当前语言档：
 
 ```cypher
 CYPHER 25
@@ -77,12 +72,11 @@ MATCH (n) RETURN n
 
 规则：
 
-- 默认语言为 Cypher 25。
-- Cypher 5 语义固定为其冻结版本，不随 DTGProxy 升级改变。
+- 默认语言为 Cypher 25；显式选择其他语言版本直接返回不支持错误。
 - Cypher 25 使用日期基线，例如 `Cypher 25 / 2026.07`。
 - 每个编译计划记录语言档、语义基线和查询指纹。
 - 新增 Cypher 25 能力先进入 Experimental，再依次进入 Preview 和 Stable。
-- Plan Cache 不允许跨语言档复用。
+- Plan Cache 必须校验语言档和语义基线。
 
 ### 3.2 兼容范围
 
@@ -158,7 +152,7 @@ Query Text
   -> Version/Option Scanner
   -> Lexer
   -> Concrete Syntax Tree
-  -> Versioned Cypher AST
+  -> Current Cypher AST
   -> Name Binder
   -> Type Checker
   -> Temporal Scope Resolver
@@ -169,7 +163,7 @@ Query Text
 模块：
 
 - `cypher-syntax`：Lexer、Parser、CST、源码位置和语法诊断。
-- `cypher-ast`：Cypher 5、Cypher 25 和 DTG 扩展 AST。
+- `cypher-ast`：Cypher 25 和 DTG 扩展 AST。
 - `cypher-sema`：作用域、类型、聚合、路径和更新语义。
 - `cypher-compiler`：规范化、逻辑计划生成和诊断映射。
 - `procedure-runtime`：函数、聚合函数和过程目录。
@@ -204,7 +198,7 @@ Parser 可在逐文件审计后抽取 Grafeo 的 Apache-2.0 实现。Binder、�
 
 Procedure 描述符必须声明输入输出 Schema、权限、确定性、副作用、资源上限和允许的 Cypher 兼容档。常用 APOC 能力可按许可证选择性重实现，但不加载 APOC JAR。
 
-## 6. Temporal IR v2
+## 6. Temporal IR
 
 ### 6.1 分层
 
@@ -545,6 +539,10 @@ ACTIVE -> PREPARING -> COMMITTED -> APPLIED
 `DeltaGraph`：两个视图之间的新增、删除和属性变化。
 
 事务时间只冻结系统认知；算法时间轴使用有效时间或事件时间。
+对外 `CALL` 中，`IntervalGraph` 和 `DeltaGraph` 都由
+`AT VALID_TIME FROM $from TO $to` 选择；`DeltaGraph` 在同一个
+`AT TRANSACTION_TIME AS OF $tx` 快照下比较 `$from` 与 `$to` 两个有效时间端点，
+不允许 Provider 另行发明或改写 transaction-time 比较参数。
 
 ### 12.2 时态遍历语义
 
@@ -609,6 +607,124 @@ trait AnalyticsProvider {
 ```
 
 Provider 选择先验证语义和精确度，再比较图规模、分布/GPU 需求、数据格式、投影成本、健康状态和队列。
+
+### 12.6 集群级任务账本与跨 Gateway 接管
+
+分析任务使用 Meta Raft 中独立于 Catalog Revision 的复制账本。任务 ID 是集群级 `u128`，
+不包含进程或 Gateway 亲和信息；现有进程内 `manager_id:local_id` 形式从当前接口删除。
+Catalog Watch 不承载任务事件，避免算法进度导致路由目录持续变更。
+
+任务规范持久化以下不可变 fence：图 ID、Catalog Revision、Topology Epoch、Schema Version、
+Backend Generation、固定 Transaction Snapshot、Valid-Time 投影范围、Graph Model、Projection
+Limits、算法/Provider 名称与版本、类型化参数、安全主体摘要和请求幂等 ID。执行者只能在这些
+fence 仍可重建同一投影时运行；拓扑变化时依据 Shard lineage 重建相同逻辑快照，无法证明
+等价则以稳定错误结束，不得在新旧 Epoch 间拼接结果。
+
+账本状态为：
+
+```text
+QUEUED -> LEASED -> RUNNING -> SUCCEEDED
+                    |   |  -> FAILED
+                    |   `----> CANCELED
+                    `--------> QUEUED (lease expired / takeover)
+```
+
+每次 Claim 生成单调增加的 `lease_epoch`，并记录 `owner_gateway_id` 和由 Meta leader 决定的
+`lease_expires_unix_ms`。Renew、Checkpoint、Result、Complete 和 Fail 都必须携带任务 revision、
+Topology Epoch 与 lease epoch；陈旧执行者的写入在 Raft apply 前被拒绝。取消是账本中的持久
+状态，新的执行者不得接管已取消任务。
+
+检查点和结果使用内容寻址分块。数据块先写入由目标图 Shard Raft 复制的保留 analytics
+namespace，块键包含 `job_id/kind/generation/ordinal`，每块携带长度、BLAKE3 摘要和前一块摘要。
+Meta 账本只提交 Manifest；Manifest 包含块数、总字节、链摘要、Projection Identity、Provider/
+Algorithm 版本、输入 applied-log index 向量的数量与规范化摘要，以及下一执行阶段。完整 index
+向量随 Artifact Manifest 块存于 Shard，接管者读取后必须与 Meta 摘要匹配。Manifest 提交前的孤儿块可回收，
+Manifest 提交后的块在任务保留期内不可删除。该 namespace 通过统一 StorageAdapter mutation
+落盘，因此 RocksDB、Neo4j 和 PostgreSQL 后端共享相同恢复语义。
+
+当前原型的 Provider checkpoint payload 已统一为一套 SPI 不透明状态：Degree 可携带已完成
+结果前缀，WCC 携带规范化 vertex/component 标签，PageRank 携带 rank vector、迭代次数、收敛
+标记、图指纹和参数指纹。payload 自带 magic/version/长度/校验和，Gateway 接管时先验证
+projection、输入 applied-index digest、算法名和 Provider state，再从 state 继续 slice；WCC
+和 PageRank 不允许退化为静默全量重算。Result/Checkpoint retention、orphan generation
+扫描与 TTL 规划已经接入当前 Gateway maintenance 路径；逐边界故障注入、跨 Gateway 接管和
+真实三后端 × 两种部署模式认证均已完成。
+
+1.1 已增加独立于存储实现的 retention 状态机：Shard 扫描结果以 generation、kind、字节数、
+创建时间和 pin 状态输入，状态机始终保护 Meta 当前 Manifest 与已 pin generation，并按终态/
+孤儿 TTL、每 kind generation 上限和每 job 字节上限从最老 generation 开始生成确定性删除计划。
+Meta 同时提供有界、按 job ID 分页的全任务维护扫描。Shard generation 枚举已通过显式维护
+RPC 接入 DataNode 和两种 ShardClient，Gateway maintenance tick 会对 Meta 当前 manifest 所在
+Shard 执行扫描、计算计划并发起幂等删除。Pinned 与 unpinned generation 都使用 generation head
+中持久化且 checksum-protected 的 `created_at_unix_ms`；缺失、冲突、截断或损坏的创建时间编码
+全部 fail-closed。删除前 Gateway 会重新读取 Meta JobRecord；只有 job
+revision 与完整当前 Manifest 均未变化、且目标 generation 严格更旧时才允许删除，任何并发
+任务或 Manifest 变化都会中止本轮计划。维护任务扫描已按 job ID 完整分页。当前实现还增加
+独立的 analytics GC lease：Gateway 维护前必须从 Meta leader 获取 term-derived `gc_epoch`，
+并在每个删除前检查租约；epoch 随删除 RPC 和 Raft command 传入 Shard，Shard 在保留 keyspace
+持久保存最高 epoch，因而较旧 owner 的延迟删除会被拒绝。Meta lease owner、owner term、epoch、
+过期时间和命令身份已通过专用 Meta Raft command 写入 journal/snapshot；进程重启测试证明新 term
+恢复已提交 lease 后会先提高 epoch，再授予不同 Gateway。Meta Ledger 现在在 terminal Job prune
+时原子创建 durable `JobTombstone`，保存最终 revision/state、prune 时间、Checkpoint/Result
+`(shard_id, generation)` 以及回收确认 epoch/time。Meta 通过有界 exclusive-job-id 分页 RPC 返回
+checksum-protected canonical tombstone；只有当前、未过期 GC lease 的 Gateway/epoch 才能提交
+`AcknowledgeArtifactsReclaimed`，未确认 tombstone 禁止 compact。Gateway 在同一维护轮次合并
+active Job、tombstone 与 Shard-wide heads：active 优先，unknown 全部 fail-closed，只有未确认
+tombstone 才授权 latest-pinned fence advance/delete。删除发生的当轮不确认；下一轮完整空 head
+scan 才提交 acknowledgement，因此 fence/delete/ack 间崩溃均可幂等接管。跨 Gateway 的
+delete-before-ack 恢复、Unknown/non-terminal 保护和 Meta 子进程 tombstone 恢复已有测试；
+独立的 `fence-advance → delete → acknowledgement` 三阶段进程停止已完成：fence 后与 delete 前
+generation 必须仍存在，ack 前 generation 必须已经删除但 tombstone 尚未确认。真实三后端矩阵
+进一步覆盖 RocksDB、PostgreSQL 17、Neo4j 5.26 Community × PrimaryReplica/Shared-Nothing；每个
+边界均由两个 replacement Gateway 并发竞争 GC lease，非 owner 被 Meta fencing，最终全局恰好
+一次成功删除、零重复删除失败，下一轮完整空扫描确认 tombstone，Unknown/non-terminal Artifact
+保持 fail-closed。Gateway 在 Meta Job/tombstone 分页和 Shard head 分页期间按剩余时间自动续租，
+并在 fence advance、delete 与 acknowledgement 前强制重新向 Meta 确认当前 owner/epoch；Shard
+请求 deadline 不得超过 Meta lease expiry，避免长扫描耗尽固定租约后反复从头开始。
+
+Gateway 调度器从 Meta 拉取可领取任务，Claim 成功后按固定快照投影并调用 Provider。Gateway
+崩溃后，其他 Gateway 在租约到期并成功增加 lease epoch 后读取最新 Manifest：版本兼容时从
+检查点恢复。当前异步 scheduler 只接受明确声明 deterministic slice/checkpoint 能力的 Degree、
+WCC 和 PageRank；其他算法返回稳定的不支持错误，不允许 silent fallback 或静默全量重算。
+检查点版本、指纹或投影不兼容时返回 `DTG-ANALYTICS-CHECKPOINT-INCOMPATIBLE`。发布结果采用
+Manifest CAS，因而崩溃重试最多产生孤儿块，不会产生两个可见结果。
+若第一 Gateway 已完成 Result upload/pin 而在 Publish 前停止，接管者只能在持久化 chunk count、
+total bytes 与 BLAKE3 content digest 全部和本次确定性 `DTAR` 完全一致时复用该 pinned
+generation。有限 generation 扫描饱和而未找到一致值时必须 fail-closed；不得根据“未观察到”推断
+不存在，也不得新建第二个可见 Result generation。
+
+1.1 scheduler 已提供单一故障注入 SPI，边界枚举覆盖 Claim、Begin、LeaseRenew、ExecutionSlice、
+CheckpointUpload、CheckpointPin、CheckpointCas、ResultUpload、ResultPin 与 Publish。生产默认
+实现为空操作，测试可使用确定性的 fail-once injector。`Begin` process-stop 已由真实三后端
+集成矩阵认证：Degree、WCC、PageRank 在 RocksDB/PostgreSQL/Neo4j 与 PrimaryReplica/
+Shared-Nothing 的全部组合中均由第二 Gateway 接管，并直接比较 uninterrupted 与 takeover 后
+完整 pinned `DTAR` Result Artifact 字节；读取前同时校验 Manifest 长度和 BLAKE3 digest。
+Degree 还在全部 backend×mode 组合中逐项覆盖 Claim、LeaseRenew、ExecutionSlice、
+CheckpointUpload、CheckpointPin、CheckpointCas、ResultUpload、ResultPin 和 Publish。
+恢复链继承首次投影的 input fence，不会把 Artifact 自身推进的 applied index 误判为输入变化；
+Checkpoint 与不满足精确复用条件的 Result 在 upload/pin/CAS 中断后留下的已占用 generation 会由
+接管方跳过，并交由 fenced GC 回收；仅已 pinned 且 chunk count、total bytes、BLAKE3 digest
+全部匹配的 pre-Publish Result 可以按前述规则复用。
+同一稳定 Gateway ID 的 runtime restart 已在 ExecutionSlice 边界覆盖全部 backend×mode：
+重启实例必须取得新的 lease epoch，稳定 ID 不能绕过 fencing，最终 Result Artifact 仍保持
+byte-identical。OS 进程级 Gateway restart 也已认证：真实 Gateway 子进程在任务进入 RUNNING 后
+被强制结束，以相同稳定 node ID 重启后恢复任务，最终只允许一个 pinned Result generation。
+独立的三节点 Meta quorum 场景还会在任务运行期间停止当前 Leader，要求存活多数派重新选主、
+Gateway 对每个 Meta endpoint 使用小于任务租约的本地尝试上限并记忆最近成功 Leader，最终结果
+仍唯一且 pinned。Gateway + Meta + 全部 DataNode/Shard + backend 的有序组合重启现已覆盖
+RocksDB、PostgreSQL 17、Neo4j 5.26 Community × PrimaryReplica/Shared-Nothing：旧 Gateway 销毁，
+Meta journal/state、DataNode durable directory、backend root/instance identity 与固定地址原样重开，
+新 Gateway 经 lease fencing 接管；恢复 `DTAR` 与 uninterrupted baseline byte-identical，且只存在
+一个 pinned Result generation、无 ghost generation。PrimaryReplica 使用真实双 voter/双 backend
+实例，停启两个成员并在恢复前后验证 leader 身份与 follower applied-index 收敛。
+
+同步 `CALL dtg.graph.*` 保持请求内执行。`dtg.analytics.submit/status/results/cancel` 全部改用
+集群账本；任意经过认证且有相同图权限的 Gateway 都可查询任务。结果读取再次校验主体摘要和
+当前权限，任务创建者身份不因 Gateway 接管而变化。
+
+首个完整验收必须覆盖：Meta 三副本重启恢复、提交幂等、并发 Claim 只有一个胜者、租约过期
+接管、旧 lease 写入被 fencing、投影完成前崩溃、Checkpoint Manifest 前后崩溃、结果发布前后
+崩溃、Cancel 与 Complete 竞争、Topology Epoch 变化以及两个 Gateway 返回相同分页结果。
 
 ## 13. 算法范围
 
@@ -756,9 +872,9 @@ incremental-analytics
 
 调整：
 
-- `temporal-query` 保留旧 DSL 作为调试/兼容入口。
-- `temporal-ir` 升级为版本化 v2，并保留 v1 解码。
-- `query-executor` 逐步拆成 Local Runtime 与 Distributed Coordinator。
+- 仅支持 Temporal Cypher；旧 DSL 和其解释器不保留调试或兼容入口。
+- `temporal-ir` 只暴露当前逻辑行代数，不提供旧计划解码或适配器。
+- `query-executor` 只保留当前批处理与时态行运行时。
 - `gateway-node` 接入 Bolt。
 - `txn-protocol` 增加 Query Overlay 和 Statement Context。
 - `storage-api` 增加 Projection、Capabilities 和 Fragment。
@@ -767,7 +883,7 @@ incremental-analytics
 
 M0 规范与测试基础：兼容档、Temporal 语法、TCK、Bolt 测试、差分工具和第三方清单。
 
-M1 Cypher 前端与参考解释器：Parser、Binder、类型、Temporal IR v2 和未优化 Oracle。
+M1 Cypher 前端与参考解释器：Parser、Binder、类型、Temporal IR 和未优化 Oracle。
 
 M2 完整读查询与 Bolt：读 Clause、路径、Procedure、RBO、Plan Cache 和三后端一致性。
 
@@ -831,7 +947,6 @@ EXPERIMENTAL -> PREVIEW -> STABLE -> DEPRECATED -> REMOVED
 
 | 维度 | 门槛 |
 |---|---|
-| Cypher 5 | 冻结兼容面全部通过 |
 | Cypher 25 | 对应日期基线全部通过 |
 | Temporal Cypher | Temporal TCK 全部通过 |
 | Bolt | 支持矩阵中的官方 Driver 全部通过 |
@@ -899,3 +1014,35 @@ EXPERIMENTAL -> PREVIEW -> STABLE -> DEPRECATED -> REMOVED
 - [Raphtory](https://github.com/Pometry/Raphtory)
 
 资料说明：本规范的外部项目事实由 AI 辅助检索官方仓库和官方文档后综合；实际引入第三方代码前必须重新锁定 Commit、递归依赖、许可证和安全状态。
+
+## 26. 当前恢复认证状态（2026-07-23）
+
+- **Implemented:** Shard 暂时不可用使用类型化 `Unavailable` 贯穿 Remote Shard、Storage
+  Adapter、Projection、Sidecar 和 Scheduler；传输中断、Leader 切换、deadline、ReadIndex
+  暂不可用不会把 `RUNNING` Job 错写为 `FAILED`。损坏、stale epoch 和确定性语义错误仍然
+  fail-closed。
+- **Integration-certified:** RocksDB + PrimaryReplica/Shared-Nothing 已验证 Gateway/Meta 全程存活时关闭全部
+  已有 Shard HTTP/2 连接、以同目录/同 node/shard/placement/backend identity 和固定地址重开
+  DataNode；恢复结果与无故障基线 `DTAR` byte-identical，最终只有一个 pinned Result。
+- **Real-backend certified:** backend Sidecar restart 已覆盖 RocksDB、PostgreSQL 17、Neo4j
+  5.26 Community × PrimaryReplica/Shared-Nothing。任务在 `RUNNING` 后经历同 identity、同目录、
+  同地址 Sidecar 关闭与恢复；既覆盖原 Gateway 继续执行，也覆盖不同 Gateway 在 lease fencing
+  后接管。结果必须与 baseline `DTAR` byte-identical，且最终恰好一个 pinned Result generation。
+- **Real-backend certified:** RocksDB、PostgreSQL 17、Neo4j 5.26 Community 均已在两种部署模式
+  覆盖有序全栈重启：所有 DataNode/Shard 与 backend Sidecar 停止，单节点 Meta leader 从同
+  journal/state 目录和固定地址重开，Gateway 1 销毁，Gateway 2 接管。恢复结果 byte-identical，
+  且最终恰好一个 pinned Result generation、无 ghost generation；PrimaryReplica 为双 voter，
+  恢复后 leader/follower applied index 必须重新收敛。
+- **Integration-certified:** Analytics Job tombstone current-format Ledger/RPC/Meta/Gateway 路径已完成；
+  Meta 子进程重启保持未确认 tombstone，Gateway 在 latest-pinned delete 后退出时可由不同 Gateway
+  经完整空扫描确认，Unknown 与非终态 Job Artifact 保持 fail-closed。
+- **Real-backend certified:** Tombstone GC 已覆盖三个 crash boundary、三个 backend、两种部署模式；
+  两个 replacement Gateway 并发竞争时，process-local metrics 必须观测至少一次 Meta
+  `ResourceExhausted` lease conflict，只允许当前 owner 删除并确认；长分页扫描支持同 epoch
+  续租，destructive RPC 前再次确认 lease。
+- **Quality-gate certified:** `cargo fmt --all -- --check`、`git diff --check`、Gateway 三后端特性
+  严格 Clippy 和 `cargo clippy --workspace --all-targets -- -D warnings` 已通过；Provider、Ledger、
+  Cluster Protocol、Meta Raft 与 Gateway 恢复套件均已重新验证。
+- **Not production-certified:** 隔离的 PostgreSQL/Neo4j DataNode-only restart、承载当前工作区版本的
+  托管 CI run 与更长期 chaos/soak 门禁尚未完成；这些边界不否定上述 implemented、integration-certified
+  和 real-backend-certified 结论，但在完成前不得把 1.1 标记为 production-certified。

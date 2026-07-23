@@ -10,7 +10,7 @@ use bolt_server::{
     BoltService, CursorId, PullOutcome, RunOutcome, RunRequest, ServiceError, ServiceFuture,
     TransactionId,
 };
-use query_executor::v2::RuntimeValue;
+use query_executor::RuntimeValue;
 
 use crate::{bolt_parameter_to_runtime, runtime_value_to_bolt};
 
@@ -80,6 +80,11 @@ impl BackendQueryResult {
             records,
             summary,
         }
+    }
+
+    #[must_use]
+    pub fn records(&self) -> &[Vec<RuntimeValue>] {
+        &self.records
     }
 }
 

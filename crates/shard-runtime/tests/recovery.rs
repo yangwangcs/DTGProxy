@@ -4,8 +4,14 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
 use adapter_rocksdb::RocksAdapter;
-use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
-use shard_runtime::ShardStateMachine;
+use raft_command::{
+    AnalyticsArtifactKindV1, ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1,
+    PinAnalyticsArtifactGenerationV1, PutAnalyticsArtifactChunkV1,
+};
+use shard_runtime::{
+    ShardStateMachine, analytics_artifact_chunk_key, analytics_artifact_generation_pin_key,
+    decode_analytics_artifact_chunk, decode_analytics_artifact_generation_pin,
+};
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter};
 use temporal_types::TransactionTime;
 
@@ -30,6 +36,101 @@ fn rocksdb_adapter_recovers_replica_metadata_and_business_state_after_restart() 
     ))
     .unwrap();
     assert_recovered(&recovered);
+}
+
+#[test]
+fn rocksdb_restart_recovers_analytics_artifact_chain_and_pin_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = PutAnalyticsArtifactChunkV1::new(
+        501,
+        AnalyticsArtifactKindV1::Result,
+        7,
+        1_725_000_000_123,
+        0,
+        [0; 32],
+        b"persisted-first".to_vec(),
+    )
+    .unwrap();
+    let first_digest = first.payload_digest;
+
+    let adapter = RocksAdapter::open(directory.path()).unwrap();
+    let mut machine = block_on(ShardStateMachine::open(adapter, 7, 9)).unwrap();
+    let second_payload = b"persisted-second";
+    block_on(machine.apply_entry(
+        1,
+        1,
+        &artifact_command(601, CommandBodyV1::PutAnalyticsArtifactChunk(first)),
+    ))
+    .unwrap();
+    drop(machine.into_adapter());
+
+    let adapter = RocksAdapter::open(directory.path()).unwrap();
+    let mut machine = block_on(ShardStateMachine::open(adapter, 7, 9)).unwrap();
+    let second = PutAnalyticsArtifactChunkV1::new(
+        501,
+        AnalyticsArtifactKindV1::Result,
+        7,
+        1_725_000_000_123,
+        1,
+        first_digest,
+        second_payload.to_vec(),
+    )
+    .unwrap();
+    block_on(machine.apply_entry(
+        1,
+        2,
+        &artifact_command(602, CommandBodyV1::PutAnalyticsArtifactChunk(second)),
+    ))
+    .unwrap();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"persisted-first");
+    hasher.update(second_payload);
+    let content_digest = *hasher.finalize().as_bytes();
+    block_on(
+        machine.apply_entry(
+            1,
+            3,
+            &artifact_command(
+                603,
+                CommandBodyV1::PinAnalyticsArtifactGeneration(
+                    PinAnalyticsArtifactGenerationV1::new(
+                        501,
+                        AnalyticsArtifactKindV1::Result,
+                        7,
+                        2,
+                        u64::try_from(b"persisted-first".len() + second_payload.len()).unwrap(),
+                        content_digest,
+                    )
+                    .unwrap(),
+                ),
+            ),
+        ),
+    )
+    .unwrap();
+    drop(machine.into_adapter());
+
+    let machine = block_on(ShardStateMachine::open(
+        RocksAdapter::open(directory.path()).unwrap(),
+        7,
+        9,
+    ))
+    .unwrap();
+    let records = block_on(machine.adapter().multi_get(&[
+        analytics_artifact_chunk_key(501, AnalyticsArtifactKindV1::Result, 7, 1),
+        analytics_artifact_generation_pin_key(501, AnalyticsArtifactKindV1::Result, 7),
+    ]))
+    .unwrap();
+    let stored = records[0].as_ref().unwrap();
+    assert_eq!(
+        decode_analytics_artifact_chunk(stored).unwrap().payload(),
+        b"persisted-second"
+    );
+    assert_eq!(
+        decode_analytics_artifact_generation_pin(records[1].as_ref().unwrap())
+            .unwrap()
+            .expected_content_digest(),
+        content_digest
+    );
 }
 
 fn exercise_and_release<A: StorageAdapter>(adapter: A) -> A {
@@ -64,6 +165,12 @@ fn exercise_and_release<A: StorageAdapter>(adapter: A) -> A {
     block_on(machine.apply_entry(3, 1, &apply)).unwrap();
     block_on(machine.apply_entry(3, 2, &tick)).unwrap();
     machine.into_adapter()
+}
+
+fn artifact_command(request_id: u128, body: CommandBodyV1) -> Vec<u8> {
+    CommandEnvelopeV1::new(7, 9, request_id, body)
+        .encode()
+        .unwrap()
 }
 
 fn assert_recovered<A: StorageAdapter>(machine: &ShardStateMachine<A>) {

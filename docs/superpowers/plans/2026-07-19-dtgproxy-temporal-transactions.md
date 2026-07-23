@@ -4,7 +4,7 @@
 
 **Goal:** Implement Cypher read-your-writes, bitemporal update lowering, auto/explicit distributed transactions, MERGE/constraint correctness, serializable validation, and recovery over the existing home-shard 2PC protocol.
 
-**Architecture:** Statements update a bounded canonical overlay. At commit, the overlay is validated against one schema/topology snapshot, split by shard, and lowered into existing temporal storage mutations. The current home-shard decision engine remains the durability authority; protocol records gain versioned dependency metadata without changing old record decoding.
+**Architecture:** Statements update a bounded canonical overlay. At commit, the overlay is validated against one schema/topology snapshot, split by shard, and lowered into existing temporal storage mutations. The current home-shard decision engine remains the durability authority; protocol records carry required dependency metadata and reject predecessor encodings.
 
 **Tech Stack:** Rust 1.93, existing temporal-storage, txn-protocol, timestamp-oracle, Raft runtime, deterministic fault injection.
 
@@ -33,8 +33,8 @@
 ### Task 2: Lower Cypher write operators
 
 **Files:**
-- Create: `crates/query-executor/src/v2/write.rs`
-- Create: `crates/query-executor/src/v2/merge.rs`
+- Create: `crates/query-executor/src/write.rs`
+- Create: `crates/query-executor/src/merge.rs`
 - Test: `crates/query-executor/tests/{cypher_create,cypher_set_remove,cypher_delete,cypher_merge,foreach}.rs`
 
 1. Write operator tests for CREATE, MERGE, SET, REMOVE, DELETE, DETACH DELETE, FOREACH, and CALL subquery writes.
@@ -52,10 +52,10 @@
 - Create: `crates/txn-protocol/src/dependency.rs`
 - Test: `crates/txn-protocol/tests/{record_compat,constraint_conflict,serializable_dependencies}.rs`
 
-1. Add failing v1 decode compatibility tests before extending records.
-2. Add `PrewriteMetadataV2` with point-read versions, range fingerprints, constraint keys, and schema/topology fencing.
+1. Add failing tests that reject prewrite records missing required dependency metadata.
+2. Add `PrewriteMetadata` with point-read versions, range fingerprints, constraint keys, and schema/topology fencing.
 3. Validate uniqueness/constraint keys and serializable dependencies during prewrite inspection; keep TemporalSnapshot behavior unchanged.
-4. Run `cargo test -p txn-protocol`; expect old and new tests pass.
+4. Run `cargo test -p txn-protocol`; expect current tests pass.
 5. Commit: `feat(txn): validate constraints and serializable dependencies`.
 
 ### Task 4: Session transaction coordinator integration

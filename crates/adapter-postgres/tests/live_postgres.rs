@@ -8,12 +8,11 @@ use adapter_registry::{AdapterFactory, AdapterOpenRequest, AdapterRegistry, Secr
 use adapter_rocksdb::{RocksAdapter, RocksAdapterFactory};
 use postgres::{Client, NoTls};
 use storage_api::{
-    AdapterRequirement, CommittedMutationBatch, KeySpan, Keyspace, LogicalKey,
+    AdapterError, AdapterRequirement, CommittedMutationBatch, KeySpan, Keyspace, LogicalKey,
     LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, Mutation, StorageAdapter,
 };
 
 #[test]
-#[ignore = "requires DTGPROXY_POSTGRES_URL and a disposable PostgreSQL database"]
 fn live_postgres_apply_export_restore_and_continue() {
     let url = std::env::var("DTGPROXY_POSTGRES_URL")
         .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
@@ -42,10 +41,26 @@ fn live_postgres_apply_export_restore_and_continue() {
         vec![Some(b"payload".to_vec()), None]
     );
     assert_eq!(
-        block_on(source.scan(&KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec())))
-            .unwrap()
-            .len(),
+        block_on(source.scan(&KeySpan::prefix(
+            Keyspace::TemporalIndex,
+            b"vertex/".to_vec()
+        )))
+        .unwrap()
+        .len(),
         1
+    );
+    assert_eq!(
+        block_on(
+            source.scan(
+                &KeySpan::prefix(Keyspace::TemporalIndex, b"vertex/".to_vec())
+                    .with_max_bytes(1)
+                    .unwrap()
+            )
+        ),
+        Err(AdapterError::ScanByteLimit {
+            limit: 1,
+            required: 15,
+        })
     );
 
     let reader =
@@ -85,7 +100,6 @@ fn live_postgres_apply_export_restore_and_continue() {
 }
 
 #[test]
-#[ignore = "requires DTGPROXY_POSTGRES_URL and a disposable PostgreSQL database"]
 fn live_canonical_snapshots_move_in_both_directions_between_rocksdb_and_postgres() {
     let url = std::env::var("DTGPROXY_POSTGRES_URL")
         .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
@@ -151,7 +165,6 @@ fn live_canonical_snapshots_move_in_both_directions_between_rocksdb_and_postgres
 }
 
 #[test]
-#[ignore = "requires DTGPROXY_POSTGRES_URL and a disposable PostgreSQL database"]
 fn live_unpublished_restore_residue_is_never_served_and_can_be_reclaimed() {
     let url = std::env::var("DTGPROXY_POSTGRES_URL")
         .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
@@ -164,16 +177,28 @@ fn live_unpublished_restore_residue_is_never_served_and_can_be_reclaimed() {
     drop(PostgresAdapter::open(&url, &bootstrap_id, 1).unwrap());
 
     let mut client = Client::connect(&url, NoTls).unwrap();
+    let fingerprint = PostgresAdapterFactory
+        .mapping_descriptor()
+        .expect("PostgreSQL Mapping descriptor")
+        .schema_fingerprint();
     client
         .execute(
-            "INSERT INTO dtgproxy.adapter_instance(instance_id, schema_version, applied_log_index, published) VALUES ($1, 1, $2, FALSE)",
-            &[&residue_id, &0_u64.to_be_bytes().as_slice()],
+            "INSERT INTO dtgproxy.adapter_instance(instance_id, schema_version, mapping_fingerprint, applied_log_index, has_applied_index_record, published) VALUES ($1, 1, $2, $3, FALSE, FALSE)",
+            &[
+                &residue_id,
+                &fingerprint.as_slice(),
+                &0_u64.to_be_bytes().as_slice(),
+            ],
         )
         .unwrap();
     client
         .execute(
-            "INSERT INTO dtgproxy.canonical_kv(instance_id, keyspace, logical_key, value) VALUES ($1, 0, $2, $3)",
-            &[&residue_id, &b"partial".as_slice(), &b"must-not-serve".as_slice()],
+            "INSERT INTO dtgproxy.opaque_records(instance_id, keyspace, logical_key, value) VALUES ($1, 6, $2, $3)",
+            &[
+                &residue_id,
+                &b"partial".as_slice(),
+                &b"must-not-serve".as_slice(),
+            ],
         )
         .unwrap();
     drop(client);
@@ -200,6 +225,65 @@ fn live_unpublished_restore_residue_is_never_served_and_can_be_reclaimed() {
     cleanup(&url, &[&bootstrap_id]);
 }
 
+#[test]
+fn live_published_mapping_rejects_canonical_restore_without_deleting_online_data() {
+    let url = std::env::var("DTGPROXY_POSTGRES_URL")
+        .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let instance_id = format!("live-published-restore-{suffix}");
+    let mapping = PostgresAdapter::open(&url, &instance_id, 2).unwrap();
+    let record_key = key(b"online/record");
+    block_on(mapping.apply_committed(batch(1, b"online/record", b"must-survive"))).unwrap();
+
+    let restore = block_on(storage_api::TemporalBackendMapping::restore_canonical(
+        &mapping,
+        LogicalSnapshotHeaderV1::new(7, 1),
+    ));
+    assert!(
+        restore.is_err(),
+        "a published Mapping must never open a canonical restore session"
+    );
+    drop(restore);
+
+    assert_eq!(
+        block_on(mapping.multi_get(&[record_key])).unwrap(),
+        vec![Some(b"must-survive".to_vec())]
+    );
+    drop(mapping);
+    cleanup(&url, &[&instance_id]);
+}
+
+#[test]
+fn live_schema_drift_rejects_reintroduced_canonical_shadow_table() {
+    let url = std::env::var("DTGPROXY_POSTGRES_URL")
+        .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let instance_id = format!("live-schema-drift-{suffix}");
+    drop(PostgresAdapter::open(&url, &instance_id, 1).unwrap());
+
+    let mut client = Client::connect(&url, NoTls).unwrap();
+    client
+        .batch_execute("CREATE TABLE dtgproxy.canonical_kv (instance_id TEXT NOT NULL)")
+        .unwrap();
+    drop(client);
+
+    assert!(
+        PostgresAdapter::open(&url, &instance_id, 1).is_err(),
+        "schema drift must fail closed even when schema_meta is unchanged"
+    );
+    let mut client = Client::connect(&url, NoTls).unwrap();
+    client
+        .batch_execute("DROP TABLE dtgproxy.canonical_kv")
+        .unwrap();
+    cleanup(&url, &[&instance_id]);
+}
+
 fn batch(index: u64, value_key: &[u8], value: &[u8]) -> CommittedMutationBatch {
     CommittedMutationBatch {
         shard_id: 1,
@@ -210,7 +294,7 @@ fn batch(index: u64, value_key: &[u8], value: &[u8]) -> CommittedMutationBatch {
 }
 
 fn key(value: &[u8]) -> LogicalKey {
-    LogicalKey::in_keyspace(Keyspace::Current, value.to_vec())
+    LogicalKey::in_keyspace(Keyspace::TemporalIndex, value.to_vec())
 }
 
 fn cleanup(url: &str, instance_ids: &[&str]) {

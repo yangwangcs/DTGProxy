@@ -1,5 +1,17 @@
 #![forbid(unsafe_code)]
 
+mod mapping;
+#[cfg(feature = "mapping-tck")]
+mod mapping_tck;
+
+pub use mapping::{
+    CanonicalRestoreSession, MAPPING_SPI_VERSION, MappingBackedAdapter, MappingCapabilities,
+    MappingCompatibilityError, MappingDescriptorV1, MappingFuture, MappingRequirement,
+    PreparedMappingTransaction, RequiredMappingCapability, TemporalBackendMapping,
+};
+#[cfg(feature = "mapping-tck")]
+pub use mapping_tck::{run_mapping_restore_tck, run_mapping_tck};
+
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::future::Future;
@@ -359,6 +371,7 @@ pub struct KeySpan {
     end: Option<Vec<u8>>,
     required_prefix: Option<Vec<u8>>,
     limit: Option<usize>,
+    max_bytes: Option<u64>,
 }
 
 impl KeySpan {
@@ -371,6 +384,7 @@ impl KeySpan {
             end,
             required_prefix: Some(prefix),
             limit: None,
+            max_bytes: None,
         }
     }
 
@@ -388,6 +402,7 @@ impl KeySpan {
             end: prefix_successor(&prefix),
             required_prefix: Some(prefix),
             limit: None,
+            max_bytes: None,
         })
     }
 
@@ -405,6 +420,7 @@ impl KeySpan {
             end,
             required_prefix: None,
             limit: None,
+            max_bytes: None,
         })
     }
 
@@ -413,6 +429,14 @@ impl KeySpan {
             return Err(KeySpanError::ZeroLimit);
         }
         self.limit = Some(limit);
+        Ok(self)
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Result<Self, KeySpanError> {
+        if max_bytes == 0 {
+            return Err(KeySpanError::ZeroByteLimit);
+        }
+        self.max_bytes = Some(max_bytes);
         Ok(self)
     }
 
@@ -447,6 +471,11 @@ impl KeySpan {
     }
 
     #[must_use]
+    pub const fn max_bytes(&self) -> Option<u64> {
+        self.max_bytes
+    }
+
+    #[must_use]
     pub fn required_prefix(&self) -> Option<&[u8]> {
         self.required_prefix.as_deref()
     }
@@ -457,6 +486,7 @@ pub enum KeySpanError {
     EmptyOrReversed,
     StartOutsidePrefix,
     ZeroLimit,
+    ZeroByteLimit,
 }
 
 impl Display for KeySpanError {
@@ -467,6 +497,7 @@ impl Display for KeySpanError {
                 formatter.write_str("key span seek start is outside the required prefix")
             }
             Self::ZeroLimit => formatter.write_str("key span limit must be positive"),
+            Self::ZeroByteLimit => formatter.write_str("key span byte limit must be positive"),
         }
     }
 }
@@ -1041,6 +1072,10 @@ pub enum AdapterError {
     MutationReplayMismatch { txn_id: u128, sequence: u32 },
     UnsupportedOperation { operation: &'static str },
     LogicalSnapshot(LogicalSnapshotError),
+    ScanByteLimit { limit: u64, required: u64 },
+    ScanResponseByteLimit { limit: u64, required: u64 },
+    Mapping(MappingCompatibilityError),
+    Unavailable(String),
     Backend(String),
     LockPoisoned,
 }
@@ -1076,6 +1111,20 @@ impl Display for AdapterError {
                 write!(formatter, "Adapter does not support {operation}")
             }
             Self::LogicalSnapshot(error) => Display::fmt(error, formatter),
+            Self::ScanByteLimit { limit, required } => {
+                write!(
+                    formatter,
+                    "scan requires {required} bytes above limit {limit}"
+                )
+            }
+            Self::ScanResponseByteLimit { limit, required } => write!(
+                formatter,
+                "scan response body requires {required} wire bytes above limit {limit}"
+            ),
+            Self::Mapping(error) => Display::fmt(error, formatter),
+            Self::Unavailable(message) => {
+                write!(formatter, "storage backend unavailable: {message}")
+            }
             Self::Backend(message) => write!(formatter, "storage backend error: {message}"),
             Self::LockPoisoned => formatter.write_str("adapter state lock is poisoned"),
         }
@@ -1088,6 +1137,39 @@ impl From<LogicalSnapshotError> for AdapterError {
     fn from(error: LogicalSnapshotError) -> Self {
         Self::LogicalSnapshot(error)
     }
+}
+
+impl From<MappingCompatibilityError> for AdapterError {
+    fn from(error: MappingCompatibilityError) -> Self {
+        Self::Mapping(error)
+    }
+}
+
+pub fn charge_scan_entry(
+    span: &KeySpan,
+    retained: u64,
+    key: &[u8],
+    value: &[u8],
+) -> Result<u64, AdapterError> {
+    let required = retained
+        .checked_add(
+            u64::try_from(key.len()).map_err(|_| AdapterError::ScanByteLimit {
+                limit: span.max_bytes().unwrap_or(u64::MAX),
+                required: u64::MAX,
+            })?,
+        )
+        .and_then(|required| required.checked_add(u64::try_from(value.len()).ok()?))
+        .ok_or(AdapterError::ScanByteLimit {
+            limit: span.max_bytes().unwrap_or(u64::MAX),
+            required: u64::MAX,
+        })?;
+    if span.max_bytes().is_some_and(|limit| required > limit) {
+        return Err(AdapterError::ScanByteLimit {
+            limit: span.max_bytes().expect("checked byte limit"),
+            required,
+        });
+    }
+    Ok(required)
 }
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
@@ -1113,6 +1195,10 @@ pub trait StorageAdapter: Send + Sync {
     }
 
     fn capabilities(&self) -> AdapterCapabilities;
+
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        None
+    }
 
     fn apply_committed<'a>(
         &'a self,
@@ -1155,6 +1241,10 @@ where
         (**self).capabilities()
     }
 
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        (**self).mapping_descriptor()
+    }
+
     fn apply_committed<'a>(
         &'a self,
         batch: CommittedMutationBatch,
@@ -1189,6 +1279,10 @@ where
 
     fn capabilities(&self) -> AdapterCapabilities {
         (**self).capabilities()
+    }
+
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        (**self).mapping_descriptor()
     }
 
     fn apply_committed<'a>(

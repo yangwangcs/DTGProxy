@@ -35,6 +35,8 @@ const WIRE_VERSION: u16 = 1;
 const HEADER_BYTES: usize = 28;
 const CHECKSUM_BYTES: usize = 4;
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
+const SCAN_RESPONSE_ENVELOPE_BYTES: u64 = 64;
+const SCAN_RESPONSE_ENTRY_PROTOBUF_BYTES: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FeatureSet(u64);
@@ -210,6 +212,7 @@ pub enum RemoteErrorCode {
     RestoreAlreadyInProgress = 112,
     ServiceFaulted = 113,
     TargetRequestMismatch = 114,
+    MappingIncompatible = 115,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,6 +292,10 @@ pub struct RemoteError {
     pub code: u32,
     pub message: String,
     pub retryable: bool,
+    pub scan_limit: Option<u64>,
+    pub scan_required: Option<u64>,
+    pub scan_response_limit: Option<u64>,
+    pub scan_response_required: Option<u64>,
 }
 
 impl Display for RemoteError {
@@ -435,6 +442,7 @@ impl TcpSidecarTransport {
         );
         match first {
             Ok(response) => Ok(response),
+            Err(error @ SidecarClientError::ScanByteLimit { .. }) => Err(error),
             Err(first_error) => {
                 *connection = None;
                 let mut replacement = connect_tcp_stream(self.config)?;
@@ -443,6 +451,7 @@ impl TcpSidecarTransport {
                         *connection = Some(replacement);
                         Ok(response)
                     }
+                    Err(error @ SidecarClientError::ScanByteLimit { .. }) => Err(error),
                     Err(second_error) => Err(SidecarClientError::Transport(format!(
                         "request failed before and after reconnect: {first_error}; {second_error}"
                     ))),
@@ -476,8 +485,15 @@ fn exchange_once(
 ) -> Result<Response, SidecarClientError> {
     write_frame(stream, request_id, request)
         .map_err(|error| SidecarClientError::Transport(error.to_string()))?;
-    let response = read_frame::<_, Response>(stream)
-        .map_err(|error| SidecarClientError::Transport(error.to_string()))?;
+    let payload_limit = scan_response_payload_limit(request).map_err(sidecar_protocol_error)?;
+    let bytes = read_frame_bytes_or_eof_bounded(stream, payload_limit)
+        .map_err(sidecar_protocol_error)?
+        .ok_or_else(|| SidecarClientError::Transport("truncated Sidecar response".into()))?;
+    let response = match request {
+        Request::Scan(span) => decode_response_frame_for_scan(&bytes, span),
+        _ => decode_frame::<Response>(&bytes),
+    }
+    .map_err(sidecar_protocol_error)?;
     if response.request_id() != request_id {
         return Err(SidecarClientError::RequestIdMismatch {
             expected: request_id,
@@ -485,6 +501,32 @@ fn exchange_once(
         });
     }
     Ok(response.into_message())
+}
+
+fn scan_response_payload_limit(request: &Request) -> Result<usize, ProtocolError> {
+    let Request::Scan(span) = request else {
+        return Ok(MAX_FRAME_PAYLOAD_BYTES);
+    };
+    let (Some(max_bytes), Some(limit)) = (span.max_bytes(), span.limit()) else {
+        return Ok(MAX_FRAME_PAYLOAD_BYTES);
+    };
+    let limit = u64::try_from(limit).map_err(|_| ProtocolError::LengthOverflow)?;
+    let required = limit
+        .checked_mul(SCAN_RESPONSE_ENTRY_PROTOBUF_BYTES)
+        .and_then(|overhead| overhead.checked_add(max_bytes))
+        .and_then(|bytes| bytes.checked_add(SCAN_RESPONSE_ENVELOPE_BYTES))
+        .ok_or(ProtocolError::LengthOverflow)?;
+    usize::try_from(required.min(MAX_FRAME_PAYLOAD_BYTES as u64))
+        .map_err(|_| ProtocolError::LengthOverflow)
+}
+
+fn sidecar_protocol_error(error: ProtocolError) -> SidecarClientError {
+    match error {
+        ProtocolError::ScanByteLimit { limit, required } => {
+            SidecarClientError::ScanByteLimit { limit, required }
+        }
+        other => SidecarClientError::Transport(other.to_string()),
+    }
 }
 
 /// Serves a persistent TCP connection until the peer closes it. Each response
@@ -807,6 +849,10 @@ pub async fn dispatch_request(adapter: &dyn StorageAdapter, request: Request) ->
                     code: RemoteErrorCode::FeatureUnsupported as u32,
                     message: "required Sidecar Feature is unavailable".to_owned(),
                     retryable: false,
+                    scan_limit: None,
+                    scan_required: None,
+                    scan_response_limit: None,
+                    scan_response_required: None,
                 })
             } else {
                 Response::Hello(HelloResponse {
@@ -861,6 +907,10 @@ pub async fn dispatch_request(adapter: &dyn StorageAdapter, request: Request) ->
             code: RemoteErrorCode::FeatureUnsupported as u32,
             message: "snapshot sessions require a stateful Sidecar service".to_owned(),
             retryable: false,
+            scan_limit: None,
+            scan_required: None,
+            scan_response_limit: None,
+            scan_response_required: None,
         }),
     }
 }
@@ -871,15 +921,35 @@ fn encode_adapter_error(error: &AdapterError) -> RemoteError {
         AdapterError::CommittedLogReplayMismatch { .. } => (2, false),
         AdapterError::DuplicateMutationSequence { .. } => (3, false),
         AdapterError::MutationReplayMismatch { .. } => (4, false),
+        AdapterError::Unavailable(_) => (5, true),
         AdapterError::Backend(_) => (5, true),
         AdapterError::LockPoisoned => (6, true),
         AdapterError::UnsupportedOperation { .. } => (7, false),
         AdapterError::LogicalSnapshot(_) => (8, false),
+        AdapterError::ScanByteLimit { .. } => (9, false),
+        AdapterError::ScanResponseByteLimit { .. } => (10, false),
+        AdapterError::Mapping(_) => (RemoteErrorCode::MappingIncompatible as u32, false),
     };
     RemoteError {
         code,
         message: error.to_string(),
         retryable,
+        scan_limit: match error {
+            AdapterError::ScanByteLimit { limit, .. } => Some(*limit),
+            _ => None,
+        },
+        scan_required: match error {
+            AdapterError::ScanByteLimit { required, .. } => Some(*required),
+            _ => None,
+        },
+        scan_response_limit: match error {
+            AdapterError::ScanResponseByteLimit { limit, .. } => Some(*limit),
+            _ => None,
+        },
+        scan_response_required: match error {
+            AdapterError::ScanResponseByteLimit { required, .. } => Some(*required),
+            _ => None,
+        },
     }
 }
 
@@ -911,6 +981,14 @@ pub enum SidecarClientError {
         actual: u64,
     },
     InvalidScan(String),
+    ScanByteLimit {
+        limit: u64,
+        required: u64,
+    },
+    ScanResponseByteLimit {
+        limit: u64,
+        required: u64,
+    },
     InvalidSnapshotResponse(String),
 }
 
@@ -952,6 +1030,14 @@ impl Display for SidecarClientError {
             Self::InvalidScan(message) => {
                 write!(formatter, "invalid Sidecar scan response: {message}")
             }
+            Self::ScanByteLimit { limit, required } => write!(
+                formatter,
+                "scan requires {required} bytes, exceeding byte limit {limit}"
+            ),
+            Self::ScanResponseByteLimit { limit, required } => write!(
+                formatter,
+                "scan response body requires {required} wire bytes, exceeding byte limit {limit}"
+            ),
             Self::InvalidSnapshotResponse(message) => {
                 write!(formatter, "invalid Sidecar snapshot response: {message}")
             }
@@ -963,7 +1049,20 @@ impl Error for SidecarClientError {}
 
 impl From<SidecarClientError> for AdapterError {
     fn from(error: SidecarClientError) -> Self {
-        Self::Backend(error.to_string())
+        match error {
+            SidecarClientError::ScanByteLimit { limit, required } => {
+                Self::ScanByteLimit { limit, required }
+            }
+            SidecarClientError::ScanResponseByteLimit { limit, required } => {
+                Self::ScanResponseByteLimit { limit, required }
+            }
+            SidecarClientError::Transport(message) => Self::Unavailable(message),
+            SidecarClientError::NotReady(message) => Self::Unavailable(message),
+            SidecarClientError::Remote(remote) if remote.retryable => {
+                Self::Unavailable(remote.to_string())
+            }
+            other => Self::Backend(other.to_string()),
+        }
     }
 }
 
@@ -1091,7 +1190,32 @@ impl<T: SidecarTransport> StorageAdapter for SidecarAdapter<T> {
             match response {
                 Response::Scan(values) => {
                     validate_scan_response(span, &values).map_err(AdapterError::from)?;
+                    let mut retained = 0_u64;
+                    for value in &values {
+                        retained = storage_api::charge_scan_entry(
+                            span,
+                            retained,
+                            value.key().as_bytes(),
+                            value.value(),
+                        )?;
+                    }
                     Ok(values)
+                }
+                Response::Error(error) if error.code == 9 => {
+                    match (error.scan_limit, error.scan_required) {
+                        (Some(limit), Some(required)) => {
+                            Err(AdapterError::ScanByteLimit { limit, required })
+                        }
+                        _ => Err(AdapterError::from(SidecarClientError::Remote(error))),
+                    }
+                }
+                Response::Error(error) if error.code == 10 => {
+                    match (error.scan_response_limit, error.scan_response_required) {
+                        (Some(limit), Some(required)) => {
+                            Err(AdapterError::ScanResponseByteLimit { limit, required })
+                        }
+                        _ => Err(AdapterError::from(SidecarClientError::Remote(error))),
+                    }
                 }
                 Response::Error(error) => {
                     Err(AdapterError::from(SidecarClientError::Remote(error)))
@@ -1341,6 +1465,13 @@ pub fn encode_frame<T: ProtocolMessage>(
 }
 
 pub fn decode_frame<T: ProtocolMessage>(bytes: &[u8]) -> Result<Frame<T>, ProtocolError> {
+    decode_frame_with(bytes, T::decode_payload)
+}
+
+fn decode_frame_with<T: ProtocolMessage>(
+    bytes: &[u8],
+    decoder: impl FnOnce(&[u8]) -> Result<T, ProtocolError>,
+) -> Result<Frame<T>, ProtocolError> {
     if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES {
         return Err(ProtocolError::TruncatedFrame);
     }
@@ -1399,7 +1530,7 @@ pub fn decode_frame<T: ProtocolMessage>(bytes: &[u8]) -> Result<Frame<T>, Protoc
         return Err(ProtocolError::ChecksumMismatch);
     }
     let payload = &bytes[HEADER_BYTES..checksum_offset];
-    let message = T::decode_payload(payload)?;
+    let message = decoder(payload)?;
     if message.encode_payload()? != payload {
         return Err(ProtocolError::NonCanonicalPayload);
     }
@@ -1429,6 +1560,19 @@ pub fn read_frame<R: Read, T: ProtocolMessage>(reader: &mut R) -> Result<Frame<T
 pub fn read_frame_or_eof<R: Read, T: ProtocolMessage>(
     reader: &mut R,
 ) -> Result<Option<Frame<T>>, ProtocolError> {
+    read_frame_bytes_or_eof(reader)?
+        .map(|frame| decode_frame(&frame))
+        .transpose()
+}
+
+fn read_frame_bytes_or_eof<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, ProtocolError> {
+    read_frame_bytes_or_eof_bounded(reader, MAX_FRAME_PAYLOAD_BYTES)
+}
+
+fn read_frame_bytes_or_eof_bounded<R: Read>(
+    reader: &mut R,
+    max_payload_bytes: usize,
+) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut header = [0_u8; HEADER_BYTES];
     loop {
         match reader.read(&mut header[..1]) {
@@ -1447,9 +1591,10 @@ pub fn read_frame_or_eof<R: Read, T: ProtocolMessage>(
     );
     let payload_length =
         usize::try_from(payload_length).map_err(|_| ProtocolError::LengthOverflow)?;
-    if payload_length > MAX_FRAME_PAYLOAD_BYTES {
+    let max_payload_bytes = max_payload_bytes.min(MAX_FRAME_PAYLOAD_BYTES);
+    if payload_length > max_payload_bytes {
         return Err(ProtocolError::PayloadTooLarge {
-            max: MAX_FRAME_PAYLOAD_BYTES,
+            max: max_payload_bytes,
             actual: payload_length,
         });
     }
@@ -1460,7 +1605,7 @@ pub fn read_frame_or_eof<R: Read, T: ProtocolMessage>(
         .ok_or(ProtocolError::LengthOverflow)?;
     frame.resize(HEADER_BYTES + suffix_length, 0);
     reader.read_exact(&mut frame[HEADER_BYTES..])?;
-    decode_frame(&frame).map(Some)
+    Ok(Some(frame))
 }
 
 fn decode_frame_kind(tag: u8) -> Result<FrameKind, ProtocolError> {
@@ -1725,6 +1870,13 @@ impl ProtocolMessage for Response {
                 code: error.code,
                 message: error.message.clone(),
                 retryable: error.retryable,
+                has_scan_byte_limit: error.scan_limit.is_some() && error.scan_required.is_some(),
+                scan_limit: error.scan_limit.unwrap_or(0),
+                scan_required: error.scan_required.unwrap_or(0),
+                has_scan_response_byte_limit: error.scan_response_limit.is_some()
+                    && error.scan_response_required.is_some(),
+                scan_response_limit: error.scan_response_limit.unwrap_or(0),
+                scan_response_required: error.scan_response_required.unwrap_or(0),
             }),
         };
         encode_protobuf(&wire::ResponseEnvelope {
@@ -1867,13 +2019,145 @@ impl ProtocolMessage for Response {
             wire::response_envelope::Body::SessionAborted(response) => Ok(Self::SessionAborted {
                 session_id: decode_session_id(&response.session_id)?,
             }),
-            wire::response_envelope::Body::Error(error) => Ok(Self::Error(RemoteError {
-                code: error.code,
-                message: error.message,
-                retryable: error.retryable,
-            })),
+            wire::response_envelope::Body::Error(error) => {
+                if !error.has_scan_byte_limit && (error.scan_limit != 0 || error.scan_required != 0)
+                {
+                    return Err(ProtocolError::NonCanonicalBody);
+                }
+                if !error.has_scan_response_byte_limit
+                    && (error.scan_response_limit != 0 || error.scan_response_required != 0)
+                {
+                    return Err(ProtocolError::NonCanonicalBody);
+                }
+                if error.has_scan_byte_limit && error.has_scan_response_byte_limit {
+                    return Err(ProtocolError::NonCanonicalBody);
+                }
+                Ok(Self::Error(RemoteError {
+                    code: error.code,
+                    message: error.message,
+                    retryable: error.retryable,
+                    scan_limit: error.has_scan_byte_limit.then_some(error.scan_limit),
+                    scan_required: error.has_scan_byte_limit.then_some(error.scan_required),
+                    scan_response_limit: error
+                        .has_scan_response_byte_limit
+                        .then_some(error.scan_response_limit),
+                    scan_response_required: error
+                        .has_scan_response_byte_limit
+                        .then_some(error.scan_response_required),
+                }))
+            }
         }
     }
+}
+
+fn decode_response_frame_for_scan(
+    bytes: &[u8],
+    span: &KeySpan,
+) -> Result<Frame<Response>, ProtocolError> {
+    decode_frame_with(bytes, |payload| {
+        decode_response_payload_for_scan(payload, span)
+    })
+}
+
+fn decode_response_payload_for_scan(
+    payload: &[u8],
+    span: &KeySpan,
+) -> Result<Response, ProtocolError> {
+    let Some((spi_version, scan_payload)) = scan_envelope(payload)? else {
+        return Response::decode_payload(payload);
+    };
+    let spi_version =
+        u16::try_from(spi_version).map_err(|_| ProtocolError::InvalidSpiVersion(spi_version))?;
+    if spi_version != ADAPTER_SPI_VERSION {
+        return Err(ProtocolError::UnsupportedSpiVersion {
+            expected: ADAPTER_SPI_VERSION,
+            actual: spi_version,
+        });
+    }
+    let mut values = Vec::new();
+    let mut retained = 0_u64;
+    let mut offset = 0_usize;
+    while offset < scan_payload.len() {
+        if take_protobuf_varint(scan_payload, &mut offset)? != 10 {
+            return Err(ProtocolError::NonCanonicalBody);
+        }
+        let value_payload = take_protobuf_bytes(scan_payload, &mut offset)?;
+        let value = wire::KeyValue::decode(value_payload)
+            .map_err(|error| ProtocolError::PayloadDecode(error.to_string()))?;
+        let value = decode_key_value(value)?;
+        retained =
+            storage_api::charge_scan_entry(span, retained, value.key().as_bytes(), value.value())
+                .map_err(|error| match error {
+                AdapterError::ScanByteLimit { limit, required } => {
+                    ProtocolError::ScanByteLimit { limit, required }
+                }
+                other => ProtocolError::InvalidSpan(other.to_string()),
+            })?;
+        values.push(value);
+    }
+    Ok(Response::Scan(values))
+}
+
+fn scan_envelope(payload: &[u8]) -> Result<Option<(u32, &[u8])>, ProtocolError> {
+    let mut offset = 0_usize;
+    if take_protobuf_varint(payload, &mut offset)? != 8 {
+        return Err(ProtocolError::NonCanonicalBody);
+    }
+    let version = take_protobuf_varint(payload, &mut offset)?;
+    let version = u32::try_from(version).map_err(|_| ProtocolError::InvalidSpiVersion(u32::MAX))?;
+    let body_tag = take_protobuf_varint(payload, &mut offset)?;
+    if body_tag == 42 {
+        let scan = take_protobuf_bytes(payload, &mut offset)?;
+        if offset != payload.len() {
+            return Err(ProtocolError::NonCanonicalBody);
+        }
+        return Ok(Some((version, scan)));
+    }
+    if matches!(
+        body_tag,
+        18 | 26 | 34 | 48 | 58 | 66 | 74 | 82 | 90 | 98 | 106 | 114 | 122 | 130
+    ) {
+        return Ok(None);
+    }
+    Err(ProtocolError::NonCanonicalBody)
+}
+
+fn take_protobuf_bytes<'a>(
+    payload: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], ProtocolError> {
+    let length = take_protobuf_varint(payload, offset)?;
+    let length = usize::try_from(length).map_err(|_| ProtocolError::LengthOverflow)?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(ProtocolError::LengthOverflow)?;
+    let bytes = payload
+        .get(*offset..end)
+        .ok_or(ProtocolError::TruncatedFrame)?;
+    *offset = end;
+    Ok(bytes)
+}
+
+fn take_protobuf_varint(payload: &[u8], offset: &mut usize) -> Result<u64, ProtocolError> {
+    let mut value = 0_u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *payload.get(*offset).ok_or(ProtocolError::TruncatedFrame)?;
+        *offset = (*offset)
+            .checked_add(1)
+            .ok_or(ProtocolError::LengthOverflow)?;
+        if shift == 63 && byte > 1 {
+            return Err(ProtocolError::PayloadDecode(
+                "protobuf varint overflow".into(),
+            ));
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(ProtocolError::PayloadDecode(
+        "protobuf varint overflow".into(),
+    ))
 }
 
 fn encode_protobuf<M: Message>(message: &M) -> Result<Vec<u8>, ProtocolError> {
@@ -2158,6 +2442,8 @@ fn encode_span(span: &KeySpan) -> Result<wire::ScanRequest, ProtocolError> {
             .transpose()
             .map_err(|_| ProtocolError::LengthOverflow)?
             .unwrap_or_default(),
+        has_max_bytes: span.max_bytes().is_some(),
+        max_bytes: span.max_bytes().unwrap_or_default(),
     })
 }
 
@@ -2165,6 +2451,7 @@ fn decode_span(span: wire::ScanRequest) -> Result<KeySpan, ProtocolError> {
     if !span.has_end && !span.end.is_empty()
         || !span.has_required_prefix && !span.required_prefix.is_empty()
         || !span.has_limit && span.limit != 0
+        || !span.has_max_bytes && span.max_bytes != 0
     {
         return Err(ProtocolError::NonCanonicalSpan);
     }
@@ -2180,9 +2467,16 @@ fn decode_span(span: wire::ScanRequest) -> Result<KeySpan, ProtocolError> {
         KeySpan::range(keyspace, span.start, span.has_end.then_some(span.end))
             .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))?
     };
-    if span.has_limit {
+    let decoded = if span.has_limit {
         decoded
             .with_limit(usize::try_from(span.limit).map_err(|_| ProtocolError::LengthOverflow)?)
+            .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))
+    } else {
+        Ok(decoded)
+    }?;
+    if span.has_max_bytes {
+        decoded
+            .with_max_bytes(span.max_bytes)
             .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))
     } else {
         Ok(decoded)
@@ -2379,6 +2673,10 @@ pub enum ProtocolError {
         tag: u32,
     },
     InvalidSpan(String),
+    ScanByteLimit {
+        limit: u64,
+        required: u64,
+    },
     NonCanonicalSpan,
     MissingCapabilities,
     UnknownBackendFamily {
@@ -2472,6 +2770,10 @@ impl Display for ProtocolError {
             }
             Self::UnknownKeyspace { tag } => write!(formatter, "unknown keyspace {tag}"),
             Self::InvalidSpan(message) => write!(formatter, "invalid key span: {message}"),
+            Self::ScanByteLimit { limit, required } => write!(
+                formatter,
+                "scan requires {required} bytes, exceeding byte limit {limit}"
+            ),
             Self::NonCanonicalSpan => formatter.write_str("key span is non-canonical"),
             Self::MissingCapabilities => formatter.write_str("Adapter capabilities are missing"),
             Self::UnknownBackendFamily { tag } => {
@@ -2490,6 +2792,79 @@ impl Error for ProtocolError {}
 impl From<std::io::Error> for ProtocolError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod bounded_scan_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn response_decoder_charges_scan_rows_before_retention() {
+        let first = wire::KeyValue {
+            key: Some(wire::LogicalKey {
+                keyspace: u32::from(Keyspace::Current.tag()),
+                key: b"a".to_vec(),
+            }),
+            value: b"b".to_vec(),
+        }
+        .encode_to_vec();
+        let mut scan = vec![10];
+        push_varint(&mut scan, first.len() as u64);
+        scan.extend_from_slice(&first);
+        scan.extend_from_slice(&[10, 5, 0xff]);
+        let mut payload = vec![8, ADAPTER_SPI_VERSION as u8, 42];
+        push_varint(&mut payload, scan.len() as u64);
+        payload.extend_from_slice(&scan);
+        let span = KeySpan::prefix(Keyspace::Current, Vec::new())
+            .with_max_bytes(1)
+            .unwrap();
+
+        assert_eq!(
+            decode_response_payload_for_scan(&payload, &span),
+            Err(ProtocolError::ScanByteLimit {
+                limit: 1,
+                required: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn scan_frame_payload_is_rejected_from_its_header_before_body_allocation() {
+        let span = KeySpan::prefix(Keyspace::Current, Vec::new())
+            .with_limit(1)
+            .unwrap()
+            .with_max_bytes(1)
+            .unwrap();
+        let limit = scan_response_payload_limit(&Request::Scan(span)).unwrap();
+        let mut header = Vec::new();
+        header.extend_from_slice(&MAGIC);
+        header.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+        header.push(FrameKind::Response as u8);
+        header.push(0);
+        header.extend_from_slice(&7_u128.to_be_bytes());
+        header.extend_from_slice(&1024_u32.to_be_bytes());
+
+        assert_eq!(limit, 97);
+        assert_eq!(
+            read_frame_bytes_or_eof_bounded(&mut Cursor::new(header), limit),
+            Err(ProtocolError::PayloadTooLarge {
+                max: 97,
+                actual: 1024,
+            })
+        );
+    }
+
+    fn push_varint(output: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            output.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                return;
+            }
+        }
     }
 }
 
@@ -2552,6 +2927,10 @@ mod wire {
         pub has_limit: bool,
         #[prost(uint64, tag = "8")]
         pub limit: u64,
+        #[prost(bool, tag = "9")]
+        pub has_max_bytes: bool,
+        #[prost(uint64, tag = "10")]
+        pub max_bytes: u64,
     }
 
     #[derive(Clone, PartialEq, Message)]
@@ -2812,6 +3191,18 @@ mod wire {
         pub message: String,
         #[prost(bool, tag = "3")]
         pub retryable: bool,
+        #[prost(bool, tag = "4")]
+        pub has_scan_byte_limit: bool,
+        #[prost(uint64, tag = "5")]
+        pub scan_limit: u64,
+        #[prost(uint64, tag = "6")]
+        pub scan_required: u64,
+        #[prost(bool, tag = "7")]
+        pub has_scan_response_byte_limit: bool,
+        #[prost(uint64, tag = "8")]
+        pub scan_response_limit: u64,
+        #[prost(uint64, tag = "9")]
+        pub scan_response_required: u64,
     }
 
     #[derive(Clone, PartialEq, Message)]

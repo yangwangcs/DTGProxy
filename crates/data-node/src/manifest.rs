@@ -8,8 +8,6 @@ use cluster_protocol::backend_profile_digest;
 use crate::StorageError;
 
 const RECORD_MAGIC: [u8; 4] = *b"DTRP";
-const LEGACY_MANIFEST_VERSION: u16 = 2;
-const SNAPSHOT_MANIFEST_VERSION: u16 = 3;
 const MANIFEST_VERSION: u16 = 4;
 const RECORD_HEADER_BYTES: usize = 10;
 const CHECKSUM_BYTES: usize = 4;
@@ -617,12 +615,6 @@ fn replay_and_repair_tail(file: &mut File) -> Result<ReplicaManifest, StorageErr
                 .try_into()
                 .expect("fixed version"),
         );
-        if !matches!(
-            version,
-            LEGACY_MANIFEST_VERSION | SNAPSHOT_MANIFEST_VERSION | MANIFEST_VERSION
-        ) {
-            return Err(StorageError::UnsupportedManifestVersion { actual: version });
-        }
         let payload_length = u32::from_be_bytes(
             bytes[offset + 6..offset + 10]
                 .try_into()
@@ -638,6 +630,9 @@ fn replay_and_repair_tail(file: &mut File) -> Result<ReplicaManifest, StorageErr
         if remaining < record_length {
             break;
         }
+        if version != MANIFEST_VERSION {
+            return Err(StorageError::UnsupportedManifestVersion { actual: version });
+        }
         let checksum_offset = offset + record_length - CHECKSUM_BYTES;
         let expected_checksum = u32::from_be_bytes(
             bytes[checksum_offset..checksum_offset + CHECKSUM_BYTES]
@@ -647,10 +642,7 @@ fn replay_and_repair_tail(file: &mut File) -> Result<ReplicaManifest, StorageErr
         if crc32fast::hash(&bytes[offset..checksum_offset]) != expected_checksum {
             return Err(StorageError::ManifestChecksumMismatch);
         }
-        manifest = decode_manifest(
-            &bytes[offset + RECORD_HEADER_BYTES..checksum_offset],
-            version,
-        )?;
+        manifest = decode_manifest(&bytes[offset + RECORD_HEADER_BYTES..checksum_offset])?;
         offset += record_length;
     }
     if offset < bytes.len() {
@@ -689,7 +681,7 @@ fn encode_manifest(manifest: &ReplicaManifest) -> Result<Vec<u8>, StorageError> 
     Ok(encoded)
 }
 
-fn decode_manifest(encoded: &[u8], version: u16) -> Result<ReplicaManifest, StorageError> {
+fn decode_manifest(encoded: &[u8]) -> Result<ReplicaManifest, StorageError> {
     let mut decoder = Decoder::new(encoded);
     let count = decoder.read_u32()? as usize;
     if count > MAX_REPLICAS {
@@ -712,30 +704,15 @@ fn decode_manifest(encoded: &[u8], version: u16) -> Result<ReplicaManifest, Stor
         let role = ReplicaRole::from_tag(decoder.read_u8()?)?;
         let schema_version = decoder.read_u64()?;
         let backend_generation = decoder.read_u64()?;
-        let snapshot_index = if version >= SNAPSHOT_MANIFEST_VERSION {
-            decoder.read_u64()?
-        } else {
-            0
-        };
+        let snapshot_index = decoder.read_u64()?;
         let directory = decoder.read_string()?;
         if !directories.insert(directory.clone()) {
             return Err(StorageError::ReplicaDirectoryConflict { directory });
         }
-        let backend_slot = if version >= MANIFEST_VERSION {
-            let decoded = decode_backend_slot(&mut decoder)?;
-            if decoded.active_generation() != backend_generation {
-                return Err(StorageError::InvalidBackendTransition);
-            }
-            decoded
-        } else {
-            let profile = BackendProfile::new(
-                "rocksdb",
-                format!("graph-{graph_id}-shard-{shard_id}-generation-{backend_generation}"),
-                BTreeMap::from([("path".to_owned(), "adapter".to_owned())]),
-                BTreeMap::new(),
-            )?;
-            BackendSlotState::active(backend_generation, profile)?
-        };
+        let backend_slot = decode_backend_slot(&mut decoder)?;
+        if backend_slot.active_generation() != backend_generation {
+            return Err(StorageError::InvalidBackendTransition);
+        }
         let entry = ReplicaEntry::new_with_backend(
             graph_id,
             shard_id,

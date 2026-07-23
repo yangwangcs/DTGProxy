@@ -236,7 +236,7 @@ async fn run_backend_migration(target: BackendProfile) {
     .await
     .unwrap();
     host.campaign(key).await.unwrap();
-    host.propose(key, 1, 100, put_command(100, b"before", b"v1"))
+    host.propose(key, 1, 100, put_command(100, b"before", b"original"))
         .await
         .unwrap();
 
@@ -262,7 +262,7 @@ async fn run_backend_migration(target: BackendProfile) {
             let state = catalog.load().await.unwrap();
             let migration = state.backend_migration(MIGRATION_ID).unwrap();
             if migration.state() == BackendMigrationState::DualApplying && !wrote_during_dual {
-                host.propose(key, 1, 101, put_command(101, b"during", b"v2"))
+                host.propose(key, 1, 101, put_command(101, b"during", b"dual-apply"))
                     .await
                     .unwrap();
                 wrote_during_dual = true;
@@ -281,8 +281,14 @@ async fn run_backend_migration(target: BackendProfile) {
     let state = catalog.load().await.unwrap();
     assert_eq!(state.graph(7).unwrap().backend().generation(), 2);
     assert_eq!(host.status(key).await.unwrap().backend_generation(), 2);
-    assert_eq!(read(&host, key, b"before").await, Some(b"v1".to_vec()));
-    assert_eq!(read(&host, key, b"during").await, Some(b"v2".to_vec()));
+    assert_eq!(
+        read(&host, key, b"before").await,
+        Some(b"original".to_vec())
+    );
+    assert_eq!(
+        read(&host, key, b"during").await,
+        Some(b"dual-apply".to_vec())
+    );
 
     let _ = stop.send(());
     server.await.unwrap().unwrap();
@@ -290,8 +296,14 @@ async fn run_backend_migration(target: BackendProfile) {
 
     let reopened = Arc::new(DataNodeHost::open(config, 64).await.unwrap());
     assert_eq!(reopened.status(key).await.unwrap().backend_generation(), 2);
-    assert_eq!(read(&reopened, key, b"before").await, Some(b"v1".to_vec()));
-    assert_eq!(read(&reopened, key, b"during").await, Some(b"v2".to_vec()));
+    assert_eq!(
+        read(&reopened, key, b"before").await,
+        Some(b"original".to_vec())
+    );
+    assert_eq!(
+        read(&reopened, key, b"during").await,
+        Some(b"dual-apply".to_vec())
+    );
 }
 
 fn initial_state(target: BackendProfile) -> CatalogState {

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use data_node::{
     DataNodeHost, EnsureReplicaOutcome, HostError, NodeConfig, NodeIdentity, ReplicaKey,
@@ -181,6 +182,21 @@ async fn placement_epoch_fence_precedes_durable_replica_activation() {
         .unwrap();
     host.propose(key(11), 3, 850, fence).await.unwrap();
 
+    assert_eq!(host.status(key(11)).await.unwrap().placement_epoch(), 4);
+    assert_eq!(
+        host.leader_read_permit(
+            key(11),
+            3,
+            851,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await,
+        Err(HostError::StaleEpoch {
+            expected: 4,
+            actual: 3,
+        })
+    );
+
     let (activated, duplicate) = host.activate_replica(key(11), 3, 4, vec![7]).await.unwrap();
     assert!(!duplicate);
     assert_eq!(activated.placement_epoch(), 4);
@@ -290,6 +306,55 @@ async fn stale_epoch_is_rejected_before_a_command_reaches_raft() {
         })
     );
     assert_eq!(host.status(key(11)).await.unwrap().applied_index(), before);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn single_replica_leader_read_barrier_returns_a_nonzero_applied_index() {
+    let temporary = tempdir().unwrap();
+    let host = DataNodeHost::open(config(temporary.path()), 8)
+        .await
+        .unwrap();
+    host.ensure_replica(spec(11)).await.unwrap();
+    host.campaign(key(11)).await.unwrap();
+
+    let read_index = host
+        .leader_read_permit(
+            key(11),
+            3,
+            201,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(read_index, 0);
+    assert!(host.status(key(11)).await.unwrap().applied_index() >= read_index);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn leader_read_barrier_rejects_a_stale_placement_epoch() {
+    let temporary = tempdir().unwrap();
+    let host = DataNodeHost::open(config(temporary.path()), 8)
+        .await
+        .unwrap();
+    host.ensure_replica(spec(11)).await.unwrap();
+    host.campaign(key(11)).await.unwrap();
+
+    assert_eq!(
+        host.leader_read_permit(
+            key(11),
+            2,
+            202,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await,
+        Err(HostError::StaleEpoch {
+            expected: 3,
+            actual: 2,
+        })
+    );
     host.shutdown().await.unwrap();
 }
 

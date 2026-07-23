@@ -4,13 +4,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use analytics_ledger::{JobCommand, JobError};
 use control_plane::CatalogCommand;
 use raft::eraftpb::{Entry, EntryType, Message, Snapshot, SnapshotMetadata};
 use raft::{Config, RawNode, StateRole, Storage};
 use raft_logstore::{RaftLogStoreError, RocksRaftStorage};
 use slog::{Logger, o};
 
-use crate::{MetaStateError, MetaStateMachine, ReserveTimestampCommand};
+use crate::{AnalyticsGcLeaseCommand, MetaStateError, MetaStateMachine, ReserveTimestampCommand};
 
 const JOURNAL_MAGIC: [u8; 4] = *b"DTMJ";
 const JOURNAL_VERSION: u16 = 1;
@@ -124,6 +125,22 @@ impl MetaRaftReplica {
             .map_err(|error| MetaRaftError::Raft(error.to_string()))
     }
 
+    pub fn propose_analytics(&mut self, command: JobCommand) -> Result<(), MetaRaftError> {
+        if !self.is_leader() {
+            return Err(MetaRaftError::NotLeader {
+                leader_id: self.leader_id(),
+            });
+        }
+        let mut validation = self.state_store.state.analytics().clone();
+        validation.apply(command.clone())?;
+        self.raw_node
+            .propose(
+                command.command_id().to_be_bytes().to_vec(),
+                command.encode()?,
+            )
+            .map_err(|error| MetaRaftError::Raft(error.to_string()))
+    }
+
     pub fn propose_timestamp(
         &mut self,
         command: ReserveTimestampCommand,
@@ -140,6 +157,24 @@ impl MetaRaftReplica {
             }
             .into());
         }
+        self.raw_node
+            .propose(
+                command.command_id().to_be_bytes().to_vec(),
+                command.encode(),
+            )
+            .map_err(|error| MetaRaftError::Raft(error.to_string()))
+    }
+
+    pub fn propose_analytics_gc_lease(
+        &mut self,
+        command: AnalyticsGcLeaseCommand,
+    ) -> Result<(), MetaRaftError> {
+        if !self.is_leader() {
+            return Err(MetaRaftError::NotLeader {
+                leader_id: self.leader_id(),
+            });
+        }
+        self.state().validate_analytics_gc_lease(command)?;
         self.raw_node
             .propose(
                 command.command_id().to_be_bytes().to_vec(),
@@ -437,6 +472,7 @@ fn discard_logger() -> Logger {
 pub enum MetaRaftError {
     Io(String),
     Catalog(control_plane::CatalogError),
+    Analytics(JobError),
     State(MetaStateError),
     Tso(crate::TsoError),
     LogStore(RaftLogStoreError),
@@ -459,6 +495,7 @@ impl Display for MetaRaftError {
         match self {
             Self::Io(message) => write!(formatter, "Meta I/O error: {message}"),
             Self::Catalog(error) => write!(formatter, "Meta Catalog error: {error}"),
+            Self::Analytics(error) => write!(formatter, "Meta analytics ledger error: {error}"),
             Self::State(error) => write!(formatter, "Meta state error: {error}"),
             Self::Tso(error) => write!(formatter, "Meta TSO error: {error}"),
             Self::LogStore(error) => write!(formatter, "Meta Raft WAL error: {error}"),
@@ -503,6 +540,12 @@ impl From<std::io::Error> for MetaRaftError {
 impl From<control_plane::CatalogError> for MetaRaftError {
     fn from(error: control_plane::CatalogError) -> Self {
         Self::Catalog(error)
+    }
+}
+
+impl From<JobError> for MetaRaftError {
+    fn from(error: JobError) -> Self {
+        Self::Analytics(error)
     }
 }
 

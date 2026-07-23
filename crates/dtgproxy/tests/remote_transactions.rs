@@ -27,7 +27,7 @@ use temporal_types::{CanonicalElement, GraphValue, Interval, ValidTime};
 use timestamp_oracle::{ManualClock, MemoryTimestampStore, TimestampOracle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use txn_protocol::IsolationLevel;
+use txn_protocol::{IsolationLevel, PrewriteMetadata};
 
 fn now_ms() -> u64 {
     u64::try_from(
@@ -71,6 +71,8 @@ fn write(
                 value.to_vec(),
             )],
         },
+        Vec::new(),
+        PrewriteMetadata::new(3, 7, Vec::new(), Vec::new()).unwrap(),
     )
     .unwrap()
 }

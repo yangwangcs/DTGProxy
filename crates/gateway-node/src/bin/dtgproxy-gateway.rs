@@ -43,7 +43,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         *config.cluster_id(),
         topology,
     )?);
-    let gateway = RemoteGatewayService::new_at_revision(
+    let gateway = RemoteGatewayService::new_at_revision_with_gateway_id(
+        config.node_id(),
         *config.cluster_id(),
         catalog_state.revision(),
         graph,

@@ -37,7 +37,7 @@ fn snapshot_suffix_recovery_preserves_complete_bitemporal_graph_semantics() {
                 vertex(1),
                 LabelId::new(1),
                 interval(1, Some(10)),
-                payload("v1"),
+                payload("vertex-one"),
             )
             .unwrap(),
         )
@@ -46,7 +46,7 @@ fn snapshot_suffix_recovery_preserves_complete_bitemporal_graph_semantics() {
                 vertex(2),
                 LabelId::new(1),
                 interval(1, Some(10)),
-                payload("v2"),
+                payload("vertex-two"),
             )
             .unwrap(),
         )
@@ -78,7 +78,7 @@ fn snapshot_suffix_recovery_preserves_complete_bitemporal_graph_semantics() {
                 vertex(1),
                 LabelId::new(1),
                 interval(4, Some(7)),
-                payload("v1-corrected"),
+                payload("vertex-one-corrected"),
             )
             .unwrap(),
         )

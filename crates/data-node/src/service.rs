@@ -1,36 +1,48 @@
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::File;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use adapter_registry::MigrationStatus;
 use cluster_protocol::proto::node_admin_service_server::NodeAdminService;
 use cluster_protocol::proto::shard_service_server::ShardService;
 use cluster_protocol::proto::{
-    ActivateReplicaRequest, ActivateReplicaResponse, BackendLifecyclePhase, BackendProfileSpec,
+    ActivateReplicaRequest, ActivateReplicaResponse, AdvanceAnalyticsArtifactFenceRequest,
+    AdvanceAnalyticsArtifactFenceResponse, AnalyticsArtifactChunk, AnalyticsArtifactGeneration,
+    AnalyticsArtifactKind as WireArtifactKind, BackendLifecyclePhase, BackendProfileSpec,
     BackendTransitionResponse, BeginBackendDualApplyRequest, ChangeMembershipRequest,
-    ChangeMembershipResponse, DeleteReplicaRequest, DeleteReplicaResponse, EnsureReplicaRequest,
-    EnsureReplicaResponse, ExecuteRequest, ExecuteResponse, ExportSnapshotRequest,
-    FinishBackendMigrationRequest, GetBackendStatusRequest, GetBackendStatusResponse,
-    GetMigrationReceiptRequest, GetMigrationReceiptResponse, InstallSnapshotResponse,
-    PrepareBackendTargetRequest, PrepareBackendTargetResponse, ReadRequest, ReadResponse,
-    ReplicaBootstrapProfile, ReplicaRole as WireReplicaRole, ReplicaStatusRequest,
-    ReplicaStatusResponse, ScanBatch, ScanRequest, SnapshotChunk,
+    ChangeMembershipResponse, DeleteAnalyticsArtifactGenerationRequest,
+    DeleteAnalyticsArtifactGenerationResponse, DeleteReplicaRequest, DeleteReplicaResponse,
+    EnsureReplicaRequest, EnsureReplicaResponse, ExecuteRequest, ExecuteResponse,
+    ExportSnapshotRequest, FinishBackendMigrationRequest, GetAnalyticsArtifactGenerationRequest,
+    GetBackendStatusRequest, GetBackendStatusResponse, GetMigrationReceiptRequest,
+    GetMigrationReceiptResponse, InstallSnapshotResponse,
+    ListAnalyticsArtifactGenerationHeadsRequest, ListAnalyticsArtifactGenerationHeadsResponse,
+    ListAnalyticsArtifactGenerationsRequest, ListAnalyticsArtifactGenerationsResponse,
+    PinAnalyticsArtifactGenerationRequest, PinAnalyticsArtifactGenerationResponse,
+    PrepareBackendTargetRequest, PrepareBackendTargetResponse, PutAnalyticsArtifactChunkRequest,
+    PutAnalyticsArtifactChunkResponse, ReadRequest, ReadResponse, ReplicaBootstrapProfile,
+    ReplicaRole as WireReplicaRole, ReplicaStatusRequest, ReplicaStatusResponse, ScanBatch,
+    ScanRequest, SnapshotChunk,
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError, ShardRequestContext};
 use prost::Message as ProstMessage;
 use storage_api::{KeySpan, KeyValue, Keyspace, LogicalKey};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::metadata::MetadataValue;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::{
     BackendProfile, BackendRuntimeStatus, BackendSlotState, ChunkAppendOutcome, DataNodeHost,
-    EnsureReplicaOutcome, HostError, MigrationChunk, ReplicaKey, ReplicaRole, ReplicaSpec,
-    ReplicaStatus,
+    EnsureReplicaOutcome, HostError, MigrationChunk, ProposalOutcome, ReplicaKey, ReplicaRole,
+    ReplicaSpec, ReplicaStatus,
 };
 
 const READ_PLAN_MAGIC: [u8; 4] = *b"DTRK";
@@ -56,12 +68,210 @@ const SNAPSHOT_OUTCOME_MAGIC: [u8; 4] = *b"DTSO";
 const SNAPSHOT_OUTCOME_VERSION: u16 = 1;
 const SNAPSHOT_OUTCOME_BYTES: usize = 50;
 const PROPOSAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+const ARTIFACT_READ_BATCH_CHUNKS: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct StableArtifactHeadObservation {
+    identity: shard_runtime::AnalyticsArtifactGenerationHeadIdentity,
+    head: shard_runtime::AnalyticsArtifactGenerationHead,
+    pin: Option<shard_runtime::AnalyticsArtifactGenerationPin>,
+}
+
+type DataNodeArtifactBatchFuture =
+    Pin<Box<dyn Future<Output = Result<(usize, Vec<Option<Vec<u8>>>), Status>> + Send + 'static>>;
+
+#[doc(hidden)]
+pub struct DataNodeArtifactStream {
+    host: Arc<DataNodeHost>,
+    key: ReplicaKey,
+    job_id: u128,
+    kind: raft_command::AnalyticsArtifactKindV1,
+    generation: u64,
+    count: usize,
+    expected_total_bytes: u64,
+    expected_content_digest: [u8; 32],
+    expected_tail_digest: [u8; 32],
+    applied_index: u64,
+    deadline_unix_ms: u64,
+    next_start: usize,
+    pending: Option<DataNodeArtifactBatchFuture>,
+    buffered: VecDeque<AnalyticsArtifactChunk>,
+    deferred_error: Option<Status>,
+    previous_digest: [u8; 32],
+    total_bytes: u64,
+    content_hasher: blake3::Hasher,
+    terminal: bool,
+}
+
+impl fmt::Debug for DataNodeArtifactStream {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DataNodeArtifactStream")
+            .field("key", &self.key)
+            .field("count", &self.count)
+            .field("next_start", &self.next_start)
+            .field("buffered", &self.buffered.len())
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DataNodeArtifactStream {
+    fn start_next_batch(&mut self) -> Result<(), Status> {
+        if unix_time_ms()? >= self.deadline_unix_ms {
+            return Err(Status::deadline_exceeded(
+                "analytics artifact read deadline expired",
+            ));
+        }
+        let start = self.next_start;
+        let end = (start + ARTIFACT_READ_BATCH_CHUNKS).min(self.count);
+        let keys = (start..end)
+            .map(|ordinal| {
+                shard_runtime::analytics_artifact_chunk_key(
+                    self.job_id,
+                    self.kind,
+                    self.generation,
+                    u64::try_from(ordinal).expect("bounded artifact ordinal"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let host = Arc::clone(&self.host);
+        let key = self.key;
+        self.next_start = end;
+        self.pending = Some(Box::pin(async move {
+            let values = host
+                .multi_get(key, keys.clone())
+                .await
+                .map_err(artifact_host_status)?;
+            if values.len() != keys.len() {
+                return Err(Status::data_loss(
+                    "analytics artifact read returned an incomplete key batch",
+                ));
+            }
+            Ok((start, values))
+        }));
+        Ok(())
+    }
+
+    fn retain_batch(&mut self, start: usize, values: Vec<Option<Vec<u8>>>) -> Result<(), Status> {
+        let mut decoded = VecDeque::with_capacity(values.len());
+        for (offset, value) in values.into_iter().enumerate() {
+            let value = value.ok_or_else(|| {
+                Status::data_loss("analytics artifact generation has a missing chunk")
+            })?;
+            let chunk = shard_runtime::decode_analytics_artifact_chunk(&value).map_err(|_| {
+                Status::data_loss("analytics artifact chunk failed integrity validation")
+            })?;
+            if chunk.previous_digest() != self.previous_digest {
+                return Err(Status::failed_precondition(
+                    "analytics artifact digest chain is discontinuous",
+                ));
+            }
+            let payload_bytes = u64::try_from(chunk.payload().len())
+                .map_err(|_| Status::data_loss("analytics artifact payload length overflow"))?;
+            self.total_bytes = self
+                .total_bytes
+                .checked_add(payload_bytes)
+                .filter(|total| *total <= self.expected_total_bytes)
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "analytics artifact exceeds the requested total byte count",
+                    )
+                })?;
+            self.content_hasher.update(chunk.payload());
+            self.previous_digest = chunk.payload_digest();
+            decoded.push_back(AnalyticsArtifactChunk {
+                ordinal: u64::try_from(start + offset).expect("bounded artifact ordinal"),
+                applied_index: self.applied_index,
+                previous_digest: chunk.previous_digest().to_vec(),
+                payload_digest: chunk.payload_digest().to_vec(),
+                payload: chunk.payload().to_vec(),
+            });
+        }
+        if self.next_start == self.count {
+            let final_error = if self.previous_digest != self.expected_tail_digest {
+                Some(Status::failed_precondition(
+                    "analytics artifact generation tail differs from its head",
+                ))
+            } else if self.total_bytes != self.expected_total_bytes {
+                Some(Status::failed_precondition(
+                    "analytics artifact total byte count differs from the request",
+                ))
+            } else if *self.content_hasher.finalize().as_bytes() != self.expected_content_digest {
+                Some(Status::failed_precondition(
+                    "analytics artifact content digest differs from the request",
+                ))
+            } else {
+                None
+            };
+            if let Some(status) = final_error {
+                decoded.pop_back();
+                self.deferred_error = Some(status);
+            }
+        }
+        self.buffered = decoded;
+        Ok(())
+    }
+}
+
+impl Stream for DataNodeArtifactStream {
+    type Item = Result<AnalyticsArtifactChunk, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.terminal {
+                return Poll::Ready(None);
+            }
+            if let Some(chunk) = self.buffered.pop_front() {
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+            if let Some(status) = self.deferred_error.take() {
+                self.terminal = true;
+                return Poll::Ready(Some(Err(status)));
+            }
+            if let Some(pending) = self.pending.as_mut() {
+                match pending.as_mut().poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok((start, values))) => {
+                        self.pending = None;
+                        if let Err(status) = self.retain_batch(start, values) {
+                            self.terminal = true;
+                            return Poll::Ready(Some(Err(status)));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Err(status)) => {
+                        self.pending = None;
+                        self.terminal = true;
+                        return Poll::Ready(Some(Err(status)));
+                    }
+                }
+            }
+            if self.next_start < self.count {
+                if let Err(status) = self.start_next_batch() {
+                    self.terminal = true;
+                    return Poll::Ready(Some(Err(status)));
+                }
+                continue;
+            }
+            self.terminal = true;
+            return Poll::Ready(None);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataOperation {
     Execute,
     Read,
     Scan,
+    PutAnalyticsArtifact,
+    PinAnalyticsArtifact,
+    GetAnalyticsArtifact,
+    ListAnalyticsArtifactGenerations,
+    ListAnalyticsArtifactGenerationHeads,
+    DeleteAnalyticsArtifact,
+    AdvanceAnalyticsArtifactFence,
     ExportSnapshot,
     InstallSnapshot,
     ReplicaStatus,
@@ -172,6 +382,33 @@ impl DataNodeGrpcService {
         Ok(status)
     }
 
+    async fn propose_until_applied(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        command: Vec<u8>,
+    ) -> Result<ProposalOutcome, Status> {
+        let mut outcome = self
+            .host
+            .propose_with_outcome(key, placement_epoch, request_id, command.clone())
+            .await;
+        while matches!(outcome, Err(HostError::ProposalPending { .. })) {
+            if unix_time_ms()? >= deadline_unix_ms {
+                return Err(Status::deadline_exceeded(
+                    "Raft proposal did not apply before request deadline",
+                ));
+            }
+            tokio::time::sleep(PROPOSAL_POLL_INTERVAL).await;
+            outcome = self
+                .host
+                .proposal_status(key, request_id, command.clone())
+                .await;
+        }
+        outcome.map_err(artifact_host_status)
+    }
+
     async fn finish_backend_migration(
         &self,
         request: FinishBackendMigrationRequest,
@@ -223,6 +460,19 @@ impl ShardService for DataNodeGrpcService {
         let request = request.into_inner();
         let (context, key, request_id) = self.validate(request.context, DataOperation::Execute)?;
         let command = CommandPayload::try_from(request.command).map_err(protocol_status)?;
+        let envelope = raft_command::CommandEnvelopeV1::decode(command.as_bytes())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if matches!(
+            envelope.body,
+            raft_command::CommandBodyV1::PutAnalyticsArtifactChunk(_)
+                | raft_command::CommandBodyV1::PinAnalyticsArtifactGeneration(_)
+                | raft_command::CommandBodyV1::DeleteAnalyticsArtifactGeneration(_)
+                | raft_command::CommandBodyV1::AdvanceAnalyticsArtifactFence(_)
+        ) {
+            return Err(Status::permission_denied(
+                "analytics artifact commands require the explicit artifact RPC",
+            ));
+        }
         self.require_leader(key).await?;
         let command = command.into_bytes();
         let mut outcome = self
@@ -263,6 +513,11 @@ impl ShardService for DataNodeGrpcService {
         }
         let keys = decode_key_read_plan(&request.plan)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if keys.iter().any(|key| key.keyspace() == Keyspace::Meta) {
+            return Err(Status::permission_denied(
+                "generic reads cannot access reserved metadata keys",
+            ));
+        }
         let values = self.host.multi_get(key, keys).await.map_err(host_status)?;
         let result = encode_key_read_result(&values)
             .map_err(|error| Status::resource_exhausted(error.to_string()))?;
@@ -270,6 +525,441 @@ impl ShardService for DataNodeGrpcService {
             applied_index: status.applied_index(),
             result,
         }))
+    }
+
+    async fn put_analytics_artifact_chunk(
+        &self,
+        request: Request<PutAnalyticsArtifactChunkRequest>,
+    ) -> Result<Response<PutAnalyticsArtifactChunkResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::PutAnalyticsArtifact)?;
+        let job_id = artifact_job_id(&request.job_id)?;
+        let kind = artifact_kind(request.kind)?;
+        if request.generation == 0 {
+            return Err(Status::invalid_argument(
+                "analytics artifact generation must be non-zero",
+            ));
+        }
+        if request.created_at_unix_ms == 0 {
+            return Err(Status::invalid_argument(
+                "analytics artifact creation time must be non-zero",
+            ));
+        }
+        let previous_digest = artifact_digest(&request.previous_digest, "previous digest")?;
+        let command = raft_command::PutAnalyticsArtifactChunkV1::new(
+            job_id,
+            kind,
+            request.generation,
+            request.created_at_unix_ms,
+            request.ordinal,
+            previous_digest,
+            request.payload,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.require_leader(key).await?;
+        let command = raft_command::CommandEnvelopeV1::new(
+            key.shard_id(),
+            context.placement_epoch(),
+            request_id,
+            raft_command::CommandBodyV1::PutAnalyticsArtifactChunk(command),
+        )
+        .encode()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .propose_until_applied(
+                key,
+                context.placement_epoch(),
+                request_id,
+                context.common().deadline_unix_ms(),
+                command,
+            )
+            .await?;
+        Ok(Response::new(PutAnalyticsArtifactChunkResponse {
+            raft_index: outcome.status().applied_index(),
+            duplicate: outcome.duplicate(),
+        }))
+    }
+
+    async fn pin_analytics_artifact_generation(
+        &self,
+        request: Request<PinAnalyticsArtifactGenerationRequest>,
+    ) -> Result<Response<PinAnalyticsArtifactGenerationResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::PinAnalyticsArtifact)?;
+        let expected_count = artifact_chunk_count(request.expected_chunk_count)?;
+        let expected_content_digest = artifact_manifest(
+            request.generation,
+            expected_count,
+            request.expected_total_bytes,
+            &request.expected_content_digest,
+        )?;
+        let command = raft_command::PinAnalyticsArtifactGenerationV1::new(
+            artifact_job_id(&request.job_id)?,
+            artifact_kind(request.kind)?,
+            request.generation,
+            u16::try_from(expected_count).map_err(|_| {
+                Status::invalid_argument("analytics artifact chunk count is out of range")
+            })?,
+            request.expected_total_bytes,
+            expected_content_digest,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.require_leader(key).await?;
+        let command = raft_command::CommandEnvelopeV1::new(
+            key.shard_id(),
+            context.placement_epoch(),
+            request_id,
+            raft_command::CommandBodyV1::PinAnalyticsArtifactGeneration(command),
+        )
+        .encode()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .propose_until_applied(
+                key,
+                context.placement_epoch(),
+                request_id,
+                context.common().deadline_unix_ms(),
+                command,
+            )
+            .await?;
+        Ok(Response::new(PinAnalyticsArtifactGenerationResponse {
+            raft_index: outcome.status().applied_index(),
+            duplicate: outcome.duplicate(),
+        }))
+    }
+
+    type GetAnalyticsArtifactGenerationStream = DataNodeArtifactStream;
+
+    async fn get_analytics_artifact_generation(
+        &self,
+        request: Request<GetAnalyticsArtifactGenerationRequest>,
+    ) -> Result<Response<Self::GetAnalyticsArtifactGenerationStream>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::GetAnalyticsArtifact)?;
+        let job_id = artifact_job_id(&request.job_id)?;
+        let kind = artifact_kind(request.kind)?;
+        let expected_count = artifact_chunk_count(request.expected_chunk_count)?;
+        let expected_content_digest = artifact_manifest(
+            request.generation,
+            expected_count,
+            request.expected_total_bytes,
+            &request.expected_content_digest,
+        )?;
+        let deadline = context.common().deadline_unix_ms();
+        let read_deadline = monotonic_deadline(deadline)?;
+        let applied_index = self
+            .host
+            .leader_read_permit(key, context.placement_epoch(), request_id, read_deadline)
+            .await
+            .map_err(artifact_host_status)?;
+        let pin_key =
+            shard_runtime::analytics_artifact_generation_pin_key(job_id, kind, request.generation);
+        let head_key =
+            shard_runtime::analytics_artifact_generation_head_key(job_id, kind, request.generation);
+        let mut records = self
+            .host
+            .multi_get(key, vec![pin_key, head_key])
+            .await
+            .map_err(artifact_host_status)?;
+        if records.len() != 2 {
+            return Err(Status::data_loss(
+                "analytics artifact pin/head read returned an invalid result count",
+            ));
+        }
+        let pin = records.remove(0).ok_or_else(|| {
+            Status::failed_precondition("analytics artifact generation is not pinned")
+        })?;
+        let pin = shard_runtime::decode_analytics_artifact_generation_pin(&pin).map_err(|_| {
+            Status::data_loss("analytics artifact generation pin failed integrity validation")
+        })?;
+        if usize::from(pin.expected_chunk_count()) != expected_count
+            || pin.expected_total_bytes() != request.expected_total_bytes
+            || pin.expected_content_digest() != expected_content_digest
+        {
+            return Err(Status::failed_precondition(
+                "analytics artifact generation pin differs from the requested manifest",
+            ));
+        }
+        let head = records
+            .pop()
+            .flatten()
+            .ok_or_else(|| Status::data_loss("analytics artifact generation has no head"))?;
+        let head =
+            shard_runtime::decode_analytics_artifact_generation_head(&head).map_err(|_| {
+                Status::data_loss("analytics artifact generation head failed integrity validation")
+            })?;
+        if usize::from(head.count()) != expected_count {
+            return Err(Status::failed_precondition(
+                "analytics artifact generation count differs from the requested count",
+            ));
+        }
+        let expected_tail_digest = head.last_digest();
+        Ok(Response::new(DataNodeArtifactStream {
+            host: Arc::clone(&self.host),
+            key,
+            job_id,
+            kind,
+            generation: request.generation,
+            count: expected_count,
+            expected_total_bytes: request.expected_total_bytes,
+            expected_content_digest,
+            expected_tail_digest,
+            applied_index,
+            deadline_unix_ms: deadline,
+            next_start: 0,
+            pending: None,
+            buffered: VecDeque::with_capacity(ARTIFACT_READ_BATCH_CHUNKS),
+            deferred_error: None,
+            previous_digest: [0; 32],
+            total_bytes: 0,
+            content_hasher: blake3::Hasher::new(),
+            terminal: false,
+        }))
+    }
+
+    async fn delete_analytics_artifact_generation(
+        &self,
+        request: Request<DeleteAnalyticsArtifactGenerationRequest>,
+    ) -> Result<Response<DeleteAnalyticsArtifactGenerationResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) =
+            self.validate(request.context, DataOperation::DeleteAnalyticsArtifact)?;
+        let command = raft_command::DeleteAnalyticsArtifactGenerationV1::new_with_gc_epoch(
+            artifact_job_id(&request.job_id)?,
+            artifact_kind(request.kind)?,
+            request.generation,
+            request.gc_epoch,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.require_leader(key).await?;
+        let command = raft_command::CommandEnvelopeV1::new(
+            key.shard_id(),
+            context.placement_epoch(),
+            request_id,
+            raft_command::CommandBodyV1::DeleteAnalyticsArtifactGeneration(command),
+        )
+        .encode()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .propose_until_applied(
+                key,
+                context.placement_epoch(),
+                request_id,
+                context.common().deadline_unix_ms(),
+                command,
+            )
+            .await?;
+        Ok(Response::new(DeleteAnalyticsArtifactGenerationResponse {
+            raft_index: outcome.status().applied_index(),
+            duplicate: outcome.duplicate(),
+        }))
+    }
+
+    async fn advance_analytics_artifact_fence(
+        &self,
+        request: Request<AdvanceAnalyticsArtifactFenceRequest>,
+    ) -> Result<Response<AdvanceAnalyticsArtifactFenceResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) = self.validate(
+            request.context,
+            DataOperation::AdvanceAnalyticsArtifactFence,
+        )?;
+        let command = raft_command::AdvanceAnalyticsArtifactFenceV1::new(
+            artifact_job_id(&request.job_id)?,
+            artifact_kind(request.kind)?,
+            request.generation,
+            request.gc_epoch,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.require_leader(key).await?;
+        let command = raft_command::CommandEnvelopeV1::new(
+            key.shard_id(),
+            context.placement_epoch(),
+            request_id,
+            raft_command::CommandBodyV1::AdvanceAnalyticsArtifactFence(command),
+        )
+        .encode()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let outcome = self
+            .propose_until_applied(
+                key,
+                context.placement_epoch(),
+                request_id,
+                context.common().deadline_unix_ms(),
+                command,
+            )
+            .await?;
+        Ok(Response::new(AdvanceAnalyticsArtifactFenceResponse {
+            raft_index: outcome.status().applied_index(),
+            duplicate: outcome.duplicate(),
+        }))
+    }
+
+    async fn list_analytics_artifact_generations(
+        &self,
+        request: Request<ListAnalyticsArtifactGenerationsRequest>,
+    ) -> Result<Response<ListAnalyticsArtifactGenerationsResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) = self.validate(
+            request.context,
+            DataOperation::ListAnalyticsArtifactGenerations,
+        )?;
+        let job_id = artifact_job_id(&request.job_id)?;
+        let kind = artifact_kind(request.kind)?;
+        let limit = usize::try_from(request.limit)
+            .map_err(|_| Status::invalid_argument("artifact generation limit is invalid"))?;
+        if !(1..=4096).contains(&limit) {
+            return Err(Status::invalid_argument(
+                "artifact generation limit must be between 1 and 4096",
+            ));
+        }
+        let deadline = monotonic_deadline(context.common().deadline_unix_ms())?;
+        let read_index = self
+            .host
+            .leader_read_permit(key, context.placement_epoch(), request_id, deadline)
+            .await
+            .map_err(artifact_host_status)?;
+        let span = KeySpan::prefix(
+            Keyspace::Meta,
+            shard_runtime::analytics_artifact_generation_head_prefix(job_id, kind),
+        )
+        .with_limit(limit)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (applied_index, observations) =
+            stable_artifact_head_scan(&self.host, key, read_index, context.placement_epoch(), span)
+                .await?;
+        let generations = observations
+            .into_iter()
+            .map(|observation| {
+                if observation.identity.job_id() != job_id || observation.identity.kind() != kind {
+                    return Err(Status::data_loss(
+                        "filtered analytics artifact scan crossed its requested prefix",
+                    ));
+                }
+                Ok(AnalyticsArtifactGeneration {
+                    job_id: request.job_id.clone(),
+                    kind: request.kind,
+                    generation: observation.identity.generation(),
+                    created_at_unix_ms: observation.head.created_at_unix_ms(),
+                    expected_chunk_count: observation
+                        .pin
+                        .map_or(u32::from(observation.head.count()), |value| {
+                            u32::from(value.expected_chunk_count())
+                        }),
+                    expected_total_bytes: observation
+                        .pin
+                        .map_or(0, |value| value.expected_total_bytes()),
+                    expected_content_digest: observation
+                        .pin
+                        .map_or_else(Vec::new, |value| value.expected_content_digest().to_vec()),
+                    pinned: observation.pin.is_some(),
+                    applied_index,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(Response::new(ListAnalyticsArtifactGenerationsResponse {
+            applied_index,
+            generations,
+        }))
+    }
+
+    async fn list_analytics_artifact_generation_heads(
+        &self,
+        request: Request<ListAnalyticsArtifactGenerationHeadsRequest>,
+    ) -> Result<Response<ListAnalyticsArtifactGenerationHeadsResponse>, Status> {
+        let request = request.into_inner();
+        let (context, key, request_id) = self.validate(
+            request.context,
+            DataOperation::ListAnalyticsArtifactGenerationHeads,
+        )?;
+        let after = request
+            .after
+            .map(|cursor| {
+                let job_id = artifact_job_id(&cursor.job_id)?;
+                let kind = artifact_kind(cursor.kind)?;
+                if cursor.generation == 0 {
+                    return Err(Status::invalid_argument(
+                        "analytics artifact generation cursor must be non-zero",
+                    ));
+                }
+                Ok((job_id, kind, cursor.generation))
+            })
+            .transpose()?;
+        let limit = usize::try_from(request.limit)
+            .map_err(|_| Status::invalid_argument("artifact generation limit is invalid"))?;
+        if !(1..=4096).contains(&limit) {
+            return Err(Status::invalid_argument(
+                "artifact generation limit must be between 1 and 4096",
+            ));
+        }
+        let deadline = monotonic_deadline(context.common().deadline_unix_ms())?;
+        let read_index = self
+            .host
+            .leader_read_permit(key, context.placement_epoch(), request_id, deadline)
+            .await
+            .map_err(artifact_host_status)?;
+        let prefix = shard_runtime::analytics_artifact_generation_heads_prefix().to_vec();
+        let span = if let Some((job_id, kind, generation)) = after {
+            let mut start =
+                shard_runtime::analytics_artifact_generation_head_key(job_id, kind, generation)
+                    .as_bytes()
+                    .to_vec();
+            start.push(0);
+            KeySpan::prefix_from(Keyspace::Meta, prefix, start)
+        } else {
+            Ok(KeySpan::prefix(Keyspace::Meta, prefix))
+        }
+        .and_then(|span| span.with_limit(limit))
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (applied_index, observations) =
+            stable_artifact_head_scan(&self.host, key, read_index, context.placement_epoch(), span)
+                .await?;
+        let full_page = observations.len() == limit;
+        let generations = observations
+            .into_iter()
+            .map(|observation| {
+                Ok(AnalyticsArtifactGeneration {
+                    job_id: observation.identity.job_id().to_be_bytes().to_vec(),
+                    kind: wire_artifact_kind(observation.identity.kind()).into(),
+                    generation: observation.identity.generation(),
+                    created_at_unix_ms: observation.head.created_at_unix_ms(),
+                    expected_chunk_count: observation
+                        .pin
+                        .map_or(u32::from(observation.head.count()), |value| {
+                            u32::from(value.expected_chunk_count())
+                        }),
+                    expected_total_bytes: observation
+                        .pin
+                        .map_or(0, |value| value.expected_total_bytes()),
+                    expected_content_digest: observation
+                        .pin
+                        .map_or_else(Vec::new, |value| value.expected_content_digest().to_vec()),
+                    pinned: observation.pin.is_some(),
+                    applied_index,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        let next = if full_page {
+            generations.last().map(|generation| {
+                cluster_protocol::proto::AnalyticsArtifactGenerationCursor {
+                    job_id: generation.job_id.clone(),
+                    kind: generation.kind,
+                    generation: generation.generation,
+                }
+            })
+        } else {
+            None
+        };
+        Ok(Response::new(
+            ListAnalyticsArtifactGenerationHeadsResponse {
+                applied_index,
+                generations,
+                next,
+            },
+        ))
     }
 
     type ScanStream = ReceiverStream<Result<ScanBatch, Status>>;
@@ -296,6 +986,11 @@ impl ShardService for DataNodeGrpcService {
         }
         let span = decode_key_scan_plan(&request.plan)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if span.keyspace() == Keyspace::Meta {
+            return Err(Status::permission_denied(
+                "generic scans cannot access reserved metadata keys",
+            ));
+        }
         let rows = self.host.scan(key, span).await.map_err(host_status)?;
         let batches = partition_scan_rows(rows, maximum_batch_bytes)
             .map_err(|error| Status::resource_exhausted(error.to_string()))?;
@@ -1340,6 +2035,7 @@ pub fn encode_key_scan_plan(span: &KeySpan) -> Result<Vec<u8>, ReadCodecError> {
         .transpose()
         .map_err(|_| ReadCodecError::ResultTooLarge)?
         .unwrap_or(0);
+    let max_bytes = span.max_bytes().unwrap_or(0);
     let mut encoded = Vec::new();
     encoded.extend_from_slice(&SCAN_PLAN_MAGIC);
     encoded.extend_from_slice(&READ_CODEC_VERSION.to_be_bytes());
@@ -1348,6 +2044,7 @@ pub fn encode_key_scan_plan(span: &KeySpan) -> Result<Vec<u8>, ReadCodecError> {
     encoded.extend_from_slice(&end_length.to_be_bytes());
     encoded.extend_from_slice(&prefix_length.to_be_bytes());
     encoded.extend_from_slice(&limit.to_be_bytes());
+    encoded.extend_from_slice(&max_bytes.to_be_bytes());
     encoded.extend_from_slice(span.start());
     if let Some(end) = span.end() {
         encoded.extend_from_slice(end);
@@ -1364,7 +2061,7 @@ pub fn encode_key_scan_plan(span: &KeySpan) -> Result<Vec<u8>, ReadCodecError> {
 
 fn decode_key_scan_plan(encoded: &[u8]) -> Result<KeySpan, ReadCodecError> {
     validate_header(encoded, SCAN_PLAN_MAGIC)?;
-    if encoded.len() < 31 || encoded.len() > MAX_SCAN_PLAN_BYTES {
+    if encoded.len() < 39 || encoded.len() > MAX_SCAN_PLAN_BYTES {
         return Err(ReadCodecError::Truncated);
     }
     let keyspace = decode_keyspace(encoded[6])?;
@@ -1379,8 +2076,9 @@ fn decode_key_scan_plan(encoded: &[u8]) -> Result<KeySpan, ReadCodecError> {
             .expect("fixed scan prefix length"),
     );
     let limit = u64::from_be_bytes(encoded[19..27].try_into().expect("fixed scan limit"));
+    let max_bytes = u64::from_be_bytes(encoded[27..35].try_into().expect("fixed scan byte limit"));
     let checksum_offset = encoded.len() - 4;
-    let mut offset = 27;
+    let mut offset = 35;
     let start = take_scan_bytes(encoded, &mut offset, start_length, checksum_offset)?;
     let end = take_optional_scan_bytes(encoded, &mut offset, end_length, checksum_offset)?;
     let prefix = take_optional_scan_bytes(encoded, &mut offset, prefix_length, checksum_offset)?;
@@ -1401,6 +2099,11 @@ fn decode_key_scan_plan(encoded: &[u8]) -> Result<KeySpan, ReadCodecError> {
     if limit != 0 {
         span = span
             .with_limit(usize::try_from(limit).map_err(|_| ReadCodecError::InvalidSpan)?)
+            .map_err(|_| ReadCodecError::InvalidSpan)?;
+    }
+    if max_bytes != 0 {
+        span = span
+            .with_max_bytes(max_bytes)
             .map_err(|_| ReadCodecError::InvalidSpan)?;
     }
     Ok(span)
@@ -1510,6 +2213,13 @@ fn encode_key_scan_batch(rows: &[KeyValue]) -> Result<Vec<u8>, ReadCodecError> {
 }
 
 pub fn decode_key_scan_batch(encoded: &[u8]) -> Result<Vec<KeyValue>, ReadCodecError> {
+    decode_key_scan_batch_bounded(encoded, u64::MAX).map(|(rows, _)| rows)
+}
+
+pub fn decode_key_scan_batch_bounded(
+    encoded: &[u8],
+    max_bytes: u64,
+) -> Result<(Vec<KeyValue>, u64), ReadCodecError> {
     validate_header(encoded, SCAN_BATCH_MAGIC)?;
     if encoded.len() > MAX_SCAN_BATCH_BYTES || encoded.len() < 14 {
         return Err(ReadCodecError::ResultTooLarge);
@@ -1524,6 +2234,7 @@ pub fn decode_key_scan_batch(encoded: &[u8]) -> Result<Vec<KeyValue>, ReadCodecE
     let checksum_offset = encoded.len() - 4;
     let mut offset = 10;
     let mut rows = Vec::with_capacity(count);
+    let mut retained = 0_u64;
     for _ in 0..count {
         if offset + 9 > checksum_offset {
             return Err(ReadCodecError::Truncated);
@@ -1539,6 +2250,20 @@ pub fn decode_key_scan_batch(encoded: &[u8]) -> Result<Vec<KeyValue>, ReadCodecE
                 .try_into()
                 .expect("bounded scan value length"),
         ) as usize;
+        let entry_bytes = u64::try_from(key_length)
+            .map_err(|_| ReadCodecError::ResultTooLarge)?
+            .checked_add(u64::try_from(value_length).map_err(|_| ReadCodecError::ResultTooLarge)?)
+            .ok_or(ReadCodecError::ResultTooLarge)?;
+        let required = retained
+            .checked_add(entry_bytes)
+            .ok_or(ReadCodecError::ResultTooLarge)?;
+        if required > max_bytes {
+            return Err(ReadCodecError::ScanByteLimit {
+                limit: max_bytes,
+                required,
+            });
+        }
+        retained = required;
         offset += 9;
         let key = take_scan_bytes(encoded, &mut offset, key_length, checksum_offset)?;
         let value = take_scan_bytes(encoded, &mut offset, value_length, checksum_offset)?;
@@ -1547,7 +2272,7 @@ pub fn decode_key_scan_batch(encoded: &[u8]) -> Result<Vec<KeyValue>, ReadCodecE
     if offset != checksum_offset {
         return Err(ReadCodecError::TrailingBytes);
     }
-    Ok(rows)
+    Ok((rows, retained))
 }
 
 fn decode_keyspace(tag: u8) -> Result<Keyspace, ReadCodecError> {
@@ -1595,6 +2320,7 @@ pub enum ReadCodecError {
     Truncated,
     TrailingBytes,
     ResultTooLarge,
+    ScanByteLimit { limit: u64, required: u64 },
     InvalidSpan,
     TooManyRows { actual: usize },
 }
@@ -1619,6 +2345,10 @@ impl Display for ReadCodecError {
                 formatter.write_str("read codec payload contains trailing bytes")
             }
             Self::ResultTooLarge => formatter.write_str("read result exceeds its size limit"),
+            Self::ScanByteLimit { limit, required } => write!(
+                formatter,
+                "scan requires {required} bytes, exceeding byte limit {limit}"
+            ),
             Self::InvalidSpan => formatter.write_str("invalid scan key span"),
             Self::TooManyRows { actual } => write!(formatter, "scan has too many rows: {actual}"),
         }
@@ -1633,6 +2363,13 @@ fn unix_time_ms() -> Result<u64, Status> {
         .map_err(|_| Status::internal("system clock is before the Unix epoch"))?
         .as_millis();
     u64::try_from(millis).map_err(|_| Status::internal("system clock overflow"))
+}
+
+fn monotonic_deadline(deadline_unix_ms: u64) -> Result<tokio::time::Instant, Status> {
+    let remaining = deadline_unix_ms
+        .checked_sub(unix_time_ms()?)
+        .ok_or_else(|| Status::deadline_exceeded("request deadline has expired"))?;
+    Ok(tokio::time::Instant::now() + Duration::from_millis(remaining))
 }
 
 fn validate_identifier(identifier: &[u8], name: &str) -> Result<(), Status> {
@@ -1747,6 +2484,198 @@ fn protocol_status(error: ProtocolError) -> Status {
     }
 }
 
+fn artifact_job_id(value: &[u8]) -> Result<u128, Status> {
+    let bytes: [u8; 16] = value
+        .try_into()
+        .map_err(|_| Status::invalid_argument("analytics artifact job ID must contain 16 bytes"))?;
+    let job_id = u128::from_be_bytes(bytes);
+    if job_id == 0 {
+        return Err(Status::invalid_argument(
+            "analytics artifact job ID must be non-zero",
+        ));
+    }
+    Ok(job_id)
+}
+
+fn artifact_kind(value: i32) -> Result<raft_command::AnalyticsArtifactKindV1, Status> {
+    match WireArtifactKind::try_from(value) {
+        Ok(WireArtifactKind::Checkpoint) => Ok(raft_command::AnalyticsArtifactKindV1::Checkpoint),
+        Ok(WireArtifactKind::Result) => Ok(raft_command::AnalyticsArtifactKindV1::Result),
+        _ => Err(Status::invalid_argument(
+            "analytics artifact kind is invalid",
+        )),
+    }
+}
+
+fn wire_artifact_kind(kind: raft_command::AnalyticsArtifactKindV1) -> WireArtifactKind {
+    match kind {
+        raft_command::AnalyticsArtifactKindV1::Checkpoint => WireArtifactKind::Checkpoint,
+        raft_command::AnalyticsArtifactKindV1::Result => WireArtifactKind::Result,
+    }
+}
+
+fn artifact_digest(value: &[u8], name: &'static str) -> Result<[u8; 32], Status> {
+    value.try_into().map_err(|_| {
+        Status::invalid_argument(format!("analytics artifact {name} must contain 32 bytes"))
+    })
+}
+
+fn artifact_chunk_count(value: u32) -> Result<usize, Status> {
+    let count = usize::try_from(value)
+        .map_err(|_| Status::invalid_argument("analytics artifact chunk count is out of range"))?;
+    if count == 0 || count > usize::from(shard_runtime::MAX_ANALYTICS_ARTIFACT_CHUNKS) {
+        return Err(Status::invalid_argument(
+            "analytics artifact chunk count must be between 1 and 4096",
+        ));
+    }
+    Ok(count)
+}
+
+async fn stable_artifact_head_scan(
+    host: &DataNodeHost,
+    key: ReplicaKey,
+    read_index: u64,
+    placement_epoch: u64,
+    span: KeySpan,
+) -> Result<(u64, Vec<StableArtifactHeadObservation>), Status> {
+    let baseline = host
+        .status(key)
+        .await
+        .map_err(artifact_snapshot_status_turn)?;
+    let rows = host.scan(key, span).await.map_err(artifact_host_status)?;
+    let mut heads = Vec::with_capacity(rows.len());
+    let mut pin_keys = Vec::with_capacity(rows.len());
+    for row in rows {
+        let identity =
+            shard_runtime::decode_analytics_artifact_generation_head_identity(row.key().as_bytes())
+                .map_err(|_| Status::data_loss("analytics artifact head key failed validation"))?;
+        let head = shard_runtime::decode_analytics_artifact_generation_head(row.value())
+            .map_err(|_| Status::data_loss("analytics artifact head failed validation"))?;
+        pin_keys.push(shard_runtime::analytics_artifact_generation_pin_key(
+            identity.job_id(),
+            identity.kind(),
+            identity.generation(),
+        ));
+        heads.push((identity, head));
+    }
+    let pins = host
+        .multi_get(key, pin_keys)
+        .await
+        .map_err(artifact_host_status)?;
+    let final_status = host
+        .status(key)
+        .await
+        .map_err(artifact_snapshot_status_turn)?;
+    let applied_index =
+        stable_artifact_snapshot_index(read_index, placement_epoch, baseline, final_status)?;
+    if pins.len() != heads.len() {
+        return Err(Status::data_loss(
+            "analytics artifact generation pin scan returned an invalid result count",
+        ));
+    }
+    let observations = heads
+        .into_iter()
+        .zip(pins)
+        .map(|((identity, head), pin)| {
+            let pin = pin
+                .map(|bytes| {
+                    shard_runtime::decode_analytics_artifact_generation_pin(&bytes).map_err(|_| {
+                        Status::data_loss("analytics artifact generation pin failed validation")
+                    })
+                })
+                .transpose()?;
+            if pin.is_some_and(|pin| pin.expected_chunk_count() != head.count()) {
+                return Err(Status::data_loss(
+                    "analytics artifact generation pin disagrees with its head",
+                ));
+            }
+            Ok(StableArtifactHeadObservation {
+                identity,
+                head,
+                pin,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok((applied_index, observations))
+}
+
+fn stable_artifact_snapshot_index(
+    read_index: u64,
+    placement_epoch: u64,
+    baseline: ReplicaStatus,
+    final_status: ReplicaStatus,
+) -> Result<u64, Status> {
+    let baseline_is_current_leader = baseline.is_leader()
+        && baseline.leader_id() == Some(baseline.node_id())
+        && baseline.placement_epoch() == placement_epoch
+        && baseline.applied_index() >= read_index
+        && read_index != 0;
+    let stable = baseline.graph_id() == final_status.graph_id()
+        && baseline.shard_id() == final_status.shard_id()
+        && baseline.node_id() == final_status.node_id()
+        && baseline.is_leader() == final_status.is_leader()
+        && baseline.leader_id() == final_status.leader_id()
+        && baseline.term() == final_status.term()
+        && baseline.placement_epoch() == final_status.placement_epoch()
+        && baseline.applied_index() == final_status.applied_index();
+    if !baseline_is_current_leader || !stable {
+        return Err(Status::aborted(
+            "analytics artifact snapshot changed during discovery; retry the request",
+        ));
+    }
+    Ok(baseline.applied_index())
+}
+
+fn artifact_snapshot_status_turn(error: HostError) -> Status {
+    let status = artifact_host_status(error);
+    match status.code() {
+        Code::DeadlineExceeded | Code::Unavailable | Code::ResourceExhausted => status,
+        _ => Status::aborted("analytics artifact snapshot status turn could not be completed"),
+    }
+}
+
+fn artifact_manifest(
+    generation: u64,
+    expected_count: usize,
+    expected_total_bytes: u64,
+    expected_content_digest: &[u8],
+) -> Result<[u8; 32], Status> {
+    let expected_content_digest = artifact_digest(expected_content_digest, "content digest")?;
+    let count = u64::try_from(expected_count)
+        .map_err(|_| Status::invalid_argument("analytics artifact chunk count is out of range"))?;
+    let maximum_total_bytes = count
+        .checked_mul(
+            u64::try_from(raft_command::MAX_ANALYTICS_ARTIFACT_CHUNK_BYTES)
+                .expect("artifact chunk limit fits in u64"),
+        )
+        .ok_or_else(|| Status::invalid_argument("analytics artifact byte limit overflow"))?;
+    if generation == 0
+        || expected_total_bytes < count
+        || expected_total_bytes > maximum_total_bytes
+        || expected_content_digest == [0; 32]
+    {
+        return Err(Status::invalid_argument(
+            "analytics artifact manifest bounds or digest are invalid",
+        ));
+    }
+    Ok(expected_content_digest)
+}
+
+fn artifact_host_status(error: HostError) -> Status {
+    match &error {
+        HostError::DurableReplica(message) if message.contains("corrupt analytics artifact") => {
+            Status::data_loss("analytics artifact failed integrity validation")
+        }
+        HostError::DurableReplica(message)
+            if message.contains("analytics artifact generation")
+                || message.contains("analytics artifact chunk conflicts") =>
+        {
+            Status::failed_precondition(message.clone())
+        }
+        _ => host_status(error),
+    }
+}
+
 fn host_status(error: HostError) -> Status {
     match error {
         HostError::UnknownReplica { .. } => Status::not_found(error.to_string()),
@@ -1754,8 +2683,17 @@ fn host_status(error: HostError) -> Status {
         HostError::Overloaded { .. } | HostError::OutboundOverloaded => {
             resource_exhausted_status(error.to_string())
         }
+        HostError::ScanByteLimit { limit, required } => scan_byte_limit_status(limit, required),
         HostError::RequestEnvelopeMismatch { .. } => Status::invalid_argument(error.to_string()),
         HostError::RequestMismatch { .. } => Status::already_exists(error.to_string()),
+        HostError::InvalidReadContext => Status::invalid_argument(error.to_string()),
+        HostError::DuplicateReadContext { .. } => Status::already_exists(error.to_string()),
+        HostError::ReadBarrierDeadline { .. } => Status::deadline_exceeded(error.to_string()),
+        HostError::ReadBarrierLimit => resource_exhausted_status(error.to_string()),
+        HostError::ReadBarrierUnavailable { .. } | HostError::ReadBarrierContextExhausted => {
+            Status::unavailable(error.to_string())
+        }
+        HostError::AdapterUnavailable(_) => Status::unavailable(error.to_string()),
         HostError::ReplicaNotReady { .. } => Status::failed_precondition(error.to_string()),
         HostError::NotLeader { leader_id } => not_leader_status(leader_id),
         HostError::MembershipConflict => Status::failed_precondition(error.to_string()),
@@ -1802,4 +2740,118 @@ fn resource_exhausted_status(message: String) -> Status {
         MetadataValue::from_static("resource_exhausted"),
     );
     status
+}
+
+fn scan_byte_limit_status(limit: u64, required: u64) -> Status {
+    let mut status = Status::resource_exhausted(format!(
+        "scan requires {required} bytes, exceeding byte limit {limit}"
+    ));
+    status.metadata_mut().insert(
+        "dtgproxy-reason",
+        MetadataValue::from_static("scan_byte_limit"),
+    );
+    if let Ok(value) = MetadataValue::try_from(limit.to_string()) {
+        status.metadata_mut().insert("dtgproxy-scan-limit", value);
+    }
+    if let Ok(value) = MetadataValue::try_from(required.to_string()) {
+        status
+            .metadata_mut()
+            .insert("dtgproxy-scan-required", value);
+    }
+    status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replica_status(
+        placement_epoch: u64,
+        leader: bool,
+        leader_id: Option<u64>,
+        term: u64,
+        applied_index: u64,
+    ) -> ReplicaStatus {
+        ReplicaStatus::new(
+            1,
+            11,
+            placement_epoch,
+            7,
+            leader,
+            leader_id,
+            term,
+            applied_index,
+            applied_index,
+            ReplicaRole::Voter,
+            1,
+            1,
+            0,
+            true,
+        )
+    }
+
+    #[test]
+    fn durable_read_index_capacity_maps_to_resource_exhausted() {
+        let host_error = HostError::from_durable(
+            shard_runtime::DurableReplicaError::TooManyPendingReadIndexRequests,
+        );
+        assert_eq!(host_error, HostError::ReadBarrierLimit);
+
+        let status = host_status(host_error);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            status.metadata().get("dtgproxy-reason").unwrap(),
+            "resource_exhausted"
+        );
+    }
+
+    #[test]
+    fn adapter_unavailable_maps_to_retryable_transport_status() {
+        let host_error = HostError::from_adapter(storage_api::AdapterError::Unavailable(
+            "backend restart".into(),
+        ));
+
+        let status = host_status(host_error);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn artifact_snapshot_status_fence_accepts_only_one_stable_leader_state() {
+        let stable = replica_status(3, true, Some(7), 5, 12);
+        assert_eq!(
+            stable_artifact_snapshot_index(10, 3, stable, stable).unwrap(),
+            12
+        );
+
+        for final_status in [
+            replica_status(3, true, Some(7), 6, 12),
+            replica_status(3, false, Some(8), 5, 12),
+            replica_status(4, true, Some(7), 5, 12),
+            replica_status(3, true, Some(7), 5, 13),
+        ] {
+            assert_eq!(
+                stable_artifact_snapshot_index(10, 3, stable, final_status)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Aborted
+            );
+        }
+        assert_eq!(
+            stable_artifact_snapshot_index(13, 3, stable, stable)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        let wrong_epoch = replica_status(4, true, Some(7), 5, 12);
+        assert_eq!(
+            stable_artifact_snapshot_index(10, 3, wrong_epoch, wrong_epoch)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        assert_eq!(
+            artifact_snapshot_status_turn(HostError::ActorStopped).code(),
+            tonic::Code::Unavailable
+        );
+    }
 }

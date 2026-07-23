@@ -1,46 +1,73 @@
-# DTGProxy PostgreSQL Adapter
+# DTGProxy PostgreSQL Native Temporal Mapping
 
-Status: the Rust Adapter, Factory restore path, and loopback Sidecar executable are implemented. Static SQL/secret-boundary tests pass. Live PostgreSQL tests and cross-backend RocksDB↔PostgreSQL migration tests compile but are deliberately ignored because this development machine has neither a PostgreSQL server nor a running Docker daemon. This backend is not yet certified for release.
+Status: the PostgreSQL native `TemporalBackendMapping` is implemented and has passed the shared
+Mapping TCK against a disposable PostgreSQL 17 instance. Real-instance tests are ordinary tests,
+not `#[ignore]`. The full PostgreSQL × deployment-mode Temporal Cypher/transaction/analytics
+matrix is also certified by the current three-backend CI workflow; this document separates the
+native Mapping evidence from the distributed deployment evidence recorded in
+`.superpowers/sdd/progress.md`.
 
-## Correctness layout
+## Native correctness layout
 
-The Adapter owns the static `dtgproxy` schema. User data never becomes SQL identifiers or SQL text.
+The Mapping owns one static `dtgproxy` schema. There is no `canonical_kv` shadow table.
 
-- `schema_meta` fences the global Adapter schema version.
-- `adapter_instance` owns one instance ID and its 8-byte unsigned `applied_log_index`.
-- `canonical_kv` stores `(instance_id, keyspace, logical_key, value)` with `BYTEA` keys and values and a primary-key B-tree in canonical order.
-- committed-log fingerprints, mutation fingerprints, Replica metadata, bitemporal records, both adjacency directions, and transaction records use the same reserved logical keys as RocksDB.
+- `schema_meta` stores the sole current Mapping name, version and 32-byte schema fingerprint.
+- `adapter_instance` fences one instance ID, Mapping fingerprint, publication state and durable
+  `applied_log_index`.
+- `vertex_identity` and `edge_identity` store stable graph identities and edge endpoints.
+- `vertex_current` and `edge_current` store current bitemporal projections.
+- `history` stores vertex/edge transaction-time entries and their valid-time changes.
+- `out_adjacency` and `in_adjacency` preserve local and cross-partition adjacency layouts.
+- `opaque_records` stores only non-graph Meta, TemporalIndex and transaction-protocol records.
+- `replay_log` and `replay_mutation` store deterministic idempotency fingerprints.
 
-An apply obtains the instance control row with `FOR UPDATE`, validates contiguous/replayed log position and mutation fingerprints, applies every put/delete, writes replay metadata and the canonical applied-index key, then updates the control row in one `SERIALIZABLE` transaction. `SET LOCAL synchronous_commit = on` is issued before mutation. The descriptor reports synchronous durability only when the connected server reports `fsync=on`; otherwise the managed-replica capability gate rejects startup. PostgreSQL documents that `synchronous_commit=on` includes a local durable commit and that `fsync=off` prevents WAL updates from being forced. [PostgreSQL WAL configuration](https://www.postgresql.org/docs/current/runtime-config-wal.html)
+Unsigned canonical identifiers remain fixed-width, big-endian `BYTEA` columns, so every native row
+can be converted back through the core temporal codec. Identity records are rebuilt from typed
+columns; current, history and adjacency payload records are validated by their current canonical
+record codecs. Export reconstructs exact `(keyspace, logical_key, value)` bytes and sorts them by
+canonical key order before chunking.
 
-Reads use one `REPEATABLE READ READ ONLY` transaction per multi-get or scan. PostgreSQL documents that all statements in such a transaction see the same snapshot. [PostgreSQL transaction modes](https://www.postgresql.org/docs/current/sql-set-transaction.html) `BYTEA` is used because binary-string operations process the actual bytes rather than locale-dependent characters. [PostgreSQL binary data](https://www.postgresql.org/docs/current/datatype-binary.html)
+## Atomic apply and recovery
 
-## Process and connection safety
+The factory declares `postgresql-native-temporal/1.0.0` and returns a `MappingBackedAdapter`.
+Factory and opened-instance Mapping descriptors must match exactly. Unknown name/version,
+fingerprint drift, `fsync=off`, unpublished state or writer-lease conflict fails startup.
 
-- A stable two-key session advisory lock makes one Sidecar the only DTGProxy writer for an instance ID. Lock collision fails closed.
-- A separate global advisory lock serializes first-time DDL and schema-version checks.
-- The fixed connection pool is bounded to 1..=128 connections.
-- Every connection sets a 30-second statement timeout, 10-second lock timeout, and 60-second idle-in-transaction timeout.
-- Connection strings enter the Factory only as `SecretString`; the Sidecar reads `DTGPROXY_POSTGRES_URL` and never prints it.
-- The current driver uses `NoTls`; consequently the Sidecar executable rejects non-loopback listeners. Database TLS and authenticated Sidecar transport remain release gates.
+`prepare` validates the committed batch and stages no database-visible writes. `apply` marks the
+prepared operation ready without publishing it. `commit` obtains the instance control row with
+`FOR UPDATE`, validates contiguous/replayed log position and mutation fingerprints, applies every
+native put/delete, writes replay state and advances the applied index in one `SERIALIZABLE`
+transaction with `synchronous_commit=on`. `abort` publishes nothing.
 
-## Logical migration
+Reads use one `REPEATABLE READ READ ONLY` transaction. Restore writes chunks only into a leased
+`published=false` instance, verifies the canonical manifest, then atomically publishes the target
+frontier. Failed or abandoned restore removes that target namespace; ordinary serving open never
+exposes it.
 
-PostgreSQL exports all canonical rows from one long-lived `REPEATABLE READ` transaction in bounded, globally ordered chunks. Export queries use a streaming row iterator and enforce the chunk byte budget before retaining each row; concurrent export sessions are capped at `pool_size` and release their permit on drop. Restore creates a newly leased instance namespace with `published=false`, idempotently writes chunks, verifies the final BLAKE3 manifest, and commits the canonical/control applied index together with `published=true` only at the end. Ordinary open rejects an unpublished namespace, so a process crash cannot expose partial restore data. A later restore that obtains the same advisory lease reclaims an unpublished crash residue and restarts from an empty namespace; dropping a failed in-process restore deletes only that target namespace. The Registry validates the restore session's stable target descriptor before consuming data or allowing `finish` to publish it.
+## Real-instance certification
 
-The ignored live tests cover:
+The non-ignored live suite covers:
 
-- atomic apply, exact replay, multi-get, prefix scan, lease exclusion, restart, export, restore, and continued log apply;
-- PostgreSQL→PostgreSQL logical restore;
-- RocksDB→PostgreSQL and PostgreSQL→RocksDB byte-preserving migration.
+- Mapping `prepare/apply/commit/abort`, exact replay, replay mismatch and non-contiguous index;
+- canonical multi-get, ordered scan, delete/history retention and failed-batch invisibility;
+- native vertex, edge, current, history and cross-partition in/out adjacency rows;
+- PostgreSQL restart, canonical export/restore and continued writes;
+- RocksDB → PostgreSQL and PostgreSQL → RocksDB canonical migration.
 
-Run against a disposable database whose role can create the `dtgproxy` schema:
+Run the self-contained local launcher. It uses an explicit `DTGPROXY_POSTGRES_URL` when supplied;
+otherwise it creates a temporary SCRAM-authenticated local PostgreSQL cluster and removes it on
+exit:
 
 ```bash
-DTGPROXY_POSTGRES_URL='host=127.0.0.1 user=dtgproxy password=... dbname=dtgproxy' \
-CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib \
-cargo test -p adapter-postgres --test live_postgres -- --ignored
+./scripts/test-postgres-live.sh
 ```
 
-The loopback Sidecar requires `DTGPROXY_POSTGRES_URL` and `DTGPROXY_INSTANCE_ID`; optional variables are `DTGPROXY_LISTEN` (default `127.0.0.1:9711`) and `DTGPROXY_POSTGRES_POOL_SIZE` (default 8). The current Sidecar wire serves describe/apply/read/scan/health. Logical export/restore sessions must be added to the versioned wire before remote hot migration is considered complete.
+CI runs the same package against a disposable PostgreSQL 17 service in
+`.github/workflows/postgres-mapping.yml`. Missing PostgreSQL infrastructure is a test failure, not
+a successful skip.
+
+The loopback Sidecar requires `DTGPROXY_POSTGRES_URL` and `DTGPROXY_INSTANCE_ID`; optional
+variables are `DTGPROXY_LISTEN` (default `127.0.0.1:9711`) and
+`DTGPROXY_POSTGRES_POOL_SIZE` (default 8). The current Sidecar wire serves
+describe/apply/read/scan/health. Stateful remote export/restore remains a separate Sidecar protocol
+gate and does not weaken the in-process Mapping certification above.

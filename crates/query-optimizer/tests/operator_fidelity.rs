@@ -1,7 +1,7 @@
 use cypher_compiler::{CompileSession, CypherCompiler};
 use physical_plan::PhysicalOperator;
 use query_optimizer::{DeploymentMode, Optimizer, OptimizerContext};
-use temporal_ir::v2::LogicalOperator;
+use temporal_ir::LogicalOperator;
 
 #[test]
 fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
@@ -66,12 +66,16 @@ fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
                 LogicalOperator::Project { expressions },
                 PhysicalOperator::Project {
                     expressions: actual_expressions,
+                    output,
                 },
-            ) => assert_eq!(actual_expressions, expressions),
+            ) => {
+                assert_eq!(actual_expressions, expressions);
+                assert_eq!(output, logical.output());
+            }
             (LogicalOperator::Filter { predicate }, PhysicalOperator::Filter(actual)) => {
                 assert_eq!(actual, predicate);
             }
-            (LogicalOperator::Argument, PhysicalOperator::Argument) => {}
+            (LogicalOperator::Argument, PhysicalOperator::Argument { .. }) => {}
             (
                 LogicalOperator::TemporalSlice {
                     valid_time,
@@ -88,4 +92,38 @@ fn physical_plan_preserves_slots_and_expressions_from_logical_plan() {
             (logical, physical) => panic!("operator lost information: {logical:?} -> {physical:?}"),
         }
     }
+}
+
+#[test]
+fn batch_subtransaction_remains_a_distinct_physical_boundary() {
+    let logical = CypherCompiler::new()
+        .compile(
+            "UNWIND [1, 2, 3] AS value \
+             CALL (value) { CREATE (:Item {id: value}) } \
+             IN TRANSACTIONS OF 2 ROWS",
+            &CompileSession::new("accounts", 7, 3, 11).expect("session"),
+        )
+        .expect("compile batch subtransaction")
+        .logical_plan()
+        .clone();
+    let optimized = Optimizer::new()
+        .optimize(
+            &logical,
+            OptimizerContext::new(DeploymentMode::SharedNothing, 2, 64 << 20, 256 << 20)
+                .expect("context"),
+        )
+        .expect("optimize batch subtransaction");
+
+    optimized.plan().validate().expect("physical batch plan");
+    let batches = optimized
+        .plan()
+        .fragments()
+        .iter()
+        .flat_map(|fragment| fragment.operators())
+        .filter_map(|operator| match operator {
+            PhysicalOperator::BatchSubtransaction { batch_rows, .. } => Some(*batch_rows),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(batches, vec![2]);
 }

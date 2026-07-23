@@ -10,6 +10,7 @@ blake3 = "=1.8.5"
 cypher-ast = { path = "../cypher-ast" }
 cypher-sema = { path = "../cypher-sema" }
 cypher-syntax = { path = "../cypher-syntax" }
+procedure-runtime = { path = "../procedure-runtime" }
 temporal-ir = { path = "../temporal-ir" }
 temporal-types = { path = "../temporal-types" }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -7,6 +8,7 @@ use shard_runtime::DurableRaftReplica;
 use storage_api::{AdapterRequirement, KeySpan, KeyValue, LogicalKey, StorageAdapter};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::{
     BackendManager, BackendProfile, BackendSlotState, HostError, ProposalOutcome, ReplicaSpec,
@@ -14,6 +16,18 @@ use crate::{
 };
 
 const MAX_READY_ROUNDS: usize = 256;
+const MAX_PENDING_READ_BARRIERS: usize = 1_024;
+
+struct PendingReadBarrier {
+    request_id: u128,
+    placement_epoch: u64,
+    leader_id: u64,
+    term: u64,
+    deadline: Instant,
+    submitted: bool,
+    read_index: Option<u64>,
+    response: oneshot::Sender<Result<u64, HostError>>,
+}
 
 pub(crate) struct ReplicaActorHandle {
     pub(crate) spec: ReplicaSpec,
@@ -137,6 +151,12 @@ pub(crate) enum ActorCommand {
         command: Vec<u8>,
         response: oneshot::Sender<Result<ProposalOutcome, HostError>>,
     },
+    LeaderReadPermit {
+        placement_epoch: u64,
+        request_id: u128,
+        deadline: Instant,
+        response: oneshot::Sender<Result<u64, HostError>>,
+    },
     Step {
         message: Box<Message>,
         response: oneshot::Sender<Result<ReplicaStatus, HostError>>,
@@ -189,7 +209,34 @@ async fn run_actor(
     mut receiver: mpsc::Receiver<ActorCommand>,
     outbound: mpsc::Sender<Message>,
 ) -> Result<(), HostError> {
-    while let Some(command) = receiver.recv().await {
+    let mut pending_read_barriers = BTreeMap::new();
+    let mut next_read_sequence = 1_u64;
+    loop {
+        settle_read_barriers(&mut replica, &mut pending_read_barriers);
+        let command = if let Some(deadline) = pending_read_barriers
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+        {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => {
+                    settle_read_barriers(&mut replica, &mut pending_read_barriers);
+                    continue;
+                }
+                command = receiver.recv() => command,
+            }
+        } else {
+            receiver.recv().await
+        };
+        let Some(command) = command else {
+            fail_all_read_barriers(
+                &mut replica,
+                &mut pending_read_barriers,
+                HostError::ActorStopped,
+            );
+            return Ok(());
+        };
         match command {
             ActorCommand::PrepareBackendTarget {
                 placement_epoch,
@@ -212,9 +259,14 @@ async fn run_actor(
             }
             ActorCommand::Campaign(response) => {
                 let result = match replica.campaign() {
-                    Ok(()) => drive_ready(&mut replica, &outbound, &mut spec)
-                        .await
-                        .map(|()| status(&replica, &spec)),
+                    Ok(()) => drive_ready(
+                        &mut replica,
+                        &outbound,
+                        &mut spec,
+                        &mut pending_read_barriers,
+                    )
+                    .await
+                    .map(|()| status(&replica, &spec)),
                     Err(error) => Err(HostError::from_durable(error)),
                 };
                 let _ = response.send(result);
@@ -231,7 +283,14 @@ async fn run_actor(
                 {
                     Ok(true) => Ok(ProposalOutcome::new(status(&replica, &spec), true)),
                     Ok(false) => match replica.propose(request_id, command.clone()) {
-                        Ok(()) => match drive_ready(&mut replica, &outbound, &mut spec).await {
+                        Ok(()) => match drive_ready(
+                            &mut replica,
+                            &outbound,
+                            &mut spec,
+                            &mut pending_read_barriers,
+                        )
+                        .await
+                        {
                             Ok(()) => match replica
                                 .state_machine()
                                 .request_replay(request_id, &command)
@@ -267,18 +326,103 @@ async fn run_actor(
                 };
                 let _ = response.send(result);
             }
+            ActorCommand::LeaderReadPermit {
+                placement_epoch,
+                request_id,
+                deadline,
+                response,
+            } => {
+                if request_id == 0 {
+                    let _ = response.send(Err(HostError::InvalidReadContext));
+                    continue;
+                }
+                if deadline <= Instant::now() {
+                    let _ = response.send(Err(HostError::ReadBarrierDeadline { request_id }));
+                    continue;
+                }
+                let authoritative_epoch = replica.metadata().placement_epoch;
+                if placement_epoch != authoritative_epoch {
+                    let _ = response.send(Err(HostError::StaleEpoch {
+                        expected: authoritative_epoch,
+                        actual: placement_epoch,
+                    }));
+                    continue;
+                }
+                if pending_read_barriers
+                    .values()
+                    .any(|pending| pending.request_id == request_id)
+                {
+                    let _ = response.send(Err(HostError::DuplicateReadContext { request_id }));
+                    continue;
+                }
+                if pending_read_barriers.len() >= MAX_PENDING_READ_BARRIERS {
+                    let _ = response.send(Err(HostError::ReadBarrierLimit));
+                    continue;
+                }
+                let Some(leader_id) = replica.leader_id().filter(|_| replica.is_leader()) else {
+                    let _ = response.send(Err(HostError::NotLeader {
+                        leader_id: replica.leader_id(),
+                    }));
+                    continue;
+                };
+                let sequence = next_read_sequence;
+                let Some(incremented) = next_read_sequence.checked_add(1) else {
+                    let _ = response.send(Err(HostError::ReadBarrierContextExhausted));
+                    continue;
+                };
+                next_read_sequence = incremented;
+                let context =
+                    read_index_context(spec.shard_id(), authoritative_epoch, request_id, sequence);
+                let term = replica.current_term();
+                pending_read_barriers.insert(
+                    context.clone(),
+                    PendingReadBarrier {
+                        request_id,
+                        placement_epoch,
+                        leader_id,
+                        term,
+                        deadline,
+                        submitted: false,
+                        read_index: None,
+                        response,
+                    },
+                );
+                if let Err(error) = drive_ready(
+                    &mut replica,
+                    &outbound,
+                    &mut spec,
+                    &mut pending_read_barriers,
+                )
+                .await
+                    && let Some(pending) = pending_read_barriers.remove(&context)
+                {
+                    replica.cancel_read_index(&context);
+                    let _ = pending.response.send(Err(error));
+                }
+            }
             ActorCommand::Step { message, response } => {
                 let result = match replica.step(*message) {
-                    Ok(()) => drive_ready(&mut replica, &outbound, &mut spec)
-                        .await
-                        .map(|()| status(&replica, &spec)),
+                    Ok(()) => drive_ready(
+                        &mut replica,
+                        &outbound,
+                        &mut spec,
+                        &mut pending_read_barriers,
+                    )
+                    .await
+                    .map(|()| status(&replica, &spec)),
                     Err(error) => Err(HostError::from_durable(error)),
                 };
                 let _ = response.send(result);
             }
             ActorCommand::Tick => {
                 replica.tick();
-                drive_ready(&mut replica, &outbound, &mut spec).await?;
+                drive_ready(
+                    &mut replica,
+                    &outbound,
+                    &mut spec,
+                    &mut pending_read_barriers,
+                )
+                .await?;
             }
             ActorCommand::Status(response) => {
                 let _ = response.send(Ok(status(&replica, &spec)));
@@ -295,7 +439,7 @@ async fn run_actor(
                     .adapter()
                     .multi_get(&keys)
                     .await
-                    .map_err(|error| HostError::Adapter(error.to_string()));
+                    .map_err(HostError::from_adapter);
                 let _ = response.send(result);
             }
             ActorCommand::Scan { span, response } => {
@@ -303,7 +447,7 @@ async fn run_actor(
                     .adapter()
                     .scan(&span)
                     .await
-                    .map_err(|error| HostError::Adapter(error.to_string()));
+                    .map_err(HostError::from_adapter);
                 let _ = response.send(result);
             }
             ActorCommand::CreateSnapshot {
@@ -352,7 +496,14 @@ async fn run_actor(
                         } else {
                             match replica.leave_joint_membership(operation_id) {
                                 Ok(()) => {
-                                    match drive_ready(&mut replica, &outbound, &mut spec).await {
+                                    match drive_ready(
+                                        &mut replica,
+                                        &outbound,
+                                        &mut spec,
+                                        &mut pending_read_barriers,
+                                    )
+                                    .await
+                                    {
                                         Ok(()) => match replica.membership() {
                                             Ok(final_state)
                                                 if final_state.voters_outgoing.is_empty()
@@ -376,7 +527,14 @@ async fn run_actor(
                     }
                     Ok(_) => {
                         match replica.propose_membership(operation_id, &new_voters, &learners) {
-                            Ok(_) => match drive_ready(&mut replica, &outbound, &mut spec).await {
+                            Ok(_) => match drive_ready(
+                                &mut replica,
+                                &outbound,
+                                &mut spec,
+                                &mut pending_read_barriers,
+                            )
+                            .await
+                            {
                                 Ok(()) => match replica.membership() {
                                     Ok(current)
                                         if current.voters == new_voters
@@ -433,19 +591,30 @@ async fn run_actor(
                 let _ = response.send(Ok(status(&replica, &spec)));
             }
             ActorCommand::Shutdown(response) => {
-                let result = drive_ready(&mut replica, &outbound, &mut spec).await;
+                fail_all_read_barriers(
+                    &mut replica,
+                    &mut pending_read_barriers,
+                    HostError::ActorStopped,
+                );
+                let result = drive_ready(
+                    &mut replica,
+                    &outbound,
+                    &mut spec,
+                    &mut pending_read_barriers,
+                )
+                .await;
                 let _ = response.send(result);
                 return Ok(());
             }
         }
     }
-    Ok(())
 }
 
 async fn drive_ready(
     replica: &mut DurableRaftReplica,
     outbound: &mpsc::Sender<Message>,
     spec: &mut ReplicaSpec,
+    pending_read_barriers: &mut BTreeMap<Vec<u8>, PendingReadBarrier>,
 ) -> Result<(), HostError> {
     for _ in 0..MAX_READY_ROUNDS {
         if !replica.has_ready() {
@@ -453,6 +622,10 @@ async fn drive_ready(
                 replica.metadata(),
                 replica.backend_slot().migration_status(),
             )?;
+            settle_read_barriers(replica, pending_read_barriers);
+            if replica.has_ready() {
+                continue;
+            }
             return Ok(());
         }
         let messages = replica
@@ -465,8 +638,125 @@ async fn drive_ready(
                 mpsc::error::TrySendError::Closed(_) => HostError::ActorStopped,
             })?;
         }
+        settle_read_barriers(replica, pending_read_barriers);
     }
     Err(HostError::ReadyLoopLimit)
+}
+
+fn settle_read_barriers(
+    replica: &mut DurableRaftReplica,
+    pending: &mut BTreeMap<Vec<u8>, PendingReadBarrier>,
+) {
+    while let Some((context, read_index, leader_id, term)) = replica.take_completed_read_state() {
+        let Some(barrier) = pending.get_mut(&context) else {
+            continue;
+        };
+        if barrier.leader_id == leader_id && barrier.term == term {
+            barrier.read_index = Some(read_index);
+        } else if let Some(barrier) = pending.remove(&context) {
+            let _ = barrier.response.send(Err(HostError::NotLeader {
+                leader_id: replica.leader_id(),
+            }));
+        }
+    }
+
+    let now = Instant::now();
+    let contexts = pending.keys().cloned().collect::<Vec<_>>();
+    for context in contexts {
+        let outcome = {
+            let barrier = pending
+                .get(&context)
+                .expect("read barrier context came from pending map");
+            if barrier.response.is_closed() {
+                Some(None)
+            } else if barrier.deadline <= now {
+                Some(Some(Err(HostError::ReadBarrierDeadline {
+                    request_id: barrier.request_id,
+                })))
+            } else if barrier.placement_epoch != replica.metadata().placement_epoch {
+                Some(Some(Err(HostError::StaleEpoch {
+                    expected: replica.metadata().placement_epoch,
+                    actual: barrier.placement_epoch,
+                })))
+            } else if !replica.is_leader()
+                || replica.leader_id() != Some(barrier.leader_id)
+                || replica.current_term() != barrier.term
+            {
+                Some(Some(Err(HostError::NotLeader {
+                    leader_id: replica.leader_id(),
+                })))
+            } else if let Some(read_index) = barrier.read_index
+                && (read_index == 0 || replica.metadata().applied_index >= read_index)
+            {
+                if read_index == 0 {
+                    Some(Some(Err(HostError::ReadBarrierUnavailable {
+                        request_id: barrier.request_id,
+                    })))
+                } else {
+                    Some(Some(Ok(read_index)))
+                }
+            } else {
+                None
+            }
+        };
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        replica.cancel_read_index(&context);
+        let barrier = pending
+            .remove(&context)
+            .expect("settled read barrier remains pending");
+        if let Some(result) = outcome {
+            let _ = barrier.response.send(result);
+        }
+    }
+
+    let contexts = pending
+        .iter()
+        .filter_map(|(context, barrier)| (!barrier.submitted).then_some(context.clone()))
+        .collect::<Vec<_>>();
+    for context in contexts {
+        match replica.request_read_index(context.clone()) {
+            Ok(()) => {
+                if let Some(barrier) = pending.get_mut(&context) {
+                    barrier.submitted = true;
+                }
+            }
+            Err(shard_runtime::DurableReplicaError::ReadIndexLeaderNotReady) => {}
+            Err(error) => {
+                let barrier = pending
+                    .remove(&context)
+                    .expect("failed ReadIndex request remains pending");
+                let _ = barrier.response.send(Err(HostError::from_durable(error)));
+            }
+        }
+    }
+}
+
+fn fail_all_read_barriers(
+    replica: &mut DurableRaftReplica,
+    pending: &mut BTreeMap<Vec<u8>, PendingReadBarrier>,
+    error: HostError,
+) {
+    for (context, barrier) in std::mem::take(pending) {
+        replica.cancel_read_index(&context);
+        let _ = barrier.response.send(Err(error.clone()));
+    }
+}
+
+fn read_index_context(
+    shard_id: u32,
+    placement_epoch: u64,
+    request_id: u128,
+    sequence: u64,
+) -> Vec<u8> {
+    let mut context = Vec::with_capacity(40);
+    context.extend_from_slice(b"DTRD");
+    context.extend_from_slice(&shard_id.to_be_bytes());
+    context.extend_from_slice(&placement_epoch.to_be_bytes());
+    context.extend_from_slice(&request_id.to_be_bytes());
+    context.extend_from_slice(&sequence.to_be_bytes());
+    context
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,7 +833,7 @@ fn status(replica: &DurableRaftReplica, spec: &ReplicaSpec) -> ReplicaStatus {
     ReplicaStatus::new(
         spec.graph_id(),
         spec.shard_id(),
-        spec.placement_epoch(),
+        replica.metadata().placement_epoch,
         replica.node_id(),
         replica.is_leader(),
         replica.leader_id(),

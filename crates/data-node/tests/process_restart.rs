@@ -7,13 +7,16 @@ use cluster_protocol::CLUSTER_PROTOCOL_VERSION;
 use cluster_protocol::proto::node_admin_service_client::NodeAdminServiceClient;
 use cluster_protocol::proto::shard_service_client::ShardServiceClient;
 use cluster_protocol::proto::{
-    EnsureReplicaRequest, ExecuteRequest, ReplicaRole, RequestContext, ShardContext,
+    AnalyticsArtifactKind, EnsureReplicaRequest, ExecuteRequest,
+    GetAnalyticsArtifactGenerationRequest, PinAnalyticsArtifactGenerationRequest,
+    PutAnalyticsArtifactChunkRequest, ReplicaRole, RequestContext, ShardContext,
 };
 use data_node::encode_rocks_replica_profile;
 use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use tempfile::tempdir;
 use temporal_types::TransactionTime;
+use tokio_stream::StreamExt;
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -149,6 +152,33 @@ async fn data_process_restarts_persisted_replicas_and_request_deduplication() {
         .unwrap()
         .into_inner();
     assert!(!first.duplicate);
+    shard
+        .put_analytics_artifact_chunk(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(204)),
+            job_id: 701_u128.to_be_bytes().to_vec(),
+            kind: AnalyticsArtifactKind::Result.into(),
+            generation: 1,
+            created_at_unix_ms: 1_725_000_000_123,
+            ordinal: 0,
+            previous_digest: vec![0; 32],
+            payload: b"survives-process-restart".to_vec(),
+        })
+        .await
+        .unwrap();
+    shard
+        .pin_analytics_artifact_generation(PinAnalyticsArtifactGenerationRequest {
+            context: Some(context(205)),
+            job_id: 701_u128.to_be_bytes().to_vec(),
+            kind: AnalyticsArtifactKind::Result.into(),
+            generation: 1,
+            expected_chunk_count: 1,
+            expected_total_bytes: u64::try_from(b"survives-process-restart".len()).unwrap(),
+            expected_content_digest: blake3::hash(b"survives-process-restart")
+                .as_bytes()
+                .to_vec(),
+        })
+        .await
+        .unwrap();
     drop(admin);
     drop(shard);
     terminate(&mut first_process);
@@ -179,6 +209,25 @@ async fn data_process_restarts_persisted_replicas_and_request_deduplication() {
         .unwrap()
         .into_inner();
     assert!(replay.duplicate);
+    let mut artifacts = shard
+        .get_analytics_artifact_generation(GetAnalyticsArtifactGenerationRequest {
+            context: Some(context(206)),
+            job_id: 701_u128.to_be_bytes().to_vec(),
+            kind: AnalyticsArtifactKind::Result.into(),
+            generation: 1,
+            expected_chunk_count: 1,
+            expected_total_bytes: u64::try_from(b"survives-process-restart".len()).unwrap(),
+            expected_content_digest: blake3::hash(b"survives-process-restart")
+                .as_bytes()
+                .to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let artifact = artifacts.next().await.unwrap().unwrap();
+    assert_eq!(artifact.ordinal, 0);
+    assert_eq!(artifact.payload, b"survives-process-restart");
+    assert!(artifacts.next().await.is_none());
     drop(admin);
     drop(shard);
     terminate(&mut second_process);

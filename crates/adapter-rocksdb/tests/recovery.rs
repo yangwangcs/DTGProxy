@@ -53,14 +53,14 @@ fn checkpoint_is_a_stable_snapshot_before_later_commits() {
     block_on(source.apply_committed(batch(
         1,
         21,
-        vec![Mutation::put(0, key.clone(), b"v1".to_vec())],
+        vec![Mutation::put(0, key.clone(), b"before".to_vec())],
     )))
     .unwrap();
     source.checkpoint(&checkpoint_path).unwrap();
     block_on(source.apply_committed(batch(
         2,
         22,
-        vec![Mutation::put(0, key.clone(), b"v2".to_vec())],
+        vec![Mutation::put(0, key.clone(), b"after".to_vec())],
     )))
     .unwrap();
 
@@ -69,11 +69,11 @@ fn checkpoint_is_a_stable_snapshot_before_later_commits() {
     assert_eq!(checkpoint.applied_log_index().unwrap(), 1);
     assert_eq!(
         block_on(source.multi_get(std::slice::from_ref(&key))).unwrap(),
-        vec![Some(b"v2".to_vec())]
+        vec![Some(b"after".to_vec())]
     );
     assert_eq!(
         block_on(checkpoint.multi_get(&[key])).unwrap(),
-        vec![Some(b"v1".to_vec())]
+        vec![Some(b"before".to_vec())]
     );
 }
 

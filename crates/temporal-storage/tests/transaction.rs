@@ -59,7 +59,7 @@ fn one_batch_atomically_commits_two_vertices_an_edge_and_both_adjacencies() {
                 vertex(1),
                 LabelId::new(1),
                 interval(1, Some(10)),
-                payload("v1"),
+                payload("vertex-one"),
             )
             .unwrap(),
         )
@@ -68,7 +68,7 @@ fn one_batch_atomically_commits_two_vertices_an_edge_and_both_adjacencies() {
                 vertex(2),
                 LabelId::new(1),
                 interval(1, Some(10)),
-                payload("v2"),
+                payload("vertex-two"),
             )
             .unwrap(),
         )
@@ -90,11 +90,11 @@ fn one_batch_atomically_commits_two_vertices_an_edge_and_both_adjacencies() {
     assert_eq!(store.adapter().applied_log_index().unwrap(), 1);
     assert_eq!(
         block_on(store.vertex_current(vertex(1), valid(5))).unwrap(),
-        Some(payload("v1"))
+        Some(payload("vertex-one"))
     );
     assert_eq!(
         block_on(store.vertex_current(vertex(2), valid(5))).unwrap(),
-        Some(payload("v2"))
+        Some(payload("vertex-two"))
     );
     assert_eq!(
         block_on(store.edge_current(edge(10), valid(5))).unwrap(),
@@ -153,7 +153,7 @@ fn endpoint_validation_failure_rolls_back_every_staged_element() {
                 vertex(1),
                 LabelId::new(1),
                 interval(1, Some(10)),
-                payload("v1"),
+                payload("vertex-one"),
             )
             .unwrap(),
         )
@@ -193,7 +193,7 @@ fn endpoint_projection_must_cover_the_complete_edge_valid_interval() {
                 vertex(1),
                 LabelId::new(1),
                 interval(1, Some(5)),
-                payload("v1"),
+                payload("vertex-one"),
             )
             .unwrap(),
         )
@@ -202,7 +202,7 @@ fn endpoint_projection_must_cover_the_complete_edge_valid_interval() {
                 vertex(2),
                 LabelId::new(1),
                 interval(1, Some(5)),
-                payload("v2"),
+                payload("vertex-two"),
             )
             .unwrap(),
         );
@@ -230,7 +230,13 @@ fn endpoint_projection_must_cover_the_complete_edge_valid_interval() {
 fn transaction_retry_is_byte_deterministic_and_duplicate_elements_are_rejected() {
     let store = TemporalStore::new(MemoryAdapter::new());
     let transaction = TemporalTransaction::new().with_vertex(
-        VertexMutation::put(vertex(1), LabelId::new(1), interval(1, None), payload("v1")).unwrap(),
+        VertexMutation::put(
+            vertex(1),
+            LabelId::new(1),
+            interval(1, None),
+            payload("vertex-one"),
+        )
+        .unwrap(),
     );
 
     let first =
@@ -263,6 +269,125 @@ fn transaction_retry_is_byte_deterministic_and_duplicate_elements_are_rejected()
         Err(TemporalStoreError::DuplicateElementOperation { element: vertex(1) })
     );
     assert_eq!(store.adapter().applied_log_index().unwrap(), 1);
+}
+
+#[test]
+fn transaction_overlay_replaces_an_earlier_mutation_for_the_same_element() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let mut overlay = TemporalTransaction::new().with_vertex(
+        VertexMutation::put(
+            vertex(1),
+            LabelId::new(1),
+            interval(1, None),
+            payload("created"),
+        )
+        .unwrap(),
+    );
+    let update = TemporalTransaction::new().with_vertex(
+        VertexMutation::put(
+            vertex(1),
+            LabelId::new(1),
+            interval(1, None),
+            payload("updated"),
+        )
+        .unwrap(),
+    );
+
+    overlay.merge_overlay(update).unwrap();
+    block_on(store.commit_transaction(context(1, 0, 100), overlay)).unwrap();
+    assert_eq!(
+        block_on(store.vertex_current(vertex(1), valid(5))).unwrap(),
+        Some(payload("updated"))
+    );
+}
+
+#[test]
+fn transaction_overlay_preserves_disjoint_valid_intervals_for_one_element() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let mut overlay = TemporalTransaction::new().with_vertex(
+        VertexMutation::put(
+            vertex(1),
+            LabelId::new(1),
+            interval(1, Some(4)),
+            payload("early"),
+        )
+        .unwrap(),
+    );
+    overlay
+        .merge_overlay(
+            TemporalTransaction::new().with_vertex(
+                VertexMutation::put(
+                    vertex(1),
+                    LabelId::new(1),
+                    interval(6, Some(9)),
+                    payload("late"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+    block_on(store.commit_transaction(context(1, 0, 100), overlay)).unwrap();
+    assert_eq!(
+        block_on(store.vertex_as_of(vertex(1), valid(2), tx(150))).unwrap(),
+        Some(payload("early"))
+    );
+    assert_eq!(
+        block_on(store.vertex_as_of(vertex(1), valid(7), tx(150))).unwrap(),
+        Some(payload("late"))
+    );
+}
+
+#[test]
+fn transaction_overlay_preserves_disjoint_valid_intervals_for_one_edge() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let endpoints = TemporalTransaction::new()
+        .with_vertex(
+            VertexMutation::put(vertex(1), LabelId::new(1), interval(1, None), payload("a"))
+                .unwrap(),
+        )
+        .with_vertex(
+            VertexMutation::put(vertex(2), LabelId::new(1), interval(1, None), payload("b"))
+                .unwrap(),
+        );
+    block_on(store.commit_transaction(context(1, 0, 100), endpoints)).unwrap();
+
+    let mut overlay = TemporalTransaction::new().with_edge(
+        EdgeMutation::put(
+            edge(10),
+            EdgeTypeId::new(9),
+            ElementId::new(1),
+            ElementId::new(2),
+            interval(1, Some(4)),
+            payload("early"),
+        )
+        .unwrap(),
+    );
+    overlay
+        .merge_overlay(
+            TemporalTransaction::new().with_edge(
+                EdgeMutation::put(
+                    edge(10),
+                    EdgeTypeId::new(9),
+                    ElementId::new(1),
+                    ElementId::new(2),
+                    interval(6, Some(9)),
+                    payload("late"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+    block_on(store.commit_transaction(context(2, 100, 200), overlay)).unwrap();
+    assert_eq!(
+        block_on(store.edge_as_of(edge(10), valid(2), tx(250))).unwrap(),
+        Some(payload("early"))
+    );
+    assert_eq!(
+        block_on(store.edge_as_of(edge(10), valid(7), tx(250))).unwrap(),
+        Some(payload("late"))
+    );
 }
 
 #[test]
@@ -358,10 +483,22 @@ fn endpoint_deletion_requires_incident_edges_to_be_rewritten_in_the_same_transac
     let label = LabelId::new(1);
     let initial = TemporalTransaction::new()
         .with_vertex(
-            VertexMutation::put(vertex(1), label, interval(1, Some(10)), payload("v1")).unwrap(),
+            VertexMutation::put(
+                vertex(1),
+                label,
+                interval(1, Some(10)),
+                payload("vertex-one"),
+            )
+            .unwrap(),
         )
         .with_vertex(
-            VertexMutation::put(vertex(2), label, interval(1, Some(10)), payload("v2")).unwrap(),
+            VertexMutation::put(
+                vertex(2),
+                label,
+                interval(1, Some(10)),
+                payload("vertex-two"),
+            )
+            .unwrap(),
         )
         .with_edge(
             EdgeMutation::put(
@@ -388,7 +525,7 @@ fn endpoint_deletion_requires_incident_edges_to_be_rewritten_in_the_same_transac
     assert_eq!(store.adapter().applied_log_index().unwrap(), 1);
     assert_eq!(
         block_on(store.vertex_current(vertex(1), valid(5))).unwrap(),
-        Some(payload("v1"))
+        Some(payload("vertex-one"))
     );
 
     let coordinated = TemporalTransaction::new()

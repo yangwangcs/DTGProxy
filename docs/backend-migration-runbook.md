@@ -1,5 +1,35 @@
 # Durable backend migration runbook
 
+The six canonical backend directions are continuously certified by
+`.github/workflows/three-backend-migration.yml`. The non-ignored
+`three_backend_migration` test writes a cross-partition temporal graph and verifies byte-identical
+canonical snapshots, fixed-valid-time query signatures, fixed-snapshot Degree results and continued
+writes for RocksDB ↔ PostgreSQL, RocksDB ↔ Neo4j and PostgreSQL ↔ Neo4j.
+
+The same workflow certifies distributed analytics in two layers. The migration-and-surface job
+runs the complete cross-backend semantic comparison. Six parallel takeover jobs select one backend
+and one deployment mode through `DTGPROXY_CERT_BACKEND` and `DTGPROXY_CERT_MODE`. Each job runs
+Degree, WCC and PageRank with a fail-once process stop at `Begin`; Degree also covers Claim,
+LeaseRenew, ExecutionSlice, CheckpointUpload, CheckpointPin, CheckpointCas, ResultUpload, ResultPin
+and Publish. Degree additionally restarts the Gateway runtime with the same stable Gateway ID at
+ExecutionSlice and verifies that a new lease epoch is still required. Every case reads the pinned
+Result Artifact directly from the storage Shard, verifies its manifest length and BLAKE3 digest,
+and requires byte identity with an uninterrupted baseline. A narrower local diagnosis may set
+`DTGPROXY_CERT_ALGORITHM` and/or `DTGPROXY_CERT_FAULT_POINT`.
+
+`Publish` is a distinct recovery boundary. If the first Gateway uploads and pins a Result but stops
+before Meta accepts the Result Manifest CAS, the replacement Gateway may reuse that pinned
+generation only when the persisted chunk count, total byte count, and BLAKE3 content digest all
+match its deterministic `DTAR` output exactly. A saturated bounded generation scan without such a
+match fails closed; it never assumes absence and never creates a second visible Result generation.
+
+Process-level recovery has a separate Gateway certification. It kills a real Gateway process only
+after an asynchronous Degree job reaches `RUNNING`, restarts the same stable node ID, and requires
+one pinned Result generation. A three-node Meta quorum case then stops the current Meta Leader
+during an in-flight job and requires the surviving majority to elect a replacement without a
+duplicate result. Status polling must use a fresh request ID for every observation; reusing one ID
+correctly replays the first idempotent response and is not a valid state-progress check.
+
 This runbook covers the independently deployed Meta, Data, and Controller path. Backend migration
 is a Catalog-owned workflow; do not invoke a local Adapter cutover on an individual Data node.
 
@@ -153,5 +183,40 @@ After `source_retired`, verify all of the following:
 3. Reads cover records written before snapshot restore and during dual apply.
 4. Restart each Data process and repeat the reads.
 5. Preserve the target Sidecar's active generated instance configuration before restarting that
-   Sidecar. Version 1.0 Sidecar selection is process-local; automatic selector persistence is a
+   Sidecar. Current Sidecar selection is process-local; automatic selector persistence is a
    boundary item, even though PostgreSQL/Neo4j data and applied indexes themselves are durable.
+
+For an in-flight analytics Job, a DataNode, Shard Leader, backend, or Sidecar outage is an
+infrastructure-unavailable condition and must not be persisted as terminal `FAILED`. Keep Meta and
+the unaffected cluster members alive, restart with the same durable directory,
+node/shard/placement/backend identity and advertised address, and allow the current Gateway lease to
+recover or expire into a higher-epoch takeover by another Gateway.
+After recovery, compare the pinned Result Artifact digest and bytes with the uninterrupted baseline
+and verify that exactly one Result generation is pinned.
+
+For analytics Artifact reclamation, never treat absence from the active Meta Job list as deletion
+proof. Prune a terminal Job first so Meta durably creates its Job tombstone. The current GC lease
+owner may then advance the Shard fence and delete TTL-eligible generations. Reclamation is
+acknowledged only on a later complete Shard-wide head scan that observes no generation for that
+tombstone. Unknown Jobs and active non-terminal Jobs remain fail-closed, and an unacknowledged
+tombstone must survive Meta or Gateway restart and must not be compacted.
+
+Current certification level: this contract is implemented end-to-end and integration-certified for
+RocksDB DataNode restart in PrimaryReplica and Shared-Nothing. Sidecar/backend restart is
+real-backend certified for RocksDB, PostgreSQL 17 and Neo4j 5.26 Community in both modes, both with
+the owning Gateway kept alive and with a distinct Gateway taking over after lease fencing. Every
+successful case produces baseline-identical canonical `DTAR` bytes and exactly one pinned Result
+generation. Ordered full-stack restart is real-backend certified for all three backends and both
+modes: Meta and every DataNode/Shard/backend restart from fixed durable identities, the first
+Gateway is destroyed, and a second Gateway completes the Job with baseline-identical bytes, one
+pinned Result, and no ghost generation. PrimaryReplica uses two voters with independent backend
+Sidecars; both members restart and the test waits for leader/follower applied-index convergence.
+Isolated PostgreSQL/Neo4j DataNode-only restart remains a separate certification item.
+
+Tombstone GC is also real-backend certified for all three backends and both modes at the
+`after-fence`, `before-delete`, and `before-acknowledgement` crash boundaries. Each case starts two
+replacement Gateways concurrently; Meta lease fencing permits exactly one successful deletion,
+the later complete empty scan acknowledges reclamation, and Unknown/non-terminal Job Artifacts
+remain protected. The matrix requires an observed Meta `ResourceExhausted` lease conflict, not just
+an inferred single delete. Long scans renew the same owner epoch near expiry, and fence, delete and
+acknowledgement each force a fresh Meta lease confirmation before proceeding.

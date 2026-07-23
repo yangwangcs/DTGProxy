@@ -228,6 +228,20 @@ fn prefix_scan_is_ordered_and_isolated_to_one_keyspace() {
     .unwrap();
     assert_eq!(bounded.len(), 1);
     assert_eq!(bounded[0].key().as_bytes(), b"edge:1");
+
+    assert_eq!(
+        block_on(
+            adapter.scan(
+                &KeySpan::prefix(Keyspace::Current, b"edge:".to_vec())
+                    .with_max_bytes(8)
+                    .unwrap(),
+            )
+        ),
+        Err(AdapterError::ScanByteLimit {
+            limit: 8,
+            required: 9,
+        })
+    );
 }
 
 struct NoopWake;

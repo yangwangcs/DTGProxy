@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+mapping-tck = []
+
 [dependencies]
 blake3 = "=1.8.5"
 

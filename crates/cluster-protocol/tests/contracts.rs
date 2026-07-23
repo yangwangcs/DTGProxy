@@ -166,3 +166,152 @@ fn status_reasons_reject_unknown_and_unspecified_values() {
         Err(ProtocolError::UnknownStatusReason { actual: 999 })
     );
 }
+
+#[test]
+fn artifact_pin_rpc_carries_the_complete_manifest_contract() {
+    let request = cluster_protocol::proto::PinAnalyticsArtifactGenerationRequest {
+        context: None,
+        job_id: 501_u128.to_be_bytes().to_vec(),
+        kind: cluster_protocol::proto::AnalyticsArtifactKind::Result.into(),
+        generation: 7,
+        expected_chunk_count: 2,
+        expected_total_bytes: 11,
+        expected_content_digest: blake3::hash(b"firstsecond").as_bytes().to_vec(),
+    };
+    assert_eq!(request.job_id.len(), 16);
+    assert_eq!(request.expected_chunk_count, 2);
+    assert_eq!(request.expected_total_bytes, 11);
+    assert_eq!(request.expected_content_digest.len(), 32);
+
+    let response = cluster_protocol::proto::PinAnalyticsArtifactGenerationResponse {
+        raft_index: 9,
+        duplicate: false,
+    };
+    assert_eq!(response.raft_index, 9);
+    assert!(!response.duplicate);
+}
+
+#[test]
+fn artifact_generation_maintenance_rpc_keeps_unpinned_entries_explicit() {
+    let request = cluster_protocol::proto::ListAnalyticsArtifactGenerationsRequest {
+        context: None,
+        job_id: 77_u128.to_be_bytes().to_vec(),
+        kind: cluster_protocol::proto::AnalyticsArtifactKind::Checkpoint.into(),
+        limit: 64,
+    };
+    assert_eq!(request.job_id.len(), 16);
+    assert_eq!(request.limit, 64);
+
+    let response = cluster_protocol::proto::ListAnalyticsArtifactGenerationsResponse {
+        applied_index: 19,
+        generations: vec![cluster_protocol::proto::AnalyticsArtifactGeneration {
+            job_id: request.job_id,
+            kind: request.kind,
+            generation: 3,
+            created_at_unix_ms: 1_725_000_000_123,
+            expected_chunk_count: 2,
+            expected_total_bytes: 11,
+            expected_content_digest: Vec::new(),
+            pinned: false,
+            applied_index: 19,
+        }],
+    };
+    assert_eq!(response.generations.len(), 1);
+    assert_eq!(
+        response.generations[0].created_at_unix_ms,
+        1_725_000_000_123
+    );
+    assert!(!response.generations[0].pinned);
+    assert!(response.generations[0].expected_content_digest.is_empty());
+}
+
+#[test]
+fn shard_wide_artifact_generation_head_rpc_uses_a_structured_cursor() {
+    let request = cluster_protocol::proto::ListAnalyticsArtifactGenerationHeadsRequest {
+        context: None,
+        after: Some(cluster_protocol::proto::AnalyticsArtifactGenerationCursor {
+            job_id: 77_u128.to_be_bytes().to_vec(),
+            kind: cluster_protocol::proto::AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 2,
+        }),
+        limit: 64,
+    };
+    assert_eq!(request.after.as_ref().unwrap().job_id.len(), 16);
+    assert_eq!(request.limit, 64);
+
+    let response = cluster_protocol::proto::ListAnalyticsArtifactGenerationHeadsResponse {
+        applied_index: 19,
+        generations: vec![cluster_protocol::proto::AnalyticsArtifactGeneration {
+            job_id: 77_u128.to_be_bytes().to_vec(),
+            kind: cluster_protocol::proto::AnalyticsArtifactKind::Result.into(),
+            generation: 3,
+            created_at_unix_ms: 1_725_000_000_123,
+            expected_chunk_count: 2,
+            expected_total_bytes: 0,
+            expected_content_digest: Vec::new(),
+            pinned: false,
+            applied_index: 19,
+        }],
+        next: Some(cluster_protocol::proto::AnalyticsArtifactGenerationCursor {
+            job_id: 77_u128.to_be_bytes().to_vec(),
+            kind: cluster_protocol::proto::AnalyticsArtifactKind::Result.into(),
+            generation: 3,
+        }),
+    };
+    assert_eq!(response.next.unwrap().generation, 3);
+}
+
+#[test]
+fn artifact_put_rpc_carries_the_gateway_generation_creation_time() {
+    let request = cluster_protocol::proto::PutAnalyticsArtifactChunkRequest {
+        context: None,
+        job_id: 501_u128.to_be_bytes().to_vec(),
+        kind: cluster_protocol::proto::AnalyticsArtifactKind::Result.into(),
+        generation: 7,
+        ordinal: 0,
+        previous_digest: vec![0; 32],
+        payload: b"result".to_vec(),
+        created_at_unix_ms: 1_725_000_000_123,
+    };
+    assert_eq!(request.created_at_unix_ms, 1_725_000_000_123);
+}
+
+#[test]
+fn analytics_proposal_returns_the_canonical_cluster_job_id() {
+    let response = cluster_protocol::proto::ProposeAnalyticsJobResponse {
+        ledger_revision: 3,
+        job_revision: 1,
+        duplicate: false,
+        request_duplicate: true,
+        canonical_job_id: 17_u128.to_be_bytes().to_vec(),
+    };
+
+    assert_eq!(response.canonical_job_id, 17_u128.to_be_bytes());
+}
+
+#[test]
+fn analytics_tombstone_pages_carry_canonical_records_and_an_exclusive_cursor() {
+    let request = cluster_protocol::proto::ListAnalyticsJobTombstonesRequest {
+        context: None,
+        after_job_id: 16_u128.to_be_bytes().to_vec(),
+        limit: 64,
+    };
+    let record = cluster_protocol::proto::AnalyticsJobTombstoneRecord {
+        job_id: 17_u128.to_be_bytes().to_vec(),
+        record: b"canonical-tombstone".to_vec(),
+        checksum: crc32fast::hash(b"canonical-tombstone"),
+    };
+    let response = cluster_protocol::proto::ListAnalyticsJobTombstonesResponse {
+        ledger_revision: 9,
+        tombstones: vec![record],
+        next_job_id: 17_u128.to_be_bytes().to_vec(),
+    };
+
+    assert_eq!(request.after_job_id.len(), 16);
+    assert_eq!(response.tombstones[0].job_id.len(), 16);
+    assert_eq!(
+        response.tombstones[0].checksum,
+        crc32fast::hash(&response.tombstones[0].record)
+    );
+    assert_eq!(response.next_job_id, 17_u128.to_be_bytes());
+}

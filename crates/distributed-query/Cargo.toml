@@ -10,12 +10,20 @@ blake3 = "=1.8.5"
 physical-plan = { path = "../physical-plan" }
 query-executor = { path = "../query-executor", default-features = false }
 storage-api = { path = "../storage-api" }
+temporal-ir = { path = "../temporal-ir" }
 temporal-storage = { path = "../temporal-storage" }
 temporal-types = { path = "../temporal-types" }
+tokio = { version = "=1.53.0", features = ["macros", "sync", "time"] }
 
 [dev-dependencies]
+analytics-api = { path = "../analytics-api" }
+analytics-runtime = { path = "../analytics-runtime" }
 adapter-memory = { path = "../adapter-memory" }
+cypher-compiler = { path = "../cypher-compiler" }
+procedure-runtime = { path = "../procedure-runtime" }
+query-optimizer = { path = "../query-optimizer" }
 temporal-ir = { path = "../temporal-ir" }
+tokio = { version = "=1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]
 workspace = true

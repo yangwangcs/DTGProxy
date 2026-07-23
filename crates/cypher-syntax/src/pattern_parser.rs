@@ -4,14 +4,14 @@ use cypher_ast::{
 };
 
 use crate::expression_parser::ExpressionParser;
-use crate::{ParseError, SourceSpan, Token, TokenKind, lex};
+use crate::{ParseError, SourceSpan, SyntaxLimits, Token, TokenKind, lex};
 
 pub fn parse_pattern(source: &str) -> Result<Pattern, ParseError> {
     let lexed = lex(source).map_err(|error| ParseError::from_syntax(&error))?;
     let mut parser = PatternParser {
         tokens: lexed.tokens(),
         position: 0,
-        source_len: source.len(),
+        source,
     };
     let mut paths = vec![parser.path()?];
     while parser.consume(&TokenKind::Comma) {
@@ -29,7 +29,7 @@ pub fn parse_pattern(source: &str) -> Result<Pattern, ParseError> {
 struct PatternParser<'tokens> {
     tokens: &'tokens [Token],
     position: usize,
-    source_len: usize,
+    source: &'tokens str,
 }
 
 impl PatternParser<'_> {
@@ -145,7 +145,11 @@ impl PatternParser<'_> {
     }
 
     fn expression(&mut self) -> Result<Expression, ParseError> {
-        let mut parser = ExpressionParser::new(&self.tokens[self.position..], self.source_len);
+        let mut parser = ExpressionParser::new(
+            &self.tokens[self.position..],
+            self.source,
+            SyntaxLimits::default(),
+        );
         let expression = parser.parse(0)?;
         self.position += parser.consumed();
         Ok(expression)
@@ -206,7 +210,7 @@ impl PatternParser<'_> {
         ParseError::new(
             code,
             self.current().map_or_else(
-                || SourceSpan::new(self.source_len, self.source_len),
+                || SourceSpan::new(self.source.len(), self.source.len()),
                 Token::span,
             ),
             message,

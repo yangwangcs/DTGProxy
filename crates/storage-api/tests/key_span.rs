@@ -1,4 +1,4 @@
-use storage_api::{KeySpan, KeySpanError, Keyspace};
+use storage_api::{AdapterError, KeySpan, KeySpanError, Keyspace};
 
 #[test]
 fn prefix_span_has_an_exclusive_lexicographic_upper_bound() {
@@ -35,9 +35,12 @@ fn bounded_range_and_prefix_seek_have_stable_inclusive_exclusive_semantics() {
     let seek = KeySpan::prefix_from(Keyspace::History, b"edge:".to_vec(), b"edge:2".to_vec())
         .unwrap()
         .with_limit(2)
+        .unwrap()
+        .with_max_bytes(64)
         .unwrap();
     assert_eq!(seek.start(), b"edge:2");
     assert_eq!(seek.limit(), Some(2));
+    assert_eq!(seek.max_bytes(), Some(64));
     assert!(seek.contains(b"edge:2"));
     assert!(seek.contains(b"edge:9"));
     assert!(!seek.contains(b"other"));
@@ -56,5 +59,22 @@ fn invalid_ranges_seeks_and_limits_are_rejected() {
     assert_eq!(
         KeySpan::prefix(Keyspace::Current, Vec::new()).with_limit(0),
         Err(KeySpanError::ZeroLimit)
+    );
+    assert_eq!(
+        KeySpan::prefix(Keyspace::Current, Vec::new()).with_max_bytes(0),
+        Err(KeySpanError::ZeroByteLimit)
+    );
+}
+
+#[test]
+fn scan_response_body_limit_has_a_distinct_wire_byte_contract() {
+    let error = AdapterError::ScanResponseByteLimit {
+        limit: 64,
+        required: 65,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "scan response body requires 65 wire bytes above limit 64"
     );
 }

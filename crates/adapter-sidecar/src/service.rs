@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use adapter_registry::{
     AdapterFactory, AdapterFactoryError, AdapterFactoryFuture, AdapterOpenRequest, AdapterRegistry,
-    AdapterRestoreFuture, AdapterRestoreSession, AdapterRestoreSessionFuture, SecretString,
+    AdapterRestoreFuture, AdapterRestoreSession, AdapterRestoreSessionFuture, RegistryError,
+    SecretString,
 };
 use storage_api::{
     AdapterDescriptorV1, AdapterError, AdapterRequirement, LogicalSnapshotAccumulator,
@@ -495,7 +496,7 @@ impl SidecarService {
                 reader,
             )
             .await
-            .map_err(|error| remote_error(RemoteErrorCode::ServiceFaulted, &error.to_string()))?;
+            .map_err(registry_remote_error)?;
         let descriptor = opened.descriptor().clone();
         let adapter = opened.into_adapter();
         let applied_log_index = adapter.applied_log_index().map_err(adapter_remote_error)?;
@@ -975,7 +976,28 @@ fn adapter_remote_error(error: AdapterError) -> RemoteError {
         code: RemoteErrorCode::ServiceFaulted as u32,
         message: error.to_string(),
         retryable: false,
+        scan_limit: None,
+        scan_required: None,
+        scan_response_limit: None,
+        scan_response_required: None,
     }
+}
+
+fn registry_remote_error(error: RegistryError) -> RemoteError {
+    let mapping_incompatible = matches!(
+        &error,
+        RegistryError::MappingIncompatible(_)
+            | RegistryError::Target(AdapterError::Mapping(_))
+            | RegistryError::Source(AdapterError::Mapping(_))
+    );
+    remote_error(
+        if mapping_incompatible {
+            RemoteErrorCode::MappingIncompatible
+        } else {
+            RemoteErrorCode::ServiceFaulted
+        },
+        &error.to_string(),
+    )
 }
 
 fn remote_error(code: RemoteErrorCode, message: &str) -> RemoteError {
@@ -983,6 +1005,10 @@ fn remote_error(code: RemoteErrorCode, message: &str) -> RemoteError {
         code: code as u32,
         message: message.to_owned(),
         retryable: false,
+        scan_limit: None,
+        scan_required: None,
+        scan_response_limit: None,
+        scan_response_required: None,
     }
 }
 

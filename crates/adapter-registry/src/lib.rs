@@ -12,7 +12,8 @@ use storage_api::{
     AdapterCapabilities, AdapterCompatibilityError, AdapterDescriptorV1, AdapterError,
     AdapterFuture, AdapterRequirement, ApplyReceipt, CommittedMutationBatch, KeySpan, KeyValue,
     LogicalKey, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
-    LogicalSnapshotReader, StorageAdapter,
+    LogicalSnapshotReader, MappingCompatibilityError, MappingDescriptorV1, MappingRequirement,
+    StorageAdapter,
 };
 
 pub type AdapterFactoryFuture<'a> =
@@ -57,6 +58,10 @@ pub trait AdapterRestoreSession: Send {
 
 pub trait AdapterFactory: Send + Sync {
     fn provider_name(&self) -> &str;
+
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        None
+    }
 
     fn open<'a>(&'a self, request: &'a AdapterOpenRequest) -> AdapterFactoryFuture<'a>;
 
@@ -180,6 +185,7 @@ pub struct OpenedAdapter {
     provider_name: String,
     instance_id: String,
     descriptor: AdapterDescriptorV1,
+    mapping_descriptor: Option<MappingDescriptorV1>,
     adapter: Arc<dyn StorageAdapter>,
 }
 
@@ -197,6 +203,11 @@ impl OpenedAdapter {
     #[must_use]
     pub const fn descriptor(&self) -> &AdapterDescriptorV1 {
         &self.descriptor
+    }
+
+    #[must_use]
+    pub const fn mapping_descriptor(&self) -> Option<&MappingDescriptorV1> {
+        self.mapping_descriptor.as_ref()
     }
 
     #[must_use]
@@ -271,13 +282,23 @@ impl AdapterRegistry {
                 .ok_or_else(|| RegistryError::UnknownProvider {
                     provider: provider.to_owned(),
                 })?;
+        let declared_mapping = factory.mapping_descriptor();
+        if let Some(mapping) = &declared_mapping {
+            mapping.validate(MappingRequirement::from(requirement))?;
+        }
         let adapter = factory.open(request).await?;
         let descriptor = adapter.descriptor();
         descriptor.validate(requirement)?;
+        let mapping_descriptor = validate_opened_mapping(
+            declared_mapping,
+            adapter.mapping_descriptor(),
+            descriptor.family(),
+        )?;
         Ok(OpenedAdapter {
             provider_name: provider.to_owned(),
             instance_id: request.instance_id.clone(),
             descriptor,
+            mapping_descriptor,
             adapter,
         })
     }
@@ -296,6 +317,10 @@ impl AdapterRegistry {
                 .ok_or_else(|| RegistryError::UnknownProvider {
                     provider: provider.to_owned(),
                 })?;
+        let declared_mapping = factory.mapping_descriptor();
+        if let Some(mapping) = &declared_mapping {
+            mapping.validate(MappingRequirement::from(requirement))?;
+        }
         let mut restore = factory
             .begin_restore(request, reader.header().clone())
             .await?;
@@ -312,6 +337,11 @@ impl AdapterRegistry {
             return Err(RegistryError::FinalDescriptorMismatch);
         }
         final_descriptor.validate(requirement)?;
+        let mapping_descriptor = validate_opened_mapping(
+            declared_mapping,
+            adapter.mapping_descriptor(),
+            final_descriptor.family(),
+        )?;
         let actual_applied_index = adapter.applied_log_index().map_err(RegistryError::Target)?;
         if actual_applied_index != expected_applied_index {
             return Err(RegistryError::RestoredIndexMismatch {
@@ -323,12 +353,32 @@ impl AdapterRegistry {
             provider_name: provider.to_owned(),
             instance_id: request.instance_id.clone(),
             descriptor: final_descriptor,
+            mapping_descriptor,
             adapter,
         })
     }
 }
 
-#[derive(Debug)]
+fn validate_opened_mapping(
+    declared: Option<MappingDescriptorV1>,
+    actual: Option<MappingDescriptorV1>,
+    adapter_family: storage_api::BackendFamily,
+) -> Result<Option<MappingDescriptorV1>, RegistryError> {
+    match (declared, actual) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(RegistryError::OpenedMappingMissing),
+        (None, Some(_)) => Err(RegistryError::OpenedMappingUnexpected),
+        (Some(declared), Some(actual)) if declared != actual => {
+            Err(RegistryError::MappingDescriptorMismatch)
+        }
+        (Some(declared), Some(_)) if declared.family() != adapter_family => {
+            Err(RegistryError::MappingFamilyMismatch)
+        }
+        (Some(declared), Some(_)) => Ok(Some(declared)),
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum RegistryError {
     InvalidProviderName { provider: String },
     DuplicateProvider { provider: String },
@@ -337,6 +387,11 @@ pub enum RegistryError {
     Source(AdapterError),
     Target(AdapterError),
     Incompatible(AdapterCompatibilityError),
+    MappingIncompatible(MappingCompatibilityError),
+    OpenedMappingMissing,
+    OpenedMappingUnexpected,
+    MappingDescriptorMismatch,
+    MappingFamilyMismatch,
     FinalDescriptorMismatch,
     RestoredIndexMismatch { expected: u64, actual: u64 },
 }
@@ -360,6 +415,18 @@ impl Display for RegistryError {
             Self::Source(error) => write!(formatter, "snapshot source failed: {error}"),
             Self::Target(error) => write!(formatter, "restored Adapter validation failed: {error}"),
             Self::Incompatible(error) => Display::fmt(error, formatter),
+            Self::MappingIncompatible(error) => Display::fmt(error, formatter),
+            Self::OpenedMappingMissing => {
+                formatter.write_str("opened Adapter omitted its declared Mapping descriptor")
+            }
+            Self::OpenedMappingUnexpected => {
+                formatter.write_str("opened Adapter exposed an undeclared Mapping descriptor")
+            }
+            Self::MappingDescriptorMismatch => formatter.write_str(
+                "opened Adapter Mapping descriptor differs from the Factory declaration",
+            ),
+            Self::MappingFamilyMismatch => formatter
+                .write_str("opened Adapter family differs from its Mapping descriptor family"),
             Self::FinalDescriptorMismatch => formatter.write_str(
                 "restored Adapter descriptor differs from the pre-publication descriptor",
             ),
@@ -378,6 +445,7 @@ impl Error for RegistryError {
             Self::Source(error) => Some(error),
             Self::Target(error) => Some(error),
             Self::Incompatible(error) => Some(error),
+            Self::MappingIncompatible(error) => Some(error),
             _ => None,
         }
     }
@@ -398,6 +466,12 @@ impl From<AdapterError> for RegistryError {
 impl From<AdapterCompatibilityError> for RegistryError {
     fn from(error: AdapterCompatibilityError) -> Self {
         Self::Incompatible(error)
+    }
+}
+
+impl From<MappingCompatibilityError> for RegistryError {
+    fn from(error: MappingCompatibilityError) -> Self {
+        Self::MappingIncompatible(error)
     }
 }
 

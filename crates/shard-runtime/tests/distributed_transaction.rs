@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
@@ -8,16 +9,25 @@ use raft_command::{
     AbortIntentV1, CommandBodyV1, CommandEnvelopeV1, FinalizeV1, OnePhaseCommitV1, PrewriteV1,
     RecordDecisionV1,
 };
-use shard_runtime::ShardStateMachine;
-use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter};
+use shard_runtime::{ShardRuntimeError, ShardStateMachine};
+use storage_api::{
+    AdapterCapabilities, AdapterFuture, KeySpan, KeyValue, Keyspace, LogicalKey, Mutation,
+    PreparedMutationBatch, StorageAdapter,
+};
 use temporal_types::TransactionTime;
 use txn_protocol::{
     HomeDecisionEngine, HomeTransactionRecord, IsolationLevel, ParticipantEngine, ParticipantProof,
-    PrewriteRequest, ShardEpoch, TransactionId, TransactionState,
+    PrewriteMetadata, PrewriteRequest, ShardEpoch, TransactionId, TransactionState,
+    TxnProtocolError,
 };
 
 fn participant() -> ShardEpoch {
     ShardEpoch::new(7, 9).unwrap()
+}
+
+fn metadata(schema_version: u64, placement_epoch: u64) -> PrewriteMetadata {
+    PrewriteMetadata::new(schema_version, placement_epoch, Vec::new(), Vec::new())
+        .expect("current prewrite metadata")
 }
 
 fn request(transaction_id: u128, start: i64) -> PrewriteRequest {
@@ -39,6 +49,8 @@ fn request(transaction_id: u128, start: i64) -> PrewriteRequest {
                 b"committed".to_vec(),
             )],
         },
+        Vec::new(),
+        metadata(3, 9),
     )
     .unwrap()
 }
@@ -215,6 +227,98 @@ fn a_client_retry_in_a_new_log_entry_advances_raft_without_reapplying_business_s
 }
 
 #[test]
+fn committed_request_replay_mismatch_is_fatal_and_does_not_advance() {
+    let request = request(101, 100);
+    let proof = ParticipantProof::new(
+        participant(),
+        TransactionTime::new(100, 1),
+        request.intent_digest(),
+    );
+    let mut machine = block_on(ShardStateMachine::open(MemoryAdapter::new(), 7, 9)).unwrap();
+    block_on(machine.apply_entry(
+        1,
+        1,
+        &command(
+            3101,
+            CommandBodyV1::Prewrite(PrewriteV1 {
+                request: request.clone(),
+                expected_proof: proof,
+            }),
+        ),
+    ))
+    .unwrap();
+    let mismatched = command(
+        3102,
+        CommandBodyV1::Finalize(FinalizeV1 {
+            participant: participant(),
+            transaction_id: request.transaction_id(),
+            intent_digest: [0x7f; 32],
+            commit_ts: TransactionTime::new(101, 0),
+        }),
+    );
+
+    assert!(matches!(
+        block_on(machine.apply_committed_entry(1, 2, &mismatched)),
+        Err(ShardRuntimeError::Transaction(
+            TxnProtocolError::RequestReplayMismatch
+        ))
+    ));
+    assert_eq!(machine.metadata().applied_index, 1);
+    assert_eq!(machine.adapter().applied_log_index().unwrap(), 1);
+    assert!(!block_on(machine.request_replay(3102, &mismatched)).unwrap());
+}
+
+#[test]
+fn committed_missing_intent_lock_is_fatal_and_does_not_advance() {
+    let request = request(102, 100);
+    let lock_key = ParticipantEngine::prewrite_inspection_keys(&request).unwrap()[1].clone();
+    let hide_lock = Arc::new(AtomicBool::new(false));
+    let adapter = MissingLockAdapter {
+        inner: MemoryAdapter::new(),
+        lock_key,
+        hide_lock: Arc::clone(&hide_lock),
+    };
+    let proof = ParticipantProof::new(
+        participant(),
+        TransactionTime::new(100, 1),
+        request.intent_digest(),
+    );
+    let mut machine = block_on(ShardStateMachine::open(adapter, 7, 9)).unwrap();
+    block_on(machine.apply_entry(
+        1,
+        1,
+        &command(
+            3201,
+            CommandBodyV1::Prewrite(PrewriteV1 {
+                request: request.clone(),
+                expected_proof: proof,
+            }),
+        ),
+    ))
+    .unwrap();
+    hide_lock.store(true, Ordering::SeqCst);
+    let finalize = command(
+        3202,
+        CommandBodyV1::Finalize(FinalizeV1 {
+            participant: participant(),
+            transaction_id: request.transaction_id(),
+            intent_digest: request.intent_digest(),
+            commit_ts: TransactionTime::new(101, 0),
+        }),
+    );
+
+    assert!(matches!(
+        block_on(machine.apply_committed_entry(1, 2, &finalize)),
+        Err(ShardRuntimeError::Transaction(
+            TxnProtocolError::MissingIntentLock { .. }
+        ))
+    ));
+    assert_eq!(machine.metadata().applied_index, 1);
+    assert_eq!(machine.adapter().applied_log_index().unwrap(), 1);
+    assert!(!block_on(machine.request_replay(3202, &finalize)).unwrap());
+}
+
+#[test]
 fn rocksdb_restart_restores_the_unresolved_intent_frontier() {
     let directory = tempfile::tempdir().unwrap();
     let request = request(111, 100);
@@ -284,6 +388,8 @@ fn one_phase_commit_retry_after_state_machine_reopen_is_durably_idempotent() {
                 b"durable".to_vec(),
             )],
         },
+        Vec::new(),
+        metadata(3, 9),
     )
     .unwrap();
     let command = command(
@@ -325,6 +431,47 @@ fn read<A: StorageAdapter>(adapter: &A, key: &LogicalKey) -> Option<Vec<u8>> {
         .unwrap()
         .pop()
         .flatten()
+}
+
+struct MissingLockAdapter {
+    inner: MemoryAdapter,
+    lock_key: LogicalKey,
+    hide_lock: Arc<AtomicBool>,
+}
+
+impl StorageAdapter for MissingLockAdapter {
+    fn capabilities(&self) -> AdapterCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn apply_committed<'a>(
+        &'a self,
+        batch: storage_api::CommittedMutationBatch,
+    ) -> AdapterFuture<'a, storage_api::ApplyReceipt> {
+        self.inner.apply_committed(batch)
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            let mut values = self.inner.multi_get(keys).await?;
+            if self.hide_lock.load(Ordering::SeqCst) {
+                for (key, value) in keys.iter().zip(&mut values) {
+                    if key == &self.lock_key {
+                        *value = None;
+                    }
+                }
+            }
+            Ok(values)
+        })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        self.inner.scan(span)
+    }
+
+    fn applied_log_index(&self) -> Result<u64, storage_api::AdapterError> {
+        self.inner.applied_log_index()
+    }
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {

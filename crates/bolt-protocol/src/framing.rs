@@ -97,6 +97,11 @@ impl ChunkDecoder {
         Ok(messages)
     }
 
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.pending.is_empty() && self.message.is_empty()
+    }
+
     fn fail<T>(&mut self, code: &'static str, message: &'static str) -> Result<T, ProtocolError> {
         self.failed = true;
         self.pending.clear();

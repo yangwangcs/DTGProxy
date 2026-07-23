@@ -14,8 +14,8 @@ use storage_api::StorageAdapter;
 use temporal_types::TransactionTime;
 
 use crate::{
-    DeterministicTransport, FollowerReadProof, ReadBarrierError, ReadPermit, ReadPermitMode,
-    ReplicaMetadata, ShardRuntimeError, ShardStateMachine,
+    CommittedEntryOutcome, DeterministicTransport, FollowerReadProof, ReadBarrierError, ReadPermit,
+    ReadPermitMode, ReplicaMetadata, ShardRuntimeError, ShardStateMachine,
 };
 
 const DEFAULT_MAX_DRIVE_ROUNDS: usize = 1_024;
@@ -95,9 +95,8 @@ impl Display for ReplicationError {
                 "request {request_id} did not commit and apply within {ticks} ticks"
             ),
             Self::DriveLimitExceeded => formatter.write_str("Raft drive loop exceeded its limit"),
-            Self::UnsupportedEntryType => {
-                formatter.write_str("dynamic Raft membership entry is not supported in Phase 2")
-            }
+            Self::UnsupportedEntryType => formatter
+                .write_str("dynamic Raft membership entry is not supported in the current runtime"),
             Self::GroupAlreadyExists { shard_id } => {
                 write!(formatter, "Shard Group {shard_id} already exists")
             }
@@ -145,16 +144,43 @@ struct PendingProposal {
 #[derive(Clone)]
 struct CompletedProposal {
     command: Vec<u8>,
-    receipt: ProposalReceipt,
+    outcome: CompletedProposalOutcome,
+}
+
+#[derive(Clone)]
+enum CompletedProposalOutcome {
+    Applied(ProposalReceipt),
+    Rejected(String),
+}
+
+fn completed_proposal_result(
+    request_id: u128,
+    completed: &CompletedProposal,
+) -> Result<ProposalReceipt, ReplicationError> {
+    match &completed.outcome {
+        CompletedProposalOutcome::Applied(receipt) => Ok(*receipt),
+        CompletedProposalOutcome::Rejected(message) => Err(ReplicationError::StateMachine(
+            ShardRuntimeError::CommittedRejection {
+                request_id,
+                message: message.clone(),
+            },
+        )),
+    }
 }
 
 struct AppliedEvent {
     request_id: u128,
+    applied_by_leader: bool,
+    result: AppliedResult,
+}
+
+#[derive(Clone)]
+struct AppliedResult {
     term: u64,
     index: u64,
-    applied_by_leader: bool,
     commit_observed_at: Instant,
     commit_to_apply: Duration,
+    rejection_message: Option<String>,
 }
 
 struct ReadyOutput {
@@ -332,7 +358,7 @@ impl RaftReplica {
         let committed = ready.take_committed_entries();
         let mut events =
             apply_entries(&mut self.state_machine, committed, applied_by_leader).await?;
-        let mut light_ready = raw_node.advance(ready);
+        let mut light_ready = raw_node.advance_append(ready);
         if let Some(commit_index) = light_ready.commit_index() {
             self.storage.wl().mut_hard_state().set_commit(commit_index);
         }
@@ -345,7 +371,7 @@ impl RaftReplica {
             )
             .await?,
         );
-        raw_node.advance_apply();
+        raw_node.advance_apply_to(self.state_machine.metadata().applied_index);
         Ok(ReadyOutput {
             messages,
             events,
@@ -386,16 +412,23 @@ async fn apply_entries(
             EntryType::EntryNormal => {
                 let command = CommandEnvelopeV1::decode(&entry.data)?;
                 let commit_observed_at = Instant::now();
-                state_machine
-                    .apply_entry(entry.term, entry.index, &entry.data)
+                let outcome = state_machine
+                    .apply_committed_entry(entry.term, entry.index, &entry.data)
                     .await?;
+                let rejection_message = match outcome {
+                    CommittedEntryOutcome::Applied(_) => None,
+                    CommittedEntryOutcome::Rejected { message, .. } => Some(message),
+                };
                 events.push(AppliedEvent {
                     request_id: command.request_id,
-                    term: entry.term,
-                    index: entry.index,
                     applied_by_leader,
-                    commit_observed_at,
-                    commit_to_apply: commit_observed_at.elapsed(),
+                    result: AppliedResult {
+                        term: entry.term,
+                        index: entry.index,
+                        commit_observed_at,
+                        commit_to_apply: commit_observed_at.elapsed(),
+                        rejection_message,
+                    },
                 });
             }
             EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
@@ -461,7 +494,7 @@ pub struct InProcessShardGroup {
     transport: DeterministicTransport,
     pending: BTreeMap<u128, PendingProposal>,
     completed: BTreeMap<u128, CompletedProposal>,
-    applied_events: BTreeMap<(u64, u128), (u64, u64, Instant, Duration)>,
+    applied_events: BTreeMap<(u64, u128), AppliedResult>,
     completed_read_states: BTreeMap<Vec<u8>, CompletedReadState>,
     pending_read_contexts: BTreeSet<Vec<u8>>,
     next_read_sequence: u64,
@@ -608,7 +641,7 @@ impl InProcessShardGroup {
             if completed.command != command {
                 return Err(ReplicationError::RequestMismatch { request_id });
             }
-            return Ok(completed.receipt);
+            return completed_proposal_result(request_id, completed);
         }
         let already_pending = if let Some(pending) = self.pending.get(&request_id) {
             if pending.command != command {
@@ -635,12 +668,12 @@ impl InProcessShardGroup {
 
         self.drain(DEFAULT_MAX_DRIVE_ROUNDS).await?;
         if let Some(completed) = self.completed.get(&request_id) {
-            return Ok(completed.receipt);
+            return completed_proposal_result(request_id, completed);
         }
         for _ in 0..max_ticks {
             self.tick().await?;
             if let Some(completed) = self.completed.get(&request_id) {
-                return Ok(completed.receipt);
+                return completed_proposal_result(request_id, completed);
             }
         }
         Err(ReplicationError::QuorumUnavailable {
@@ -959,24 +992,10 @@ impl InProcessShardGroup {
 
     fn record_events(&mut self, node_id: u64, events: Vec<AppliedEvent>) {
         for event in events {
-            self.applied_events.insert(
-                (node_id, event.request_id),
-                (
-                    event.term,
-                    event.index,
-                    event.commit_observed_at,
-                    event.commit_to_apply,
-                ),
-            );
+            self.applied_events
+                .insert((node_id, event.request_id), event.result.clone());
             if event.applied_by_leader {
-                self.complete_request(
-                    node_id,
-                    event.request_id,
-                    event.term,
-                    event.index,
-                    event.commit_observed_at,
-                    event.commit_to_apply,
-                );
+                self.complete_request(node_id, event.request_id, event.result);
             }
         }
     }
@@ -1011,39 +1030,16 @@ impl InProcessShardGroup {
         let applied: Vec<_> = self
             .applied_events
             .iter()
-            .filter_map(
-                |((node_id, request_id), (term, index, commit_observed_at, commit_to_apply))| {
-                    (*node_id == leader_id).then_some((
-                        *request_id,
-                        *term,
-                        *index,
-                        *commit_observed_at,
-                        *commit_to_apply,
-                    ))
-                },
-            )
+            .filter_map(|((node_id, request_id), result)| {
+                (*node_id == leader_id).then_some((*request_id, result.clone()))
+            })
             .collect();
-        for (request_id, term, index, commit_observed_at, commit_to_apply) in applied {
-            self.complete_request(
-                leader_id,
-                request_id,
-                term,
-                index,
-                commit_observed_at,
-                commit_to_apply,
-            );
+        for (request_id, result) in applied {
+            self.complete_request(leader_id, request_id, result);
         }
     }
 
-    fn complete_request(
-        &mut self,
-        leader_id: u64,
-        request_id: u128,
-        term: u64,
-        index: u64,
-        commit_observed_at: Instant,
-        commit_to_apply: Duration,
-    ) {
+    fn complete_request(&mut self, leader_id: u64, request_id: u128, result: AppliedResult) {
         let Some(pending) = self.pending.remove(&request_id) else {
             return;
         };
@@ -1051,15 +1047,21 @@ impl InProcessShardGroup {
             request_id,
             CompletedProposal {
                 command: pending.command,
-                receipt: ProposalReceipt {
-                    request_id,
-                    leader_id,
-                    term,
-                    index,
-                    proposal_to_commit: commit_observed_at
-                        .saturating_duration_since(pending.proposed_at),
-                    commit_to_apply,
-                },
+                outcome: result.rejection_message.map_or_else(
+                    || {
+                        CompletedProposalOutcome::Applied(ProposalReceipt {
+                            request_id,
+                            leader_id,
+                            term: result.term,
+                            index: result.index,
+                            proposal_to_commit: result
+                                .commit_observed_at
+                                .saturating_duration_since(pending.proposed_at),
+                            commit_to_apply: result.commit_to_apply,
+                        })
+                    },
+                    CompletedProposalOutcome::Rejected,
+                ),
             },
         );
     }
@@ -1098,6 +1100,13 @@ impl InProcessShardGroup {
         self.replicas
             .get(&node_id)
             .map(|replica| replica.state_machine.adapter().as_ref())
+    }
+
+    #[must_use]
+    pub fn replica_adapter_arc(&self, node_id: u64) -> Option<Arc<dyn StorageAdapter>> {
+        self.replicas
+            .get(&node_id)
+            .map(|replica| Arc::clone(replica.state_machine.adapter()))
     }
 
     #[must_use]

@@ -42,8 +42,8 @@ impl From<cypher_sema::SemanticError> for CompileError {
     }
 }
 
-impl From<temporal_ir::v2::ValidationError> for CompileError {
-    fn from(error: temporal_ir::v2::ValidationError) -> Self {
+impl From<temporal_ir::ValidationError> for CompileError {
+    fn from(error: temporal_ir::ValidationError) -> Self {
         Self::new("DTG-IR-VALIDATION", error.to_string())
     }
 }

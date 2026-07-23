@@ -7,7 +7,11 @@ mod statement;
 mod temporal;
 mod version;
 
-pub use clause::{Clause, ClauseKind, TextSpan};
+pub use clause::{
+    CallSubquery, Clause, ClauseKind, DEFAULT_SUBQUERY_BATCH_ROWS, InTransactions,
+    MAX_SUBQUERY_BATCH_ROWS, ProcedureCall, ProcedureYield, SubqueryErrorPolicy, TextSpan,
+    YieldItem,
+};
 pub use expression::{BinaryOperator, Expression, Identifier, UnaryOperator};
 pub use pattern::{
     NodePattern, PathPattern, Pattern, PatternLength, RelationshipChain, RelationshipDirection,

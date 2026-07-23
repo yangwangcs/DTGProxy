@@ -1,8 +1,8 @@
-use distributed_query::{BatchEnvelope, BatchMerger, DistributedQueryError, SnapshotTokenV2};
+use distributed_query::{BatchEnvelope, BatchMerger, DistributedQueryError, SnapshotToken};
 use temporal_types::TransactionTime;
 
-fn snapshot(epoch: u64) -> SnapshotTokenV2 {
-    SnapshotTokenV2::new(7, 3, epoch, TransactionTime::new(100, 2), [5; 32]).expect("snapshot")
+fn snapshot(epoch: u64) -> SnapshotToken {
+    SnapshotToken::new(7, 3, epoch, TransactionTime::new(100, 2), [5; 32]).expect("snapshot")
 }
 
 #[test]

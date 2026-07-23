@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
-use adapter_rocksdb::RocksAdapter;
 use dtgproxy::config::NodeConfig;
 use dtgproxy::control_plane::{
     BackendProfile, DeploymentMode, GraphDefinition, Placement, TopologyDefinition,
@@ -17,9 +16,7 @@ use dtgproxy::gateway::{
     GATEWAY_API_VERSION, GatewayOperation, GatewayRequest, GatewayService, initialize_node,
     send_request, serve,
 };
-use query_executor::LocalExecutor;
 use storage_api::AdapterRequirement;
-use temporal_storage::TemporalStore;
 
 const USAGE: &str = "DTGProxy 1.0 prototype\n\
 Usage:\n\
@@ -27,8 +24,6 @@ Usage:\n\
   dtgproxy serve --config <file>\n\
   dtgproxy status --config <file>\n\
   dtgproxy transaction --config <file> --file <request.json>\n\
-  dtgproxy query --config <file> --text <query>\n\
-  dtgproxy query --db <path> --text <query>\n\
   dtgproxy backend verify --config <file>\n\
   dtgproxy backend migrate --config <file> --provider <name>\n\
 Shard spec: shard_id:placement_epoch:voter+voter[,shard_id:placement_epoch:voter]";
@@ -66,7 +61,6 @@ fn run(arguments: Vec<String>) -> Result<Option<String>, CliError> {
         [command, rest @ ..] if command == "status" => status(rest).map(Some),
         [command, rest @ ..] if command == "serve" => serve_command(rest).map(|()| None),
         [command, rest @ ..] if command == "transaction" => transaction(rest).map(Some),
-        [command, rest @ ..] if command == "query" => query(rest).map(Some),
         [command, subcommand, rest @ ..] if command == "backend" && subcommand == "verify" => {
             backend_verify(rest).map(Some)
         }
@@ -166,25 +160,6 @@ fn transaction(arguments: &[String]) -> Result<String, CliError> {
     String::from_utf8(response).map_err(runtime_error)
 }
 
-fn query(arguments: &[String]) -> Result<String, CliError> {
-    let options = options(arguments)?;
-    let text = required(&options, "--text")?;
-    if let Some(database) = options.get("--db") {
-        return execute_local_query(database, text);
-    }
-    let config = NodeConfig::load(required(&options, "--config")?).map_err(runtime_error)?;
-    let request = GatewayRequest {
-        version: GATEWAY_API_VERSION,
-        request_id: "cli-query".into(),
-        operation: GatewayOperation::Query {
-            text: text.to_owned(),
-        },
-    };
-    let request = serde_json::to_vec(&request).map_err(runtime_error)?;
-    let response = send_request(config.listen(), &request).map_err(runtime_error)?;
-    String::from_utf8(response).map_err(runtime_error)
-}
-
 fn backend_verify(arguments: &[String]) -> Result<String, CliError> {
     let config = load_config(arguments)?;
     let gateway = block_on(GatewayService::open(config)).map_err(runtime_error)?;
@@ -246,15 +221,6 @@ fn backend_migrate(arguments: &[String]) -> Result<String, CliError> {
 fn load_config(arguments: &[String]) -> Result<NodeConfig, CliError> {
     let options = options(arguments)?;
     NodeConfig::load(required(&options, "--config")?).map_err(runtime_error)
-}
-
-fn execute_local_query(database: &str, query: &str) -> Result<String, CliError> {
-    let plan = temporal_query::parse(query)
-        .map_err(|error| CliError::Usage(format!("query parse error: {error}")))?;
-    let adapter = RocksAdapter::open(database).map_err(runtime_error)?;
-    let result = block_on(LocalExecutor::new(TemporalStore::new(adapter)).execute(&plan))
-        .map_err(runtime_error)?;
-    result.to_canonical_json().map_err(runtime_error)
 }
 
 fn options(arguments: &[String]) -> Result<BTreeMap<String, String>, CliError> {

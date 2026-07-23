@@ -1,13 +1,15 @@
 use raft_command::{
-    AbortBackendMigrationV1, AbortIntentV1, ApplyPreparedV1, BeginBackendDualApplyV1,
-    CommandBodyV1, CommandCodecError, CommandEnvelopeV1, CutoverBackendV1, FinalizeV1,
-    MAX_COMMAND_BYTES, OnePhaseCommitV1, PrewriteV1, RecordDecisionV1,
+    AbortBackendMigrationV1, AbortIntentV1, AdvanceAnalyticsArtifactFenceV1,
+    AnalyticsArtifactKindV1, ApplyPreparedV1, BeginBackendDualApplyV1, CommandBodyV1,
+    CommandCodecError, CommandEnvelopeV1, CutoverBackendV1, DeleteAnalyticsArtifactGenerationV1,
+    FinalizeV1, MAX_ANALYTICS_ARTIFACT_CHUNK_BYTES, MAX_COMMAND_BYTES, OnePhaseCommitV1,
+    PinAnalyticsArtifactGenerationV1, PrewriteV1, PutAnalyticsArtifactChunkV1, RecordDecisionV1,
 };
 use storage_api::{Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use temporal_types::TransactionTime;
 use txn_protocol::{
-    HomeTransactionRecord, IsolationLevel, ParticipantProof, PrewriteRequest, ShardEpoch,
-    TransactionId, TransactionState,
+    HomeTransactionRecord, IsolationLevel, ParticipantProof, PrewriteMetadata, PrewriteRequest,
+    ShardEpoch, TransactionId, TransactionState,
 };
 
 fn apply_command() -> CommandEnvelopeV1 {
@@ -40,6 +42,11 @@ fn participant(shard_id: u32) -> ShardEpoch {
     ShardEpoch::new(shard_id, 11).unwrap()
 }
 
+fn metadata(schema_version: u64, placement_epoch: u64) -> PrewriteMetadata {
+    PrewriteMetadata::new(schema_version, placement_epoch, Vec::new(), Vec::new())
+        .expect("current prewrite metadata")
+}
+
 fn prewrite_request() -> PrewriteRequest {
     PrewriteRequest::new(
         TransactionId::new(42),
@@ -59,6 +66,8 @@ fn prewrite_request() -> PrewriteRequest {
                 b"value".to_vec(),
             )],
         },
+        Vec::new(),
+        metadata(5, 11),
     )
     .unwrap()
 }
@@ -89,6 +98,20 @@ fn every_distributed_transaction_phase_round_trips_canonically() {
                 request: request.clone(),
                 expected_proof: proof,
             }),
+        ),
+        CommandEnvelopeV1::new(
+            11,
+            3,
+            924,
+            CommandBodyV1::AdvanceAnalyticsArtifactFence(
+                AdvanceAnalyticsArtifactFenceV1::new(
+                    501,
+                    AnalyticsArtifactKindV1::Checkpoint,
+                    8,
+                    19,
+                )
+                .unwrap(),
+            ),
         ),
         CommandEnvelopeV1::new(
             7,
@@ -220,6 +243,161 @@ fn backend_lifecycle_commands_round_trip_with_generation_and_digest_fences() {
                 .encode()
                 .unwrap(),
             encoded
+        );
+    }
+}
+
+#[test]
+fn analytics_artifact_put_and_delete_commands_are_canonical_and_bounded() {
+    let put = PutAnalyticsArtifactChunkV1::new(
+        501,
+        AnalyticsArtifactKindV1::Checkpoint,
+        7,
+        1_725_000_000_123,
+        0,
+        [0; 32],
+        b"checkpoint-chunk".to_vec(),
+    )
+    .unwrap();
+    assert_eq!(put.created_at_unix_ms, 1_725_000_000_123);
+    let commands = [
+        CommandEnvelopeV1::new(11, 3, 920, CommandBodyV1::PutAnalyticsArtifactChunk(put)),
+        CommandEnvelopeV1::new(
+            11,
+            3,
+            921,
+            CommandBodyV1::DeleteAnalyticsArtifactGeneration(
+                DeleteAnalyticsArtifactGenerationV1::new_with_gc_epoch(
+                    501,
+                    AnalyticsArtifactKindV1::Checkpoint,
+                    7,
+                    19,
+                )
+                .unwrap(),
+            ),
+        ),
+    ];
+
+    for command in commands {
+        let encoded = command.encode().unwrap();
+        assert_eq!(CommandEnvelopeV1::decode(&encoded).unwrap(), command);
+    }
+    assert_eq!(
+        DeleteAnalyticsArtifactGenerationV1::new_with_gc_epoch(
+            501,
+            AnalyticsArtifactKindV1::Result,
+            7,
+            0,
+        )
+        .unwrap_err(),
+        CommandCodecError::InvalidAnalyticsArtifact
+    );
+    assert_eq!(
+        AdvanceAnalyticsArtifactFenceV1::new(501, AnalyticsArtifactKindV1::Result, 8, 0,)
+            .unwrap_err(),
+        CommandCodecError::InvalidAnalyticsArtifact
+    );
+    assert_eq!(
+        PutAnalyticsArtifactChunkV1::new(
+            501,
+            AnalyticsArtifactKindV1::Result,
+            7,
+            1_725_000_000_123,
+            1,
+            [0; 32],
+            b"invalid-chain".to_vec(),
+        )
+        .unwrap_err(),
+        CommandCodecError::InvalidAnalyticsArtifact
+    );
+    assert_eq!(
+        PutAnalyticsArtifactChunkV1::new(
+            501,
+            AnalyticsArtifactKindV1::Result,
+            7,
+            0,
+            0,
+            [0; 32],
+            b"missing-created-at".to_vec(),
+        )
+        .unwrap_err(),
+        CommandCodecError::InvalidAnalyticsArtifact
+    );
+}
+
+#[test]
+fn legacy_artifact_put_without_created_at_fails_closed() {
+    let command = CommandEnvelopeV1::new(
+        11,
+        3,
+        923,
+        CommandBodyV1::PutAnalyticsArtifactChunk(
+            PutAnalyticsArtifactChunkV1::new(
+                501,
+                AnalyticsArtifactKindV1::Result,
+                7,
+                1_725_000_000_123,
+                0,
+                [0; 32],
+                b"legacy".to_vec(),
+            )
+            .unwrap(),
+        ),
+    );
+    let mut legacy = command.encode().unwrap();
+    legacy.drain(65..73);
+    let body_length = u32::from_be_bytes(legacy[36..40].try_into().unwrap()) - 8;
+    legacy[36..40].copy_from_slice(&body_length.to_be_bytes());
+    refresh_checksum(&mut legacy);
+    assert!(CommandEnvelopeV1::decode(&legacy).is_err());
+}
+
+#[test]
+fn analytics_artifact_pin_command_is_canonical_and_manifest_bounded() {
+    let digest = *blake3::hash(b"ab").as_bytes();
+    let pin = PinAnalyticsArtifactGenerationV1::new(
+        501,
+        AnalyticsArtifactKindV1::Checkpoint,
+        7,
+        2,
+        2,
+        digest,
+    )
+    .unwrap();
+    let command = CommandEnvelopeV1::new(
+        11,
+        3,
+        922,
+        CommandBodyV1::PinAnalyticsArtifactGeneration(pin),
+    );
+    let encoded = command.encode().unwrap();
+    assert_eq!(CommandEnvelopeV1::decode(&encoded).unwrap(), command);
+    assert_eq!(
+        CommandEnvelopeV1::decode(&encoded)
+            .unwrap()
+            .encode()
+            .unwrap(),
+        encoded
+    );
+
+    for (count, total_bytes, content_digest) in [
+        (0, 1, digest),
+        (1, 0, digest),
+        (2, 1, digest),
+        (4097, 4097, digest),
+        (1, MAX_ANALYTICS_ARTIFACT_CHUNK_BYTES as u64 + 1, digest),
+        (1, 1, [0; 32]),
+    ] {
+        assert_eq!(
+            PinAnalyticsArtifactGenerationV1::new(
+                501,
+                AnalyticsArtifactKindV1::Checkpoint,
+                7,
+                count,
+                total_bytes,
+                content_digest,
+            ),
+            Err(CommandCodecError::InvalidAnalyticsArtifact)
         );
     }
 }

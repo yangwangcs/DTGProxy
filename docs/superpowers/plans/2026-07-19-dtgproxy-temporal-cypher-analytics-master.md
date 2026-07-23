@@ -4,14 +4,14 @@
 
 **Goal:** Deliver the DTGProxy 1.0 prototype as a backend-neutral Cypher/Bolt, distributed bitemporal query and transaction, and temporal graph analytics middleware over RocksDB, Neo4j, and PostgreSQL.
 
-**Architecture:** Preserve the proven storage, Raft, routing, and transaction layers. Add a versioned language front end and Temporal IR v2 beside the existing debug DSL/IR v1, lower v2 to an explicit distributed physical DAG, and expose one session/transaction service to Bolt and the existing gateway API. Analytics consumes immutable canonical projections, never backend-native graph objects. Every public wire, plan, projection, and provider structure is versioned and bounded.
+**Architecture:** Preserve the proven storage, Raft, routing, and transaction layers. The Cypher front end lowers directly into the Temporal IR and explicit distributed physical DAG. Temporal Cypher is the sole query surface. Analytics consumes immutable canonical projections, never backend-native graph objects. Every public wire, plan, projection, and provider structure is bounded.
 
 **Tech Stack:** Rust 1.93, Tokio, Tonic, existing Raft and adapter SPI, handwritten safe-Rust Cypher/Bolt core, serde for control metadata, blake3 for fingerprints, petgraph as the first in-process provider, optional C/WASM/remote provider boundaries.
 
 ## Global Constraints
 
 - Keep `#![forbid(unsafe_code)]` in every core crate. Any future native FFI is isolated in a `*-sys` crate and is not part of the 1.0 trusted core.
-- Keep `temporal-query` and `TemporalPlan` v1 as a supported debug surface until v2 migration tests prove equivalence.
+- Support only Temporal Cypher and the Temporal IR; no alternate query, IR, executor, or gateway path is supported.
 - Never send user Cypher to a backend. Backend pushdown receives only validated physical fragments.
 - TSO exclusively owns new transaction timestamps. Client-supplied transaction time is read-only.
 - Enforce graph, schema, topology, security, compatibility-profile, and snapshot identities at every distributed boundary.
@@ -34,19 +34,19 @@ The implementation builds on these existing stable contracts:
 | `temporal-storage` | canonical bitemporal materialization and history | projection scans and write lowering |
 | `txn-protocol` | home-shard 2PC, participant intents, recovery | read/write dependency metadata and constraint locks |
 | `control-plane` | graph/schema/topology/backend profiles | statistics, procedures, algorithms, policies |
-| `temporal-ir` | v1 debug plans | isolated `v2` module with logical row algebra |
-| `query-executor` | v1 local and distributed scan execution | v2 operator runtime and physical fragments |
+| `temporal-ir` | current logical row algebra | validated current IR |
+| `query-executor` | current batch and temporal-row runtime | physical fragment execution |
 | `gateway-node` | admission, routing, remote shard access | session service and Bolt listener |
 | `dtgproxy` | embedded runtime, transaction coordinator, migrations | compiled-query and analytics orchestration |
 
-Compatibility is additive: v1 types are not renamed or reinterpreted. A `LegacyPlanAdapter` may convert only semantically representable v1 plans into v2 plans.
+Any query or IR representation outside the current format is rejected rather than translated.
 
 ## 2. Workspace Dependency Graph
 
 ```text
 temporal-types
   ├─ cypher-ast ── cypher-syntax
-  ├─ temporal-ir(v2)
+  ├─ temporal-ir
   └─ analytics-api
 
 cypher-syntax ──> cypher-ast
@@ -132,7 +132,7 @@ Diagnostics never embed backend error strings directly; errors map through a ver
 
 ### 3.3 Temporal and snapshot context
 
-`temporal-ir::v2` defines:
+`temporal-ir` defines:
 
 ```rust
 pub enum ValidTimeScope {
@@ -168,7 +168,7 @@ crates/cypher-ast/src/
 crates/cypher-sema/src/
   lib.rs catalog.rs scope.rs binder.rs types.rs aggregate.rs update.rs temporal.rs functions.rs errors.rs
 crates/cypher-compiler/src/
-  lib.rs options.rs normalize.rs lower.rs fingerprint.rs cache.rs legacy.rs
+  lib.rs options.rs normalize.rs lower.rs fingerprint.rs cache.rs
 ```
 
 The parser is lossless and recovery-aware. Version scanning occurs before lexing so reserved-word and feature gates are profile-specific. DTG `AT` and `DIFF` nodes remain explicit through semantic analysis, then lower to ordinary temporal logical operators.
@@ -199,21 +199,21 @@ pub struct CompiledQuery {
     pub parameter_schema: ParameterSchema,
     pub result_schema: RowSchema,
     pub effect: QueryEffect,
-    pub logical_plan: temporal_ir::v2::LogicalPlan,
+    pub logical_plan: temporal_ir::LogicalPlan,
 }
 ```
 
 Plan-cache keys include normalized query, language baseline, graph/schema version, parameter type shape, security fingerprint, and feature flags.
 
-## 5. Temporal IR v2 and Optimizer Code Design
+## 5. Temporal IR and Optimizer Code Design
 
 ### 5.1 Logical plan
 
-`temporal-ir::v2::LogicalPlan` is an arena of immutable nodes with validated input IDs:
+`temporal-ir::LogicalPlan` is an arena of immutable nodes with validated input IDs:
 
 ```rust
 pub struct LogicalPlan {
-    pub header: PlanHeaderV2,
+    pub header: PlanHeader,
     pub nodes: Vec<LogicalNode>,
     pub root: LogicalNodeId,
     pub output: RowSchema,
@@ -241,7 +241,7 @@ pub enum LogicalOperator {
 
 ```rust
 pub struct PhysicalPlan {
-    pub header: PhysicalPlanHeaderV1,
+    pub header: PhysicalPlanHeader,
     pub fragments: Vec<PlanFragment>,
     pub exchanges: Vec<Exchange>,
     pub root: FragmentId,
@@ -378,8 +378,8 @@ IDs are sorted and remapped densely. Projection identity hashes graph/schema/top
 
 ```rust
 pub trait AnalyticsProvider: Send + Sync {
-    fn descriptor(&self) -> &ProviderDescriptorV1;
-    fn algorithms(&self) -> &[AlgorithmDescriptorV1];
+    fn descriptor(&self) -> &ProviderDescriptor;
+    fn algorithms(&self) -> &[AlgorithmDescriptor];
     fn run<'a>(&'a self, request: AlgorithmRequest<'a>) -> AnalyticsFuture<'a, AlgorithmResult>;
     fn cancel<'a>(&'a self, run: RunId) -> AnalyticsFuture<'a, ()>;
 }
@@ -401,6 +401,39 @@ Vertex-centric native jobs use partition-local state, superstep messages, global
 
 Incremental jobs consume committed logical change batches after transaction apply. Checkpoints record input applied-log indexes, projection identity, provider/algorithm version, and state digest. Any gap, topology change, or incompatible algorithm upgrade triggers replay or full recomputation.
 
+### 8.5 Cluster analytics ledger implementation sequence
+
+The current implementation removes process-affine job IDs and replaces the in-memory job manager
+with one cluster ledger. No old job-handle parser or compatibility path remains.
+
+1. Add `analytics-ledger` with canonical command/snapshot codecs and a deterministic state machine.
+   Implement Submit, Claim, Renew, BeginRun, CommitCheckpoint, PublishResult, Fail, Cancel, and
+   ExpireLease transitions. Every mutating transition uses request replay protection plus expected
+   job revision, topology epoch, and lease epoch fencing. Unit tests cover every valid transition,
+   stale writer, replay mismatch, competing claim, terminal-state immutability, codec corruption,
+   and snapshot round trip.
+2. Embed the ledger beside Catalog and TSO in `MetaStateMachine`, with separate command magic and
+   revision. Include it in the current Meta snapshot format and expose Submit/Get/ListClaimable/
+   Mutate RPCs through `MetaService`. Quorum and process-restart tests prove committed state and
+   lease epochs survive leader failover without changing Catalog Revision.
+3. Add analytics artifact mutations to `raft-command` and `shard-runtime`. Store bounded,
+   digest-checked checkpoint/result chunks under a reserved analytics namespace through the active
+   StorageAdapter. Remote Shard RPCs expose put/get/delete-by-generation; adapter and replica
+   recovery tests run for memory and RocksDB first, followed by Neo4j/PostgreSQL live certification.
+4. Replace `AnalyticsJobManager` with a cluster coordinator SPI in `procedure-runtime`. Gateway
+   builds an immutable job specification from the compiled procedure, fixed transaction snapshot,
+   temporal scope, routing topology and security context. Submit/status/results/cancel call Meta;
+   synchronous algorithm procedures continue to use the typed Provider directly.
+5. Add a Gateway scheduler that claims/renews leases, rebuilds the fixed projection, loads the
+   latest compatible checkpoint, runs or resumes the Provider, writes artifact chunks, and CAS
+   publishes their Manifest. Two-Gateway integration tests kill the first owner at each phase and
+   prove takeover, stale-owner fencing, cancellation, and byte-identical pagination.
+6. Extend the Provider SPI with versioned checkpoint encode/restore and deterministic execution
+   slices. Degree, WCC and PageRank implement native distributed checkpoints first; remaining
+   stable algorithms either implement a declared checkpoint or use bounded deterministic replay
+   from the fixed projection. Unsupported recovery is an explicit stable error, never silent
+   process-local fallback.
+
 ## 9. Execution Order and Checkpoints
 
 1. Implement the Cypher/Bolt plan and commit after parser/sema/protocol state-machine suites pass.
@@ -410,19 +443,16 @@ Incremental jobs consume committed logical change batches after transaction appl
 5. Integrate gateway end-to-end and run backend/deployment matrices.
 6. Only then execute the unified boundary certification plan and fix every finding.
 
-Detailed plans:
-
-- `docs/superpowers/plans/2026-07-19-dtgproxy-cypher-bolt.md`
-- `docs/superpowers/plans/2026-07-19-dtgproxy-temporal-ir-distributed-query.md`
-- `docs/superpowers/plans/2026-07-19-dtgproxy-temporal-transactions.md`
-- `docs/superpowers/plans/2026-07-19-dtgproxy-temporal-analytics.md`
-- `docs/superpowers/plans/2026-07-19-dtgproxy-boundary-certification.md`
+The transaction work is tracked in
+`docs/superpowers/plans/2026-07-19-dtgproxy-temporal-transactions.md`; final certification is
+tracked in `docs/superpowers/plans/2026-07-19-dtgproxy-boundary-certification.md`. This master
+plan is the sole current source for Cypher, IR, executor, and analytics implementation scope.
 
 ## 10. Definition of Done
 
 - Every stable syntax, semantic, transaction, algorithm, backend, and deployment row in the approved specification has a named automated test.
 - No `todo!`, `unimplemented!`, placeholder success, silent fallback, or ignored conformance test exists in stable code.
-- Cypher 5 and Cypher 25 profiles are versioned and tested independently; DTG extensions never change standard-query semantics.
+- Only the current Cypher 25 profile is supported; older language profiles have no compatibility path, and DTG extensions never change standard-query semantics.
 - Explicit and auto-commit Bolt transactions share the same coordinator used by the existing API.
 - Three backends and both deployment modes return canonical-equivalent results for the stable matrix.
 - Crash, retry, replay, cancellation, rebalance, and stale-epoch tests demonstrate safe failure.

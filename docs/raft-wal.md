@@ -1,6 +1,6 @@
 # Durable Raft WAL and Replica Restart
 
-Phase 2 keeps consensus durability and temporal graph data in separate RocksDB databases. The
+The current runtime keeps consensus durability and temporal graph data in separate RocksDB databases. The
 Raft WAL owns HardState, ConfState, log entries, and the latest Raft snapshot. The Adapter owns all
 Current/History/adjacency/transaction records plus the Replica's term, applied index, epoch, and
 safe-time watermarks in one atomic business batch. They are joined by the applied log index, not by

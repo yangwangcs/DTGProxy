@@ -14,6 +14,7 @@ pub use raft_host::{MetaRaftError, MetaRaftReplica};
 pub use raft_runtime::{MetaRaftGrpcService, MetaRaftRuntime, MetaRaftRuntimeError};
 pub use service::MetaNodeService;
 pub use state_machine::{
-    CatalogEvent, MetaApplyReceipt, MetaStateError, MetaStateMachine, WatchBatch,
+    AnalyticsGcLeaseCommand, AnalyticsGcLeaseRecord, CatalogEvent, MetaApplyReceipt,
+    MetaStateError, MetaStateMachine, WatchBatch,
 };
 pub use tso::{ReplicatedTso, ReserveTimestampCommand, TimestampBatch, TsoError};

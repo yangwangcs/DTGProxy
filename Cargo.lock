@@ -16,9 +16,13 @@ dependencies = [
  "adapter-registry",
  "adapter-sidecar",
  "base64",
+ "blake3",
+ "serde",
  "serde_json",
  "storage-api",
  "tempfile",
+ "temporal-storage",
+ "temporal-types",
  "ureq",
 ]
 
@@ -29,10 +33,13 @@ dependencies = [
  "adapter-registry",
  "adapter-rocksdb",
  "adapter-sidecar",
+ "blake3",
  "fallible-iterator",
  "postgres",
  "storage-api",
  "tempfile",
+ "temporal-storage",
+ "temporal-types",
 ]
 
 [[package]]
@@ -48,9 +55,11 @@ name = "adapter-rocksdb"
 version = "1.0.0"
 dependencies = [
  "adapter-registry",
+ "blake3",
  "rocksdb",
  "storage-api",
  "tempfile",
+ "temporal-storage",
 ]
 
 [[package]]
@@ -87,6 +96,17 @@ dependencies = [
 name = "analytics-api"
 version = "1.0.0"
 dependencies = [
+ "temporal-types",
+]
+
+[[package]]
+name = "analytics-ledger"
+version = "1.0.0"
+dependencies = [
+ "analytics-api",
+ "blake3",
+ "crc32fast",
+ "raft-command",
  "temporal-types",
 ]
 
@@ -436,6 +456,7 @@ dependencies = [
  "cypher-ast",
  "cypher-sema",
  "cypher-syntax",
+ "procedure-runtime",
  "temporal-ir",
  "temporal-types",
 ]
@@ -445,12 +466,15 @@ name = "cypher-engine"
 version = "1.0.0"
 dependencies = [
  "adapter-memory",
+ "analytics-api",
+ "analytics-ledger",
  "blake3",
  "bolt-protocol",
  "bolt-server",
  "cypher-ast",
  "cypher-compiler",
  "distributed-query",
+ "procedure-runtime",
  "query-executor",
  "query-optimizer",
  "temporal-ir",
@@ -463,8 +487,11 @@ dependencies = [
 name = "cypher-sema"
 version = "1.0.0"
 dependencies = [
+ "analytics-api",
  "cypher-ast",
  "cypher-syntax",
+ "procedure-runtime",
+ "temporal-ir",
 ]
 
 [[package]]
@@ -529,13 +556,19 @@ name = "distributed-query"
 version = "1.0.0"
 dependencies = [
  "adapter-memory",
+ "analytics-api",
+ "analytics-runtime",
  "blake3",
+ "cypher-compiler",
  "physical-plan",
+ "procedure-runtime",
  "query-executor",
+ "query-optimizer",
  "storage-api",
  "temporal-ir",
  "temporal-storage",
  "temporal-types",
+ "tokio",
 ]
 
 [[package]]
@@ -548,6 +581,8 @@ dependencies = [
  "adapter-registry",
  "adapter-rocksdb",
  "adapter-sidecar",
+ "analytics-api",
+ "analytics-runtime",
  "blake3",
  "cluster-protocol",
  "control-plane",
@@ -565,7 +600,6 @@ dependencies = [
  "storage-api",
  "tempfile",
  "temporal-ir",
- "temporal-query",
  "temporal-storage",
  "temporal-types",
  "timestamp-oracle",
@@ -743,19 +777,28 @@ dependencies = [
 name = "gateway-node"
 version = "1.0.0"
 dependencies = [
+ "adapter-neo4j",
+ "adapter-postgres",
+ "adapter-rocksdb",
+ "adapter-sidecar",
  "analytics-api",
+ "analytics-ledger",
  "analytics-runtime",
+ "blake3",
  "bolt-protocol",
  "bolt-server",
  "cluster-protocol",
  "control-plane",
  "crc32fast",
+ "cypher-ast",
  "cypher-compiler",
  "cypher-engine",
+ "cypher-syntax",
  "data-node",
  "distributed-query",
  "dtgproxy",
  "meta-node",
+ "procedure-runtime",
  "query-executor",
  "raft-command",
  "serde",
@@ -764,7 +807,6 @@ dependencies = [
  "storage-api",
  "tempfile",
  "temporal-ir",
- "temporal-query",
  "temporal-storage",
  "temporal-types",
  "timestamp-oracle",
@@ -1264,6 +1306,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "meta-node"
 version = "1.0.0"
 dependencies = [
+ "analytics-ledger",
  "cluster-protocol",
  "control-plane",
  "crc32fast",
@@ -1554,6 +1597,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "procedure-runtime"
+version = "1.0.0"
+dependencies = [
+ "analytics-api",
+ "analytics-ledger",
+ "analytics-runtime",
+ "blake3",
+ "cypher-ast",
+ "temporal-ir",
+ "temporal-types",
+ "tokio",
+]
+
+[[package]]
 name = "prost"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1705,8 +1762,13 @@ version = "1.0.0"
 dependencies = [
  "adapter-memory",
  "adapter-rocksdb",
+ "analytics-api",
+ "analytics-ledger",
  "blake3",
+ "cypher-compiler",
  "physical-plan",
+ "procedure-runtime",
+ "query-optimizer",
  "raft-command",
  "shard-runtime",
  "storage-api",
@@ -1714,6 +1776,7 @@ dependencies = [
  "temporal-ir",
  "temporal-storage",
  "temporal-types",
+ "tokio",
 ]
 
 [[package]]
@@ -1760,6 +1823,7 @@ dependencies = [
 name = "raft-command"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "crc32fast",
  "storage-api",
  "temporal-types",
@@ -2069,6 +2133,7 @@ name = "shard-client"
 version = "1.0.0"
 dependencies = [
  "adapter-memory",
+ "blake3",
  "cluster-protocol",
  "data-node",
  "raft-command",
@@ -2265,15 +2330,6 @@ dependencies = [
 name = "temporal-model"
 version = "1.0.0"
 dependencies = [
- "temporal-types",
-]
-
-[[package]]
-name = "temporal-query"
-version = "1.0.0"
-dependencies = [
- "temporal-ir",
- "temporal-storage",
  "temporal-types",
 ]
 

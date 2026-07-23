@@ -1,6 +1,5 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CypherVersion {
-    V5,
     V25,
 }
 
@@ -11,14 +10,6 @@ pub struct CypherProfile {
 }
 
 impl CypherProfile {
-    #[must_use]
-    pub const fn cypher_5() -> Self {
-        Self {
-            version: CypherVersion::V5,
-            semantic_baseline: "Cypher 5 / frozen",
-        }
-    }
-
     #[must_use]
     pub const fn cypher_25() -> Self {
         Self {

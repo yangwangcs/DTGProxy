@@ -18,6 +18,7 @@ pub struct BoltConnectionConfig {
     max_message_bytes: usize,
     max_chunk_bytes: usize,
     read_buffer_bytes: usize,
+    auth_required: bool,
 }
 
 impl BoltConnectionConfig {
@@ -42,7 +43,14 @@ impl BoltConnectionConfig {
             max_message_bytes,
             max_chunk_bytes,
             read_buffer_bytes,
+            auth_required: false,
         })
+    }
+
+    #[must_use]
+    pub const fn require_auth(mut self) -> Self {
+        self.auth_required = true;
+        self
     }
 }
 
@@ -53,6 +61,7 @@ impl Default for BoltConnectionConfig {
             max_message_bytes: 16 << 20,
             max_chunk_bytes: usize::from(u16::MAX),
             read_buffer_bytes: 16 << 10,
+            auth_required: false,
         }
     }
 }
@@ -85,12 +94,22 @@ where
 
     let mut decoder = ChunkDecoder::new(config.max_message_bytes, config.max_chunk_bytes)
         .map_err(|error| ConnectionError::Protocol(error.to_string()))?;
-    let mut machine = BoltMachine::new(service);
+    let mut machine = BoltMachine::new_with_auth(service, config.auth_required);
     let mut buffer = vec![0; config.read_buffer_bytes];
     loop {
         let read = stream.read(&mut buffer).await?;
         if read == 0 {
-            return Ok(());
+            return if decoder.is_clean() {
+                machine
+                    .close()
+                    .await
+                    .map_err(|error| ConnectionError::Protocol(error.to_string()))?;
+                Ok(())
+            } else {
+                Err(ConnectionError::Protocol(
+                    "Bolt connection ended with a partial chunked message".into(),
+                ))
+            };
         }
         let messages = decoder
             .push(&buffer[..read])

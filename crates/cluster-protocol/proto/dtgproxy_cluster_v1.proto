@@ -68,6 +68,83 @@ message ProposeResponse {
   bool duplicate = 2;
 }
 
+message ProposeAnalyticsJobRequest {
+  RequestContext context = 1;
+  bytes command = 2;
+}
+
+message ProposeAnalyticsJobResponse {
+  uint64 ledger_revision = 1;
+  uint64 job_revision = 2;
+  bool duplicate = 3;
+  bool request_duplicate = 4;
+  bytes canonical_job_id = 5;
+}
+
+message GetAnalyticsJobRequest {
+  RequestContext context = 1;
+  bytes job_id = 2;
+}
+
+message GetAnalyticsJobResponse {
+  uint64 ledger_revision = 1;
+  bytes record = 2;
+  uint32 checksum = 3;
+}
+
+message ListClaimableAnalyticsJobsRequest {
+  RequestContext context = 1;
+  uint64 now_unix_ms = 2;
+  bytes after_job_id = 3;
+  uint32 limit = 4;
+}
+
+message AnalyticsJobCandidate {
+  bytes job_id = 1;
+  uint64 job_revision = 2;
+  uint64 expired_lease_epoch = 3;
+}
+
+message ListClaimableAnalyticsJobsResponse {
+  uint64 ledger_revision = 1;
+  repeated AnalyticsJobCandidate candidates = 2;
+}
+
+message ListAnalyticsJobsRequest {
+  RequestContext context = 1;
+  bytes after_job_id = 2;
+  uint32 limit = 3;
+}
+
+message AnalyticsJobRecord {
+  bytes job_id = 1;
+  bytes record = 2;
+  uint32 checksum = 3;
+}
+
+message ListAnalyticsJobsResponse {
+  uint64 ledger_revision = 1;
+  repeated AnalyticsJobRecord jobs = 2;
+}
+
+message ListAnalyticsJobTombstonesRequest {
+  RequestContext context = 1;
+  bytes after_job_id = 2;
+  uint32 limit = 3;
+}
+
+message AnalyticsJobTombstoneRecord {
+  bytes job_id = 1;
+  bytes record = 2;
+  uint32 checksum = 3;
+}
+
+message ListAnalyticsJobTombstonesResponse {
+  uint64 ledger_revision = 1;
+  repeated AnalyticsJobTombstoneRecord tombstones = 2;
+  bytes next_job_id = 3;
+}
+
 message AllocateTimestampRequest {
   RequestContext context = 1;
   uint32 count = 2;
@@ -114,13 +191,30 @@ message AcquireControllerLeaseResponse {
   uint64 lease_expires_unix_ms = 2;
 }
 
+message AcquireAnalyticsGcLeaseRequest {
+  RequestContext context = 1;
+  uint64 gateway_id = 2;
+}
+
+message AcquireAnalyticsGcLeaseResponse {
+  uint64 owner_term = 1;
+  uint64 gc_epoch = 2;
+  uint64 lease_expires_unix_ms = 3;
+}
+
 service MetaService {
   rpc GetCatalog(GetCatalogRequest) returns (GetCatalogResponse);
   rpc WatchCatalog(WatchCatalogRequest) returns (stream CatalogEvent);
   rpc Propose(ProposeRequest) returns (ProposeResponse);
+  rpc ProposeAnalyticsJob(ProposeAnalyticsJobRequest) returns (ProposeAnalyticsJobResponse);
+  rpc GetAnalyticsJob(GetAnalyticsJobRequest) returns (GetAnalyticsJobResponse);
+  rpc ListClaimableAnalyticsJobs(ListClaimableAnalyticsJobsRequest) returns (ListClaimableAnalyticsJobsResponse);
+  rpc ListAnalyticsJobs(ListAnalyticsJobsRequest) returns (ListAnalyticsJobsResponse);
+  rpc ListAnalyticsJobTombstones(ListAnalyticsJobTombstonesRequest) returns (ListAnalyticsJobTombstonesResponse);
   rpc AllocateTimestamp(AllocateTimestampRequest) returns (AllocateTimestampResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc AcquireControllerLease(AcquireControllerLeaseRequest) returns (AcquireControllerLeaseResponse);
+  rpc AcquireAnalyticsGcLease(AcquireAnalyticsGcLeaseRequest) returns (AcquireAnalyticsGcLeaseResponse);
 }
 
 // Internal Meta-group Raft transport. The encoded message is raft-rs' stable
@@ -190,6 +284,129 @@ message ScanBatch {
   bool terminal = 4;
 }
 
+enum AnalyticsArtifactKind {
+  ANALYTICS_ARTIFACT_KIND_UNSPECIFIED = 0;
+  ANALYTICS_ARTIFACT_KIND_CHECKPOINT = 1;
+  ANALYTICS_ARTIFACT_KIND_RESULT = 2;
+}
+
+message PutAnalyticsArtifactChunkRequest {
+  ShardContext context = 1;
+  bytes job_id = 2;
+  AnalyticsArtifactKind kind = 3;
+  uint64 generation = 4;
+  uint64 ordinal = 5;
+  bytes previous_digest = 6;
+  bytes payload = 7;
+  uint64 created_at_unix_ms = 8;
+}
+
+message PutAnalyticsArtifactChunkResponse {
+  uint64 raft_index = 1;
+  bool duplicate = 2;
+}
+
+message PinAnalyticsArtifactGenerationRequest {
+  ShardContext context = 1;
+  bytes job_id = 2;
+  AnalyticsArtifactKind kind = 3;
+  uint64 generation = 4;
+  uint32 expected_chunk_count = 5;
+  uint64 expected_total_bytes = 6;
+  bytes expected_content_digest = 7;
+}
+
+message PinAnalyticsArtifactGenerationResponse {
+  uint64 raft_index = 1;
+  bool duplicate = 2;
+}
+
+message GetAnalyticsArtifactGenerationRequest {
+  ShardContext context = 1;
+  bytes job_id = 2;
+  AnalyticsArtifactKind kind = 3;
+  uint64 generation = 4;
+  uint32 expected_chunk_count = 5;
+  uint64 expected_total_bytes = 6;
+  bytes expected_content_digest = 7;
+}
+
+message AnalyticsArtifactChunk {
+  uint64 ordinal = 1;
+  uint64 applied_index = 2;
+  bytes previous_digest = 3;
+  bytes payload_digest = 4;
+  bytes payload = 5;
+}
+
+message DeleteAnalyticsArtifactGenerationRequest {
+  ShardContext context = 1;
+  bytes job_id = 2;
+  AnalyticsArtifactKind kind = 3;
+  uint64 generation = 4;
+  uint64 gc_epoch = 5;
+}
+
+message DeleteAnalyticsArtifactGenerationResponse {
+  uint64 raft_index = 1;
+  bool duplicate = 2;
+}
+
+message AdvanceAnalyticsArtifactFenceRequest {
+  ShardContext context = 1;
+  bytes job_id = 2;
+  AnalyticsArtifactKind kind = 3;
+  uint64 generation = 4;
+  uint64 gc_epoch = 5;
+}
+
+message AdvanceAnalyticsArtifactFenceResponse {
+  uint64 raft_index = 1;
+  bool duplicate = 2;
+}
+
+message ListAnalyticsArtifactGenerationsRequest {
+  ShardContext context = 1;
+  bytes job_id = 2;
+  AnalyticsArtifactKind kind = 3;
+  uint32 limit = 4;
+}
+
+message AnalyticsArtifactGeneration {
+  bytes job_id = 1;
+  AnalyticsArtifactKind kind = 2;
+  uint64 generation = 3;
+  uint32 expected_chunk_count = 4;
+  uint64 expected_total_bytes = 5;
+  bytes expected_content_digest = 6;
+  bool pinned = 7;
+  uint64 applied_index = 8;
+  uint64 created_at_unix_ms = 9;
+}
+
+message ListAnalyticsArtifactGenerationsResponse {
+  uint64 applied_index = 1;
+  repeated AnalyticsArtifactGeneration generations = 2;
+}
+
+message AnalyticsArtifactGenerationCursor {
+  bytes job_id = 1;
+  AnalyticsArtifactKind kind = 2;
+  uint64 generation = 3;
+}
+
+message ListAnalyticsArtifactGenerationHeadsRequest {
+  ShardContext context = 1;
+  AnalyticsArtifactGenerationCursor after = 2;
+  uint32 limit = 3;
+}
+
+message ListAnalyticsArtifactGenerationHeadsResponse {
+  uint64 applied_index = 1;
+  repeated AnalyticsArtifactGeneration generations = 2;
+  AnalyticsArtifactGenerationCursor next = 3;
+}
+
 message SnapshotChunk {
   ShardContext context = 1;
   bytes migration_id = 2;
@@ -237,6 +454,13 @@ service ShardService {
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc Read(ReadRequest) returns (ReadResponse);
   rpc Scan(ScanRequest) returns (stream ScanBatch);
+  rpc PutAnalyticsArtifactChunk(PutAnalyticsArtifactChunkRequest) returns (PutAnalyticsArtifactChunkResponse);
+  rpc PinAnalyticsArtifactGeneration(PinAnalyticsArtifactGenerationRequest) returns (PinAnalyticsArtifactGenerationResponse);
+  rpc GetAnalyticsArtifactGeneration(GetAnalyticsArtifactGenerationRequest) returns (stream AnalyticsArtifactChunk);
+  rpc DeleteAnalyticsArtifactGeneration(DeleteAnalyticsArtifactGenerationRequest) returns (DeleteAnalyticsArtifactGenerationResponse);
+  rpc AdvanceAnalyticsArtifactFence(AdvanceAnalyticsArtifactFenceRequest) returns (AdvanceAnalyticsArtifactFenceResponse);
+  rpc ListAnalyticsArtifactGenerations(ListAnalyticsArtifactGenerationsRequest) returns (ListAnalyticsArtifactGenerationsResponse);
+  rpc ListAnalyticsArtifactGenerationHeads(ListAnalyticsArtifactGenerationHeadsRequest) returns (ListAnalyticsArtifactGenerationHeadsResponse);
   rpc ExportSnapshot(ExportSnapshotRequest) returns (stream SnapshotChunk);
   rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
   rpc ReplicaStatus(ReplicaStatusRequest) returns (ReplicaStatusResponse);

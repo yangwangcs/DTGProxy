@@ -34,11 +34,15 @@ benchmark binaries; their numbers are diagnostic and are not service SLOs.
 - PrimaryReplica and SharedNothing semantic suites both pass; SharedNothing cross-Shard execution
   is exercised through remote clients and deterministic fan-out/merge tests.
 
-## Environment-gated exclusions
+## Backend certification status
 
-- `adapter-neo4j/tests/live_neo4j.rs`: 1 ignored test; requires a disposable Neo4j service.
-- `adapter-postgres/tests/live_postgres.rs`: 3 ignored tests; require a disposable PostgreSQL
-  service.
+The exclusions recorded in the original 2026-07-18 verification run are closed. PostgreSQL 17 and
+Neo4j 5.26 Community are provisioned as disposable GitHub Actions services. Their live Mapping
+tests are not marked `#[ignore]`; an unavailable or incompatible service fails certification.
 
-These exclusions block production backend certification, not the local research-prototype claim.
-The exact remaining boundaries are recorded in `docs/dtgproxy-v1-boundary-audit.md`.
+`.github/workflows/three-backend-migration.yml` runs all six migration directions and the complete
+RocksDB/PostgreSQL/Neo4j x PrimaryReplica/Shared-Nothing distributed surface test, including
+Temporal Cypher, temporal transactions, projections, synchronous/asynchronous Degree, result
+pagination, and lease-expiry takeover by a second Gateway. This document remains the P0 runtime
+record; current backend evidence is maintained in `docs/postgresql-adapter.md`,
+`docs/adapter-spi.md`, and `.superpowers/sdd/progress.md`.

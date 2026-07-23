@@ -10,12 +10,15 @@ mod coordinator;
 mod worker;
 
 pub use coordinator::DistributedCoordinator;
-pub use worker::{FragmentWorker, LocalFragmentWorker, WorkerBatch, WorkerFuture};
+pub use worker::{
+    FragmentWorker, LocalFragmentWorker, TemporalWorkerBatch, TemporalWorkerFuture, WorkerBatch,
+    WorkerFuture,
+};
 
 pub const DISTRIBUTED_QUERY_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SnapshotTokenV2 {
+pub struct SnapshotToken {
     graph_id: u64,
     schema_version: u64,
     topology_epoch: u64,
@@ -24,7 +27,7 @@ pub struct SnapshotTokenV2 {
     fingerprint: [u8; 32],
 }
 
-impl SnapshotTokenV2 {
+impl SnapshotToken {
     pub fn new(
         graph_id: u64,
         schema_version: u64,
@@ -40,7 +43,7 @@ impl SnapshotTokenV2 {
             return Err(DistributedQueryError::InvalidSnapshot);
         }
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"DTGProxy/DistributedSnapshot/V2");
+        hasher.update(b"DTGProxy/DistributedSnapshot/Latest");
         hasher.update(&graph_id.to_be_bytes());
         hasher.update(&schema_version.to_be_bytes());
         hasher.update(&topology_epoch.to_be_bytes());
@@ -93,16 +96,17 @@ impl SnapshotTokenV2 {
 pub struct FragmentRequest {
     protocol_version: u16,
     fragment_id: physical_plan::FragmentId,
-    snapshot: SnapshotTokenV2,
+    snapshot: SnapshotToken,
     deadline_unix_ms: u64,
     memory_bytes: u64,
     batch_rows: u32,
+    expected_shards: Vec<u32>,
 }
 
 impl FragmentRequest {
     pub fn new(
         fragment_id: physical_plan::FragmentId,
-        snapshot: SnapshotTokenV2,
+        snapshot: SnapshotToken,
         deadline_unix_ms: u64,
         memory_bytes: u64,
         batch_rows: u32,
@@ -117,7 +121,20 @@ impl FragmentRequest {
             deadline_unix_ms,
             memory_bytes,
             batch_rows,
+            expected_shards: Vec::new(),
         })
+    }
+
+    pub fn with_expected_shards(
+        mut self,
+        expected_shards: Vec<u32>,
+    ) -> Result<Self, DistributedQueryError> {
+        let unique = expected_shards.iter().copied().collect::<BTreeSet<_>>();
+        if expected_shards.is_empty() || unique.len() != expected_shards.len() {
+            return Err(DistributedQueryError::InvalidRequest);
+        }
+        self.expected_shards = expected_shards;
+        Ok(self)
     }
 
     #[must_use]
@@ -126,7 +143,7 @@ impl FragmentRequest {
     }
 
     #[must_use]
-    pub const fn snapshot(&self) -> &SnapshotTokenV2 {
+    pub const fn snapshot(&self) -> &SnapshotToken {
         &self.snapshot
     }
 
@@ -143,6 +160,11 @@ impl FragmentRequest {
     #[must_use]
     pub const fn batch_rows(&self) -> u32 {
         self.batch_rows
+    }
+
+    #[must_use]
+    pub fn expected_shards(&self) -> &[u32] {
+        &self.expected_shards
     }
 }
 
@@ -161,7 +183,7 @@ impl BatchEnvelope {
         shard_id: u32,
         sequence: u64,
         has_more: bool,
-        snapshot: &SnapshotTokenV2,
+        snapshot: &SnapshotToken,
         payload: Vec<u8>,
     ) -> Self {
         Self {
@@ -190,7 +212,7 @@ pub struct BatchMerger {
 impl BatchMerger {
     pub fn new(
         expected_shards: Vec<u32>,
-        snapshot: SnapshotTokenV2,
+        snapshot: SnapshotToken,
         max_payload_bytes: usize,
     ) -> Result<Self, DistributedQueryError> {
         if expected_shards.is_empty() || max_payload_bytes == 0 {
@@ -284,6 +306,21 @@ pub enum DistributedQueryError {
     PayloadLimit,
     SequenceExhausted,
     IncompleteShards(Vec<u32>),
+    MissingShards(Vec<u32>),
+    SecurityMismatch,
+    Cancelled,
+    MemoryLimitExceeded {
+        limit: u64,
+        required: u64,
+    },
+    ApplyInvocationLimit {
+        max: u64,
+    },
+    ApplyOutputRowLimit {
+        max: u64,
+    },
+    RecursivePlanViolation,
+    StorageFailure,
     WorkerIdentityMismatch,
     FragmentMismatch,
     DeadlineExceeded,

@@ -85,6 +85,28 @@ fn cross_partition_edge_identity_round_trips_endpoint_partitions() {
 }
 
 #[test]
+fn edge_identity_uses_the_current_format_and_rejects_its_predecessor() {
+    let edge = EdgeIdentity::new(
+        edge_ref(),
+        EdgeTypeId::new(8),
+        ElementId::new(3),
+        ElementId::new(4),
+    )
+    .unwrap();
+    let bytes = edge.encode();
+
+    assert_eq!(&bytes[4..6], 2_u16.to_be_bytes());
+    assert_eq!(EdgeIdentity::decode(&bytes).unwrap(), edge);
+
+    let mut predecessor = bytes;
+    predecessor[4..6].copy_from_slice(&1_u16.to_be_bytes());
+    assert_eq!(
+        EdgeIdentity::decode(&predecessor),
+        Err(RecordCodecError::UnsupportedVersion(1))
+    );
+}
+
+#[test]
 fn projection_round_trips_disjoint_finite_and_unbounded_segments_without_type_loss() {
     let projection = ProjectionRecord::new(
         TransactionTime::new(100, 2),

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod artifact;
 mod durable_replica;
 mod metadata;
 mod raft_group;
@@ -10,14 +11,33 @@ mod transport;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+pub use artifact::{
+    AnalyticsArtifactChunk, AnalyticsArtifactGenerationHead,
+    AnalyticsArtifactGenerationHeadIdentity, AnalyticsArtifactGenerationPin,
+    MAX_ANALYTICS_ARTIFACT_CHUNKS, analytics_artifact_chunk_key,
+    analytics_artifact_generation_head_key, analytics_artifact_generation_head_prefix,
+    analytics_artifact_generation_heads_prefix, analytics_artifact_generation_pin_key,
+    decode_analytics_artifact_chunk, decode_analytics_artifact_generation_head,
+    decode_analytics_artifact_generation_head_identity,
+    decode_analytics_artifact_generation_head_key, decode_analytics_artifact_generation_pin,
+};
 pub use durable_replica::{DurableRaftReplica, DurableReplicaError};
 pub use metadata::{BackendLifecycle, MIN_REPLICA_TIME, ReplicaMetadata};
 pub use raft_group::{InProcessShardGroup, MultiRaftRuntime, ProposalReceipt, ReplicationError};
 pub use read_barrier::{FollowerReadProof, ReadBarrierError, ReadPermit, ReadPermitMode};
 pub use state_machine::ShardStateMachine;
-use storage_api::AdapterError;
+use storage_api::{AdapterError, ApplyReceipt};
 use temporal_types::TransactionTime;
 pub use transport::DeterministicTransport;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommittedEntryOutcome {
+    Applied(ApplyReceipt),
+    Rejected {
+        receipt: ApplyReceipt,
+        message: String,
+    },
+}
 
 #[derive(Debug)]
 pub enum ShardRuntimeError {
@@ -86,11 +106,21 @@ pub enum ShardRuntimeError {
     RequestMismatch {
         request_id: u128,
     },
+    CommittedRejection {
+        request_id: u128,
+        message: String,
+    },
     TooManyMutations,
     InvalidBackendGeneration {
         generation: u64,
     },
     BackendLifecycleConflict,
+    AnalyticsArtifactFence,
+    AnalyticsArtifactConflict,
+    AnalyticsArtifactLimit,
+    CorruptAnalyticsArtifact {
+        record: &'static str,
+    },
 }
 
 impl Display for ShardRuntimeError {
@@ -171,6 +201,13 @@ impl Display for ShardRuntimeError {
                 formatter,
                 "request {request_id} was retried with different command bytes"
             ),
+            Self::CommittedRejection {
+                request_id,
+                message,
+            } => write!(
+                formatter,
+                "request {request_id} was durably rejected: {message}"
+            ),
             Self::TooManyMutations => {
                 formatter.write_str("Replica metadata exceeds mutation sequence space")
             }
@@ -179,6 +216,18 @@ impl Display for ShardRuntimeError {
             }
             Self::BackendLifecycleConflict => {
                 formatter.write_str("backend lifecycle command conflicts with replicated state")
+            }
+            Self::AnalyticsArtifactFence => {
+                formatter.write_str("analytics artifact generation is stale or sealed")
+            }
+            Self::AnalyticsArtifactConflict => {
+                formatter.write_str("analytics artifact chunk conflicts with stored content")
+            }
+            Self::AnalyticsArtifactLimit => {
+                formatter.write_str("analytics artifact generation exceeds the chunk limit")
+            }
+            Self::CorruptAnalyticsArtifact { record } => {
+                write!(formatter, "corrupt analytics artifact {record}")
             }
         }
     }
@@ -210,5 +259,139 @@ impl From<raft_command::CommandCodecError> for ShardRuntimeError {
 impl From<txn_protocol::TxnProtocolError> for ShardRuntimeError {
     fn from(error: txn_protocol::TxnProtocolError) -> Self {
         Self::Transaction(error)
+    }
+}
+
+pub(crate) fn is_deterministic_business_error(error: &ShardRuntimeError) -> bool {
+    match error {
+        ShardRuntimeError::Transaction(error) => is_deterministic_transaction_error(error),
+        ShardRuntimeError::StaleEpoch { .. }
+        | ShardRuntimeError::NonMonotonicCommit { .. }
+        | ShardRuntimeError::CommitAtOrBeforeClosed { .. }
+        | ShardRuntimeError::IntentAtOrBeforeClosed { .. }
+        | ShardRuntimeError::ParticipantProofMismatch
+        | ShardRuntimeError::NonMonotonicClosed { .. }
+        | ShardRuntimeError::ReservedMetadataKey
+        | ShardRuntimeError::TooManyMutations
+        | ShardRuntimeError::BackendLifecycleConflict
+        | ShardRuntimeError::AnalyticsArtifactFence
+        | ShardRuntimeError::AnalyticsArtifactConflict
+        | ShardRuntimeError::AnalyticsArtifactLimit => true,
+        ShardRuntimeError::Adapter(_)
+        | ShardRuntimeError::Command(_)
+        | ShardRuntimeError::InvalidLogPosition { .. }
+        | ShardRuntimeError::ShardMismatch { .. }
+        | ShardRuntimeError::NonContiguousIndex { .. }
+        | ShardRuntimeError::NonMonotonicTerm { .. }
+        | ShardRuntimeError::DivergentReplay { .. }
+        | ShardRuntimeError::MetadataIndexMismatch { .. }
+        | ShardRuntimeError::CorruptMetadata { .. }
+        | ShardRuntimeError::ReplicaFaulted { .. }
+        | ShardRuntimeError::ApplyReceiptMismatch { .. }
+        | ShardRuntimeError::RequestEnvelopeMismatch { .. }
+        | ShardRuntimeError::RequestMismatch { .. }
+        | ShardRuntimeError::CommittedRejection { .. }
+        | ShardRuntimeError::InvalidBackendGeneration { .. } => false,
+        ShardRuntimeError::CorruptAnalyticsArtifact { .. } => false,
+    }
+}
+
+fn is_deterministic_transaction_error(error: &txn_protocol::TxnProtocolError) -> bool {
+    use txn_protocol::TxnProtocolError;
+
+    match error {
+        TxnProtocolError::InvalidTransactionId
+        | TxnProtocolError::InvalidPlacementEpoch { .. }
+        | TxnProtocolError::InvalidSchemaVersion
+        | TxnProtocolError::InvalidExpiry { .. }
+        | TxnProtocolError::InvalidParticipantCount { .. }
+        | TxnProtocolError::DuplicateParticipant
+        | TxnProtocolError::ParticipantMissing { .. }
+        | TxnProtocolError::HomeParticipantMissing { .. }
+        | TxnProtocolError::BatchShardMismatch { .. }
+        | TxnProtocolError::BatchTransactionMismatch
+        | TxnProtocolError::InvalidMutationCount { .. }
+        | TxnProtocolError::NonCanonicalMutationSequence { .. }
+        | TxnProtocolError::DuplicateMutationKey
+        | TxnProtocolError::InvalidConstraintClaimCount { .. }
+        | TxnProtocolError::InvalidConstraintKey
+        | TxnProtocolError::InvalidConstraintValue { .. }
+        | TxnProtocolError::DuplicateConstraintKey
+        | TxnProtocolError::InvalidReadDependencyKey
+        | TxnProtocolError::InvalidMetadataFence
+        | TxnProtocolError::MetadataFenceMismatch
+        | TxnProtocolError::InvalidPointReadCount { .. }
+        | TxnProtocolError::InvalidRangeReadCount { .. }
+        | TxnProtocolError::DuplicatePointReadKey
+        | TxnProtocolError::DuplicateRangeRead
+        | TxnProtocolError::ReadDependencyConflict { .. }
+        | TxnProtocolError::DuplicateParticipantProof
+        | TxnProtocolError::ParticipantProofSetMismatch
+        | TxnProtocolError::InvalidParticipantProof
+        | TxnProtocolError::UnexpectedParticipantProofs { .. }
+        | TxnProtocolError::CommitBeforeParticipantMinimum
+        | TxnProtocolError::CommitTimestampMissing
+        | TxnProtocolError::UnexpectedCommitTimestamp { .. }
+        | TxnProtocolError::InvalidCommitTimestamp { .. }
+        | TxnProtocolError::IntentConflict { .. }
+        | TxnProtocolError::WriteConflict { .. }
+        | TxnProtocolError::ConstraintConflict { .. }
+        | TxnProtocolError::MissingIntent
+        | TxnProtocolError::TransactionAlreadyAborted
+        | TxnProtocolError::TransactionAlreadyCommitted
+        | TxnProtocolError::InvalidHomeDecisionState { .. }
+        | TxnProtocolError::HomeDecisionConflict
+        | TxnProtocolError::TimestampExhausted => true,
+        TxnProtocolError::InvalidRangePrefixLength { .. }
+        | TxnProtocolError::RecordTooLarge { .. }
+        | TxnProtocolError::CorruptRecord
+        | TxnProtocolError::UnsupportedRecordVersion { .. }
+        | TxnProtocolError::NonCanonicalRecord
+        | TxnProtocolError::PayloadEncode(_)
+        | TxnProtocolError::PayloadDecode(_)
+        | TxnProtocolError::MissingField(_)
+        | TxnProtocolError::InvalidIdentifierLength { .. }
+        | TxnProtocolError::InvalidDigestLength { .. }
+        | TxnProtocolError::UnknownIsolation { .. }
+        | TxnProtocolError::UnknownTransactionState { .. }
+        | TxnProtocolError::UnknownKeyspace { .. }
+        | TxnProtocolError::UnknownMutationOperation { .. }
+        | TxnProtocolError::NonCanonicalDelete
+        | TxnProtocolError::LengthOverflow
+        | TxnProtocolError::InspectionCountMismatch { .. }
+        | TxnProtocolError::RequestReplayMismatch
+        | TxnProtocolError::MissingIntentLock { .. }
+        | TxnProtocolError::CorruptParticipantState => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use storage_api::{Keyspace, LogicalKey};
+    use txn_protocol::TxnProtocolError;
+
+    use super::{ShardRuntimeError, is_deterministic_business_error};
+
+    #[test]
+    fn committed_rejection_classifier_accepts_conflicts_but_not_corruption() {
+        let conflict = ShardRuntimeError::Transaction(TxnProtocolError::ConstraintConflict {
+            key: LogicalKey::in_keyspace(Keyspace::Current, b"unique/email".to_vec()),
+        });
+        assert!(is_deterministic_business_error(&conflict));
+
+        let corruption = ShardRuntimeError::Transaction(TxnProtocolError::CorruptRecord);
+        assert!(!is_deterministic_business_error(&corruption));
+        let invariant = ShardRuntimeError::Transaction(TxnProtocolError::InspectionCountMismatch {
+            expected: 2,
+            actual: 1,
+        });
+        assert!(!is_deterministic_business_error(&invariant));
+        let replay_invariant =
+            ShardRuntimeError::Transaction(TxnProtocolError::RequestReplayMismatch);
+        assert!(!is_deterministic_business_error(&replay_invariant));
+        let missing_lock = ShardRuntimeError::Transaction(TxnProtocolError::MissingIntentLock {
+            key: LogicalKey::in_keyspace(Keyspace::Current, b"intent/lock".to_vec()),
+        });
+        assert!(!is_deterministic_business_error(&missing_lock));
     }
 }

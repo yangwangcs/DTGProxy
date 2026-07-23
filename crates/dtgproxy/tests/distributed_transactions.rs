@@ -18,12 +18,17 @@ use temporal_types::{CanonicalElement, GraphValue, Interval, ValidTime};
 use timestamp_oracle::{ManualClock, MemoryTimestampStore, TimestampOracle};
 use txn_protocol::TransactionState;
 use txn_protocol::{
-    HomeDecisionEngine, HomeTransactionRecord, IsolationLevel, ParticipantProof, PrewriteRequest,
-    ShardEpoch,
+    ConstraintClaim, HomeDecisionEngine, HomeTransactionRecord, IsolationLevel, ParticipantEngine,
+    ParticipantProof, PointReadVersion, PrewriteMetadata, PrewriteRequest, ShardEpoch,
 };
 
 fn placement(shard_id: u32) -> ShardPlacement {
     ShardPlacement::new(shard_id, 7, vec![u64::from(shard_id)]).unwrap()
+}
+
+fn metadata(schema_version: u64, placement_epoch: u64) -> PrewriteMetadata {
+    PrewriteMetadata::new(schema_version, placement_epoch, Vec::new(), Vec::new())
+        .expect("current prewrite metadata")
 }
 
 fn batch(
@@ -44,6 +49,39 @@ fn batch(
                 value.to_vec(),
             )],
         },
+        Vec::new(),
+        metadata(3, 7),
+    )
+    .unwrap()
+}
+
+fn batch_with_constraint(
+    shard_id: u32,
+    transaction_id: u128,
+    key: &[u8],
+    value: &[u8],
+    constraint_owner: &[u8],
+) -> PreparedShardTransaction {
+    PreparedShardTransaction::new(
+        shard_id,
+        7,
+        PreparedMutationBatch {
+            shard_id,
+            txn_id: transaction_id,
+            mutations: vec![Mutation::put(
+                0,
+                LogicalKey::in_keyspace(Keyspace::Current, key.to_vec()),
+                value.to_vec(),
+            )],
+        },
+        vec![
+            ConstraintClaim::new(
+                LogicalKey::in_keyspace(Keyspace::Txn, b"dtg/constraint/v1/7/ada".to_vec()),
+                constraint_owner.to_vec(),
+            )
+            .unwrap(),
+        ],
+        metadata(3, 7),
     )
     .unwrap()
 }
@@ -93,6 +131,161 @@ fn cross_shard_commit_records_home_decision_and_applies_every_participant() {
 }
 
 #[test]
+fn serializable_coordinator_persists_schema_and_topology_fences() {
+    let config = DeploymentConfig::primary_replica(placement(10));
+    let mut runtime = block_on(InProcessDeploymentRuntime::new(config)).unwrap();
+    block_on(runtime.elect(10, 10)).unwrap();
+    let oracle = TimestampOracle::open(
+        Arc::new(MemoryTimestampStore::new()),
+        Arc::new(ManualClock::new(1_100)),
+        16,
+    )
+    .unwrap();
+    let coordinator = TransactionCoordinator::new(&oracle, 20);
+    let context = coordinator
+        .begin(3, IsolationLevel::TemporalSerializable, 10_000)
+        .unwrap();
+    let receipt = block_on(coordinator.commit(
+        &mut runtime,
+        context,
+        vec![batch(
+            10,
+            context.transaction_id().value(),
+            b"v/serializable",
+            b"value",
+        )],
+    ))
+    .unwrap();
+
+    let key = ParticipantEngine::participant_record_key(receipt.home(), receipt.transaction_id())
+        .unwrap();
+    let bytes = read_key(&runtime, receipt.home().shard_id(), &key).unwrap();
+    let record = ParticipantEngine::recovery_record(&bytes).unwrap();
+    let metadata = record.request().metadata();
+    assert_eq!(metadata.schema_version(), 3);
+    assert_eq!(metadata.topology_epoch(), receipt.home().placement_epoch());
+}
+
+#[test]
+fn serializable_coordinator_preserves_supplied_point_read_dependencies() {
+    let config = DeploymentConfig::primary_replica(placement(10));
+    let mut runtime = block_on(InProcessDeploymentRuntime::new(config)).unwrap();
+    block_on(runtime.elect(10, 10)).unwrap();
+    let oracle = TimestampOracle::open(
+        Arc::new(MemoryTimestampStore::new()),
+        Arc::new(ManualClock::new(1_200)),
+        16,
+    )
+    .unwrap();
+    let coordinator = TransactionCoordinator::new(&oracle, 20);
+    let context = coordinator
+        .begin(3, IsolationLevel::TemporalSerializable, 10_000)
+        .unwrap();
+    let metadata = PrewriteMetadata::new(
+        3,
+        7,
+        vec![
+            PointReadVersion::new(
+                LogicalKey::in_keyspace(Keyspace::Current, b"read/missing".to_vec()),
+                None,
+            )
+            .unwrap(),
+        ],
+        Vec::new(),
+    )
+    .unwrap();
+    let write = PreparedShardTransaction::new(
+        10,
+        7,
+        PreparedMutationBatch {
+            shard_id: 10,
+            txn_id: context.transaction_id().value(),
+            mutations: vec![Mutation::put(
+                0,
+                LogicalKey::in_keyspace(Keyspace::Current, b"v/metadata".to_vec()),
+                b"value".to_vec(),
+            )],
+        },
+        Vec::new(),
+        metadata,
+    )
+    .unwrap();
+    let receipt = block_on(coordinator.commit(&mut runtime, context, vec![write])).unwrap();
+
+    let key = ParticipantEngine::participant_record_key(receipt.home(), receipt.transaction_id())
+        .unwrap();
+    let bytes = read_key(&runtime, receipt.home().shard_id(), &key).unwrap();
+    let record = ParticipantEngine::recovery_record(&bytes).unwrap();
+    assert_eq!(
+        record.request().metadata().point_reads()[0].key(),
+        &LogicalKey::in_keyspace(Keyspace::Current, b"read/missing".to_vec())
+    );
+}
+
+#[test]
+fn committed_constraint_claim_cannot_be_overwritten_by_another_transaction() {
+    let config = DeploymentConfig::primary_replica(placement(10));
+    let mut runtime = block_on(InProcessDeploymentRuntime::new(config)).unwrap();
+    block_on(runtime.elect(10, 10)).unwrap();
+    let oracle = TimestampOracle::open(
+        Arc::new(MemoryTimestampStore::new()),
+        Arc::new(ManualClock::new(1_250)),
+        16,
+    )
+    .unwrap();
+    let coordinator = TransactionCoordinator::new(&oracle, 20);
+
+    let first = coordinator
+        .begin(3, IsolationLevel::TemporalSnapshot, 10_000)
+        .unwrap();
+    block_on(coordinator.commit(
+        &mut runtime,
+        first,
+        vec![batch_with_constraint(
+            10,
+            first.transaction_id().value(),
+            b"v/first",
+            b"first",
+            b"element-a",
+        )],
+    ))
+    .unwrap();
+
+    let second = coordinator
+        .begin(3, IsolationLevel::TemporalSnapshot, 10_000)
+        .unwrap();
+    let error = block_on(coordinator.commit(
+        &mut runtime,
+        second,
+        vec![batch_with_constraint(
+            10,
+            second.transaction_id().value(),
+            b"v/second",
+            b"second",
+            b"element-b",
+        )],
+    ))
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionCoordinatorError::Replication {
+            source: shard_runtime::ReplicationError::StateMachine(
+                shard_runtime::ShardRuntimeError::CommittedRejection { ref message, .. }
+            ),
+            ..
+        } if message.contains("ConstraintConflict")
+    ));
+    assert_eq!(
+        read_key(
+            &runtime,
+            10,
+            &LogicalKey::in_keyspace(Keyspace::Txn, b"dtg/constraint/v1/7/ada".to_vec()),
+        ),
+        Some(b"element-a".to_vec())
+    );
+}
+
+#[test]
 fn recovery_scans_prepared_intents_and_rolls_forward_a_durable_home_commit() {
     let config = DeploymentConfig::shared_nothing(9, vec![placement(10), placement(20)]).unwrap();
     let mut runtime = block_on(InProcessDeploymentRuntime::new(config)).unwrap();
@@ -132,6 +325,8 @@ fn recovery_scans_prepared_intents_and_rolls_forward_a_durable_home_commit() {
                 )
                 .batch()
                 .clone(),
+                Vec::new(),
+                metadata(3, participant.placement_epoch()),
             )
             .unwrap()
         })

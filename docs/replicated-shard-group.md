@@ -1,6 +1,6 @@
 # DTGProxy Replicated Shard Group
 
-Phase 2 uses TiKV's Apache-2.0 `raft-rs` 0.7.0 consensus module with `prost-codec` and without its
+The current replicated-shard runtime uses TiKV's Apache-2.0 `raft-rs` 0.7.0 consensus module with `prost-codec` and without its
 default logger. DTGProxy owns storage, transport, command semantics, state-machine application,
 safe time, and request completion. No NebulaGraph C++ source is copied.
 
@@ -35,10 +35,9 @@ are retained per Replica, so a newly elected Leader can complete a request that 
 as a follower. Retrying an already completed request with identical bytes returns the original
 receipt; reusing the ID with different bytes fails closed.
 
-The in-process harness retains pending/completed request memory. Durable cross-leader request
-deduplication is deliberately part of the Phase 3 transaction-status records; callers must not
-assume an unacknowledged Phase 2 proposal has been durably deduplicated after a whole-process
-restart.
+The in-process harness retains pending/completed request memory. Durable cross-leader recovery
+uses the replicated transaction-status records; callers must resolve an unacknowledged proposal
+through idempotent request or transaction-status lookup after a whole-process restart.
 
 ## Deterministic network and Multi-Raft
 

@@ -31,8 +31,9 @@ pub use raft_network::{RaftDelivery, RaftNetworkError, SharedRaftTransport};
 pub use raft_runtime::{DataRaftRuntime, DataRaftRuntimeError};
 pub use service::{
     DataNodeGrpcService, DataOperation, ReadCodecError, ReplicaProfileError, RequestAuthorizer,
-    decode_key_read_result, decode_key_scan_batch, encode_backend_replica_profile,
-    encode_key_read_plan, encode_key_scan_plan, encode_rocks_replica_profile,
+    decode_key_read_result, decode_key_scan_batch, decode_key_scan_batch_bounded,
+    encode_backend_replica_profile, encode_key_read_plan, encode_key_scan_plan,
+    encode_rocks_replica_profile,
 };
 
 use std::error::Error;

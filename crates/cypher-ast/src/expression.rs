@@ -1,3 +1,5 @@
+use crate::QueryStatement;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Identifier {
     value: String,
@@ -56,6 +58,8 @@ pub enum Expression {
         name: Vec<Identifier>,
         arguments: Vec<Expression>,
     },
+    ExistsSubquery(Box<QueryStatement>),
+    CountSubquery(Box<QueryStatement>),
 }
 
 impl Expression {

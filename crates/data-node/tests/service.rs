@@ -11,15 +11,24 @@ use cluster_protocol::proto::shard_service_client::ShardServiceClient;
 use cluster_protocol::proto::shard_service_server::ShardService;
 use cluster_protocol::proto::shard_service_server::ShardServiceServer;
 use cluster_protocol::proto::{
-    EnsureReplicaRequest, ExecuteRequest, ReadRequest, ReplicaRole as WireReplicaRole,
-    RequestContext, ScanRequest, ShardContext,
+    AnalyticsArtifactGenerationCursor, AnalyticsArtifactKind,
+    DeleteAnalyticsArtifactGenerationRequest, EnsureReplicaRequest, ExecuteRequest,
+    GetAnalyticsArtifactGenerationRequest, ListAnalyticsArtifactGenerationHeadsRequest,
+    ListAnalyticsArtifactGenerationsRequest, PinAnalyticsArtifactGenerationRequest,
+    PutAnalyticsArtifactChunkRequest, ReadRequest, ReplicaRole as WireReplicaRole, RequestContext,
+    ScanRequest, ShardContext,
 };
 use data_node::{
-    DataNodeGrpcService, DataNodeHost, NodeConfig, NodeIdentity, ReplicaKey, ReplicaRole,
-    ReplicaSpec, TransportSecurity, decode_key_read_result, decode_key_scan_batch,
-    encode_key_read_plan, encode_key_scan_plan, encode_rocks_replica_profile,
+    DataNodeGrpcService, DataNodeHost, DataOperation, NodeConfig, NodeIdentity, ReplicaKey,
+    ReplicaRole, ReplicaSpec, RequestAuthorizer, TransportSecurity, decode_key_read_result,
+    decode_key_scan_batch, encode_key_read_plan, encode_key_scan_plan,
+    encode_rocks_replica_profile,
 };
-use raft_command::{ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1};
+use raft_command::{
+    AnalyticsArtifactKindV1, ApplyPreparedV1, CommandBodyV1, CommandEnvelopeV1,
+    DeleteAnalyticsArtifactGenerationV1, PinAnalyticsArtifactGenerationV1,
+    PutAnalyticsArtifactChunkV1,
+};
 use storage_api::{KeySpan, Keyspace, LogicalKey, Mutation, PreparedMutationBatch};
 use tempfile::tempdir;
 use temporal_types::TransactionTime;
@@ -99,6 +108,456 @@ fn command(request_id: u128, value: &[u8]) -> Vec<u8> {
     )
     .encode()
     .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_artifact_rpc_puts_reads_and_deletes_a_generation() {
+    let temporary = tempdir().unwrap();
+    let host = Arc::new(
+        DataNodeHost::open(config(temporary.path()), 8)
+            .await
+            .unwrap(),
+    );
+    host.ensure_replica(spec()).await.unwrap();
+    host.campaign(ReplicaKey::new(1, 11).unwrap())
+        .await
+        .unwrap();
+    let service = DataNodeGrpcService::new(Arc::clone(&host));
+    let job_id = 701_u128.to_be_bytes().to_vec();
+    let created_at_unix_ms = 1_725_000_000_123;
+
+    let first = service
+        .put_analytics_artifact_chunk(Request::new(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(701, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            created_at_unix_ms,
+            ordinal: 0,
+            previous_digest: vec![0; 32],
+            payload: b"first".to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!first.duplicate);
+    let duplicate = service
+        .put_analytics_artifact_chunk(Request::new(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(701, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            created_at_unix_ms,
+            ordinal: 0,
+            previous_digest: vec![0; 32],
+            payload: b"first".to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(duplicate.duplicate);
+
+    let digest = blake3::hash(b"first").as_bytes().to_vec();
+    let mut content_hasher = blake3::Hasher::new();
+    content_hasher.update(b"first");
+    content_hasher.update(b"second");
+    let content_digest = content_hasher.finalize();
+    let second = service
+        .put_analytics_artifact_chunk(Request::new(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(702, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            created_at_unix_ms,
+            ordinal: 1,
+            previous_digest: digest,
+            payload: b"second".to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let listed = service
+        .list_analytics_artifact_generations(Request::new(
+            ListAnalyticsArtifactGenerationsRequest {
+                context: Some(context(7021, 3, now_ms() + 60_000)),
+                job_id: job_id.clone(),
+                kind: AnalyticsArtifactKind::Checkpoint.into(),
+                limit: 16,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.generations.len(), 1);
+    assert_eq!(listed.generations[0].created_at_unix_ms, created_at_unix_ms);
+    let invalid_cursor = service
+        .list_analytics_artifact_generation_heads(Request::new(
+            ListAnalyticsArtifactGenerationHeadsRequest {
+                context: Some(context(70211, 3, now_ms() + 60_000)),
+                after: Some(AnalyticsArtifactGenerationCursor {
+                    job_id: Vec::new(),
+                    kind: AnalyticsArtifactKind::Checkpoint.into(),
+                    generation: 1,
+                }),
+                limit: 16,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_cursor.code(), Code::InvalidArgument);
+
+    let mismatched_created_at = service
+        .put_analytics_artifact_chunk(Request::new(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(7022, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            created_at_unix_ms: created_at_unix_ms + 1,
+            ordinal: 2,
+            previous_digest: blake3::hash(b"second").as_bytes().to_vec(),
+            payload: b"third".to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(mismatched_created_at.code(), Code::FailedPrecondition);
+    let unpinned = service
+        .get_analytics_artifact_generation(Request::new(GetAnalyticsArtifactGenerationRequest {
+            context: Some(context(703, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 2,
+            expected_total_bytes: 11,
+            expected_content_digest: content_digest.as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unpinned.code(), Code::FailedPrecondition);
+    service
+        .pin_analytics_artifact_generation(Request::new(PinAnalyticsArtifactGenerationRequest {
+            context: Some(context(704, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 2,
+            expected_total_bytes: 11,
+            expected_content_digest: content_digest.as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap();
+    service
+        .pin_analytics_artifact_generation(Request::new(PinAnalyticsArtifactGenerationRequest {
+            context: Some(context(7042, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 2,
+            expected_total_bytes: 11,
+            expected_content_digest: content_digest.as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap();
+    let conflicting_pin = service
+        .pin_analytics_artifact_generation(Request::new(PinAnalyticsArtifactGenerationRequest {
+            context: Some(context(7043, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 2,
+            expected_total_bytes: 11,
+            expected_content_digest: vec![0x77; 32],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(conflicting_pin.code(), Code::FailedPrecondition);
+    let stream = service
+        .get_analytics_artifact_generation(Request::new(GetAnalyticsArtifactGenerationRequest {
+            context: Some(context(703, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 2,
+            expected_total_bytes: 11,
+            expected_content_digest: content_digest.as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let chunks = stream.collect::<Vec<_>>().await;
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks.into_iter().all(|chunk| {
+        chunk
+            .is_ok_and(|chunk| chunk.applied_index != 0 && chunk.applied_index >= second.raft_index)
+    }));
+
+    let digest_mismatch = service
+        .get_analytics_artifact_generation(Request::new(GetAnalyticsArtifactGenerationRequest {
+            context: Some(context(7031, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 2,
+            expected_total_bytes: 11,
+            expected_content_digest: vec![9; 32],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(digest_mismatch.code(), Code::FailedPrecondition);
+
+    let invalid_manifest = service
+        .get_analytics_artifact_generation(Request::new(GetAnalyticsArtifactGenerationRequest {
+            context: Some(context(7032, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 2,
+            expected_total_bytes: 1,
+            expected_content_digest: vec![0; 32],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_manifest.code(), Code::InvalidArgument);
+
+    let fenced = service
+        .put_analytics_artifact_chunk(Request::new(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(7041, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            created_at_unix_ms,
+            ordinal: 2,
+            previous_digest: vec![9; 32],
+            payload: b"wrong".to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(fenced.code(), Code::FailedPrecondition);
+
+    let pinned_delete = service
+        .delete_analytics_artifact_generation(Request::new(
+            DeleteAnalyticsArtifactGenerationRequest {
+                context: Some(context(705, 3, now_ms() + 60_000)),
+                job_id: job_id.clone(),
+                kind: AnalyticsArtifactKind::Checkpoint.into(),
+                generation: 1,
+                gc_epoch: 1,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(pinned_delete.code(), Code::FailedPrecondition);
+
+    drop(service);
+    Arc::try_unwrap(host)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn generic_execute_rejects_all_artifact_mutations() {
+    let temporary = tempdir().unwrap();
+    let host = Arc::new(
+        DataNodeHost::open(config(temporary.path()), 8)
+            .await
+            .unwrap(),
+    );
+    host.ensure_replica(spec()).await.unwrap();
+    host.campaign(ReplicaKey::new(1, 11).unwrap())
+        .await
+        .unwrap();
+    let service = DataNodeGrpcService::new(Arc::clone(&host));
+    let digest = *blake3::hash(b"bypass").as_bytes();
+    let bodies = [
+        CommandBodyV1::PutAnalyticsArtifactChunk(
+            PutAnalyticsArtifactChunkV1::new(
+                790,
+                AnalyticsArtifactKindV1::Result,
+                1,
+                1_725_000_000_123,
+                0,
+                [0; 32],
+                b"bypass".to_vec(),
+            )
+            .unwrap(),
+        ),
+        CommandBodyV1::PinAnalyticsArtifactGeneration(
+            PinAnalyticsArtifactGenerationV1::new(
+                790,
+                AnalyticsArtifactKindV1::Result,
+                1,
+                1,
+                6,
+                digest,
+            )
+            .unwrap(),
+        ),
+        CommandBodyV1::DeleteAnalyticsArtifactGeneration(
+            DeleteAnalyticsArtifactGenerationV1::new(790, AnalyticsArtifactKindV1::Result, 1)
+                .unwrap(),
+        ),
+    ];
+    for (offset, body) in bodies.into_iter().enumerate() {
+        let request_id = 790_u128 + u128::try_from(offset).unwrap();
+        let encoded = CommandEnvelopeV1::new(11, 3, request_id, body)
+            .encode()
+            .unwrap();
+        let rejected = service
+            .execute(Request::new(ExecuteRequest {
+                context: Some(context(request_id, 3, now_ms() + 60_000)),
+                command: encoded,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), Code::PermissionDenied);
+    }
+    drop(service);
+    Arc::try_unwrap(host)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+struct DenyPinAuthorizer;
+
+impl RequestAuthorizer for DenyPinAuthorizer {
+    fn authorize(
+        &self,
+        _context: &cluster_protocol::CommonRequestContext,
+        operation: DataOperation,
+    ) -> Result<(), tonic::Status> {
+        if operation == DataOperation::PinAnalyticsArtifact {
+            Err(tonic::Status::permission_denied("pin denied"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn artifact_pin_uses_its_own_authorization_operation() {
+    let temporary = tempdir().unwrap();
+    let host = Arc::new(
+        DataNodeHost::open(config(temporary.path()), 8)
+            .await
+            .unwrap(),
+    );
+    host.ensure_replica(spec()).await.unwrap();
+    host.campaign(ReplicaKey::new(1, 11).unwrap())
+        .await
+        .unwrap();
+    let service =
+        DataNodeGrpcService::with_authorizer(Arc::clone(&host), Arc::new(DenyPinAuthorizer));
+    let job_id = 791_u128.to_be_bytes().to_vec();
+    service
+        .put_analytics_artifact_chunk(Request::new(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(791, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Result.into(),
+            generation: 1,
+            created_at_unix_ms: 1_725_000_000_123,
+            ordinal: 0,
+            previous_digest: vec![0; 32],
+            payload: b"authorized-put".to_vec(),
+        }))
+        .await
+        .unwrap();
+    let denied = service
+        .pin_analytics_artifact_generation(Request::new(PinAnalyticsArtifactGenerationRequest {
+            context: Some(context(792, 3, now_ms() + 60_000)),
+            job_id,
+            kind: AnalyticsArtifactKind::Result.into(),
+            generation: 1,
+            expected_chunk_count: 1,
+            expected_total_bytes: u64::try_from(b"authorized-put".len()).unwrap(),
+            expected_content_digest: blake3::hash(b"authorized-put").as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    drop(service);
+    Arc::try_unwrap(host)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn analytics_artifact_get_rejects_old_epoch_after_activation_apply() {
+    let temporary = tempdir().unwrap();
+    let host = Arc::new(
+        DataNodeHost::open(config(temporary.path()), 8)
+            .await
+            .unwrap(),
+    );
+    let key = ReplicaKey::new(1, 11).unwrap();
+    host.ensure_replica(spec()).await.unwrap();
+    host.campaign(key).await.unwrap();
+    let service = DataNodeGrpcService::new(Arc::clone(&host));
+    let job_id = 750_u128.to_be_bytes().to_vec();
+    service
+        .put_analytics_artifact_chunk(Request::new(PutAnalyticsArtifactChunkRequest {
+            context: Some(context(750, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            created_at_unix_ms: 1_725_000_000_123,
+            ordinal: 0,
+            previous_digest: vec![0; 32],
+            payload: b"epoch-three".to_vec(),
+        }))
+        .await
+        .unwrap();
+    service
+        .pin_analytics_artifact_generation(Request::new(PinAnalyticsArtifactGenerationRequest {
+            context: Some(context(7501, 3, now_ms() + 60_000)),
+            job_id: job_id.clone(),
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 1,
+            expected_total_bytes: u64::try_from(b"epoch-three".len()).unwrap(),
+            expected_content_digest: blake3::hash(b"epoch-three").as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap();
+    let activation = CommandEnvelopeV1::new(11, 3, 751, CommandBodyV1::ActivatePlacementEpoch(4))
+        .encode()
+        .unwrap();
+    host.propose(key, 3, 751, activation).await.unwrap();
+    assert_eq!(host.status(key).await.unwrap().placement_epoch(), 4);
+
+    let stale = service
+        .get_analytics_artifact_generation(Request::new(GetAnalyticsArtifactGenerationRequest {
+            context: Some(context(752, 3, now_ms() + 60_000)),
+            job_id,
+            kind: AnalyticsArtifactKind::Checkpoint.into(),
+            generation: 1,
+            expected_chunk_count: 1,
+            expected_total_bytes: u64::try_from(b"epoch-three".len()).unwrap(),
+            expected_content_digest: blake3::hash(b"epoch-three").as_bytes().to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
+    assert_eq!(
+        stale.metadata().get("dtgproxy-reason").unwrap(),
+        "stale_epoch"
+    );
+    assert_eq!(stale.metadata().get("dtgproxy-current-epoch").unwrap(), "4");
+
+    drop(service);
+    Arc::try_unwrap(host)
+        .ok()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

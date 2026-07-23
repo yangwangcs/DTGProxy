@@ -158,15 +158,19 @@ impl StorageAdapter for MemoryAdapter {
         Box::pin(async move {
             let state = self.lock_state()?;
             let start = LogicalKey::in_keyspace(span.keyspace(), span.start().to_vec());
-            Ok(state
-                .data
-                .range(start..)
-                .take_while(|(key, _)| {
-                    key.keyspace() == span.keyspace() && span.contains(key.as_bytes())
-                })
-                .take(span.limit().unwrap_or(usize::MAX))
-                .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
-                .collect())
+            let mut values = Vec::new();
+            let mut retained = 0_u64;
+            for (key, value) in state.data.range(start..) {
+                if key.keyspace() != span.keyspace() || !span.contains(key.as_bytes()) {
+                    break;
+                }
+                retained = storage_api::charge_scan_entry(span, retained, key.as_bytes(), value)?;
+                values.push(KeyValue::new(key.clone(), value.clone()));
+                if values.len() == span.limit().unwrap_or(usize::MAX) {
+                    break;
+                }
+            }
+            Ok(values)
         })
     }
 

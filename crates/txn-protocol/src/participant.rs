@@ -13,6 +13,8 @@ use crate::model::{
 const PARTICIPANT_PREFIX: &[u8] = b"\x01dtg/txn/v1/participant/";
 const LOCK_PREFIX: &[u8] = b"\x01dtg/txn/v1/lock/";
 const WRITE_PREFIX: &[u8] = b"\x01dtg/txn/v1/write/";
+const CONSTRAINT_LOCK_PREFIX: &[u8] = b"\x01dtg/txn/v1/constraint-lock/";
+const CONSTRAINT_WRITE_PREFIX: &[u8] = b"\x01dtg/txn/v1/constraint-write/";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrewriteOutcome {
@@ -131,6 +133,34 @@ impl AbortOutcome {
 pub struct ParticipantEngine;
 
 impl ParticipantEngine {
+    pub fn constraint_owner_read_keys(
+        participant: crate::ShardEpoch,
+        constraint_key: &LogicalKey,
+    ) -> Result<[LogicalKey; 2], TxnProtocolError> {
+        if constraint_key.keyspace() != Keyspace::Txn || constraint_key.as_bytes().is_empty() {
+            return Err(TxnProtocolError::InvalidConstraintKey);
+        }
+        Ok([
+            constraint_key.clone(),
+            metadata_key_for(CONSTRAINT_WRITE_PREFIX, participant, constraint_key)?,
+        ])
+    }
+
+    pub fn constraint_owner_at_snapshot(
+        owner: Option<&[u8]>,
+        committed_write: Option<&[u8]>,
+        start_ts: TransactionTime,
+    ) -> Result<Option<Vec<u8>>, TxnProtocolError> {
+        match (owner, committed_write) {
+            (None, None) => Ok(None),
+            (Some(owner), Some(committed_write)) => {
+                let write = decode_committed_write(committed_write)?;
+                Ok((write.commit_ts <= start_ts).then(|| owner.to_vec()))
+            }
+            _ => Err(TxnProtocolError::CorruptParticipantState),
+        }
+    }
+
     #[must_use]
     pub fn recovery_span(participant: crate::ShardEpoch) -> KeySpan {
         let mut prefix = Vec::with_capacity(PARTICIPANT_PREFIX.len() + 4);
@@ -208,6 +238,15 @@ impl ParticipantEngine {
             keys.push(metadata_key(LOCK_PREFIX, request, key)?);
             keys.push(metadata_key(WRITE_PREFIX, request, key)?);
         }
+        for claim in request.constraint_claims() {
+            keys.push(claim.key().clone());
+            keys.push(metadata_key(CONSTRAINT_LOCK_PREFIX, request, claim.key())?);
+            keys.push(metadata_key(CONSTRAINT_WRITE_PREFIX, request, claim.key())?);
+        }
+        for read in point_reads(request) {
+            keys.push(metadata_key(LOCK_PREFIX, request, read.key())?);
+            keys.push(metadata_key(WRITE_PREFIX, request, read.key())?);
+        }
         Ok(keys)
     }
 
@@ -224,7 +263,28 @@ impl ParticipantEngine {
             validate_replay(request, &record)?;
             return match record.state {
                 TransactionState::Preparing => {
-                    validate_locks(request, inspected_values.iter().skip(1).step_by(2), digest)?;
+                    let mutation_count = request.batch().mutations.len();
+                    let constraint_count = request.constraint_claims().len();
+                    validate_locks(
+                        request,
+                        inspected_values
+                            .iter()
+                            .skip(1)
+                            .take(mutation_count * 2)
+                            .step_by(2),
+                        digest,
+                    )?;
+                    let constraint_offset = 1 + mutation_count * 2;
+                    validate_constraint_locks(
+                        request,
+                        inspected_values
+                            .iter()
+                            .skip(constraint_offset + 1)
+                            .take(constraint_count * 3)
+                            .step_by(3),
+                        digest,
+                    )?;
+                    validate_point_read_dependencies(request, inspected_values)?;
                     Ok(PrewriteOutcome {
                         proof: record.proof,
                         mutations: Vec::new(),
@@ -265,6 +325,8 @@ impl ParticipantEngine {
                 }
             }
         }
+        validate_constraint_prewrite(request, inspected_values)?;
+        validate_point_read_dependencies(request, inspected_values)?;
 
         let proof = ParticipantProof::new(
             request.participant(),
@@ -289,7 +351,25 @@ impl ParticipantEngine {
             value: encode_participant_record(&record)?,
         });
         let lock_value = encode_lock(&lock)?;
-        for lock_key in inspection_keys.iter().skip(1).step_by(2) {
+        for lock_key in inspection_keys
+            .iter()
+            .skip(1)
+            .take(request.batch().mutations.len() * 2)
+            .step_by(2)
+        {
+            operations.push(MutationOperation::Put {
+                key: lock_key.clone(),
+                value: lock_value.clone(),
+            });
+        }
+        let constraint_offset = 1 + request.batch().mutations.len() * 2;
+        let constraint_count = request.constraint_claims().len();
+        for lock_key in inspection_keys
+            .iter()
+            .skip(constraint_offset + 1)
+            .take(constraint_count * 3)
+            .step_by(3)
+        {
             operations.push(MutationOperation::Put {
                 key: lock_key.clone(),
                 value: lock_value.clone(),
@@ -311,9 +391,28 @@ impl ParticipantEngine {
         validate_inspection_count(&prewrite_keys, inspected_values)?;
         let prewrite = Self::prewrite(request, inspected_values)?;
         let finalize_values = if prewrite.duplicate() {
-            let mut values = Vec::with_capacity(request.batch().mutations.len() + 1);
+            let mut values = Vec::with_capacity(
+                request.batch().mutations.len() + request.constraint_claims().len() + 1,
+            );
             values.push(inspected_values[0].clone());
-            values.extend(inspected_values.iter().skip(1).step_by(2).cloned());
+            values.extend(
+                inspected_values
+                    .iter()
+                    .skip(1)
+                    .take(request.batch().mutations.len() * 2)
+                    .step_by(2)
+                    .cloned(),
+            );
+            let constraint_offset = 1 + request.batch().mutations.len() * 2;
+            let constraint_count = request.constraint_claims().len();
+            values.extend(
+                inspected_values
+                    .iter()
+                    .skip(constraint_offset + 1)
+                    .take(constraint_count * 3)
+                    .step_by(3)
+                    .cloned(),
+            );
             values
         } else {
             let mut values = Vec::with_capacity(request.batch().mutations.len() + 1);
@@ -335,6 +434,9 @@ impl ParticipantEngine {
         keys.push(participant_key(request));
         for key in business_keys(request) {
             keys.push(metadata_key(LOCK_PREFIX, request, key)?);
+        }
+        for claim in request.constraint_claims() {
+            keys.push(metadata_key(CONSTRAINT_LOCK_PREFIX, request, claim.key())?);
         }
         Ok(keys)
     }
@@ -374,14 +476,26 @@ impl ParticipantEngine {
         }
         validate_locks(
             request,
-            inspected_values.iter().skip(1),
+            inspected_values
+                .iter()
+                .skip(1)
+                .take(request.batch().mutations.len()),
+            request.intent_digest(),
+        )?;
+        validate_constraint_locks(
+            request,
+            inspected_values
+                .iter()
+                .skip(1 + request.batch().mutations.len()),
             request.intent_digest(),
         )?;
 
         let mutation_count = request.batch().mutations.len();
+        let constraint_count = request.constraint_claims().len();
         let mut operations = Vec::with_capacity(
             mutation_count
-                .checked_mul(3)
+                .checked_add(constraint_count)
+                .and_then(|count| count.checked_mul(3))
                 .and_then(|count| count.checked_add(1))
                 .ok_or(TxnProtocolError::LengthOverflow)?,
         );
@@ -399,6 +513,24 @@ impl ParticipantEngine {
         for (key, lock_key) in business_keys(request).zip(inspection_keys.iter().skip(1)) {
             operations.push(MutationOperation::Put {
                 key: metadata_key(WRITE_PREFIX, request, key)?,
+                value: write_value.clone(),
+            });
+            operations.push(MutationOperation::Delete {
+                key: lock_key.clone(),
+            });
+        }
+        let constraint_offset = 1 + mutation_count;
+        for (claim, lock_key) in request
+            .constraint_claims()
+            .iter()
+            .zip(inspection_keys.iter().skip(constraint_offset))
+        {
+            operations.push(MutationOperation::Put {
+                key: claim.key().clone(),
+                value: claim.value().to_vec(),
+            });
+            operations.push(MutationOperation::Put {
+                key: metadata_key(CONSTRAINT_WRITE_PREFIX, request, claim.key())?,
                 value: write_value.clone(),
             });
             operations.push(MutationOperation::Delete {
@@ -452,7 +584,17 @@ impl ParticipantEngine {
         }
         validate_locks(
             request,
-            inspected_values.iter().skip(1),
+            inspected_values
+                .iter()
+                .skip(1)
+                .take(request.batch().mutations.len()),
+            request.intent_digest(),
+        )?;
+        validate_constraint_locks(
+            request,
+            inspected_values
+                .iter()
+                .skip(1 + request.batch().mutations.len()),
             request.intent_digest(),
         )?;
         let mut operations = Vec::with_capacity(inspection_keys.len());
@@ -483,6 +625,14 @@ fn metadata_key(
     request: &PrewriteRequest,
     business_key: &LogicalKey,
 ) -> Result<LogicalKey, TxnProtocolError> {
+    metadata_key_for(prefix, request.participant(), business_key)
+}
+
+fn metadata_key_for(
+    prefix: &[u8],
+    participant: crate::ShardEpoch,
+    business_key: &LogicalKey,
+) -> Result<LogicalKey, TxnProtocolError> {
     let key_length = u32::try_from(business_key.as_bytes().len())
         .map_err(|_| TxnProtocolError::LengthOverflow)?;
     let mut bytes = Vec::with_capacity(
@@ -493,7 +643,7 @@ fn metadata_key(
             .ok_or(TxnProtocolError::LengthOverflow)?,
     );
     bytes.extend_from_slice(prefix);
-    bytes.extend_from_slice(&request.participant().shard_id().to_be_bytes());
+    bytes.extend_from_slice(&participant.shard_id().to_be_bytes());
     bytes.push(business_key.keyspace().tag());
     bytes.extend_from_slice(&key_length.to_be_bytes());
     bytes.extend_from_slice(business_key.as_bytes());
@@ -508,6 +658,10 @@ fn business_keys(request: &PrewriteRequest) -> impl Iterator<Item = &LogicalKey>
         .map(|mutation| match &mutation.operation {
             MutationOperation::Put { key, .. } | MutationOperation::Delete { key } => key,
         })
+}
+
+fn point_reads(request: &PrewriteRequest) -> impl Iterator<Item = &crate::PointReadVersion> {
+    request.metadata().point_reads().iter()
 }
 
 fn validate_replay(
@@ -532,6 +686,107 @@ fn validate_locks<'a>(
         let bytes = value
             .as_deref()
             .ok_or_else(|| TxnProtocolError::MissingIntentLock { key: key.clone() })?;
+        let lock = decode_lock(bytes)?;
+        if lock.transaction_id != request.transaction_id()
+            || lock.start_ts != request.start_ts()
+            || lock.expires_at != request.expires_at()
+            || lock.intent_digest != digest
+        {
+            return Err(TxnProtocolError::CorruptParticipantState);
+        }
+    }
+    Ok(())
+}
+
+fn validate_constraint_prewrite(
+    request: &PrewriteRequest,
+    inspected_values: &[Option<Vec<u8>>],
+) -> Result<(), TxnProtocolError> {
+    let offset = 1 + request.batch().mutations.len() * 2;
+    let length = request.constraint_claims().len() * 3;
+    for (claim, values) in request
+        .constraint_claims()
+        .iter()
+        .zip(inspected_values[offset..offset + length].chunks_exact(3))
+    {
+        let [existing, lock, write] = values else {
+            return Err(TxnProtocolError::CorruptParticipantState);
+        };
+        if let Some(existing) = existing.as_deref()
+            && existing != claim.value()
+        {
+            return Err(TxnProtocolError::ConstraintConflict {
+                key: claim.key().clone(),
+            });
+        }
+        if let Some(bytes) = lock.as_deref() {
+            let lock = decode_lock(bytes)?;
+            if lock.transaction_id == request.transaction_id() {
+                return Err(TxnProtocolError::CorruptParticipantState);
+            }
+            return Err(TxnProtocolError::IntentConflict {
+                key: claim.key().clone(),
+                owner: lock.transaction_id,
+            });
+        }
+        if let Some(bytes) = write.as_deref() {
+            let write = decode_committed_write(bytes)?;
+            if write.commit_ts > request.start_ts() {
+                return Err(TxnProtocolError::WriteConflict {
+                    key: claim.key().clone(),
+                    committed_at: write.commit_ts,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_point_read_dependencies(
+    request: &PrewriteRequest,
+    inspected_values: &[Option<Vec<u8>>],
+) -> Result<(), TxnProtocolError> {
+    let offset = 1 + request.batch().mutations.len() * 2 + request.constraint_claims().len() * 3;
+    for (read, values) in point_reads(request).zip(inspected_values[offset..].chunks_exact(2)) {
+        let [lock, write] = values else {
+            return Err(TxnProtocolError::CorruptParticipantState);
+        };
+        if let Some(bytes) = lock.as_deref() {
+            let lock = decode_lock(bytes)?;
+            if lock.transaction_id != request.transaction_id() {
+                return Err(TxnProtocolError::IntentConflict {
+                    key: read.key().clone(),
+                    owner: lock.transaction_id,
+                });
+            }
+        }
+        let actual = write
+            .as_deref()
+            .map(decode_committed_write)
+            .transpose()?
+            .map(|write| write.commit_ts);
+        if actual != read.observed_commit_ts() {
+            return Err(TxnProtocolError::ReadDependencyConflict {
+                key: read.key().clone(),
+                expected: read.observed_commit_ts(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_constraint_locks<'a>(
+    request: &PrewriteRequest,
+    locks: impl Iterator<Item = &'a Option<Vec<u8>>>,
+    digest: [u8; 32],
+) -> Result<(), TxnProtocolError> {
+    for (claim, value) in request.constraint_claims().iter().zip(locks) {
+        let bytes = value
+            .as_deref()
+            .ok_or_else(|| TxnProtocolError::MissingIntentLock {
+                key: claim.key().clone(),
+            })?;
         let lock = decode_lock(bytes)?;
         if lock.transaction_id != request.transaction_id()
             || lock.start_ts != request.start_ts()

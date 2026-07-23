@@ -65,3 +65,52 @@ async fn protocol_error_enters_failed_until_reset() {
     assert!(matches!(reset.as_slice(), [ServerMessage::Success(_)]));
     assert_eq!(machine.state(), ConnectionState::Ready);
 }
+
+#[tokio::test]
+async fn interrupt_cancels_an_active_cursor_and_returns_to_ready() {
+    let mut machine = BoltMachine::new(Arc::new(FakeService::default()));
+    machine.handle(ClientMessage::Hello(BTreeMap::new())).await;
+    let run = machine
+        .handle(ClientMessage::Run {
+            query: "RETURN 1 AS value".into(),
+            parameters: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        })
+        .await;
+    assert!(matches!(run.as_slice(), [ServerMessage::Success(_)]));
+    let interrupted = machine.handle(ClientMessage::Interrupt).await;
+    assert!(matches!(
+        interrupted.as_slice(),
+        [ServerMessage::Success(_)]
+    ));
+    assert_eq!(machine.state(), ConnectionState::Ready);
+}
+
+#[tokio::test]
+async fn required_authentication_blocks_run_until_logon() {
+    let mut machine = BoltMachine::new_with_auth(Arc::new(FakeService::default()), true);
+    machine.handle(ClientMessage::Hello(BTreeMap::new())).await;
+    let denied = machine
+        .handle(ClientMessage::Run {
+            query: "RETURN 1".into(),
+            parameters: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        })
+        .await;
+    assert!(matches!(denied.as_slice(), [ServerMessage::Failure { .. }]));
+    machine.handle(ClientMessage::Reset).await;
+    machine
+        .handle(ClientMessage::Logon(BTreeMap::from([(
+            "scheme".into(),
+            Value::String("basic".into()),
+        )])))
+        .await;
+    let allowed = machine
+        .handle(ClientMessage::Run {
+            query: "RETURN 1".into(),
+            parameters: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        })
+        .await;
+    assert!(matches!(allowed.as_slice(), [ServerMessage::Success(_)]));
+}

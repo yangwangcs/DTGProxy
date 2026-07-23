@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use storage_api::{KeySpan, Keyspace, LogicalKey, StorageAdapter};
 use temporal_types::TransactionTime;
 
-use crate::ShardRuntimeError;
+use crate::{ShardRuntimeError, artifact::ANALYTICS_ARTIFACT_PREFIX};
 
 const META_PREFIX: &[u8] = b"\x01dtg/replica/v1/";
 const POSITION_KEY: &[u8] = b"\x01dtg/replica/v1/position";
@@ -13,19 +13,22 @@ const RESOLVED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/resolved-ts";
 const ADAPTER_APPLIED_TS_KEY: &[u8] = b"\x01dtg/replica/v1/adapter-applied-ts";
 const BACKEND_STATE_KEY: &[u8] = b"\x01dtg/replica/v1/backend-state";
 const ENTRY_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/entry/";
-const REQUEST_DIGEST_PREFIX: &[u8] = b"\x01dtg/replica/v1/request/";
+const REQUEST_OUTCOME_PREFIX: &[u8] = b"\x01dtg/replica/v1/request/";
 const UNRESOLVED_INTENT_PREFIX: &[u8] = b"\x01dtg/replica/v1/unresolved/";
 const META_VERSION: u16 = 1;
 const POSITION_MAGIC: [u8; 4] = *b"DTRP";
 const TIMESTAMP_MAGIC: [u8; 4] = *b"DTTM";
 const ENTRY_DIGEST_MAGIC: [u8; 4] = *b"DTRE";
-const REQUEST_DIGEST_MAGIC: [u8; 4] = *b"DTRQ";
+const REQUEST_OUTCOME_MAGIC: [u8; 4] = *b"DTRQ";
 const UNRESOLVED_INTENT_MAGIC: [u8; 4] = *b"DTRU";
 const BACKEND_STATE_MAGIC: [u8; 4] = *b"DTBG";
 const POSITION_VALUE_BYTES: usize = 38;
 const TIMESTAMP_VALUE_BYTES: usize = 22;
 const ENTRY_DIGEST_VALUE_BYTES: usize = 50;
-const REQUEST_DIGEST_VALUE_BYTES: usize = 42;
+const REQUEST_OUTCOME_FIXED_BYTES: usize = 45;
+const MAX_REJECTION_MESSAGE_BYTES: usize = 512;
+const REQUEST_APPLIED_TAG: u8 = 1;
+const REQUEST_REJECTED_TAG: u8 = 2;
 const BACKEND_STATE_VALUE_BYTES: usize = 67;
 
 pub const MIN_REPLICA_TIME: TransactionTime = TransactionTime::new(i64::MIN, 0);
@@ -51,6 +54,27 @@ pub struct ReplicaMetadata {
     pub adapter_applied_ts: TransactionTime,
     pub backend_generation: u64,
     pub backend_lifecycle: BackendLifecycle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RequestOutcomeRecord {
+    Applied { digest: [u8; 32] },
+    Rejected { digest: [u8; 32], message: String },
+}
+
+impl RequestOutcomeRecord {
+    pub(crate) fn rejected(digest: [u8; 32], message: &str) -> Self {
+        Self::Rejected {
+            digest,
+            message: bounded_rejection_message(message),
+        }
+    }
+
+    pub(crate) const fn digest(&self) -> [u8; 32] {
+        match self {
+            Self::Applied { digest } | Self::Rejected { digest, .. } => *digest,
+        }
+    }
 }
 
 impl ReplicaMetadata {
@@ -223,7 +247,9 @@ fn decode_optional_timestamp(
 }
 
 pub(crate) fn is_reserved_metadata_key(key: &LogicalKey) -> bool {
-    key.keyspace() == Keyspace::Meta && key.as_bytes().starts_with(META_PREFIX)
+    key.keyspace() == Keyspace::Meta
+        && (key.as_bytes().starts_with(META_PREFIX)
+            || key.as_bytes().starts_with(ANALYTICS_ARTIFACT_PREFIX))
 }
 
 pub(crate) fn position_key() -> LogicalKey {
@@ -253,9 +279,9 @@ pub(crate) fn entry_digest_key(index: u64) -> LogicalKey {
     meta_key(key)
 }
 
-pub(crate) fn request_digest_key(request_id: u128) -> LogicalKey {
-    let mut key = Vec::with_capacity(REQUEST_DIGEST_PREFIX.len() + 16);
-    key.extend_from_slice(REQUEST_DIGEST_PREFIX);
+pub(crate) fn request_outcome_key(request_id: u128) -> LogicalKey {
+    let mut key = Vec::with_capacity(REQUEST_OUTCOME_PREFIX.len() + 16);
+    key.extend_from_slice(REQUEST_OUTCOME_PREFIX);
     key.extend_from_slice(&request_id.to_be_bytes());
     meta_key(key)
 }
@@ -436,25 +462,86 @@ pub(crate) fn decode_entry_digest(bytes: &[u8]) -> Result<(u64, [u8; 32]), Shard
     ))
 }
 
-pub(crate) fn encode_request_digest(digest: [u8; 32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(REQUEST_DIGEST_VALUE_BYTES);
-    bytes.extend_from_slice(&REQUEST_DIGEST_MAGIC);
+pub(crate) fn encode_request_outcome(outcome: &RequestOutcomeRecord) -> Vec<u8> {
+    let (tag, digest, message) = match outcome {
+        RequestOutcomeRecord::Applied { digest } => (REQUEST_APPLIED_TAG, *digest, Vec::new()),
+        RequestOutcomeRecord::Rejected { digest, message } => (
+            REQUEST_REJECTED_TAG,
+            *digest,
+            bounded_rejection_message(message).into_bytes(),
+        ),
+    };
+    let mut bytes = Vec::with_capacity(REQUEST_OUTCOME_FIXED_BYTES + message.len());
+    bytes.extend_from_slice(&REQUEST_OUTCOME_MAGIC);
     bytes.extend_from_slice(&META_VERSION.to_be_bytes());
+    bytes.push(tag);
     bytes.extend_from_slice(&digest);
+    bytes.extend_from_slice(
+        &u16::try_from(message.len())
+            .expect("bounded rejection message length fits u16")
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(&message);
     append_checksum(&mut bytes);
     bytes
 }
 
-pub(crate) fn decode_request_digest(bytes: &[u8]) -> Result<[u8; 32], ShardRuntimeError> {
-    validate_record(
-        bytes,
-        REQUEST_DIGEST_VALUE_BYTES,
-        REQUEST_DIGEST_MAGIC,
-        "request-digest",
-    )?;
-    Ok(bytes[6..38]
+pub(crate) fn decode_request_outcome(
+    bytes: &[u8],
+) -> Result<RequestOutcomeRecord, ShardRuntimeError> {
+    const RECORD: &str = "request-outcome";
+    if bytes.len() < REQUEST_OUTCOME_FIXED_BYTES
+        || bytes[..4] != REQUEST_OUTCOME_MAGIC
+        || u16::from_be_bytes(
+            bytes[4..6]
+                .try_into()
+                .expect("fixed metadata version slice"),
+        ) != META_VERSION
+    {
+        return Err(ShardRuntimeError::CorruptMetadata { record: RECORD });
+    }
+    let message_length = usize::from(u16::from_be_bytes(
+        bytes[39..41]
+            .try_into()
+            .expect("fixed request outcome length slice"),
+    ));
+    if message_length > MAX_REJECTION_MESSAGE_BYTES
+        || bytes.len() != REQUEST_OUTCOME_FIXED_BYTES + message_length
+    {
+        return Err(ShardRuntimeError::CorruptMetadata { record: RECORD });
+    }
+    let checksum_offset = bytes.len() - 4;
+    let stored_checksum = u32::from_be_bytes(
+        bytes[checksum_offset..]
+            .try_into()
+            .expect("fixed request outcome checksum slice"),
+    );
+    if crc32fast::hash(&bytes[..checksum_offset]) != stored_checksum {
+        return Err(ShardRuntimeError::CorruptMetadata { record: RECORD });
+    }
+    let digest = bytes[7..39]
         .try_into()
-        .expect("fixed request digest hash slice"))
+        .expect("fixed request outcome digest slice");
+    match bytes[6] {
+        REQUEST_APPLIED_TAG if message_length == 0 => Ok(RequestOutcomeRecord::Applied { digest }),
+        REQUEST_REJECTED_TAG => {
+            let message = std::str::from_utf8(&bytes[41..checksum_offset])
+                .map_err(|_| ShardRuntimeError::CorruptMetadata { record: RECORD })?;
+            Ok(RequestOutcomeRecord::Rejected {
+                digest,
+                message: message.to_owned(),
+            })
+        }
+        _ => Err(ShardRuntimeError::CorruptMetadata { record: RECORD }),
+    }
+}
+
+fn bounded_rejection_message(message: &str) -> String {
+    let mut end = min(message.len(), MAX_REJECTION_MESSAGE_BYTES);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_owned()
 }
 
 fn append_checksum(bytes: &mut Vec<u8>) {
@@ -494,10 +581,10 @@ fn validate_record(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendLifecycle, ENTRY_DIGEST_VALUE_BYTES, ReplicaMetadata, decode_backend_state,
-        decode_entry_digest, decode_position, decode_request_digest, decode_timestamp,
-        encode_backend_state, encode_entry_digest, encode_position, encode_request_digest,
-        encode_timestamp,
+        BackendLifecycle, ENTRY_DIGEST_VALUE_BYTES, ReplicaMetadata, RequestOutcomeRecord,
+        decode_backend_state, decode_entry_digest, decode_position, decode_request_outcome,
+        decode_timestamp, encode_backend_state, encode_entry_digest, encode_position,
+        encode_request_outcome, encode_timestamp,
     };
     use crate::ShardRuntimeError;
     use temporal_types::TransactionTime;
@@ -532,9 +619,10 @@ mod tests {
             decode_entry_digest(&encode_entry_digest(29, digest)).unwrap(),
             (29, digest)
         );
+        let request_outcome = RequestOutcomeRecord::Applied { digest };
         assert_eq!(
-            decode_request_digest(&encode_request_digest(digest)).unwrap(),
-            digest
+            decode_request_outcome(&encode_request_outcome(&request_outcome)).unwrap(),
+            request_outcome
         );
         assert_eq!(
             decode_backend_state(&encode_backend_state(metadata)).unwrap(),
@@ -547,6 +635,37 @@ mod tests {
             decode_entry_digest(&corrupted),
             Err(ShardRuntimeError::CorruptMetadata {
                 record: "entry-digest"
+            })
+        ));
+    }
+
+    #[test]
+    fn request_outcome_codec_bounds_utf8_and_rejects_corruption() {
+        let digest = [0x5a; 32];
+        let outcome = RequestOutcomeRecord::rejected(digest, &"界".repeat(300));
+        let RequestOutcomeRecord::Rejected { message, .. } = &outcome else {
+            panic!("expected rejected outcome");
+        };
+        assert!(message.len() <= 512);
+        assert!(message.is_char_boundary(message.len()));
+        assert_eq!(
+            decode_request_outcome(&encode_request_outcome(&outcome)).unwrap(),
+            outcome
+        );
+
+        let mut invalid_utf8 = encode_request_outcome(&RequestOutcomeRecord::Rejected {
+            digest,
+            message: "x".to_owned(),
+        });
+        let message_offset = 4 + 2 + 1 + 32 + 2;
+        invalid_utf8[message_offset] = 0xff;
+        let checksum_offset = invalid_utf8.len() - 4;
+        let checksum = crc32fast::hash(&invalid_utf8[..checksum_offset]);
+        invalid_utf8[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+        assert!(matches!(
+            decode_request_outcome(&invalid_utf8),
+            Err(ShardRuntimeError::CorruptMetadata {
+                record: "request-outcome"
             })
         ));
     }

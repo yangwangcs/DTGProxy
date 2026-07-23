@@ -26,7 +26,6 @@ members = [
     "crates/temporal-storage",
     "crates/temporal-ir",
     "crates/query-executor",
-    "crates/temporal-query",
     "crates/cypher-ast",
     "crates/cypher-syntax",
     "crates/cypher-sema",
@@ -38,7 +37,9 @@ members = [
     "crates/distributed-query",
     "crates/cypher-engine",
     "crates/analytics-api",
+    "crates/analytics-ledger",
     "crates/analytics-runtime",
+    "crates/procedure-runtime",
     "crates/dtgproxy",
 ]
 resolver = "3"

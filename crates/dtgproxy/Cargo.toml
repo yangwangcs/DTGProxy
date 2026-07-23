@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+three-backend-certification = []
+
 [dependencies]
 adapter-neo4j = { path = "../adapter-neo4j" }
 adapter-postgres = { path = "../adapter-postgres" }
@@ -22,7 +25,6 @@ shard-client = { path = "../shard-client" }
 shard-runtime = { path = "../shard-runtime" }
 storage-api = { path = "../storage-api" }
 temporal-ir = { path = "../temporal-ir" }
-temporal-query = { path = "../temporal-query" }
 temporal-storage = { path = "../temporal-storage" }
 temporal-types = { path = "../temporal-types" }
 timestamp-oracle = { path = "../timestamp-oracle" }
@@ -30,6 +32,8 @@ txn-protocol = { path = "../txn-protocol" }
 
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }
+analytics-api = { path = "../analytics-api" }
+analytics-runtime = { path = "../analytics-runtime" }
 cluster-protocol = { path = "../cluster-protocol" }
 data-node = { path = "../data-node" }
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
@@ -40,9 +44,9 @@ tokio = { version = "=1.53.0", features = ["rt", "macros", "sync", "net", "time"
 tokio-stream = { version = "=0.1.18", features = ["net"] }
 tonic = { version = "=0.14.6", features = ["transport"] }
 
-[[bench]]
-name = "phase2"
-harness = false
+[[test]]
+name = "three_backend_migration"
+required-features = ["three-backend-certification"]
 
 [lints]
 workspace = true

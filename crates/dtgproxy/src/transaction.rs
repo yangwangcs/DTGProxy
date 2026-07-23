@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -12,18 +14,21 @@ use raft_command::{
 use shard_client::{ExecuteCommand, ShardClient, ShardClientStorageAdapter, ShardRequestContext};
 use shard_runtime::ReadBarrierError;
 use shard_runtime::ReplicationError;
-use storage_api::{AdapterError, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch};
+use storage_api::{
+    AdapterError, Keyspace, LogicalKey, Mutation, MutationOperation, PreparedMutationBatch,
+};
 use temporal_ir::GraphScope;
 use temporal_storage::{
-    PrepareContext, TemporalStore, TemporalStoreError, TemporalTransaction, decode_graph_key,
-    graph_key_scope,
+    ElementId, ElementKind, ElementRef, GraphId, PartitionId, PrepareContext, TemporalStore,
+    TemporalStoreError, TemporalTransaction, decode_graph_key, graph_key_scope,
 };
 use temporal_types::TransactionTime;
 use timestamp_oracle::{TimestampOracle, TimestampOracleError};
 use txn_protocol::{
-    HomeDecisionEngine, HomeTransactionRecord, IsolationLevel, ParticipantEngine, ParticipantProof,
-    ParticipantRecoveryRecord, PrewriteRequest, RecoveryAction, ShardEpoch, TransactionId,
-    TransactionState, TxnProtocolError, recovery_action,
+    ConstraintClaim, HomeDecisionEngine, HomeTransactionRecord, IsolationLevel,
+    MAX_TRANSACTION_MUTATIONS, ParticipantEngine, ParticipantProof, ParticipantRecoveryRecord,
+    PrewriteMetadata, PrewriteRequest, RecoveryAction, ShardEpoch, TransactionId, TransactionState,
+    TxnProtocolError, recovery_action,
 };
 
 use crate::{DeploymentConfig, InProcessDeploymentRuntime};
@@ -34,6 +39,113 @@ const COMMIT_DECISION_PHASE: u8 = 3;
 const FINALIZE_PHASE: u8 = 4;
 const ABORT_DECISION_PHASE: u8 = 5;
 const ABORT_INTENT_PHASE: u8 = 6;
+const CONSTRAINT_KEY_PREFIX: &[u8] = b"\x01dtg/constraint/v1/";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedConstraintClaim {
+    graph_id: u64,
+    key: [u8; 32],
+    owner: ElementRef,
+}
+
+impl RoutedConstraintClaim {
+    pub fn new(
+        graph_id: u64,
+        key: [u8; 32],
+        owner: ElementRef,
+    ) -> Result<Self, TransactionCoordinatorError> {
+        if graph_id == 0 || key == [0; 32] || owner.graph().value() != graph_id {
+            return Err(TransactionCoordinatorError::InvalidConstraintClaim);
+        }
+        Ok(Self {
+            graph_id,
+            key,
+            owner,
+        })
+    }
+
+    #[must_use]
+    pub const fn owner(&self) -> ElementRef {
+        self.owner
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> [u8; 32] {
+        self.key
+    }
+
+    fn protocol_claim(&self) -> Result<ConstraintClaim, TransactionCoordinatorError> {
+        let mut key = Vec::with_capacity(CONSTRAINT_KEY_PREFIX.len() + 8 + 32);
+        key.extend_from_slice(CONSTRAINT_KEY_PREFIX);
+        key.extend_from_slice(&self.graph_id.to_be_bytes());
+        key.extend_from_slice(&self.key);
+        let mut value = Vec::with_capacity(29);
+        value.push(self.owner.kind() as u8);
+        value.extend_from_slice(&self.owner.graph().value().to_be_bytes());
+        value.extend_from_slice(&self.owner.partition().value().to_be_bytes());
+        value.extend_from_slice(&self.owner.id().value().to_be_bytes());
+        Ok(ConstraintClaim::new(
+            LogicalKey::in_keyspace(Keyspace::Txn, key),
+            value,
+        )?)
+    }
+
+    pub fn owner_read_keys(
+        &self,
+        deployment: &DeploymentConfig,
+    ) -> Result<(ShardEpoch, [LogicalKey; 2]), TransactionCoordinatorError> {
+        let participant = route_constraint_claim(deployment, self)?;
+        let claim = self.protocol_claim()?;
+        let keys = ParticipantEngine::constraint_owner_read_keys(participant, claim.key())?;
+        Ok((participant, keys))
+    }
+
+    pub fn owner_at_snapshot(
+        &self,
+        owner: Option<&[u8]>,
+        committed_write: Option<&[u8]>,
+        start_ts: TransactionTime,
+    ) -> Result<Option<ElementRef>, TransactionCoordinatorError> {
+        let Some(bytes) =
+            ParticipantEngine::constraint_owner_at_snapshot(owner, committed_write, start_ts)?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != 29 {
+            return Err(TransactionCoordinatorError::InvalidConstraintOwner);
+        }
+        let kind = match bytes[0] {
+            1 => ElementKind::Vertex,
+            2 => ElementKind::Edge,
+            _ => return Err(TransactionCoordinatorError::InvalidConstraintOwner),
+        };
+        let graph = u64::from_be_bytes(
+            bytes[1..9]
+                .try_into()
+                .expect("fixed constraint owner graph slice"),
+        );
+        let partition = u32::from_be_bytes(
+            bytes[9..13]
+                .try_into()
+                .expect("fixed constraint owner partition slice"),
+        );
+        let id = u128::from_be_bytes(
+            bytes[13..29]
+                .try_into()
+                .expect("fixed constraint owner element slice"),
+        );
+        if graph != self.graph_id {
+            return Err(TransactionCoordinatorError::InvalidConstraintOwner);
+        }
+        let graph = GraphId::new(graph);
+        let partition = PartitionId::new(partition);
+        let id = ElementId::new(id);
+        Ok(Some(match kind {
+            ElementKind::Vertex => ElementRef::vertex(graph, partition, id),
+            ElementKind::Edge => ElementRef::edge(graph, partition, id),
+        }))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionContext {
@@ -116,6 +228,8 @@ impl TransactionContext {
 pub struct PreparedShardTransaction {
     participant: ShardEpoch,
     batch: PreparedMutationBatch,
+    constraint_claims: Vec<ConstraintClaim>,
+    metadata: PrewriteMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +253,11 @@ impl ScopedTemporalTransaction {
     pub const fn transaction(&self) -> &TemporalTransaction {
         &self.transaction
     }
+
+    #[must_use]
+    pub fn into_parts(self) -> (GraphScope, TemporalTransaction) {
+        (self.scope, self.transaction)
+    }
 }
 
 impl PreparedShardTransaction {
@@ -146,6 +265,8 @@ impl PreparedShardTransaction {
         shard_id: u32,
         placement_epoch: u64,
         batch: PreparedMutationBatch,
+        constraint_claims: Vec<ConstraintClaim>,
+        metadata: PrewriteMetadata,
     ) -> Result<Self, TransactionCoordinatorError> {
         if batch.shard_id != shard_id {
             return Err(TransactionCoordinatorError::BatchShardMismatch {
@@ -156,6 +277,8 @@ impl PreparedShardTransaction {
         Ok(Self {
             participant: ShardEpoch::new(shard_id, placement_epoch)?,
             batch,
+            constraint_claims,
+            metadata,
         })
     }
 
@@ -167,6 +290,16 @@ impl PreparedShardTransaction {
     #[must_use]
     pub const fn batch(&self) -> &PreparedMutationBatch {
         &self.batch
+    }
+
+    #[must_use]
+    pub fn constraint_claims(&self) -> &[ConstraintClaim] {
+        &self.constraint_claims
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> &PrewriteMetadata {
+        &self.metadata
     }
 }
 
@@ -515,30 +648,17 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         let home = participants[0];
         if writes.len() == 1 {
             let write = writes.pop().expect("write set has exactly one element");
-            let request = PrewriteRequest::new(
-                context.transaction_id,
-                context.start_ts,
-                context.schema_version,
-                write.participant,
-                home,
-                participants.clone(),
-                context.isolation,
-                context.expires_at,
-                write.batch,
-            )?;
+            let participant = write.participant;
+            let request = prewrite_request(context, home, participants.clone(), write)?;
             let proof = ParticipantProof::new(
-                write.participant,
+                participant,
                 timestamp_successor(context.start_ts)?,
                 request.intent_digest(),
             );
             let command = CommandEnvelopeV1::new(
-                write.participant.shard_id(),
-                write.participant.placement_epoch(),
-                phase_request_id(
-                    context.transaction_id,
-                    SINGLE_SHARD_PHASE,
-                    write.participant,
-                ),
+                participant.shard_id(),
+                participant.placement_epoch(),
+                phase_request_id(context.transaction_id, SINGLE_SHARD_PHASE, participant),
                 CommandBodyV1::OnePhaseCommit(OnePhaseCommitV1 {
                     request,
                     expected_proof: proof,
@@ -547,11 +667,11 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             )
             .encode()?;
             dispatcher
-                .propose(write.participant, command, self.max_ticks)
+                .propose(participant, command, self.max_ticks)
                 .await
                 .map_err(|source| TransactionCoordinatorError::Replication {
                     phase: "single-shard-commit",
-                    participant: write.participant,
+                    participant,
                     source,
                 })?;
             return Ok(receipt(context, home, participants, true));
@@ -559,19 +679,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
 
         let requests = writes
             .into_iter()
-            .map(|write| {
-                PrewriteRequest::new(
-                    context.transaction_id,
-                    context.start_ts,
-                    context.schema_version,
-                    write.participant,
-                    home,
-                    participants.clone(),
-                    context.isolation,
-                    context.expires_at,
-                    write.batch,
-                )
-            })
+            .map(|write| prewrite_request(context, home, participants.clone(), write))
             .collect::<Result<Vec<_>, _>>()?;
         let proofs = requests
             .iter()
@@ -610,7 +718,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             .propose_many(prewrite_commands, self.max_ticks)
             .await?;
         let mut prepared = Vec::with_capacity(requests.len());
-        let mut failed = Vec::new();
+        let mut failed_cleanup = Vec::new();
         let mut first_failure = None;
         for (shard_id, result) in prewrite_results {
             let index = requests
@@ -619,7 +727,9 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             match result {
                 Ok(_) => prepared.push((requests[index].clone(), proofs[index].clone())),
                 Err(error) => {
-                    failed.push(requests[index].participant());
+                    if !is_persisted_committed_merge_rejection(&error) {
+                        failed_cleanup.push(requests[index].participant());
+                    }
                     if first_failure.is_none() {
                         first_failure = Some((requests[index].participant(), error));
                     }
@@ -630,7 +740,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             let (abort_decision_durable, mut cleanup_pending) = self
                 .rollback_prepared(dispatcher, context, home, &participants, &prepared)
                 .await;
-            cleanup_pending.extend(failed);
+            cleanup_pending.extend(failed_cleanup);
             cleanup_pending.sort_unstable();
             cleanup_pending.dedup();
             return Err(TransactionCoordinatorError::PrewriteFailed {
@@ -760,7 +870,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             grouped
                 .entry(participant)
                 .or_default()
-                .extend(scoped.transaction);
+                .merge_overlay(scoped.transaction)?;
         }
 
         let mut routed = BTreeMap::<ShardEpoch, BTreeMap<LogicalKey, MutationOperation>>::new();
@@ -843,6 +953,13 @@ impl<'oracle> TransactionCoordinator<'oracle> {
                         txn_id: context.transaction_id.value(),
                         mutations,
                     },
+                    constraint_claims: Vec::new(),
+                    metadata: PrewriteMetadata::new(
+                        context.schema_version,
+                        participant.placement_epoch(),
+                        Vec::new(),
+                        Vec::new(),
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
@@ -859,6 +976,79 @@ impl<'oracle> TransactionCoordinator<'oracle> {
         context: TransactionContext,
         transactions: Vec<ScopedTemporalTransaction>,
     ) -> Result<TransactionReceipt, TransactionCoordinatorError> {
+        self.commit_temporal_remote_with_constraints(
+            client,
+            deployment,
+            graph_id,
+            deadline_unix_ms,
+            context,
+            transactions,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_temporal_remote_with_constraints(
+        &self,
+        client: Arc<dyn ShardClient>,
+        deployment: &DeploymentConfig,
+        graph_id: u64,
+        deadline_unix_ms: u64,
+        context: TransactionContext,
+        transactions: Vec<ScopedTemporalTransaction>,
+        constraints: Vec<RoutedConstraintClaim>,
+    ) -> Result<TransactionReceipt, TransactionCoordinatorError> {
+        let writes = self
+            .prepare_temporal_remote_candidate(
+                Arc::clone(&client),
+                deployment,
+                graph_id,
+                deadline_unix_ms,
+                context,
+                transactions,
+                constraints,
+            )
+            .await?;
+        self.commit_remote(client.as_ref(), graph_id, deadline_unix_ms, context, writes)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn validate_temporal_remote_candidate(
+        &self,
+        client: Arc<dyn ShardClient>,
+        deployment: &DeploymentConfig,
+        graph_id: u64,
+        deadline_unix_ms: u64,
+        context: TransactionContext,
+        transactions: Vec<ScopedTemporalTransaction>,
+        constraints: Vec<RoutedConstraintClaim>,
+    ) -> Result<(), TransactionCoordinatorError> {
+        self.prepare_temporal_remote_candidate(
+            client,
+            deployment,
+            graph_id,
+            deadline_unix_ms,
+            context,
+            transactions,
+            constraints,
+        )
+        .await
+        .map(drop)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_temporal_remote_candidate(
+        &self,
+        client: Arc<dyn ShardClient>,
+        deployment: &DeploymentConfig,
+        graph_id: u64,
+        deadline_unix_ms: u64,
+        context: TransactionContext,
+        transactions: Vec<ScopedTemporalTransaction>,
+        constraints: Vec<RoutedConstraintClaim>,
+    ) -> Result<Vec<PreparedShardTransaction>, TransactionCoordinatorError> {
         if transactions.is_empty() {
             return Err(TransactionCoordinatorError::EmptyWriteSet);
         }
@@ -894,7 +1084,7 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             grouped
                 .entry(participant)
                 .or_default()
-                .extend(scoped.transaction);
+                .merge_overlay(scoped.transaction)?;
         }
 
         let mut routed = BTreeMap::<ShardEpoch, BTreeMap<LogicalKey, MutationOperation>>::new();
@@ -941,6 +1131,31 @@ impl<'oracle> TransactionCoordinator<'oracle> {
             insert_routed_operation(&mut routed, participant, operation)?;
         }
 
+        let mut routed_claims =
+            BTreeMap::<ShardEpoch, BTreeMap<LogicalKey, ConstraintClaim>>::new();
+        for constraint in constraints {
+            if constraint.graph_id != graph_id {
+                return Err(TransactionCoordinatorError::ScopeMismatch);
+            }
+            let participant = route_constraint_claim(deployment, &constraint)?;
+            let claim = constraint.protocol_claim()?;
+            routed.entry(participant).or_default();
+            match routed_claims
+                .entry(participant)
+                .or_default()
+                .entry(claim.key().clone())
+            {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(claim);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().value() == claim.value() => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(TransactionCoordinatorError::ConflictingConstraintClaim);
+                }
+            }
+        }
+
         let writes = routed
             .into_iter()
             .map(|(participant, operations)| {
@@ -965,11 +1180,28 @@ impl<'oracle> TransactionCoordinator<'oracle> {
                         txn_id: context.transaction_id.value(),
                         mutations,
                     },
+                    constraint_claims: routed_claims
+                        .remove(&participant)
+                        .map(BTreeMap::into_values)
+                        .unwrap_or_default()
+                        .collect(),
+                    metadata: PrewriteMetadata::new(
+                        context.schema_version,
+                        participant.placement_epoch(),
+                        Vec::new(),
+                        Vec::new(),
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, TransactionCoordinatorError>>()?;
-        self.commit_remote(client.as_ref(), graph_id, deadline_unix_ms, context, writes)
-            .await
+        validate_prepared_candidate_with_limits(
+            context,
+            &writes,
+            usize::MAX,
+            MAX_TRANSACTION_MUTATIONS,
+            usize::MAX,
+        )?;
+        Ok(writes)
     }
 
     pub async fn status(
@@ -1263,6 +1495,82 @@ fn receipt(
     }
 }
 
+fn validate_prepared_candidate_with_limits(
+    context: TransactionContext,
+    writes: &[PreparedShardTransaction],
+    maximum_participants: usize,
+    maximum_mutations: usize,
+    maximum_constraint_claims: usize,
+) -> Result<(), TransactionCoordinatorError> {
+    if writes.is_empty() {
+        return Err(TransactionCoordinatorError::EmptyWriteSet);
+    }
+    let mut writes = writes.to_vec();
+    writes.sort_by_key(PreparedShardTransaction::participant);
+    if writes
+        .windows(2)
+        .any(|pair| pair[0].participant == pair[1].participant)
+    {
+        return Err(TransactionCoordinatorError::DuplicateParticipant);
+    }
+    if writes.len() > maximum_participants {
+        return Err(TxnProtocolError::InvalidParticipantCount {
+            max: maximum_participants,
+            actual: writes.len(),
+        }
+        .into());
+    }
+    let participants = writes
+        .iter()
+        .map(PreparedShardTransaction::participant)
+        .collect::<Vec<_>>();
+    let home = participants[0];
+    for write in writes {
+        if write.batch.txn_id != context.transaction_id.value() {
+            return Err(TransactionCoordinatorError::BatchTransactionMismatch);
+        }
+        if (write.batch.mutations.is_empty() && write.constraint_claims.is_empty())
+            || write.batch.mutations.len() > maximum_mutations
+        {
+            return Err(TxnProtocolError::InvalidMutationCount {
+                max: maximum_mutations,
+                actual: write.batch.mutations.len(),
+            }
+            .into());
+        }
+        if write.constraint_claims.len() > maximum_constraint_claims {
+            return Err(TxnProtocolError::InvalidConstraintClaimCount {
+                max: maximum_constraint_claims,
+                actual: write.constraint_claims.len(),
+            }
+            .into());
+        }
+        prewrite_request(context, home, participants.clone(), write)?;
+    }
+    Ok(())
+}
+
+fn prewrite_request(
+    context: TransactionContext,
+    home: ShardEpoch,
+    participants: Vec<ShardEpoch>,
+    write: PreparedShardTransaction,
+) -> Result<PrewriteRequest, TxnProtocolError> {
+    PrewriteRequest::new(
+        context.transaction_id,
+        context.start_ts,
+        context.schema_version,
+        write.participant,
+        home,
+        participants,
+        context.isolation,
+        context.expires_at,
+        write.batch,
+        write.constraint_claims,
+        write.metadata,
+    )
+}
+
 fn route_operation(
     runtime: &InProcessDeploymentRuntime,
     operation: &MutationOperation,
@@ -1305,6 +1613,27 @@ fn route_operation_with_config(
     let graph_key = decode_graph_key(key).map_err(TemporalStoreError::from)?;
     let (graph, partition) = graph_key_scope(graph_key);
     let placement = deployment.route_scope(GraphScope::new(graph, partition));
+    Ok(ShardEpoch::new(
+        placement.shard_id(),
+        placement.placement_epoch(),
+    )?)
+}
+
+fn route_constraint_claim(
+    deployment: &DeploymentConfig,
+    claim: &RoutedConstraintClaim,
+) -> Result<ShardEpoch, TransactionCoordinatorError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"DTGProxy/ConstraintShard/V1");
+    hasher.update(&claim.graph_id.to_be_bytes());
+    hasher.update(&claim.key);
+    let digest = hasher.finalize();
+    let partition = u32::from_be_bytes(digest.as_bytes()[..4].try_into().expect("fixed digest"))
+        % deployment.virtual_partitions();
+    let placement = deployment.route_scope(GraphScope::new(
+        temporal_storage::GraphId::new(claim.graph_id),
+        temporal_storage::PartitionId::new(partition),
+    ));
     Ok(ShardEpoch::new(
         placement.shard_id(),
         placement.placement_epoch(),
@@ -1434,6 +1763,8 @@ pub enum TransactionCoordinatorError {
     InvalidSchemaVersion,
     InvalidTransactionTtl,
     InvalidRemoteContext,
+    InvalidConstraintClaim,
+    InvalidConstraintOwner,
     LocalOracleUnavailable,
     ExpiryOverflow,
     TimestampExhausted,
@@ -1460,6 +1791,7 @@ pub enum TransactionCoordinatorError {
     ConflictingRoutedMutation {
         key: LogicalKey,
     },
+    ConflictingConstraintClaim,
     CommitTimestampTooEarly,
     Replication {
         phase: &'static str,
@@ -1485,6 +1817,49 @@ pub enum TransactionCoordinatorError {
     },
 }
 
+impl TransactionCoordinatorError {
+    #[must_use]
+    pub fn is_retryable_merge_contention(&self) -> bool {
+        match self {
+            Self::PrewriteFailed {
+                abort_decision_durable,
+                cleanup_pending,
+                source,
+                ..
+            } => {
+                *abort_decision_durable
+                    && cleanup_pending.is_empty()
+                    && is_explicit_merge_conflict(&source.to_string())
+            }
+            Self::Replication {
+                phase: "single-shard-commit",
+                source,
+                ..
+            } => is_explicit_merge_conflict(&source.to_string()),
+            _ => false,
+        }
+    }
+}
+
+fn is_explicit_merge_conflict(message: &str) -> bool {
+    message.contains("WriteConflict")
+        || message.contains("IntentConflict")
+        || message.contains("ConstraintConflict")
+}
+
+fn is_persisted_committed_merge_rejection(error: &ReplicationError) -> bool {
+    match error {
+        ReplicationError::StateMachine(shard_runtime::ShardRuntimeError::CommittedRejection {
+            message,
+            ..
+        }) => is_explicit_merge_conflict(message),
+        ReplicationError::Raft(message) => {
+            message.contains("was durably rejected:") && is_explicit_merge_conflict(message)
+        }
+        _ => false,
+    }
+}
+
 impl Display for TransactionCoordinatorError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -1499,6 +1874,12 @@ impl Display for TransactionCoordinatorError {
             Self::InvalidTransactionTtl => formatter.write_str("transaction TTL must be nonzero"),
             Self::InvalidRemoteContext => {
                 formatter.write_str("remote transaction graph or deadline is invalid")
+            }
+            Self::InvalidConstraintClaim => {
+                formatter.write_str("invalid distributed constraint claim")
+            }
+            Self::InvalidConstraintOwner => {
+                formatter.write_str("invalid distributed constraint owner")
             }
             Self::LocalOracleUnavailable => {
                 formatter.write_str("this coordinator requires timestamps from remote Meta")
@@ -1538,6 +1919,9 @@ impl Display for TransactionCoordinatorError {
                 formatter,
                 "temporal transaction routes conflicting operations to {key:?}"
             ),
+            Self::ConflictingConstraintClaim => {
+                formatter.write_str("one transaction contains conflicting constraint owners")
+            }
             Self::CommitTimestampTooEarly => {
                 formatter.write_str("commit timestamp does not exceed every participant minimum")
             }
@@ -1642,5 +2026,98 @@ impl From<TemporalStoreError> for TransactionCoordinatorError {
 impl From<ReplicationError> for TransactionCoordinatorError {
     fn from(error: ReplicationError) -> Self {
         Self::Runtime(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn participant() -> ShardEpoch {
+        ShardEpoch::new(7, 1).expect("valid participant")
+    }
+
+    #[test]
+    fn merge_retry_requires_an_explicit_conflict_after_a_durable_abort() {
+        let conflict = TransactionCoordinatorError::PrewriteFailed {
+            participant: participant(),
+            abort_decision_durable: true,
+            cleanup_pending: Vec::new(),
+            source: ReplicationError::Raft("WriteConflict".into()),
+        };
+        assert!(conflict.is_retryable_merge_contention());
+
+        let network_failure = TransactionCoordinatorError::PrewriteFailed {
+            participant: participant(),
+            abort_decision_durable: true,
+            cleanup_pending: Vec::new(),
+            source: ReplicationError::Raft("transport unavailable".into()),
+        };
+        assert!(!network_failure.is_retryable_merge_contention());
+    }
+
+    #[test]
+    fn only_persisted_committed_merge_rejections_are_safe_from_failed_prewrite_cleanup() {
+        let structured =
+            ReplicationError::StateMachine(shard_runtime::ShardRuntimeError::CommittedRejection {
+                request_id: 9,
+                message: "transaction protocol error: IntentConflict".into(),
+            });
+        assert!(is_persisted_committed_merge_rejection(&structured));
+
+        let remote = ReplicationError::Raft(
+            "Shard client internal error: request 9 was durably rejected: transaction protocol error: ConstraintConflict"
+                .into(),
+        );
+        assert!(is_persisted_committed_merge_rejection(&remote));
+
+        let ambiguous =
+            ReplicationError::Raft("IntentConflict before apply acknowledgement".into());
+        assert!(!is_persisted_committed_merge_rejection(&ambiguous));
+        assert!(!is_persisted_committed_merge_rejection(
+            &ReplicationError::Raft("transport unavailable".into())
+        ));
+    }
+
+    #[test]
+    fn candidate_validation_counts_prepared_physical_mutations() {
+        let context = TransactionContext::from_allocated(
+            TransactionTime::new(10, 0),
+            TransactionTime::new(20, 0),
+            1,
+            IsolationLevel::TemporalSnapshot,
+            100,
+        )
+        .expect("context");
+        let mutations = (0..3)
+            .map(|sequence| {
+                Mutation::put(
+                    sequence,
+                    LogicalKey::in_keyspace(Keyspace::Current, vec![sequence as u8]),
+                    vec![sequence as u8],
+                )
+            })
+            .collect();
+        let write = PreparedShardTransaction {
+            participant: participant(),
+            batch: PreparedMutationBatch {
+                shard_id: participant().shard_id(),
+                txn_id: context.transaction_id().value(),
+                mutations,
+            },
+            constraint_claims: Vec::new(),
+            metadata: PrewriteMetadata::new(1, 1, Vec::new(), Vec::new()).expect("metadata"),
+        };
+
+        let error = validate_prepared_candidate_with_limits(context, &[write], 64, 2, 1_024)
+            .expect_err("prepared physical mutation count must be bounded");
+
+        assert!(matches!(
+            error,
+            TransactionCoordinatorError::Protocol(TxnProtocolError::InvalidMutationCount {
+                max: 2,
+                actual: 3,
+            })
+        ));
     }
 }

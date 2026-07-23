@@ -1,15 +1,32 @@
 use cypher_ast::{BinaryOperator, Expression, Identifier, UnaryOperator};
 
-use crate::{ParseError, SourceSpan, Token, TokenKind, lex};
+use crate::parser::query_ast_node_count;
+use crate::{
+    ParseError, SourceSpan, SyntaxLimits, Token, TokenKind, lex_with_limits, parse_with_limits,
+};
 
 pub fn parse_expression(source: &str) -> Result<Expression, ParseError> {
-    let lexed = lex(source).map_err(|error| ParseError::from_syntax(&error))?;
-    let mut parser = ExpressionParser::new(lexed.tokens(), source.len());
+    parse_expression_with_limits(source, SyntaxLimits::default())
+}
+
+pub(crate) fn parse_expression_with_limits(
+    source: &str,
+    limits: SyntaxLimits,
+) -> Result<Expression, ParseError> {
+    let lexed = lex_with_limits(source, limits).map_err(|error| ParseError::from_syntax(&error))?;
+    let mut parser = ExpressionParser::new(lexed.tokens(), source, limits);
     let expression = parser.parse(0)?;
     if parser.position != lexed.tokens().len() {
         return Err(parser.error_here(
             "DTG-CYPHER-UNEXPECTED-TOKEN",
             "unexpected token after expression",
+        ));
+    }
+    if expression_node_count(&expression) > limits.max_ast_nodes() {
+        return Err(ParseError::new(
+            "DTG-CYPHER-TOO-MANY-AST-NODES",
+            SourceSpan::new(0, source.len()),
+            "expression AST node count exceeds the configured limit",
         ));
     }
     Ok(expression)
@@ -18,15 +35,21 @@ pub fn parse_expression(source: &str) -> Result<Expression, ParseError> {
 pub(crate) struct ExpressionParser<'tokens> {
     tokens: &'tokens [Token],
     position: usize,
-    source_len: usize,
+    source: &'tokens str,
+    limits: SyntaxLimits,
 }
 
 impl<'tokens> ExpressionParser<'tokens> {
-    pub(crate) const fn new(tokens: &'tokens [Token], source_len: usize) -> Self {
+    pub(crate) const fn new(
+        tokens: &'tokens [Token],
+        source: &'tokens str,
+        limits: SyntaxLimits,
+    ) -> Self {
         Self {
             tokens,
             position: 0,
-            source_len,
+            source,
+            limits,
         }
     }
 
@@ -94,6 +117,12 @@ impl<'tokens> ExpressionParser<'tokens> {
         if self.consume_word("NOT") {
             return Ok(Expression::unary(UnaryOperator::Not, self.parse(4)?));
         }
+        if self.current_is_word("EXISTS") && self.next_kind() == Some(&TokenKind::LeftBrace) {
+            return self.subquery_expression(true);
+        }
+        if self.current_is_word("COUNT") && self.next_kind() == Some(&TokenKind::LeftBrace) {
+            return self.subquery_expression(false);
+        }
         let token = self.current().ok_or_else(|| {
             self.error_here("DTG-CYPHER-EXPECTED-EXPRESSION", "expected an expression")
         })?;
@@ -136,6 +165,53 @@ impl<'tokens> ExpressionParser<'tokens> {
         };
         self.position += 1;
         Ok(expression)
+    }
+
+    fn subquery_expression(&mut self, exists: bool) -> Result<Expression, ParseError> {
+        let keyword = self.position;
+        let open = keyword + 1;
+        let mut depth = 0_usize;
+        let close = (open..self.tokens.len())
+            .find(|index| {
+                match self.tokens[*index].kind() {
+                    TokenKind::LeftBrace => depth += 1,
+                    TokenKind::RightBrace => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            })
+            .ok_or_else(|| {
+                self.error_here(
+                    "DTG-CYPHER-UNBALANCED-DELIMITER",
+                    "subquery expression body is not closed",
+                )
+            })?;
+        let source =
+            self.source[self.tokens[open].span().end()..self.tokens[close].span().start()].trim();
+        if source.is_empty() {
+            return Err(self.error_here(
+                "DTG-CYPHER-INVALID-SUBQUERY",
+                "subquery expression cannot be empty",
+            ));
+        }
+        let parsed = parse_with_limits(source, self.limits)?;
+        let cypher_ast::Statement::Query(query) = parsed.statement() else {
+            return Err(self.error_here(
+                "DTG-CYPHER-SUBQUERY-STATEMENT",
+                "subquery expression must contain a Cypher query",
+            ));
+        };
+        self.position = close + 1;
+        Ok(if exists {
+            Expression::ExistsSubquery(Box::new(query.clone()))
+        } else {
+            Expression::CountSubquery(Box::new(query.clone()))
+        })
     }
 
     fn list(&mut self) -> Result<Expression, ParseError> {
@@ -266,6 +342,16 @@ impl<'tokens> ExpressionParser<'tokens> {
         })
     }
 
+    fn current_is_word(&self, expected: &str) -> bool {
+        self.current().is_some_and(|token| {
+            matches!(token.kind(), TokenKind::Word(word) if word.eq_ignore_ascii_case(expected))
+        })
+    }
+
+    fn next_kind(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.position + 1).map(Token::kind)
+    }
+
     fn current(&self) -> Option<&Token> {
         self.tokens.get(self.position)
     }
@@ -278,7 +364,7 @@ impl<'tokens> ExpressionParser<'tokens> {
         ParseError::new(
             code,
             self.current().map_or_else(
-                || SourceSpan::new(self.source_len, self.source_len),
+                || SourceSpan::new(self.source.len(), self.source.len()),
                 Token::span,
             ),
             message,
@@ -295,5 +381,41 @@ fn qualified_name(expression: Expression) -> Option<Vec<Identifier>> {
             Some(name)
         }
         _ => None,
+    }
+}
+
+fn expression_node_count(expression: &Expression) -> usize {
+    match expression {
+        Expression::List(items) => items.iter().fold(1_usize, |count, item| {
+            count.saturating_add(expression_node_count(item))
+        }),
+        Expression::Map(items) => items.iter().fold(1_usize, |count, (_, value)| {
+            count.saturating_add(expression_node_count(value))
+        }),
+        Expression::Unary { expression, .. } => {
+            1_usize.saturating_add(expression_node_count(expression))
+        }
+        Expression::Binary { left, right, .. } => 1_usize
+            .saturating_add(expression_node_count(left))
+            .saturating_add(expression_node_count(right)),
+        Expression::Property { value, .. } => 1_usize.saturating_add(expression_node_count(value)),
+        Expression::Index { value, index } => 1_usize
+            .saturating_add(expression_node_count(value))
+            .saturating_add(expression_node_count(index)),
+        Expression::FunctionCall { arguments, .. } => {
+            arguments.iter().fold(1_usize, |count, argument| {
+                count.saturating_add(expression_node_count(argument))
+            })
+        }
+        Expression::ExistsSubquery(query) | Expression::CountSubquery(query) => {
+            1_usize.saturating_add(query_ast_node_count(query))
+        }
+        Expression::Null
+        | Expression::Boolean(_)
+        | Expression::Integer(_)
+        | Expression::Float(_)
+        | Expression::String(_)
+        | Expression::Parameter(_)
+        | Expression::Identifier(_) => 1,
     }
 }

@@ -8,7 +8,7 @@ use dtgproxy::gateway::{ApiMutation, GATEWAY_API_VERSION, GatewayOperation, Gate
 use temporal_types::CanonicalElement;
 
 #[test]
-fn cli_process_write_query_and_restart_recovery() {
+fn cli_process_write_and_restart_recovery() {
     let temporary = tempfile::tempdir().unwrap();
     let config = temporary.path().join("node.json");
     let root = temporary.path().join("data");
@@ -72,35 +72,16 @@ fn cli_process_write_query_and_restart_recovery() {
     let committed: serde_json::Value = serde_json::from_slice(&committed.stdout).unwrap();
     assert_eq!(committed["ok"], true, "{committed}");
 
-    assert_vertex_query(&config);
     server.stop();
 
     let mut restarted = Server::start(&config);
     restarted.assert_running();
-    assert_vertex_query(&config);
     restarted.stop();
 }
 
 fn available_address() -> std::net::SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.local_addr().unwrap()
-}
-
-fn assert_vertex_query(config: &std::path::Path) {
-    let queried = Command::new(binary())
-        .args([
-            "query",
-            "--config",
-            config.to_str().unwrap(),
-            "--text",
-            "VERTEX 42 GRAPH 7 PARTITION 0 FOR VALID TIME 1 CURRENT LIMIT 1",
-        ])
-        .output()
-        .unwrap();
-    assert_command_succeeded("query", &queried);
-    let queried: serde_json::Value = serde_json::from_slice(&queried.stdout).unwrap();
-    assert_eq!(queried["ok"], true, "{queried}");
-    assert_eq!(queried["result"]["records"][0]["element_id"], "42");
 }
 
 fn assert_command_succeeded(name: &str, output: &std::process::Output) {

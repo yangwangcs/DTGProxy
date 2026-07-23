@@ -23,6 +23,10 @@ const ACTIVATE_PLACEMENT_EPOCH_TAG: u8 = 8;
 const BEGIN_BACKEND_DUAL_APPLY_TAG: u8 = 9;
 const CUTOVER_BACKEND_TAG: u8 = 10;
 const ABORT_BACKEND_MIGRATION_TAG: u8 = 11;
+const PUT_ANALYTICS_ARTIFACT_CHUNK_TAG: u8 = 12;
+const DELETE_ANALYTICS_ARTIFACT_GENERATION_TAG: u8 = 13;
+const PIN_ANALYTICS_ARTIFACT_GENERATION_TAG: u8 = 14;
+const ADVANCE_ANALYTICS_ARTIFACT_FENCE_TAG: u8 = 15;
 const PUT_TAG: u8 = 1;
 const DELETE_TAG: u8 = 2;
 const HEADER_BYTES: usize = 40;
@@ -33,6 +37,8 @@ pub const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_MUTATIONS: usize = 65_536;
 pub const MAX_KEY_BYTES: usize = 64 * 1024;
 pub const MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ANALYTICS_ARTIFACT_CHUNK_BYTES: usize = 1024 * 1024;
+pub const MAX_ANALYTICS_ARTIFACT_CHUNKS: u16 = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandEnvelopeV1 {
@@ -278,6 +284,49 @@ impl CommandEnvelopeV1 {
                 )?;
                 CommandBodyV1::AbortBackendMigration(command)
             }
+            PUT_ANALYTICS_ARTIFACT_CHUNK_TAG => {
+                let command = PutAnalyticsArtifactChunkV1::from_parts(
+                    body_reader.u128()?,
+                    decode_artifact_kind(body_reader.u8()?)?,
+                    body_reader.u64()?,
+                    body_reader.u64()?,
+                    body_reader.u64()?,
+                    decode_digest(&mut body_reader)?,
+                    decode_digest(&mut body_reader)?,
+                    body_reader
+                        .length_delimited(MAX_ANALYTICS_ARTIFACT_CHUNK_BYTES)?
+                        .to_vec(),
+                )?;
+                CommandBodyV1::PutAnalyticsArtifactChunk(command)
+            }
+            DELETE_ANALYTICS_ARTIFACT_GENERATION_TAG => {
+                CommandBodyV1::DeleteAnalyticsArtifactGeneration(
+                    DeleteAnalyticsArtifactGenerationV1::new_with_gc_epoch(
+                        body_reader.u128()?,
+                        decode_artifact_kind(body_reader.u8()?)?,
+                        body_reader.u64()?,
+                        body_reader.u64()?,
+                    )?,
+                )
+            }
+            PIN_ANALYTICS_ARTIFACT_GENERATION_TAG => CommandBodyV1::PinAnalyticsArtifactGeneration(
+                PinAnalyticsArtifactGenerationV1::new(
+                    body_reader.u128()?,
+                    decode_artifact_kind(body_reader.u8()?)?,
+                    body_reader.u64()?,
+                    body_reader.u16()?,
+                    body_reader.u64()?,
+                    decode_digest(&mut body_reader)?,
+                )?,
+            ),
+            ADVANCE_ANALYTICS_ARTIFACT_FENCE_TAG => {
+                CommandBodyV1::AdvanceAnalyticsArtifactFence(AdvanceAnalyticsArtifactFenceV1::new(
+                    body_reader.u128()?,
+                    decode_artifact_kind(body_reader.u8()?)?,
+                    body_reader.u64()?,
+                    body_reader.u64()?,
+                )?)
+            }
             tag => return Err(CommandCodecError::UnknownBodyTag { tag }),
         };
         body_reader.finish()?;
@@ -440,6 +489,48 @@ impl CommandEnvelopeV1 {
                     ),
                 ))
             }
+            CommandBodyV1::PutAnalyticsArtifactChunk(command) => {
+                command.validate()?;
+                let mut body = Vec::with_capacity(109 + command.payload.len());
+                body.extend_from_slice(&command.job_id.to_be_bytes());
+                body.push(encode_artifact_kind(command.kind));
+                body.extend_from_slice(&command.generation.to_be_bytes());
+                body.extend_from_slice(&command.created_at_unix_ms.to_be_bytes());
+                body.extend_from_slice(&command.ordinal.to_be_bytes());
+                body.extend_from_slice(&command.previous_digest);
+                body.extend_from_slice(&command.payload_digest);
+                write_length_delimited(&mut body, &command.payload)?;
+                Ok((PUT_ANALYTICS_ARTIFACT_CHUNK_TAG, body))
+            }
+            CommandBodyV1::DeleteAnalyticsArtifactGeneration(command) => {
+                command.validate()?;
+                let mut body = Vec::with_capacity(33);
+                body.extend_from_slice(&command.job_id.to_be_bytes());
+                body.push(encode_artifact_kind(command.kind));
+                body.extend_from_slice(&command.generation.to_be_bytes());
+                body.extend_from_slice(&command.gc_epoch.to_be_bytes());
+                Ok((DELETE_ANALYTICS_ARTIFACT_GENERATION_TAG, body))
+            }
+            CommandBodyV1::PinAnalyticsArtifactGeneration(command) => {
+                command.validate()?;
+                let mut body = Vec::with_capacity(67);
+                body.extend_from_slice(&command.job_id.to_be_bytes());
+                body.push(encode_artifact_kind(command.kind));
+                body.extend_from_slice(&command.generation.to_be_bytes());
+                body.extend_from_slice(&command.expected_chunk_count.to_be_bytes());
+                body.extend_from_slice(&command.expected_total_bytes.to_be_bytes());
+                body.extend_from_slice(&command.expected_content_digest);
+                Ok((PIN_ANALYTICS_ARTIFACT_GENERATION_TAG, body))
+            }
+            CommandBodyV1::AdvanceAnalyticsArtifactFence(command) => {
+                command.validate()?;
+                let mut body = Vec::with_capacity(33);
+                body.extend_from_slice(&command.job_id.to_be_bytes());
+                body.push(encode_artifact_kind(command.kind));
+                body.extend_from_slice(&command.generation.to_be_bytes());
+                body.extend_from_slice(&command.gc_epoch.to_be_bytes());
+                Ok((ADVANCE_ANALYTICS_ARTIFACT_FENCE_TAG, body))
+            }
         }
     }
 }
@@ -457,6 +548,232 @@ pub enum CommandBodyV1 {
     BeginBackendDualApply(BeginBackendDualApplyV1),
     CutoverBackend(CutoverBackendV1),
     AbortBackendMigration(AbortBackendMigrationV1),
+    PutAnalyticsArtifactChunk(PutAnalyticsArtifactChunkV1),
+    DeleteAnalyticsArtifactGeneration(DeleteAnalyticsArtifactGenerationV1),
+    PinAnalyticsArtifactGeneration(PinAnalyticsArtifactGenerationV1),
+    AdvanceAnalyticsArtifactFence(AdvanceAnalyticsArtifactFenceV1),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnalyticsArtifactKindV1 {
+    Checkpoint,
+    Result,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PutAnalyticsArtifactChunkV1 {
+    pub job_id: u128,
+    pub kind: AnalyticsArtifactKindV1,
+    pub generation: u64,
+    pub created_at_unix_ms: u64,
+    pub ordinal: u64,
+    pub previous_digest: [u8; 32],
+    pub payload_digest: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+impl PutAnalyticsArtifactChunkV1 {
+    pub fn new(
+        job_id: u128,
+        kind: AnalyticsArtifactKindV1,
+        generation: u64,
+        created_at_unix_ms: u64,
+        ordinal: u64,
+        previous_digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<Self, CommandCodecError> {
+        let payload_digest = *blake3::hash(&payload).as_bytes();
+        Self::from_parts(
+            job_id,
+            kind,
+            generation,
+            created_at_unix_ms,
+            ordinal,
+            previous_digest,
+            payload_digest,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        job_id: u128,
+        kind: AnalyticsArtifactKindV1,
+        generation: u64,
+        created_at_unix_ms: u64,
+        ordinal: u64,
+        previous_digest: [u8; 32],
+        payload_digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<Self, CommandCodecError> {
+        let command = Self {
+            job_id,
+            kind,
+            generation,
+            created_at_unix_ms,
+            ordinal,
+            previous_digest,
+            payload_digest,
+            payload,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), CommandCodecError> {
+        if self.job_id == 0
+            || self.generation == 0
+            || self.created_at_unix_ms == 0
+            || self.payload.is_empty()
+            || self.payload.len() > MAX_ANALYTICS_ARTIFACT_CHUNK_BYTES
+            || (self.ordinal == 0) != (self.previous_digest == [0; 32])
+            || self.payload_digest != *blake3::hash(&self.payload).as_bytes()
+        {
+            return Err(CommandCodecError::InvalidAnalyticsArtifact);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeleteAnalyticsArtifactGenerationV1 {
+    pub job_id: u128,
+    pub kind: AnalyticsArtifactKindV1,
+    pub generation: u64,
+    pub gc_epoch: u64,
+}
+
+impl DeleteAnalyticsArtifactGenerationV1 {
+    pub fn new(
+        job_id: u128,
+        kind: AnalyticsArtifactKindV1,
+        generation: u64,
+    ) -> Result<Self, CommandCodecError> {
+        Self::new_with_gc_epoch(job_id, kind, generation, 1)
+    }
+
+    pub fn new_with_gc_epoch(
+        job_id: u128,
+        kind: AnalyticsArtifactKindV1,
+        generation: u64,
+        gc_epoch: u64,
+    ) -> Result<Self, CommandCodecError> {
+        let command = Self {
+            job_id,
+            kind,
+            generation,
+            gc_epoch,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), CommandCodecError> {
+        if self.job_id == 0 || self.generation == 0 || self.gc_epoch == 0 {
+            return Err(CommandCodecError::InvalidAnalyticsArtifact);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdvanceAnalyticsArtifactFenceV1 {
+    pub job_id: u128,
+    pub kind: AnalyticsArtifactKindV1,
+    pub generation: u64,
+    pub gc_epoch: u64,
+}
+
+impl AdvanceAnalyticsArtifactFenceV1 {
+    pub fn new(
+        job_id: u128,
+        kind: AnalyticsArtifactKindV1,
+        generation: u64,
+        gc_epoch: u64,
+    ) -> Result<Self, CommandCodecError> {
+        let command = Self {
+            job_id,
+            kind,
+            generation,
+            gc_epoch,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), CommandCodecError> {
+        if self.job_id == 0 || self.generation == 0 || self.gc_epoch == 0 {
+            return Err(CommandCodecError::InvalidAnalyticsArtifact);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinAnalyticsArtifactGenerationV1 {
+    pub job_id: u128,
+    pub kind: AnalyticsArtifactKindV1,
+    pub generation: u64,
+    pub expected_chunk_count: u16,
+    pub expected_total_bytes: u64,
+    pub expected_content_digest: [u8; 32],
+}
+
+impl PinAnalyticsArtifactGenerationV1 {
+    pub fn new(
+        job_id: u128,
+        kind: AnalyticsArtifactKindV1,
+        generation: u64,
+        expected_chunk_count: u16,
+        expected_total_bytes: u64,
+        expected_content_digest: [u8; 32],
+    ) -> Result<Self, CommandCodecError> {
+        let command = Self {
+            job_id,
+            kind,
+            generation,
+            expected_chunk_count,
+            expected_total_bytes,
+            expected_content_digest,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    fn validate(&self) -> Result<(), CommandCodecError> {
+        let maximum_total_bytes = u64::from(self.expected_chunk_count)
+            .checked_mul(
+                u64::try_from(MAX_ANALYTICS_ARTIFACT_CHUNK_BYTES)
+                    .expect("artifact chunk limit fits u64"),
+            )
+            .ok_or(CommandCodecError::InvalidAnalyticsArtifact)?;
+        if self.job_id == 0
+            || self.generation == 0
+            || self.expected_chunk_count == 0
+            || self.expected_chunk_count > MAX_ANALYTICS_ARTIFACT_CHUNKS
+            || self.expected_total_bytes < u64::from(self.expected_chunk_count)
+            || self.expected_total_bytes > maximum_total_bytes
+            || self.expected_content_digest == [0; 32]
+        {
+            return Err(CommandCodecError::InvalidAnalyticsArtifact);
+        }
+        Ok(())
+    }
+}
+
+fn encode_artifact_kind(kind: AnalyticsArtifactKindV1) -> u8 {
+    match kind {
+        AnalyticsArtifactKindV1::Checkpoint => 1,
+        AnalyticsArtifactKindV1::Result => 2,
+    }
+}
+
+fn decode_artifact_kind(tag: u8) -> Result<AnalyticsArtifactKindV1, CommandCodecError> {
+    match tag {
+        1 => Ok(AnalyticsArtifactKindV1::Checkpoint),
+        2 => Ok(AnalyticsArtifactKindV1::Result),
+        _ => Err(CommandCodecError::InvalidAnalyticsArtifact),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -830,6 +1147,12 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
 
+    fn u16(&mut self) -> Result<u16, CommandCodecError> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("fixed reader slice"),
+        ))
+    }
+
     fn u32(&mut self) -> Result<u32, CommandCodecError> {
         Ok(u32::from_be_bytes(
             self.take(4)?.try_into().expect("fixed reader slice"),
@@ -907,6 +1230,7 @@ pub enum CommandCodecError {
     InvalidParticipantProof,
     InvalidTransactionId,
     InvalidOnePhaseCommit,
+    InvalidAnalyticsArtifact,
     TransactionProtocol(String),
     TrailingBodyBytes { remaining: usize },
 }
@@ -984,6 +1308,9 @@ impl Display for CommandCodecError {
             Self::InvalidTransactionId => formatter.write_str("transaction ID must be nonzero"),
             Self::InvalidOnePhaseCommit => formatter.write_str(
                 "one-phase commit requires one participant and a commit timestamp after its minimum",
+            ),
+            Self::InvalidAnalyticsArtifact => formatter.write_str(
+                "analytics artifact requires nonzero identity/generation, bounded payload, and a canonical digest chain",
             ),
             Self::TransactionProtocol(error) => write!(formatter, "transaction protocol: {error}"),
             Self::TrailingBodyBytes { remaining } => {

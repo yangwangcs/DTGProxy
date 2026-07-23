@@ -30,6 +30,8 @@ pub struct BoltMachine<S> {
     state: ConnectionState,
     cursor: Option<CursorId>,
     transaction: Option<TransactionId>,
+    auth_required: bool,
+    authenticated: bool,
 }
 
 impl<S> BoltMachine<S>
@@ -38,11 +40,18 @@ where
 {
     #[must_use]
     pub const fn new(service: Arc<S>) -> Self {
+        Self::new_with_auth(service, false)
+    }
+
+    #[must_use]
+    pub const fn new_with_auth(service: Arc<S>, auth_required: bool) -> Self {
         Self {
             service,
             state: ConnectionState::Connected,
             cursor: None,
             transaction: None,
+            auth_required,
+            authenticated: !auth_required,
         }
     }
 
@@ -51,14 +60,24 @@ where
         self.state
     }
 
+    pub async fn close(&mut self) -> Result<(), ServiceError> {
+        if self.state == ConnectionState::Defunct {
+            return Ok(());
+        }
+        if let Some(cursor) = self.cursor.take() {
+            self.service.discard(cursor, -1).await?;
+        }
+        self.rollback_open_transaction().await?;
+        self.state = ConnectionState::Defunct;
+        Ok(())
+    }
+
     pub async fn handle(&mut self, message: ClientMessage) -> Vec<ServerMessage> {
         if self.state == ConnectionState::Defunct {
             return Vec::new();
         }
         if matches!(&message, ClientMessage::Goodbye) {
-            let _ = self.rollback_open_transaction().await;
-            self.cursor = None;
-            self.state = ConnectionState::Defunct;
+            let _ = self.close().await;
             return Vec::new();
         }
         if matches!(&message, ClientMessage::Reset) {
@@ -85,13 +104,19 @@ where
             }
             ClientMessage::Logon(auth) if self.state == ConnectionState::Ready => {
                 match self.service.logon(auth).await {
-                    Ok(metadata) => success(metadata),
+                    Ok(metadata) => {
+                        self.authenticated = true;
+                        success(metadata)
+                    }
                     Err(error) => self.service_failure(error),
                 }
             }
             ClientMessage::Logoff if self.state == ConnectionState::Ready => {
                 match self.service.logoff().await {
-                    Ok(()) => success(BTreeMap::new()),
+                    Ok(()) => {
+                        self.authenticated = !self.auth_required;
+                        success(BTreeMap::new())
+                    }
                     Err(error) => self.service_failure(error),
                 }
             }
@@ -104,6 +129,9 @@ where
                 ConnectionState::Ready | ConnectionState::TxReady
             ) =>
             {
+                if self.auth_required && !self.authenticated {
+                    return self.protocol_failure("LOGON is required before RUN");
+                }
                 let tx = self.transaction;
                 match self
                     .service
@@ -157,6 +185,9 @@ where
                 self.discard(n, query_id).await
             }
             ClientMessage::Begin(extra) if self.state == ConnectionState::Ready => {
+                if self.auth_required && !self.authenticated {
+                    return self.protocol_failure("LOGON is required before BEGIN");
+                }
                 match self.service.begin(extra).await {
                     Ok(transaction) => {
                         self.transaction = Some(transaction);
@@ -201,10 +232,7 @@ where
                     Err(error) => self.service_failure(error),
                 }
             }
-            ClientMessage::Interrupt => {
-                self.state = ConnectionState::Interrupted;
-                success(BTreeMap::new())
-            }
+            ClientMessage::Interrupt => self.interrupt().await,
             _ => self.protocol_failure("message is not valid in the current Bolt state"),
         }
     }
@@ -273,12 +301,36 @@ where
     }
 
     async fn reset(&mut self) -> Vec<ServerMessage> {
+        if self.state == ConnectionState::Connected {
+            return self.protocol_failure("RESET is not valid before HELLO");
+        }
         if self.rollback_open_transaction().await.is_err() {
             return self.protocol_failure("failed to roll back transaction during RESET");
         }
         self.cursor = None;
         self.state = ConnectionState::Ready;
         success(BTreeMap::new())
+    }
+
+    async fn interrupt(&mut self) -> Vec<ServerMessage> {
+        if let Some(cursor) = self.cursor.take()
+            && self.service.discard(cursor, -1).await.is_err()
+        {
+            self.state = ConnectionState::Failed;
+            return vec![ServerMessage::Failure {
+                code: "Neo.TransientError.General.DatabaseUnavailable".into(),
+                message: "failed to cancel the active Bolt cursor".into(),
+            }];
+        }
+        self.state = if self.transaction.is_some() {
+            ConnectionState::TxReady
+        } else {
+            ConnectionState::Ready
+        };
+        success(BTreeMap::from([(
+            "interrupted".into(),
+            Value::Boolean(true),
+        )]))
     }
 
     async fn rollback_open_transaction(&mut self) -> Result<(), ServiceError> {

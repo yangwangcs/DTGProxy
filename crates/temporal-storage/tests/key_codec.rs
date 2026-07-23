@@ -171,6 +171,20 @@ fn reverse_transaction_time_orders_newer_history_first() {
 }
 
 #[test]
+fn edge_history_key_round_trips_with_edge_element_kind() {
+    let edge = ElementRef::edge(GraphId::new(1), PartitionId::new(2), ElementId::new(3));
+    let key = history_anchor_key(edge, TransactionTime::new(200, 0), 0);
+    assert_eq!(
+        decode_graph_key(&key).unwrap(),
+        GraphKey::HistoryAnchor {
+            element: edge,
+            transaction_time: TransactionTime::new(200, 0),
+            segment_id: 0,
+        }
+    );
+}
+
+#[test]
 fn decoder_rejects_wrong_keyspace_truncation_and_trailing_bytes() {
     let mut wrong_space = vertex_identity_key(vertex());
     wrong_space =

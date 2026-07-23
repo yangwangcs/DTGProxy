@@ -91,6 +91,32 @@ async fn serves_handshake_hello_run_and_pull_over_chunked_bytes() {
     task.await.expect("connection task").expect("connection");
 }
 
+#[tokio::test]
+async fn rolls_back_an_explicit_transaction_when_the_peer_closes_cleanly() {
+    let (mut client, mut server) = tokio::io::duplex(64 << 10);
+    let service = Arc::new(FakeService::default());
+    let task_service = Arc::clone(&service);
+    let task = tokio::spawn(async move {
+        serve_connection(&mut server, task_service, BoltConnectionConfig::default()).await
+    });
+
+    let mut handshake = Vec::from(BOLT_MAGIC.to_be_bytes());
+    handshake.extend_from_slice(&BoltVersion::new(5, 8, 0).encode());
+    handshake.extend_from_slice(&[0; 12]);
+    client.write_all(&handshake).await.expect("handshake");
+    let mut selected = [0; 4];
+    client.read_exact(&mut selected).await.expect("selection");
+    let mut receiver = Receiver::new();
+    send(&mut client, ClientMessage::Hello(BTreeMap::new())).await;
+    let _ = receiver.receive(&mut client).await;
+    send(&mut client, ClientMessage::Begin(BTreeMap::new())).await;
+    let _ = receiver.receive(&mut client).await;
+
+    drop(client);
+    task.await.expect("connection task").expect("connection");
+    assert_eq!(service.rolled_back_transactions(), 1);
+}
+
 async fn send(stream: &mut tokio::io::DuplexStream, message: ClientMessage) {
     let payload = encode_client_message(&message).expect("message");
     let framed = encode_chunks(&payload, 32).expect("chunks");

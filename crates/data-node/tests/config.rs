@@ -150,19 +150,18 @@ fn base_config(data_directory: &std::path::Path) -> serde_json::Value {
 }
 
 #[test]
-fn raft_runtime_addresses_are_explicit_and_backward_compatible() {
+fn raft_runtime_addresses_accept_omitted_or_explicit_settings() {
     let temporary = tempdir().unwrap();
     let path = temporary.path().join("data.json");
-    let legacy = base_config(&temporary.path().join("data"));
-    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let mut config = base_config(&temporary.path().join("data"));
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     let loaded = DataNodeRuntimeConfig::load(&path).unwrap();
     assert_eq!(loaded.raft_listen_address(), None);
     assert!(loaded.raft_peers().is_empty());
 
-    let mut networked = legacy;
-    networked["raft_listen_address"] = serde_json::json!("127.0.0.1:7201");
-    networked["raft_peers"] = serde_json::json!({ "2": "127.0.0.1:7202" });
-    std::fs::write(&path, serde_json::to_vec(&networked).unwrap()).unwrap();
+    config["raft_listen_address"] = serde_json::json!("127.0.0.1:7201");
+    config["raft_peers"] = serde_json::json!({ "2": "127.0.0.1:7202" });
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     let loaded = DataNodeRuntimeConfig::load(&path).unwrap();
     assert_eq!(
         loaded.raft_listen_address().unwrap().to_string(),

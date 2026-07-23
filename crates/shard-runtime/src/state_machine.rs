@@ -8,14 +8,16 @@ use storage_api::{
 };
 use temporal_types::TransactionTime;
 
-use crate::ShardRuntimeError;
+use crate::artifact::{prepare_advance_fence, prepare_delete, prepare_pin, prepare_put};
 use crate::metadata::{
-    BackendLifecycle, ReplicaMetadata, adapter_applied_ts_key, backend_state_key, closed_ts_key,
-    decode_entry_digest, decode_request_digest, encode_backend_state, encode_entry_digest,
-    encode_position, encode_request_digest, encode_timestamp, encode_unresolved_intent,
-    entry_digest_key, is_reserved_metadata_key, load_metadata, load_unresolved_intents,
-    position_key, request_digest_key, resolved_ts_key, unresolved_intent_key,
+    BackendLifecycle, ReplicaMetadata, RequestOutcomeRecord, adapter_applied_ts_key,
+    backend_state_key, closed_ts_key, decode_entry_digest, decode_request_outcome,
+    encode_backend_state, encode_entry_digest, encode_position, encode_request_outcome,
+    encode_timestamp, encode_unresolved_intent, entry_digest_key, is_reserved_metadata_key,
+    load_metadata, load_unresolved_intents, position_key, request_outcome_key, resolved_ts_key,
+    unresolved_intent_key,
 };
+use crate::{CommittedEntryOutcome, ShardRuntimeError, is_deterministic_business_error};
 use txn_protocol::{HomeDecisionEngine, ParticipantEngine, TransactionId};
 
 pub struct ShardStateMachine<A> {
@@ -92,11 +94,42 @@ where
         index: u64,
         command_bytes: &[u8],
     ) -> Result<ApplyReceipt, ShardRuntimeError> {
+        match self
+            .apply_entry_internal(term, index, command_bytes, false)
+            .await?
+        {
+            CommittedEntryOutcome::Applied(receipt) => Ok(receipt),
+            CommittedEntryOutcome::Rejected { message, .. } => {
+                let request_id = CommandEnvelopeV1::decode(command_bytes)?.request_id;
+                Err(ShardRuntimeError::CommittedRejection {
+                    request_id,
+                    message,
+                })
+            }
+        }
+    }
+
+    pub async fn apply_committed_entry(
+        &mut self,
+        term: u64,
+        index: u64,
+        command_bytes: &[u8],
+    ) -> Result<CommittedEntryOutcome, ShardRuntimeError> {
+        self.apply_entry_internal(term, index, command_bytes, true)
+            .await
+    }
+
+    async fn apply_entry_internal(
+        &mut self,
+        term: u64,
+        index: u64,
+        command_bytes: &[u8],
+        persist_business_rejection: bool,
+    ) -> Result<CommittedEntryOutcome, ShardRuntimeError> {
         if term == 0 || index == 0 {
             return Err(ShardRuntimeError::InvalidLogPosition { term, index });
         }
         let command = CommandEnvelopeV1::decode(command_bytes)?;
-        self.validate_authority(&command)?;
 
         if let Some(failed_index) = self.faulted_at {
             if failed_index != index {
@@ -134,10 +167,25 @@ where
                 return Err(error);
             }
             self.faulted_at = None;
-            return Ok(ApplyReceipt {
+            let receipt = ApplyReceipt {
                 applied_log_index: self.metadata.applied_index,
                 duplicate: true,
-            });
+            };
+            let disposition = self
+                .request_disposition(command.request_id, command_digest(command_bytes))
+                .await?;
+            if !persist_business_rejection {
+                self.validate_authority(&command)?;
+            }
+            return match disposition {
+                RequestDisposition::AppliedDuplicate => Ok(CommittedEntryOutcome::Applied(receipt)),
+                RequestDisposition::RejectedDuplicate(message) => {
+                    Ok(CommittedEntryOutcome::Rejected { receipt, message })
+                }
+                RequestDisposition::New => Err(ShardRuntimeError::CorruptMetadata {
+                    record: "request-outcome",
+                }),
+            };
         }
 
         let expected_index = self.metadata.applied_index.saturating_add(1);
@@ -156,28 +204,94 @@ where
 
         let request_id = command.request_id;
         let request_digest = command_digest(command_bytes);
-        let request_duplicate = self.request_disposition(request_id, request_digest).await?;
-        let prepared = if request_duplicate {
-            PreparedApply {
-                metadata: ReplicaMetadata {
-                    last_term: term,
-                    applied_index: index,
-                    ..self.metadata
-                },
-                mutations: Vec::new(),
-                unresolved_change: UnresolvedChange::None,
-            }
+        let request_disposition = self.request_disposition(request_id, request_digest).await?;
+        let authority_error = if matches!(&request_disposition, RequestDisposition::New) {
+            self.validate_authority(&command).err()
         } else {
-            self.prepare_apply(term, index, command.body).await?
+            if !persist_business_rejection {
+                self.validate_authority(&command)?;
+            }
+            None
+        };
+        let mut new_request_outcome = None;
+        let (prepared, rejection_message, request_duplicate) = match request_disposition {
+            RequestDisposition::New => match match authority_error {
+                Some(error) => Err(error),
+                None => self.prepare_apply(term, index, command.body).await,
+            } {
+                Ok(prepared) => {
+                    new_request_outcome = Some(RequestOutcomeRecord::Applied {
+                        digest: request_digest,
+                    });
+                    (prepared, None, false)
+                }
+                Err(error)
+                    if persist_business_rejection && is_deterministic_business_error(&error) =>
+                {
+                    let outcome =
+                        RequestOutcomeRecord::rejected(request_digest, &error.to_string());
+                    let RequestOutcomeRecord::Rejected { message, .. } = &outcome else {
+                        unreachable!("rejected constructor returns a rejected outcome")
+                    };
+                    let message = message.clone();
+                    new_request_outcome = Some(outcome);
+                    (
+                        PreparedApply {
+                            metadata: ReplicaMetadata {
+                                last_term: term,
+                                applied_index: index,
+                                ..self.metadata
+                            },
+                            mutations: Vec::new(),
+                            unresolved_change: UnresolvedChange::None,
+                        },
+                        Some(message),
+                        false,
+                    )
+                }
+                Err(error) => return Err(error),
+            },
+            RequestDisposition::AppliedDuplicate => (
+                PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        ..self.metadata
+                    },
+                    mutations: Vec::new(),
+                    unresolved_change: UnresolvedChange::None,
+                },
+                None,
+                true,
+            ),
+            RequestDisposition::RejectedDuplicate(message) if persist_business_rejection => (
+                PreparedApply {
+                    metadata: ReplicaMetadata {
+                        last_term: term,
+                        applied_index: index,
+                        ..self.metadata
+                    },
+                    mutations: Vec::new(),
+                    unresolved_change: UnresolvedChange::None,
+                },
+                Some(message),
+                true,
+            ),
+            RequestDisposition::RejectedDuplicate(message) => {
+                return Err(ShardRuntimeError::CommittedRejection {
+                    request_id,
+                    message,
+                });
+            }
         };
         let next_metadata = prepared.metadata;
         let mut mutations = prepared.mutations;
         append_unresolved_change(&mut mutations, prepared.unresolved_change)?;
-        if !request_duplicate {
+        if let Some(outcome) = new_request_outcome.as_ref() {
             append_meta_mutation(
                 &mut mutations,
-                request_digest_key(request_id),
-                encode_request_digest(request_digest),
+                request_outcome_key(request_id),
+                encode_request_outcome(outcome),
             )?;
         }
         append_meta_mutation(
@@ -223,10 +337,14 @@ where
         self.metadata = next_metadata;
         self.unresolved.apply(prepared.unresolved_change)?;
         self.faulted_at = None;
-        Ok(ApplyReceipt {
+        let receipt = ApplyReceipt {
             applied_log_index: receipt.applied_log_index,
             duplicate: request_duplicate || receipt.duplicate,
-        })
+        };
+        match rejection_message {
+            Some(message) => Ok(CommittedEntryOutcome::Rejected { receipt, message }),
+            None => Ok(CommittedEntryOutcome::Applied(receipt)),
+        }
     }
 
     pub async fn apply_noop_entry(
@@ -672,6 +790,42 @@ where
                     unresolved_change: UnresolvedChange::None,
                 })
             }
+            CommandBodyV1::PutAnalyticsArtifactChunk(command) => Ok(PreparedApply {
+                metadata: ReplicaMetadata {
+                    last_term: term,
+                    applied_index: index,
+                    ..self.metadata
+                },
+                mutations: prepare_put(&self.adapter, &command).await?,
+                unresolved_change: UnresolvedChange::None,
+            }),
+            CommandBodyV1::DeleteAnalyticsArtifactGeneration(command) => Ok(PreparedApply {
+                metadata: ReplicaMetadata {
+                    last_term: term,
+                    applied_index: index,
+                    ..self.metadata
+                },
+                mutations: prepare_delete(&self.adapter, &command).await?,
+                unresolved_change: UnresolvedChange::None,
+            }),
+            CommandBodyV1::PinAnalyticsArtifactGeneration(command) => Ok(PreparedApply {
+                metadata: ReplicaMetadata {
+                    last_term: term,
+                    applied_index: index,
+                    ..self.metadata
+                },
+                mutations: prepare_pin(&self.adapter, &command).await?,
+                unresolved_change: UnresolvedChange::None,
+            }),
+            CommandBodyV1::AdvanceAnalyticsArtifactFence(command) => Ok(PreparedApply {
+                metadata: ReplicaMetadata {
+                    last_term: term,
+                    applied_index: index,
+                    ..self.metadata
+                },
+                mutations: prepare_advance_fence(&self.adapter, &command).await?,
+                unresolved_change: UnresolvedChange::None,
+            }),
         }
     }
 
@@ -732,11 +886,18 @@ where
                 actual: command.request_id,
             });
         }
-        let duplicate = self
+        let disposition = self
             .request_disposition(request_id, command_digest(command_bytes))
             .await?;
-        if duplicate {
-            return Ok(true);
+        match disposition {
+            RequestDisposition::AppliedDuplicate => return Ok(true),
+            RequestDisposition::RejectedDuplicate(message) => {
+                return Err(ShardRuntimeError::CommittedRejection {
+                    request_id,
+                    message,
+                });
+            }
+            RequestDisposition::New => {}
         }
         self.validate_authority(&command)?;
         Ok(false)
@@ -746,21 +907,33 @@ where
         &self,
         request_id: u128,
         expected_digest: [u8; 32],
-    ) -> Result<bool, ShardRuntimeError> {
+    ) -> Result<RequestDisposition, ShardRuntimeError> {
         let value = self
             .adapter
-            .multi_get(&[request_digest_key(request_id)])
+            .multi_get(&[request_outcome_key(request_id)])
             .await?
             .pop()
             .flatten();
         let Some(value) = value else {
-            return Ok(false);
+            return Ok(RequestDisposition::New);
         };
-        if decode_request_digest(&value)? != expected_digest {
+        let outcome = decode_request_outcome(&value)?;
+        if outcome.digest() != expected_digest {
             return Err(ShardRuntimeError::RequestMismatch { request_id });
         }
-        Ok(true)
+        match outcome {
+            RequestOutcomeRecord::Applied { .. } => Ok(RequestDisposition::AppliedDuplicate),
+            RequestOutcomeRecord::Rejected { message, .. } => {
+                Ok(RequestDisposition::RejectedDuplicate(message))
+            }
+        }
     }
+}
+
+enum RequestDisposition {
+    New,
+    AppliedDuplicate,
+    RejectedDuplicate(String),
 }
 
 struct PreparedApply {

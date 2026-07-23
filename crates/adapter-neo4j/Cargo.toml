@@ -8,12 +8,17 @@ license.workspace = true
 [dependencies]
 adapter-registry = { path = "../adapter-registry" }
 adapter-sidecar = { path = "../adapter-sidecar" }
+blake3 = "=1.8.5"
 base64 = "=0.22.1"
+serde = "=1.0.228"
 serde_json = "=1.0.145"
 storage-api = { path = "../storage-api" }
+temporal-storage = { path = "../temporal-storage" }
 ureq = { version = "=2.12.1", features = ["json"] }
 
 [dev-dependencies]
+storage-api = { path = "../storage-api", features = ["mapping-tck"] }
+temporal-types = { path = "../temporal-types" }
 tempfile = "3"
 
 [lints]

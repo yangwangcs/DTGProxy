@@ -6,7 +6,7 @@ use bolt_server::{BoltMachine, ServerMessage};
 use cypher_engine::{
     BackendFuture, BackendQueryResult, BoltQueryBackend, BoltQueryRequest, CypherBoltService,
 };
-use query_executor::v2::RuntimeValue;
+use query_executor::RuntimeValue;
 
 #[derive(Default)]
 struct Backend {
