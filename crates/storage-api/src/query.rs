@@ -7,6 +7,7 @@ use temporal_types::{GraphValue, ValidTime};
 pub const MAX_QUERY_PAGE_ITEMS: usize = 65_536;
 pub const MAX_QUERY_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_CANDIDATE_CONSTRAINTS: usize = 256;
+pub const MAX_CANONICAL_BATCH_RANGES: usize = 256;
 
 /// Describes what an adapter guarantees about a pushed-down operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +117,7 @@ impl CanonicalScanRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalScanPage {
+    request: CanonicalScanRequest,
     applied_log_index: u64,
     entries: Vec<KeyValue>,
     next_start: Option<LogicalKey>,
@@ -135,6 +137,7 @@ impl CanonicalScanPage {
             next_start.as_ref(),
         )?;
         Ok(Self {
+            request: request.clone(),
             applied_log_index,
             entries,
             next_start,
@@ -159,6 +162,145 @@ impl CanonicalScanPage {
     #[must_use]
     pub fn into_entries(self) -> Vec<KeyValue> {
         self.entries
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBatchScanRequest {
+    scans: Vec<CanonicalScanRequest>,
+    max_total_bytes: u64,
+}
+
+impl CanonicalBatchScanRequest {
+    pub fn new(
+        scans: Vec<CanonicalScanRequest>,
+        max_total_bytes: u64,
+    ) -> Result<Self, QueryPrimitiveError> {
+        if scans.is_empty() {
+            return Err(QueryPrimitiveError::EmptyInput);
+        }
+        if scans.len() > MAX_CANONICAL_BATCH_RANGES {
+            return Err(QueryPrimitiveError::InputLimitExceeded {
+                limit: MAX_CANONICAL_BATCH_RANGES,
+                actual: scans.len(),
+            });
+        }
+        if max_total_bytes == 0 {
+            return Err(QueryPrimitiveError::ZeroByteLimit);
+        }
+        if max_total_bytes > MAX_QUERY_PAGE_BYTES {
+            return Err(QueryPrimitiveError::ByteLimitTooLarge {
+                limit: max_total_bytes,
+                maximum: MAX_QUERY_PAGE_BYTES,
+            });
+        }
+
+        let mut total_items = 0_usize;
+        let mut total_bytes = 0_u64;
+        for (ordinal, scan) in scans.iter().enumerate() {
+            if scans[..ordinal]
+                .iter()
+                .any(|previous| previous.span() == scan.span())
+            {
+                return Err(QueryPrimitiveError::DuplicateCanonicalRange);
+            }
+            total_items = total_items
+                .checked_add(scan.bounds().max_items())
+                .unwrap_or(usize::MAX);
+            total_bytes = total_bytes
+                .checked_add(scan.bounds().max_bytes())
+                .unwrap_or(u64::MAX);
+        }
+        if total_items > MAX_QUERY_PAGE_ITEMS {
+            return Err(QueryPrimitiveError::InputLimitExceeded {
+                limit: MAX_QUERY_PAGE_ITEMS,
+                actual: total_items,
+            });
+        }
+        if total_bytes > max_total_bytes {
+            return Err(QueryPrimitiveError::RequestByteLimitExceeded {
+                limit: max_total_bytes,
+                required: total_bytes,
+            });
+        }
+
+        Ok(Self {
+            scans,
+            max_total_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn scans(&self) -> &[CanonicalScanRequest] {
+        &self.scans
+    }
+
+    #[must_use]
+    pub const fn max_total_bytes(&self) -> u64 {
+        self.max_total_bytes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBatchScanPage {
+    applied_log_index: u64,
+    pages: Vec<CanonicalScanPage>,
+}
+
+impl CanonicalBatchScanPage {
+    pub fn new(
+        request: &CanonicalBatchScanRequest,
+        applied_log_index: u64,
+        pages: Vec<CanonicalScanPage>,
+    ) -> Result<Self, QueryPrimitiveError> {
+        if pages.len() != request.scans().len() {
+            return Err(QueryPrimitiveError::CardinalityMismatch {
+                expected: request.scans().len(),
+                actual: pages.len(),
+            });
+        }
+
+        let mut retained = 0_u64;
+        for (ordinal, (scan, page)) in request.scans().iter().zip(&pages).enumerate() {
+            if &page.request != scan {
+                return Err(QueryPrimitiveError::CanonicalRequestMismatch { ordinal });
+            }
+            if page.applied_log_index() != applied_log_index {
+                return Err(QueryPrimitiveError::AppliedIndexMismatch {
+                    expected: applied_log_index,
+                    actual: page.applied_log_index(),
+                });
+            }
+            validate_canonical_scan_page(
+                scan.span(),
+                scan.bounds(),
+                page.entries(),
+                page.next_start(),
+            )?;
+            for entry in page.entries() {
+                retained = charge_total_entry(retained, entry, request.max_total_bytes())?;
+            }
+        }
+
+        Ok(Self {
+            applied_log_index,
+            pages,
+        })
+    }
+
+    #[must_use]
+    pub const fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    #[must_use]
+    pub fn pages(&self) -> &[CanonicalScanPage] {
+        &self.pages
+    }
+
+    #[must_use]
+    pub fn into_pages(self) -> Vec<CanonicalScanPage> {
+        self.pages
     }
 }
 
@@ -784,6 +926,14 @@ pub enum QueryPrimitiveError {
     EntryOutsideSpan,
     EntriesNotStrictlyOrdered,
     InvalidContinuation,
+    DuplicateCanonicalRange,
+    CanonicalRequestMismatch {
+        ordinal: usize,
+    },
+    AppliedIndexMismatch {
+        expected: u64,
+        actual: u64,
+    },
     CardinalityMismatch {
         expected: usize,
         actual: usize,
@@ -847,6 +997,17 @@ impl Display for QueryPrimitiveError {
             Self::InvalidContinuation => {
                 formatter.write_str("query page continuation is outside or behind its span")
             }
+            Self::DuplicateCanonicalRange => {
+                formatter.write_str("canonical batch ranges must be unique")
+            }
+            Self::CanonicalRequestMismatch { ordinal } => write!(
+                formatter,
+                "canonical batch page at ordinal {ordinal} does not match its request"
+            ),
+            Self::AppliedIndexMismatch { expected, actual } => write!(
+                formatter,
+                "query page applied log index {actual} does not match {expected}"
+            ),
             Self::CardinalityMismatch { expected, actual } => {
                 write!(
                     formatter,
@@ -1040,6 +1201,29 @@ fn charge_entry(
 ) -> Result<u64, QueryPrimitiveError> {
     let retained = charge_bytes(retained, entry.key().as_bytes().len(), bounds)?;
     charge_bytes(retained, entry.value().len(), bounds)
+}
+
+fn charge_total_entry(
+    retained: u64,
+    entry: &KeyValue,
+    max_total_bytes: u64,
+) -> Result<u64, QueryPrimitiveError> {
+    let required = u64::try_from(entry.key().as_bytes().len())
+        .ok()
+        .and_then(|key_bytes| retained.checked_add(key_bytes))
+        .and_then(|retained| {
+            u64::try_from(entry.value().len())
+                .ok()
+                .and_then(|value_bytes| retained.checked_add(value_bytes))
+        })
+        .unwrap_or(u64::MAX);
+    if required > max_total_bytes {
+        return Err(QueryPrimitiveError::PageByteLimitExceeded {
+            limit: max_total_bytes,
+            required,
+        });
+    }
+    Ok(required)
 }
 
 fn charge_bytes(

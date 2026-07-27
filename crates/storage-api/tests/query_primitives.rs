@@ -5,10 +5,12 @@ use std::task::{Context, Poll, Wake, Waker};
 use storage_api::{
     AdapterCapabilities, AdapterError, AdapterFuture, AdjacencyEntry, AdjacencyExpandPage,
     AdjacencyExpandRequest, ApplyReceipt, CandidateScanPage, CandidateScanRequest,
-    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
-    CommittedMutationBatch, ComparisonOperator, KeySpan, KeyValue, Keyspace, LogicalKey,
-    PropertyConstraint, PropertyGatherPage, PropertyGatherRequest, PropertyRow, PushdownGuarantee,
-    QueryPageBounds, QueryPrimitiveCapabilities, QueryPrimitiveError, StorageAdapter,
+    CanonicalBatchScanPage, CanonicalBatchScanRequest, CanonicalScanPage, CanonicalScanRequest,
+    ChangeScanPage, ChangeScanRequest, CommittedMutationBatch, ComparisonOperator, KeySpan,
+    KeyValue, Keyspace, LogicalKey, MAX_CANONICAL_BATCH_RANGES, MAX_QUERY_PAGE_BYTES,
+    MAX_QUERY_PAGE_ITEMS, PropertyConstraint, PropertyGatherPage, PropertyGatherRequest,
+    PropertyRow, PushdownGuarantee, QueryPageBounds, QueryPrimitiveCapabilities,
+    QueryPrimitiveError, ReadSnapshot, StorageAdapter,
 };
 use temporal_types::GraphValue;
 
@@ -92,6 +94,138 @@ fn canonical_scan_page_enforces_bounds_order_and_continuation() {
         ),
         Err(QueryPrimitiveError::PageByteLimitExceeded { .. })
     ));
+}
+
+#[test]
+fn canonical_batch_request_enforces_range_and_aggregate_limits() {
+    let first = CanonicalScanRequest::new(
+        KeySpan::prefix(Keyspace::Current, b"a/".to_vec()),
+        bounds(2, 32),
+    )
+    .unwrap();
+    let second = CanonicalScanRequest::new(
+        KeySpan::prefix(Keyspace::Current, b"b/".to_vec()),
+        bounds(3, 48),
+    )
+    .unwrap();
+
+    assert_eq!(
+        CanonicalBatchScanRequest::new(Vec::new(), 1),
+        Err(QueryPrimitiveError::EmptyInput)
+    );
+    let duplicate = CanonicalScanRequest::new(first.span().clone(), bounds(1, 16)).unwrap();
+    assert!(matches!(
+        CanonicalBatchScanRequest::new(vec![first.clone(), duplicate], 64),
+        Err(QueryPrimitiveError::DuplicateCanonicalRange)
+    ));
+    assert!(matches!(
+        CanonicalBatchScanRequest::new(vec![first.clone()], MAX_QUERY_PAGE_BYTES + 1),
+        Err(QueryPrimitiveError::ByteLimitTooLarge { .. })
+    ));
+    assert!(matches!(
+        CanonicalBatchScanRequest::new(vec![first.clone(), second.clone()], 79),
+        Err(QueryPrimitiveError::RequestByteLimitExceeded { .. })
+    ));
+
+    let oversized_items = CanonicalScanRequest::new(
+        KeySpan::prefix(Keyspace::Current, b"c/".to_vec()),
+        bounds(MAX_QUERY_PAGE_ITEMS, 8),
+    )
+    .unwrap();
+    assert!(matches!(
+        CanonicalBatchScanRequest::new(vec![first.clone(), oversized_items], 40),
+        Err(QueryPrimitiveError::InputLimitExceeded { .. })
+    ));
+
+    let too_many = (0..=MAX_CANONICAL_BATCH_RANGES)
+        .map(|ordinal| {
+            CanonicalScanRequest::new(
+                KeySpan::prefix(Keyspace::Current, format!("range/{ordinal}/").into_bytes()),
+                bounds(1, 32),
+            )
+            .unwrap()
+        })
+        .collect();
+    assert!(matches!(
+        CanonicalBatchScanRequest::new(too_many, MAX_QUERY_PAGE_BYTES),
+        Err(QueryPrimitiveError::InputLimitExceeded { .. })
+    ));
+
+    let request = CanonicalBatchScanRequest::new(vec![second.clone(), first.clone()], 80).unwrap();
+    assert_eq!(request.scans(), &[second, first]);
+    assert_eq!(request.max_total_bytes(), 80);
+}
+
+#[test]
+fn canonical_batch_page_enforces_order_index_and_aggregate_bytes() {
+    let first = CanonicalScanRequest::new(
+        KeySpan::prefix(Keyspace::Current, b"a/".to_vec()),
+        bounds(1, 8),
+    )
+    .unwrap();
+    let second = CanonicalScanRequest::new(
+        KeySpan::prefix(Keyspace::Current, b"b/".to_vec()),
+        bounds(1, 8),
+    )
+    .unwrap();
+    let request = CanonicalBatchScanRequest::new(vec![first.clone(), second.clone()], 16).unwrap();
+    let first_page = CanonicalScanPage::new(
+        &first,
+        42,
+        vec![entry(Keyspace::Current, b"a/1", b"one")],
+        None,
+    )
+    .unwrap();
+    let second_page = CanonicalScanPage::new(
+        &second,
+        42,
+        vec![entry(Keyspace::Current, b"b/1", b"two")],
+        None,
+    )
+    .unwrap();
+
+    let page =
+        CanonicalBatchScanPage::new(&request, 42, vec![first_page.clone(), second_page.clone()])
+            .unwrap();
+    assert_eq!(page.applied_log_index(), 42);
+    assert_eq!(page.pages(), &[first_page.clone(), second_page.clone()]);
+    assert!(
+        page.pages()
+            .iter()
+            .flat_map(CanonicalScanPage::entries)
+            .map(|entry| entry.key().as_bytes().len() + entry.value().len())
+            .sum::<usize>()
+            <= 16
+    );
+    assert_eq!(
+        page.into_pages(),
+        vec![first_page.clone(), second_page.clone()]
+    );
+
+    assert!(matches!(
+        CanonicalBatchScanPage::new(&request, 42, vec![first_page.clone()]),
+        Err(QueryPrimitiveError::CardinalityMismatch { .. })
+    ));
+    assert_eq!(
+        CanonicalBatchScanPage::new(&request, 42, vec![second_page.clone(), first_page.clone()]),
+        Err(QueryPrimitiveError::CanonicalRequestMismatch { ordinal: 0 })
+    );
+
+    let mismatched_index = CanonicalScanPage::new(&second, 41, Vec::new(), None).unwrap();
+    assert_eq!(
+        CanonicalBatchScanPage::new(&request, 42, vec![first_page.clone(), mismatched_index]),
+        Err(QueryPrimitiveError::AppliedIndexMismatch {
+            expected: 42,
+            actual: 41,
+        })
+    );
+
+    let empty_first = CanonicalScanPage::new(&first, 42, Vec::new(), None).unwrap();
+    let empty_second = CanonicalScanPage::new(&second, 42, Vec::new(), None).unwrap();
+    assert_eq!(
+        CanonicalBatchScanPage::new(&request, 42, vec![empty_second, empty_first]),
+        Err(QueryPrimitiveError::CanonicalRequestMismatch { ordinal: 0 })
+    );
 }
 
 #[test]
@@ -386,6 +520,23 @@ fn optional_adapter_primitives_are_unsupported_by_default() {
     }
 }
 
+#[test]
+fn snapshot_canonical_batch_scan_is_unsupported_by_default() {
+    let scan = CanonicalScanRequest::new(
+        KeySpan::prefix(Keyspace::Current, Vec::new()),
+        bounds(1, 64),
+    )
+    .unwrap();
+    let request = CanonicalBatchScanRequest::new(vec![scan], 64).unwrap();
+
+    assert_eq!(
+        block_on(MinimalSnapshot.scan_canonical_batch(&request)),
+        Err(AdapterError::UnsupportedOperation {
+            operation: "snapshot canonical batch scan",
+        })
+    );
+}
+
 fn bounds(max_items: usize, max_bytes: u64) -> QueryPageBounds {
     QueryPageBounds::new(max_items, max_bytes).unwrap()
 }
@@ -399,6 +550,22 @@ fn entry(keyspace: Keyspace, key_bytes: &[u8], value: &[u8]) -> KeyValue {
 }
 
 struct MinimalAdapter;
+
+struct MinimalSnapshot;
+
+impl ReadSnapshot for MinimalSnapshot {
+    fn applied_log_index(&self) -> u64 {
+        0
+    }
+
+    fn multi_get<'a>(&'a self, _keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async { panic!("not used") })
+    }
+
+    fn scan<'a>(&'a self, _span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async { panic!("not used") })
+    }
+}
 
 impl StorageAdapter for MinimalAdapter {
     fn capabilities(&self) -> AdapterCapabilities {

@@ -16,10 +16,10 @@ use rocksdb::{
 use storage_api::{
     ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
     AdapterFuture, AdjacencyCursor, AdjacencyEntry, AdjacencyExpandPage, AdjacencyExpandRequest,
-    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalRestoreSession,
-    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
-    CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
-    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
+    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalBatchScanPage,
+    CanonicalBatchScanRequest, CanonicalRestoreSession, CanonicalScanPage, CanonicalScanRequest,
+    ChangeScanPage, ChangeScanRequest, CommittedMutationBatch, Durability, KeySpan, KeyValue,
+    Keyspace, LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
     LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
     LogicalSnapshotReader, MappingCapabilities, MappingDescriptorV1, MappingFuture,
     MutationOperation, PreparedMappingTransaction, PropertyGatherPage, PropertyGatherRequest,
@@ -1024,6 +1024,31 @@ impl ReadSnapshot for RocksReadSnapshot<'_> {
         })
     }
 
+    fn scan_canonical_batch<'a>(
+        &'a self,
+        request: &'a CanonicalBatchScanRequest,
+    ) -> AdapterFuture<'a, CanonicalBatchScanPage> {
+        Box::pin(async move {
+            let mut pages = Vec::with_capacity(request.scans().len());
+            let mut retained = 0_u64;
+            for scan in request.scans() {
+                let cf = self.adapter.cf(scan.span().keyspace())?;
+                let iterator = self.snapshot.iterator_cf(
+                    &cf,
+                    IteratorMode::From(scan.span().start(), Direction::Forward),
+                );
+                let (entries, next_start) =
+                    bounded_rocks_page(iterator, scan.span(), scan.bounds())?;
+                retained = charge_batch_entries(retained, &entries, request.max_total_bytes())?;
+                pages.push(
+                    CanonicalScanPage::new(scan, self.applied_log_index, entries, next_start)
+                        .map_err(query_error)?,
+                );
+            }
+            CanonicalBatchScanPage::new(request, self.applied_log_index, pages).map_err(query_error)
+        })
+    }
+
     fn scan_candidates<'a>(
         &'a self,
         request: &'a CandidateScanRequest,
@@ -1225,6 +1250,26 @@ fn bounded_rocks_page(
         ));
     }
     Ok((entries, next_start))
+}
+
+fn charge_batch_entries(
+    retained: u64,
+    entries: &[KeyValue],
+    limit: u64,
+) -> Result<u64, AdapterError> {
+    let required = entries.iter().try_fold(retained, |retained, entry| {
+        retained
+            .checked_add(u64::try_from(entry.key().as_bytes().len()).ok()?)
+            .and_then(|retained| retained.checked_add(u64::try_from(entry.value().len()).ok()?))
+    });
+    let required = required.ok_or(AdapterError::ScanByteLimit {
+        limit,
+        required: u64::MAX,
+    })?;
+    if required > limit {
+        return Err(AdapterError::ScanByteLimit { limit, required });
+    }
+    Ok(required)
 }
 
 const fn rocks_query_primitive_capabilities() -> QueryPrimitiveCapabilities {

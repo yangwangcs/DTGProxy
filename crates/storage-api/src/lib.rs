@@ -1238,6 +1238,17 @@ pub trait ReadSnapshot: Send + Sync {
         })
     }
 
+    fn scan_canonical_batch<'a>(
+        &'a self,
+        _request: &'a CanonicalBatchScanRequest,
+    ) -> AdapterFuture<'a, CanonicalBatchScanPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "snapshot canonical batch scan",
+            })
+        })
+    }
+
     fn scan_candidates<'a>(
         &'a self,
         _request: &'a CandidateScanRequest,
