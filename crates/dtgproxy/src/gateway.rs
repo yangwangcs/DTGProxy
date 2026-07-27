@@ -71,6 +71,7 @@ pub struct GatewayService {
     runtime: InProcessDeploymentRuntime,
     backends: Vec<BackendReplicaStatus>,
     backend_slots: BTreeMap<(u32, u64), Arc<HotSwapAdapter>>,
+    loaded_backend_providers: Vec<String>,
 }
 
 type ReplicaAdapters = BTreeMap<(u32, u64), Arc<dyn StorageAdapter>>;
@@ -81,7 +82,7 @@ async fn open_backend_replicas(
     graph: &GraphDefinition,
     deployment: &DeploymentConfig,
 ) -> Result<(ReplicaAdapters, Vec<BackendReplicaStatus>, BackendSlots), GatewayError> {
-    let registry = backend_registry()?;
+    let registry = backend_registry(graph.backend().provider())?;
 
     let mut adapters = ReplicaAdapters::new();
     let mut statuses = Vec::new();
@@ -117,13 +118,35 @@ async fn open_backend_replicas(
     Ok((adapters, statuses, slots))
 }
 
-fn backend_registry() -> Result<AdapterRegistry, GatewayError> {
+fn backend_registry(provider: &str) -> Result<AdapterRegistry, GatewayError> {
     let mut registry = AdapterRegistry::new();
-    registry.register(Arc::new(Neo4jAdapterFactory))?;
-    registry.register(Arc::new(RocksAdapterFactory))?;
-    registry.register(Arc::new(TcpSidecarAdapterFactory))?;
-    registry.register(Arc::new(PostgresAdapterFactory))?;
+    match provider {
+        "rocksdb" => registry.register(Arc::new(RocksAdapterFactory))?,
+        "postgresql" => registry.register(Arc::new(PostgresAdapterFactory))?,
+        "neo4j" => registry.register(Arc::new(Neo4jAdapterFactory))?,
+        "sidecar" => registry.register(Arc::new(TcpSidecarAdapterFactory))?,
+        provider => {
+            return Err(GatewayError::Backend(format!(
+                "unsupported backend provider {provider}"
+            )));
+        }
+    }
     Ok(registry)
+}
+
+#[cfg(test)]
+mod backend_registry_tests {
+    use super::backend_registry;
+
+    #[test]
+    fn registers_only_the_requested_production_provider() {
+        for provider in ["rocksdb", "postgresql", "neo4j", "sidecar"] {
+            assert_eq!(
+                backend_registry(provider).unwrap().providers(),
+                vec![provider]
+            );
+        }
+    }
 }
 
 fn backend_open_request(
@@ -221,6 +244,8 @@ impl GatewayService {
         TransactionCoordinator::new(&oracle, config.max_raft_ticks())
             .recover_pending(&mut runtime)
             .await?;
+        let mut loaded_backend_providers = vec![graph.backend().provider().to_owned()];
+        loaded_backend_providers.sort();
         Ok(Self {
             config,
             catalog,
@@ -228,6 +253,7 @@ impl GatewayService {
             runtime,
             backends,
             backend_slots,
+            loaded_backend_providers,
         })
     }
 
@@ -286,7 +312,7 @@ impl GatewayService {
             AdapterRequirement::HotPluggableReplica,
             next_generation,
         )?;
-        let registry = backend_registry()?;
+        let registry = backend_registry(target_profile.provider())?;
         let placements = self
             .runtime
             .config()
@@ -344,6 +370,8 @@ impl GatewayService {
                 .expect("started migration has a backend slot")
                 .cutover()?;
         }
+        self.loaded_backend_providers = vec![target_profile.provider().to_owned()];
+        self.loaded_backend_providers.sort();
         let expected_revision = self.catalog.state().revision();
         let command_id =
             (u128::from(expected_revision.saturating_add(1)) << 64) | u128::from(graph.graph_id());
@@ -405,6 +433,7 @@ impl GatewayService {
             topology_epoch: graph.topology().epoch(),
             backend_provider: graph.backend().provider().to_owned(),
             backend_generation: graph.backend().generation(),
+            loaded_backend_providers: self.loaded_backend_providers.clone(),
             shards: graph
                 .topology()
                 .placements()
@@ -592,6 +621,7 @@ pub struct GatewayStatus {
     topology_epoch: u64,
     backend_provider: String,
     backend_generation: u64,
+    loaded_backend_providers: Vec<String>,
     shards: Vec<GatewayShardStatus>,
 }
 
@@ -660,8 +690,20 @@ impl GatewayStatus {
     }
 
     #[must_use]
+    pub fn loaded_backend_providers(&self) -> &[String] {
+        &self.loaded_backend_providers
+    }
+
+    #[must_use]
     pub fn shards(&self) -> &[GatewayShardStatus] {
         &self.shards
+    }
+}
+
+impl BackendMigrationReceipt {
+    #[must_use]
+    pub fn target_provider(&self) -> &str {
+        &self.target_provider
     }
 }
 

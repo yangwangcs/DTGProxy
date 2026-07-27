@@ -100,6 +100,7 @@ fn versioned_node_config_and_catalog_start_both_deployment_modes() {
             }
         );
         assert_eq!(status.backend_provider(), "rocksdb");
+        assert_eq!(status.loaded_backend_providers(), &["rocksdb"]);
         assert!(
             status
                 .shards()
@@ -220,21 +221,14 @@ fn online_backend_migration_snapshots_cuts_over_and_publishes_catalog_generation
         block_on(gateway.execute_request(put_vertex_request("before-migration", "9", &payload)));
     assert!(serde_json::to_value(before).unwrap()["ok"] == true);
 
-    let migration = block_on(gateway.execute_request(GatewayRequest {
-        version: GATEWAY_API_VERSION,
-        request_id: "migration-1".into(),
-        operation: GatewayOperation::MigrateBackend {
-            provider: "rocksdb".into(),
-            public_parameters: BTreeMap::from([(
-                "path".into(),
-                "backends/migrated-generation-2".into(),
-            )]),
-            secret_references: BTreeMap::new(),
-        },
-    }));
-    let migration = serde_json::to_value(migration).unwrap();
-    assert_eq!(migration["ok"], true, "{migration}");
-    assert_eq!(migration["result"]["target_generation"], 2);
+    let parameters = BTreeMap::from([("path".into(), "backends/migrated-generation-2".into())]);
+    let receipt =
+        block_on(gateway.migrate_backend("rocksdb".into(), parameters, BTreeMap::new())).unwrap();
+    assert_eq!(receipt.target_provider(), "rocksdb");
+    assert_eq!(
+        gateway.status().unwrap().loaded_backend_providers(),
+        &["rocksdb"]
+    );
 
     let after =
         block_on(gateway.execute_request(put_vertex_request("after-migration", "10", &payload)));
@@ -256,6 +250,33 @@ fn online_backend_migration_snapshots_cuts_over_and_publishes_catalog_generation
         2
     );
     assert_eq!(reopened.status().unwrap().backend_provider(), "rocksdb");
+}
+
+#[test]
+fn unsupported_backend_migration_fails_before_creating_a_target_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("node.json");
+    let config = NodeConfig::new(
+        directory.path().join("data"),
+        7,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        20,
+        16,
+    )
+    .unwrap();
+    initialize_node(&config_path, &config, graph(DeploymentMode::PrimaryReplica)).unwrap();
+    let mut gateway = block_on(GatewayService::open(config)).unwrap();
+    let target = gateway.config().root().join("backends/unsupported-target");
+
+    let error = block_on(gateway.migrate_backend(
+        "unsupported".into(),
+        BTreeMap::from([("path".into(), "backends/unsupported-target".into())]),
+        BTreeMap::new(),
+    ))
+    .unwrap_err();
+
+    assert!(error.to_string().contains("unsupported backend provider"));
+    assert!(!target.exists());
 }
 
 #[test]
