@@ -1845,6 +1845,8 @@ fn backend_transition_response(
 }
 
 fn backend_status_response(runtime: BackendRuntimeStatus) -> GetBackendStatusResponse {
+    let logical_backend = runtime.logical_backend();
+    let loaded_backends = runtime.loaded_backends();
     let (phase, source_generation, target_generation, digest, fence_index) = match runtime.slot() {
         BackendSlotState::Active { generation, .. } => {
             (BackendLifecyclePhase::Active, *generation, 0, Vec::new(), 0)
@@ -1877,6 +1879,8 @@ fn backend_status_response(runtime: BackendRuntimeStatus) -> GetBackendStatusRes
         target_profile_digest: digest,
         fence_index,
         synchronized_index,
+        logical_backend,
+        loaded_backends,
     }
 }
 

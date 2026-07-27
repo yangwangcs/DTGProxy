@@ -152,6 +152,8 @@ async fn admin_backend_workflow_dual_applies_cuts_over_and_survives_restart() {
         .unwrap()
         .into_inner();
     assert_eq!(dual.phase, BackendLifecyclePhase::DualApplying as i32);
+    assert_eq!(dual.logical_backend, "rocksdb");
+    assert_eq!(dual.loaded_backends, vec!["rocksdb"]);
     assert_eq!(
         dual.synchronized_index,
         dual.status.as_ref().unwrap().applied_index
@@ -175,6 +177,8 @@ async fn admin_backend_workflow_dual_applies_cuts_over_and_survives_restart() {
         .unwrap()
         .into_inner();
     assert_eq!(active.phase, BackendLifecyclePhase::Active as i32);
+    assert_eq!(active.logical_backend, "rocksdb");
+    assert_eq!(active.loaded_backends, vec!["rocksdb"]);
     assert_eq!(active.source_generation, 8);
     assert_eq!(active.status.unwrap().backend_generation, 8);
 

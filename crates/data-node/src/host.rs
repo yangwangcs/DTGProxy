@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, Mutex, RwLock};
@@ -354,6 +354,38 @@ impl BackendRuntimeStatus {
     #[must_use]
     pub const fn local(&self) -> MigrationStatus {
         self.local
+    }
+
+    #[must_use]
+    pub fn logical_backend(&self) -> String {
+        logical_backend_name(self.slot.active_profile())
+    }
+
+    #[must_use]
+    pub fn loaded_backends(&self) -> Vec<String> {
+        let mut loaded = BTreeSet::new();
+        match &self.slot {
+            BackendSlotState::Active { profile, .. } => {
+                loaded.insert(logical_backend_name(profile));
+            }
+            BackendSlotState::DualApplying { source, target, .. } => {
+                loaded.insert(logical_backend_name(source));
+                loaded.insert(logical_backend_name(target));
+            }
+        }
+        loaded.into_iter().collect()
+    }
+}
+
+fn logical_backend_name(profile: &crate::BackendProfile) -> String {
+    match profile.provider() {
+        "rocksdb" => "rocksdb".to_owned(),
+        "sidecar" => profile
+            .public_parameters()
+            .get("target_provider")
+            .cloned()
+            .expect("opened sidecar profile must identify its target provider"),
+        provider => unreachable!("opened backend profile has unsupported provider {provider}"),
     }
 }
 
@@ -1459,5 +1491,59 @@ impl From<StorageError> for HostError {
 impl From<MigrationStorageError> for HostError {
     fn from(error: MigrationStorageError) -> Self {
         Self::MigrationStorage(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BackendProfile;
+
+    #[test]
+    fn backend_runtime_status_reports_sanitized_sorted_logical_backends() {
+        let source = BackendProfile::new(
+            "rocksdb",
+            "source",
+            BTreeMap::from([("path".into(), "source-data".into())]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let target = BackendProfile::new(
+            "sidecar",
+            "target",
+            BTreeMap::from([
+                ("endpoint".into(), "127.0.0.1:5432".into()),
+                ("target_provider".into(), "postgresql".into()),
+            ]),
+            BTreeMap::from([("password".into(), "postgres-password".into())]),
+        )
+        .unwrap();
+        let slot = BackendSlotState::dual_applying(7, source, 8, target, 13, 13).unwrap();
+        let spec = ReplicaSpec::new_with_backend(
+            1,
+            1,
+            1,
+            vec![7],
+            ReplicaRole::Voter,
+            1,
+            slot.clone(),
+            "replica",
+        )
+        .unwrap();
+        let runtime = BackendRuntimeStatus {
+            replica: dormant_status(7, &spec),
+            slot,
+            local: MigrationStatus::DualApplying {
+                source_generation: 7,
+                target_generation: 8,
+                synchronized_index: 13,
+            },
+        };
+
+        assert_eq!(runtime.logical_backend(), "rocksdb");
+        assert_eq!(
+            runtime.loaded_backends(),
+            vec!["postgresql".to_owned(), "rocksdb".to_owned()]
+        );
     }
 }

@@ -591,6 +591,8 @@ message GetBackendStatusResponse {
   bytes target_profile_digest = 5;
   uint64 fence_index = 6;
   uint64 synchronized_index = 7;
+  string logical_backend = 20;
+  repeated string loaded_backends = 21;
 }
 
 service NodeAdminService {
