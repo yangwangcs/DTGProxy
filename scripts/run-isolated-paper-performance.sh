@@ -123,6 +123,7 @@ for relative, expected in entries.items():
 try:
     ready = json.loads((bundle / "READY.json").read_text(encoding="utf-8"))
     spec = json.loads((bundle / "formal-spec.json").read_text(encoding="utf-8"))
+    runtime = json.loads((bundle / "runtime-manifest.json").read_text(encoding="utf-8"))
     evidence = json.loads((bundle / "managed-process-evidence.json").read_text(encoding="utf-8"))
 except Exception as error:
     reject(f"{expected_backend} prepared metadata is invalid: {error}")
@@ -136,10 +137,43 @@ if (not isinstance(run_id, str) or not run_id or run_id in (".", "..") or
     reject(f"{expected_backend} READY run_id is invalid")
 processes = evidence.get("managed_processes")
 roles = {process.get("role") for process in processes} if isinstance(processes, list) else set()
-if (evidence.get("selected_backend") != expected_backend or not processes or
+expected_lifecycle = (
+    "the sealed run command must retire every exact managed process before returning; "
+    "the sequential runner never sends process signals"
+)
+if (evidence.get("schema_version") != 1 or
+        evidence.get("selected_backend") != expected_backend or
+        evidence.get("lifecycle_contract") != expected_lifecycle or not processes or
         roles != {"gateway", "data_node"} or
         any(process.get("backend") != expected_backend for process in processes)):
     reject(f"{expected_backend} managed process evidence mismatch")
+runtime_targets = runtime.get("proxy_targets")
+if not isinstance(runtime_targets, list) or not runtime_targets:
+    reject(f"{expected_backend} runtime process inventory is missing")
+expected_gateways = {
+    (target.get("gateway_process", {}).get("pid"),
+     target.get("gateway_process", {}).get("executable"))
+    for target in runtime_targets
+}
+expected_data_nodes = {
+    (process.get("pid"), process.get("executable"),
+     process.get("probe", {}).get("ssh_target"))
+    for target in runtime_targets
+    for process in target.get("data_node_processes", [])
+}
+actual_gateways = {
+    (process.get("identity", {}).get("pid"), process.get("executable"))
+    for process in processes if process.get("role") == "gateway"
+}
+actual_data_nodes = {
+    (process.get("identity", {}).get("pid"), process.get("executable"),
+     process.get("probe", {}).get("ssh_target"))
+    for process in processes if process.get("role") == "data_node"
+}
+if (expected_gateways != actual_gateways or expected_data_nodes != actual_data_nodes or
+        len(actual_gateways) != sum(process.get("role") == "gateway" for process in processes) or
+        len(actual_data_nodes) != sum(process.get("role") == "data_node" for process in processes)):
+    reject(f"{expected_backend} managed process evidence differs from runtime inventory")
 backend_service = evidence.get("backend_service")
 if expected_backend == "rocksdb":
     if backend_service != {"ownership": "embedded", "managed_by": "data_node"}:
@@ -166,6 +200,11 @@ if (not orchestrator.is_absolute() or orchestrator.is_symlink() or
 print(run_id)
 print(orchestrator)
 print(claimed)
+print(json.dumps(sorted([
+    [process["identity"]["host_id"], process["identity"]["boot_id"],
+     process["identity"]["process_start_id"], process["identity"]["pid"]]
+    for process in processes
+]), separators=(",", ":")))
 PY
 }
 
@@ -347,12 +386,10 @@ for process in evidence.get("managed_processes", []):
     for name in ("host_id", "boot_id", "process_start_id"):
         if not isinstance(current.get(name), str) or not current[name].strip():
             reject(f"{expected_backend} managed PID identity probe returned invalid {name}")
-    same_process = (
-        current.get("host_id") == previous.get("host_id") and
-        current.get("boot_id") == previous.get("boot_id") and
-        current.get("process_start_id") == previous.get("process_start_id")
-    )
-    if same_process:
+    if current.get("host_id") != previous.get("host_id"):
+        reject(f"{expected_backend} managed PID probe resolved to a different host identity")
+    if (current.get("boot_id") == previous.get("boot_id") and
+            current.get("process_start_id") == previous.get("process_start_id")):
         reject(f"{expected_backend} managed PID is still the same process")
 PY
 }
@@ -362,6 +399,7 @@ declare -a bundles=("$rocksdb_bundle" "$postgresql_bundle" "$neo4j_bundle")
 declare -a run_ids=()
 declare -a orchestrators=()
 declare -a orchestrator_digests=()
+declare -a managed_identities=()
 declare -a artifacts=()
 
 for index in 0 1 2; do
@@ -373,16 +411,35 @@ for index in 0 1 2; do
     IFS= read -r run_id
     IFS= read -r orchestrator
     IFS= read -r orchestrator_digest
+    IFS= read -r identities
   } <"$metadata"
   run_ids+=("$run_id")
   orchestrators+=("$orchestrator")
   orchestrator_digests+=("$orchestrator_digest")
+  managed_identities+=("$identities")
 done
 if [[ ${orchestrator_digests[0]} != "${orchestrator_digests[1]}" ||
       ${orchestrator_digests[0]} != "${orchestrator_digests[2]}" ]]; then
   printf '%s\n' 'all prepared bundles must seal the same orchestrator SHA-256' >&2
   exit 1
 fi
+python3 - \
+  "${run_ids[0]}" "${run_ids[1]}" "${run_ids[2]}" \
+  "${managed_identities[0]}" "${managed_identities[1]}" "${managed_identities[2]}" <<'PY'
+import json
+import sys
+
+run_ids = sys.argv[1:4]
+identity_sets = [set(map(tuple, json.loads(value))) for value in sys.argv[4:7]]
+if len(set(run_ids)) != 3:
+    raise SystemExit("run-isolated-paper-performance: prepared bundles must have distinct run_id values")
+for left in range(3):
+    for right in range(left + 1, 3):
+        if identity_sets[left] & identity_sets[right]:
+            raise SystemExit(
+                "run-isolated-paper-performance: prepared bundles share a managed process identity"
+            )
+PY
 
 for index in 0 1 2; do
   backend=${backends[$index]}

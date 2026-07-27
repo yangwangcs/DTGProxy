@@ -153,6 +153,7 @@ make_isolated_bundle() {
   local executor="$scratch/isolated-$selected_backend-executor"
   local orchestrator="$scratch/isolated-$selected_backend-orchestrator"
   local pid=$((4100 + ${#selected_backend}))
+  local gateway_pid=$((990000 + ${#selected_backend}))
   mkdir -p "$bundle"
   printf '#!/bin/sh\nexit 0\n' >"$executor"
   chmod +x "$executor"
@@ -206,7 +207,34 @@ EOF
   chmod +x "$orchestrator"
   jq -n --arg backend "$selected_backend" --arg run_id "$run_id" \
     '{selected_backend: $backend, run_id: $run_id}' >"$bundle/formal-spec.json"
-  jq -n --arg backend "$selected_backend" '{backends: {($backend): {}}}' >"$bundle/runtime-manifest.json"
+  jq -n \
+    --arg backend "$selected_backend" \
+    --arg host "paper-$selected_backend" \
+    --argjson pid "$pid" \
+    --argjson gateway_pid "$gateway_pid" '
+    {
+      schema_version: 1,
+      backends: {($backend): {}},
+      proxy_targets: [{
+        backend: $backend,
+        gateway_process: {
+          pid: $gateway_pid,
+          executable: "/opt/dtgproxy/gateway"
+        },
+        data_node_processes: [{
+          pid: $pid,
+          executable: "/opt/dtgproxy/data-node",
+          executable_sha256: ("a" * 64),
+          probe: {
+            ssh_target: $host,
+            host_id: $host,
+            boot_id: "boot-1",
+            probe_binary: "/opt/dtgproxy/probe",
+            data_interface: "eth0"
+          }
+        }]
+      }]
+    }' >"$bundle/runtime-manifest.json"
   jq -n \
     --arg backend "$selected_backend" \
     --arg host "paper-$selected_backend" \
@@ -263,7 +291,8 @@ EOF
     --arg backend "$selected_backend" \
     --arg host "paper-$selected_backend" \
     --arg start "start-$selected_backend" \
-    --argjson pid "$pid" '
+    --argjson pid "$pid" \
+    --argjson gateway_pid "$gateway_pid" '
     {
       schema_version: 1,
       selected_backend: $backend,
@@ -283,7 +312,12 @@ EOF
         {
           backend: $backend,
           role: "gateway",
-          identity: {host_id: "local-fixture", boot_id: "boot-local", process_start_id: "start-local", pid: 999999},
+          identity: {
+            host_id: "local-fixture",
+            boot_id: "boot-local",
+            process_start_id: ("start-local-" + $backend),
+            pid: $gateway_pid
+          },
           executable: "/opt/dtgproxy/gateway",
           executable_sha256: ("c" * 64),
           probe: {kind: "local"}
@@ -351,6 +385,7 @@ while [ $# -gt 0 ]; do
 done
 start="start-$backend"
 [ "${STICKY_BACKEND-}" = "$backend" ] || start="new-$start"
+[ "${WRONG_HOST_BACKEND-}" != "$backend" ] || host="wrong-$host"
 [ "${MALFORMED_IDENTITY_BACKEND-}" != "$backend" ] || {
   jq -cn --arg host "$host" --argjson pid "$pid" \
     '{host_id: $host, boot_id: "boot-1", pid: $pid}'
@@ -364,6 +399,119 @@ chmod +x "$scratch/bin/ssh"
 rocksdb_bundle=$(make_isolated_bundle rocksdb isolated-rocksdb)
 postgresql_bundle=$(make_isolated_bundle postgresql isolated-postgresql)
 neo4j_bundle=$(make_isolated_bundle neo4j isolated-neo4j)
+
+expect_isolated_preflight_rejected() {
+  local name=$1
+  local expected=$2
+  local rocksdb=$3
+  local postgresql=$4
+  local neo4j=$5
+  local events="$scratch/$name.events"
+  local log="$scratch/$name.log"
+  if ISOLATED_EVENT_LOG="$events" PATH="$scratch/bin:$PATH" \
+    "$isolated_script" \
+    --rocksdb-bundle "$rocksdb" \
+    --postgresql-bundle "$postgresql" \
+    --neo4j-bundle "$neo4j" \
+    --output-root "$scratch/$name-output" >"$log" 2>&1; then
+    fail "$name unexpectedly passed"
+  fi
+  grep -F "$expected" "$log" >/dev/null || {
+    cat "$log" >&2
+    fail "$name failed for the wrong reason"
+  }
+  [[ ! -e $events ]] || fail "$name launched a backend"
+}
+
+missing_inventory_process_bundle="$scratch/isolated-postgresql-missing-inventory-process"
+cp -R "$postgresql_bundle" "$missing_inventory_process_bundle"
+jq '.proxy_targets[0].data_node_processes += [{
+  pid: 424242,
+  executable: "/opt/dtgproxy/data-node",
+  executable_sha256: ("d" * 64),
+  probe: {
+    ssh_target: "paper-postgresql-extra",
+    host_id: "paper-postgresql-extra",
+    boot_id: "boot-extra",
+    probe_binary: "/opt/dtgproxy/probe",
+    data_interface: "eth0"
+  }
+}]' "$missing_inventory_process_bundle/runtime-manifest.json" \
+  >"$missing_inventory_process_bundle/runtime-manifest.json.new"
+mv "$missing_inventory_process_bundle/runtime-manifest.json.new" \
+  "$missing_inventory_process_bundle/runtime-manifest.json"
+seal_bundle "$missing_inventory_process_bundle"
+expect_isolated_preflight_rejected \
+  missing-inventory-process 'managed process evidence differs from runtime inventory' \
+  "$rocksdb_bundle" "$missing_inventory_process_bundle" "$neo4j_bundle"
+printf '%s\n' 'PASS isolated runner rejects runtime processes omitted from managed evidence before launch'
+
+duplicate_run_bundle="$scratch/isolated-postgresql-duplicate-run-id"
+cp -R "$postgresql_bundle" "$duplicate_run_bundle"
+jq --arg run_id isolated-rocksdb '.run_id = $run_id' \
+  "$duplicate_run_bundle/READY.json" >"$duplicate_run_bundle/READY.json.new"
+mv "$duplicate_run_bundle/READY.json.new" "$duplicate_run_bundle/READY.json"
+jq --arg run_id isolated-rocksdb '.run_id = $run_id' \
+  "$duplicate_run_bundle/formal-spec.json" >"$duplicate_run_bundle/formal-spec.json.new"
+mv "$duplicate_run_bundle/formal-spec.json.new" "$duplicate_run_bundle/formal-spec.json"
+seal_bundle "$duplicate_run_bundle"
+expect_isolated_preflight_rejected \
+  duplicate-run-id 'prepared bundles must have distinct run_id values' \
+  "$rocksdb_bundle" "$duplicate_run_bundle" "$neo4j_bundle"
+printf '%s\n' 'PASS isolated runner rejects duplicate run IDs before launch'
+
+shared_identity_bundle="$scratch/isolated-postgresql-shared-identity"
+cp -R "$postgresql_bundle" "$shared_identity_bundle"
+rocksdb_gateway_identity=$(jq -c '.managed_processes[] | select(.role == "gateway") | .identity' \
+  "$rocksdb_bundle/managed-process-evidence.json")
+jq --argjson identity "$rocksdb_gateway_identity" '
+  (.managed_processes[] | select(.role == "gateway") | .identity) = $identity |
+  (.managed_processes[] | select(.role == "gateway") | .probe) = {
+    kind: "remote",
+    ssh_target: "paper-postgresql",
+    probe_binary: "/opt/dtgproxy/probe",
+    network_interface: "eth0"
+  }
+' "$shared_identity_bundle/managed-process-evidence.json" \
+  >"$shared_identity_bundle/managed-process-evidence.json.new"
+mv "$shared_identity_bundle/managed-process-evidence.json.new" \
+  "$shared_identity_bundle/managed-process-evidence.json"
+jq --argjson pid "$(jq '.pid' <<<"$rocksdb_gateway_identity")" '
+  .proxy_targets[0].gateway_process.pid = $pid
+' "$shared_identity_bundle/runtime-manifest.json" \
+  >"$shared_identity_bundle/runtime-manifest.json.new"
+mv "$shared_identity_bundle/runtime-manifest.json.new" \
+  "$shared_identity_bundle/runtime-manifest.json"
+seal_bundle "$shared_identity_bundle"
+expect_isolated_preflight_rejected \
+  shared-managed-identity 'prepared bundles share a managed process identity' \
+  "$rocksdb_bundle" "$shared_identity_bundle" "$neo4j_bundle"
+printf '%s\n' 'PASS isolated runner rejects shared exact managed identities before launch'
+
+wrong_schema_bundle="$scratch/isolated-postgresql-wrong-managed-schema"
+cp -R "$postgresql_bundle" "$wrong_schema_bundle"
+jq '.schema_version = 2' "$wrong_schema_bundle/managed-process-evidence.json" \
+  >"$wrong_schema_bundle/managed-process-evidence.json.new"
+mv "$wrong_schema_bundle/managed-process-evidence.json.new" \
+  "$wrong_schema_bundle/managed-process-evidence.json"
+seal_bundle "$wrong_schema_bundle"
+expect_isolated_preflight_rejected \
+  wrong-managed-schema 'managed process evidence mismatch' \
+  "$rocksdb_bundle" "$wrong_schema_bundle" "$neo4j_bundle"
+printf '%s\n' 'PASS isolated runner requires the managed evidence schema contract before launch'
+
+wrong_lifecycle_bundle="$scratch/isolated-postgresql-wrong-lifecycle"
+cp -R "$postgresql_bundle" "$wrong_lifecycle_bundle"
+jq '.lifecycle_contract = "runner may terminate processes"' \
+  "$wrong_lifecycle_bundle/managed-process-evidence.json" \
+  >"$wrong_lifecycle_bundle/managed-process-evidence.json.new"
+mv "$wrong_lifecycle_bundle/managed-process-evidence.json.new" \
+  "$wrong_lifecycle_bundle/managed-process-evidence.json"
+seal_bundle "$wrong_lifecycle_bundle"
+expect_isolated_preflight_rejected \
+  wrong-lifecycle 'managed process evidence mismatch' \
+  "$rocksdb_bundle" "$wrong_lifecycle_bundle" "$neo4j_bundle"
+printf '%s\n' 'PASS isolated runner requires the no-signal lifecycle contract before launch'
 
 mismatched_orchestrator_bundle="$scratch/isolated-postgresql-mismatched-orchestrator"
 cp -R "$postgresql_bundle" "$mismatched_orchestrator_bundle"
@@ -506,6 +654,27 @@ grep -F 'managed PID identity probe returned invalid process_start_id' \
 [[ ! -e $output/combined ]] || fail "malformed process identity created combined output"
 printf '%s\n' 'PASS isolated runner fails closed on malformed process identity'
 
+events="$scratch/isolated-wrong-host.events"
+output="$scratch/isolated-wrong-host-output"
+if ISOLATED_EVENT_LOG="$events" WRONG_HOST_BACKEND=rocksdb PATH="$scratch/bin:$PATH" \
+  "$isolated_script" \
+  --rocksdb-bundle "$rocksdb_bundle" \
+  --postgresql-bundle "$postgresql_bundle" \
+  --neo4j-bundle "$neo4j_bundle" \
+  --output-root "$output" >"$scratch/isolated-wrong-host.log" 2>&1; then
+  fail "isolated runner accepted a managed PID probe from a different host"
+fi
+grep -F 'managed PID probe resolved to a different host identity' \
+  "$scratch/isolated-wrong-host.log" >/dev/null || {
+  cat "$scratch/isolated-wrong-host.log" >&2
+  fail "wrong-host identity failed for the wrong reason"
+}
+[[ $(cat "$events") == 'run rocksdb
+verify rocksdb
+identity rocksdb' ]] || fail "wrong-host identity did not stop before the next backend"
+[[ ! -e $output/combined ]] || fail "wrong-host identity created combined output"
+printf '%s\n' 'PASS isolated runner fails closed when a probe resolves to another host'
+
 gateway_leak_bundle="$scratch/isolated-rocksdb-gateway-leak"
 cp -R "$rocksdb_bundle" "$gateway_leak_bundle"
 python3 - "$gateway_leak_bundle/managed-process-evidence.json" "$$" <<'PY'
@@ -539,6 +708,11 @@ gateway["identity"] = {
 }
 path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+jq --argjson pid "$$" '.proxy_targets[0].gateway_process.pid = $pid' \
+  "$gateway_leak_bundle/runtime-manifest.json" \
+  >"$gateway_leak_bundle/runtime-manifest.json.new"
+mv "$gateway_leak_bundle/runtime-manifest.json.new" \
+  "$gateway_leak_bundle/runtime-manifest.json"
 seal_bundle "$gateway_leak_bundle"
 events="$scratch/isolated-gateway-leak.events"
 output="$scratch/isolated-gateway-leak-output"
