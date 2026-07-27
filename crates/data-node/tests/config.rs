@@ -175,10 +175,12 @@ fn runtime_config_requires_a_supported_logical_backend() {
     }
 
     let unsupported = write_config_with_backend("memory");
-    assert!(matches!(
-        DataNodeRuntimeConfig::load(unsupported.path().join("data.json")),
-        Err(FileConfigError::UnsupportedBackend { .. })
-    ));
+    assert_eq!(
+        DataNodeRuntimeConfig::load(unsupported.path().join("data.json")).unwrap_err(),
+        FileConfigError::UnsupportedBackend {
+            backend: "memory".to_owned(),
+        }
+    );
 
     let temporary = tempdir().unwrap();
     let path = temporary.path().join("data.json");

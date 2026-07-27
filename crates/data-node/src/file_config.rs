@@ -194,24 +194,16 @@ impl RawDataNodeConfig {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RawStartupBackend {
-    Rocksdb,
-    Postgresql,
-    Neo4j,
-    #[serde(other)]
-    Unsupported,
-}
+#[serde(transparent)]
+struct RawStartupBackend(String);
 
 impl RawStartupBackend {
     fn into_startup_backend(self) -> Result<StartupBackend, FileConfigError> {
-        match self {
-            Self::Rocksdb => Ok(StartupBackend::Rocksdb),
-            Self::Postgresql => Ok(StartupBackend::Postgresql),
-            Self::Neo4j => Ok(StartupBackend::Neo4j),
-            Self::Unsupported => Err(FileConfigError::UnsupportedBackend {
-                actual: "unknown".to_owned(),
-            }),
+        match self.0.as_str() {
+            "rocksdb" => Ok(StartupBackend::Rocksdb),
+            "postgresql" => Ok(StartupBackend::Postgresql),
+            "neo4j" => Ok(StartupBackend::Neo4j),
+            _ => Err(FileConfigError::UnsupportedBackend { backend: self.0 }),
         }
     }
 }
@@ -249,7 +241,7 @@ pub enum FileConfigError {
     Json(String),
     InvalidFileSize { actual: usize },
     UnsupportedVersion { actual: u32 },
-    UnsupportedBackend { actual: String },
+    UnsupportedBackend { backend: String },
     InvalidClusterId,
     InvalidActorQueueCapacity { actual: usize },
     InvalidShutdownGrace { actual_ms: u64 },
@@ -277,10 +269,10 @@ impl Display for FileConfigError {
             Self::UnsupportedVersion { actual } => {
                 write!(formatter, "unsupported Data node config version {actual}")
             }
-            Self::UnsupportedBackend { actual } => {
+            Self::UnsupportedBackend { backend } => {
                 write!(
                     formatter,
-                    "unsupported Data node logical backend {actual:?}"
+                    "unsupported Data node logical backend {backend:?}"
                 )
             }
             Self::InvalidClusterId => {
