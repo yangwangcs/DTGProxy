@@ -382,6 +382,26 @@ fn formal_environment_rejects_missing_placeholder_and_synthetic_values() {
 }
 
 #[test]
+fn rust_schema_accepts_a_formal_spec_with_only_the_selected_backend_version() {
+    let mut spec = formal_spec("selected-version-schema", Backend::Rocksdb);
+    spec.environment.versions.postgresql = "not-selected".into();
+    spec.environment.versions.neo4j = "not-selected".into();
+    spec.environment.digest = spec.environment.computed_digest().unwrap();
+
+    let bytes = serde_json::to_vec(&spec).expect("serialize formal experiment spec");
+    let parsed: ExperimentSpec =
+        serde_json::from_slice(&bytes).expect("real Rust ExperimentSpec schema");
+    let manifest = parsed
+        .into_manifest(false)
+        .expect("validate selected-backend formal spec");
+
+    assert_eq!(manifest.selected_backend, Backend::Rocksdb);
+    assert_eq!(manifest.environment.versions.rocksdb, "9.10.0");
+    assert_eq!(manifest.environment.versions.postgresql, "not-selected");
+    assert_eq!(manifest.environment.versions.neo4j, "not-selected");
+}
+
+#[test]
 fn diagnostic_simulator_seals_an_explicit_synthetic_environment() {
     let root = unique_temp("synthetic-environment");
     fs::create_dir(&root).expect("temporary output root");

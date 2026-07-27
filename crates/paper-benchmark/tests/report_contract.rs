@@ -949,6 +949,21 @@ fn report_contract_binds_manifests_to_observations_and_exact_timing() {
 }
 
 #[test]
+fn report_contract_rejects_observations_from_a_different_selected_backend() {
+    let dataset = valid_dataset_manifest();
+    let workload = valid_workload_manifest();
+    let run = valid_run_manifest(&dataset, &workload);
+    let mut observations = complete_formal_cell(&run, &dataset, &workload);
+    for observation in &mut observations {
+        observation.backend = Backend::Postgresql;
+    }
+
+    let error = validate_report_contract(&run, &dataset, &workload, &observations)
+        .expect_err("observation backend must match the run selected_backend");
+    assert!(error.to_string().contains("selected_backend"));
+}
+
+#[test]
 fn formal_contract_requires_each_path_repetition_exactly_once_per_cell() {
     let dataset = valid_dataset_manifest();
     let workload = valid_workload_manifest();

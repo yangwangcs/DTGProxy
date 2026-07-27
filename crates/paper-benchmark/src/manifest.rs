@@ -682,6 +682,11 @@ pub fn validate_report_contract<'a>(
     let expected_configuration_digest = run.computed_configuration_digest()?;
     for observation in &observations {
         observation.validate()?;
+        if observation.backend != run.selected_backend {
+            return Err(ContractError::InvalidField(
+                "observation.backend differs from selected_backend",
+            ));
+        }
         if observation.run_id != run.run_id
             || observation.dataset_digest != dataset.content_digest
             || observation.workload_digest != workload.digest

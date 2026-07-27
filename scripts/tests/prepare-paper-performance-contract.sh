@@ -38,6 +38,42 @@ expect_rejected() {
   printf 'PASS rejected %s (%s)\n' "$name" "$expected"
 }
 
+assert_selected_bundle() {
+  local output=$1
+  local selected_backend=$2
+  local selected_version=$3
+  jq -e --arg backend "$selected_backend" '
+    .selected_backend == $backend and .status == "prepared"
+  ' "$output/READY.json" >/dev/null || fail "$selected_backend READY identity mismatch"
+  jq -e --arg backend "$selected_backend" '
+    .selected_backend == $backend and
+    all(.matrix.suites[]; .backends == [$backend])
+  ' "$output/formal-spec.json" >/dev/null || fail "$selected_backend formal spec mismatch"
+  jq -e --arg backend "$selected_backend" '
+    (.backends | keys) == [$backend] and
+    (.proxy_targets | length) == 8 and
+    all(.proxy_targets[]; .backend == $backend)
+  ' "$output/runtime-manifest.json" >/dev/null || fail "$selected_backend runtime filter mismatch"
+  jq -e --arg backend "$selected_backend" '
+    (.backends | length) == 1 and .backends[0].backend == $backend and
+    (.topologies | length) == 3 and
+    all(.topologies[]; .backend == $backend)
+  ' "$output/dataset-evidence.json" >/dev/null || fail "$selected_backend dataset filter mismatch"
+  jq -e --arg backend "$selected_backend" '
+    (.backends | keys) == [$backend]
+  ' "$output/backend-evidence.json" >/dev/null || fail "$selected_backend version evidence mismatch"
+  jq -e --arg backend "$selected_backend" --arg version "$selected_version" '
+    .versions[$backend] == $version and
+    ([.versions | to_entries[] |
+      select(.key != "rustc" and .key != "cargo" and .key != $backend) |
+      .value] | all(. == "not-selected"))
+  ' "$output/environment-fingerprint.json" >/dev/null || fail "$selected_backend fingerprint version mismatch"
+  jq -e --arg backend "$selected_backend" '
+    (.targets | length) == 8 and all(.targets[]; .backend == $backend)
+  ' "$output/remote-node-evidence.json" >/dev/null || fail "$selected_backend remote evidence mismatch"
+  (cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "$selected_backend checksums do not verify"
+}
+
 make_fake_binary() {
   local path=$1
   cc -Os "$scratch/fake-process.c" -o "$path"
@@ -55,13 +91,14 @@ sha256_file() {
 
 invoke_prepare() {
   local output=$1
+  local selected_backend=${PREPARE_BACKEND:-rocksdb}
   shift
   PATH="$scratch/bin:$PATH" \
   FAKE_SSH_LOG="$scratch/ssh.log" \
   FAKE_REMOTE_DATA_DIGEST="$(sha256_file "$scratch/bin/dtgproxy-data-node")" \
   FAKE_REMOTE_PROBE_DIGEST="$(sha256_file "$scratch/bin/dtgproxy-paper-cell-executor")" \
   "$prepare" \
-    --backend rocksdb \
+    --backend "$selected_backend" \
     --spec "$scratch/formal-spec.json" \
     --runtime-manifest "$scratch/runtime-manifest.json" \
     --dataset-evidence "$scratch/dataset-evidence.json" \
@@ -460,7 +497,23 @@ jq -e '
   )
 ' "$output/remote-node-evidence.json" >/dev/null || fail "remote node evidence contract mismatch"
 (cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "sealed checksums do not verify"
+assert_selected_bundle "$output" rocksdb 9.7.4
 printf 'PASS prepared formal bundle without running a matrix\n'
+
+cp "$scratch/formal-spec.json" "$scratch/formal-spec.rocksdb.json"
+for selection in postgresql:17.5 neo4j:2025.05; do
+  selected_backend=${selection%%:*}
+  selected_version=${selection#*:}
+  jq --arg backend "$selected_backend" '
+    .selected_backend = $backend |
+    (.matrix.suites[].backends) = [$backend]
+  ' "$scratch/formal-spec.rocksdb.json" >"$scratch/formal-spec.json"
+  selected_output="$scratch/prepared-$selected_backend"
+  PREPARE_BACKEND="$selected_backend" invoke_prepare "$selected_output"
+  assert_selected_bundle "$selected_output" "$selected_backend" "$selected_version"
+  printf 'PASS prepared isolated %s formal bundle\n' "$selected_backend"
+done
+mv "$scratch/formal-spec.rocksdb.json" "$scratch/formal-spec.json"
 
 cp "$scratch/formal-spec.json" "$scratch/formal-spec.valid.json"
 jq '(.matrix.suites[] | select(.kind == "comparison") | .backends) = ["postgresql"]' \
