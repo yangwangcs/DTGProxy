@@ -38,6 +38,25 @@ The independently deployable cluster path consists of `dtgproxy-meta`, `dtgproxy
 move a live Shard with resumable snapshot transfer, learner catch-up, joint consensus, epoch
 lineage, and cleanup pins; see the [P0 verification record](docs/verification/dtgproxy-p0-cluster-runtime.md).
 
+## Explicit backend selection
+
+Every normal `dtgproxy-data` startup must declare exactly one logical `backend`: `rocksdb`,
+`postgresql`, or `neo4j`. Startup validates the selection before opening the service and initializes
+only the selected path:
+
+```text
+rocksdb    -> embedded rocksdb
+postgresql -> sidecar(target_provider=postgresql)
+neo4j      -> sidecar(target_provider=neo4j)
+```
+
+The two Sidecar-backed choices remain distinct logical backends even though the Data Node provider
+name is `sidecar`. The selected backend, actual provider, active generation, and loaded backend set
+are exposed as lifecycle evidence. During ordinary operation the loaded set contains one backend.
+Online migration may load the declared target on demand, temporarily making the set contain the
+source and target; completion or abort releases the old or target backend and returns to one.
+Missing, unknown, or profile-mismatched selections fail before the Data Node becomes ready.
+
 ## Temporal persistence slice
 
 `TemporalStore` accepts a `TemporalTransaction` containing typed vertex and edge mutations with
