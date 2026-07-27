@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
+use adapter_registry::HotSwapRecoveryState;
 use adapter_rocksdb::RocksAdapter;
 use adapter_sidecar::{SidecarService, TcpSidecarServerConfig, spawn_stateful_tcp_sidecar_server};
 use data_node::{BackendError, BackendManager, BackendProfile, BackendSlotState, StartupBackend};
@@ -120,6 +121,55 @@ fn production_backend_manager_opens_a_loopback_sidecar_profile() {
     assert_eq!(slot.generation(), 8);
     assert_eq!(slot.active_provider_name(), "sidecar");
     assert_eq!(slot.descriptor().family(), BackendFamily::KeyValue);
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn production_backend_manager_recovers_dual_applying_rocks_and_sidecar() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target_backend =
+        Arc::new(RocksAdapter::open(temporary.path().join("target-rocks")).unwrap());
+    let server = spawn_stateful_tcp_sidecar_server(
+        TcpSidecarServerConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        Arc::new(SidecarService::new(target_backend, None)),
+    )
+    .unwrap();
+    let source = BackendProfile::new(
+        "rocksdb",
+        "source-generation-7",
+        BTreeMap::from([("path".into(), "source-generation-7".into())]),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let target = BackendProfile::new(
+        "sidecar",
+        "target-generation-8",
+        BTreeMap::from([
+            ("endpoint".into(), server.local_addr().to_string()),
+            ("pool_size".into(), "1".into()),
+            ("target_provider".into(), "rocksdb".into()),
+        ]),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let state = BackendSlotState::dual_applying(7, source, 8, target, 0, 0).unwrap();
+    let manager = BackendManager::production(StartupBackend::Rocksdb).unwrap();
+
+    let slot = block_on(manager.open_slot(temporary.path(), &state)).unwrap();
+
+    assert_eq!(slot.generation(), 7);
+    assert_eq!(slot.active_provider_name(), "rocksdb");
+    assert!(matches!(
+        slot.recovery_state(),
+        HotSwapRecoveryState::DualApplying {
+            source_generation: 7,
+            source_provider_name,
+            target_generation: 8,
+            target_provider_name,
+            synchronized_index: 0,
+            ..
+        } if source_provider_name == "rocksdb" && target_provider_name == "sidecar"
+    ));
     server.shutdown().unwrap();
 }
 

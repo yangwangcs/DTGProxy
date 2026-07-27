@@ -33,7 +33,8 @@ use control_plane::{
 use cypher_engine::{CypherBoltService, schema_id};
 use data_node::{
     BackendProfile, BackendSlotState, DataNodeGrpcService, DataNodeHost, DataRaftRuntime,
-    NodeConfig, NodeIdentity, ReplicaKey, ReplicaRole, ReplicaSpec, TransportSecurity,
+    NodeConfig, NodeIdentity, ReplicaKey, ReplicaRole, ReplicaSpec, StartupBackend,
+    TransportSecurity,
 };
 use dtgproxy::DeploymentConfig;
 use dtgproxy::gateway::{ApiMutation, GATEWAY_API_VERSION, GatewayOperation, GatewayRequest};
@@ -119,6 +120,14 @@ impl Backend {
             Self::RocksDb => 701,
             Self::PostgreSql => 702,
             Self::Neo4j => 703,
+        }
+    }
+
+    const fn startup_backend(self) -> StartupBackend {
+        match self {
+            Self::RocksDb => StartupBackend::Rocksdb,
+            Self::PostgreSql => StartupBackend::Postgresql,
+            Self::Neo4j => StartupBackend::Neo4j,
         }
     }
 }
@@ -917,14 +926,19 @@ impl LiveRestartableShard {
             BTreeMap::from([
                 ("endpoint".into(), self.sidecar_address.to_string()),
                 ("pool_size".into(), "1".into()),
+                ("target_provider".into(), self.backend.name().into()),
             ]),
             BTreeMap::new(),
         )
         .unwrap();
         let host = Arc::new(
-            DataNodeHost::open(data_config(&self.root, self.node_id), 32)
-                .await
-                .unwrap(),
+            DataNodeHost::open_with_backend(
+                data_config(&self.root, self.node_id),
+                32,
+                self.backend.startup_backend(),
+            )
+            .await
+            .unwrap(),
         );
         host.ensure_replica(
             ReplicaSpec::new_with_backend(
@@ -1134,14 +1148,16 @@ async fn run_gc_recovery_certification(
                 BTreeMap::from([
                     ("endpoint".into(), sidecar_address.to_string()),
                     ("pool_size".into(), "1".into()),
+                    ("target_provider".into(), backend.name().into()),
                 ]),
                 BTreeMap::new(),
             )
             .unwrap();
             let host = Arc::new(
-                DataNodeHost::open(
+                DataNodeHost::open_with_backend(
                     data_config(&temporary.path().join(format!("data-{node_id}")), node_id),
                     32,
+                    backend.startup_backend(),
                 )
                 .await
                 .unwrap(),
@@ -1589,14 +1605,16 @@ async fn run_surface(
                 BTreeMap::from([
                     ("endpoint".into(), sidecar_address.to_string()),
                     ("pool_size".into(), "1".into()),
+                    ("target_provider".into(), backend.name().into()),
                 ]),
                 BTreeMap::new(),
             )
             .unwrap();
             let host = Arc::new(
-                DataNodeHost::open(
+                DataNodeHost::open_with_backend(
                     data_config(&temporary.path().join(format!("data-{node_id}")), node_id),
                     32,
+                    backend.startup_backend(),
                 )
                 .await
                 .unwrap(),

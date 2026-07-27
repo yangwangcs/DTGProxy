@@ -174,6 +174,7 @@ fn logical_backend(profile: &BackendProfile) -> Result<StartupBackend, BackendEr
             .get("target_provider")
             .map(String::as_str)
         {
+            Some("rocksdb") => Ok(StartupBackend::Rocksdb),
             Some("postgresql") => Ok(StartupBackend::Postgresql),
             Some("neo4j") => Ok(StartupBackend::Neo4j),
             _ => Err(BackendError::InvalidSidecarTargetProvider),
@@ -183,12 +184,12 @@ fn logical_backend(profile: &BackendProfile) -> Result<StartupBackend, BackendEr
 }
 
 fn registry_for(profile: &BackendProfile) -> Result<AdapterRegistry, BackendError> {
+    logical_backend(profile)?;
     let mut registry = AdapterRegistry::new();
-    match logical_backend(profile)? {
-        StartupBackend::Rocksdb => registry.register(Arc::new(RocksAdapterFactory))?,
-        StartupBackend::Postgresql | StartupBackend::Neo4j => {
-            registry.register(Arc::new(TcpSidecarAdapterFactory))?;
-        }
+    match profile.provider() {
+        "rocksdb" => registry.register(Arc::new(RocksAdapterFactory))?,
+        "sidecar" => registry.register(Arc::new(TcpSidecarAdapterFactory))?,
+        provider => return Err(BackendError::UnsupportedProvider(provider.to_owned())),
     }
     Ok(registry)
 }
@@ -280,8 +281,9 @@ impl Display for BackendError {
             Self::UnsupportedProvider(provider) => {
                 write!(formatter, "unsupported backend provider {provider}")
             }
-            Self::InvalidSidecarTargetProvider => formatter
-                .write_str("Sidecar backend must declare target_provider as postgresql or neo4j"),
+            Self::InvalidSidecarTargetProvider => formatter.write_str(
+                "Sidecar backend must declare target_provider as rocksdb, postgresql, or neo4j",
+            ),
             Self::ActiveBackendMismatch {
                 configured,
                 profile,
