@@ -71,6 +71,19 @@ assert_selected_bundle() {
   jq -e --arg backend "$selected_backend" '
     (.targets | length) == 8 and all(.targets[]; .backend == $backend)
   ' "$output/remote-node-evidence.json" >/dev/null || fail "$selected_backend remote evidence mismatch"
+  jq -e --arg backend "$selected_backend" '
+    .schema_version == 1 and .selected_backend == $backend and
+    ([.managed_processes[].role] | unique) == ["data_node", "gateway"] and
+    ([.managed_processes[] | select(.role == "gateway") | .probe.kind] | unique) == ["local"] and
+    ([.managed_processes[] | select(.role == "data_node") | .probe.kind] | unique) == ["remote"] and
+    (if $backend == "rocksdb" then
+       .backend_service == {ownership: "embedded", managed_by: "data_node"}
+     else
+       .backend_service.ownership == "external" and
+       .backend_service.managed == false and
+       (.backend_service.reason | length > 0)
+     end)
+  ' "$output/managed-process-evidence.json" >/dev/null || fail "$selected_backend managed process evidence mismatch"
   (cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "$selected_backend checksums do not verify"
 }
 
@@ -436,6 +449,7 @@ invoke_prepare "$output"
 for file in \
   formal-spec.json runtime-manifest.json dataset-evidence.json backend-evidence.json \
   gateway-build-evidence.json environment-fingerprint.json remote-node-evidence.json \
+  managed-process-evidence.json \
   READY.json SHA256SUMS; do
   [[ -f $output/$file ]] || fail "prepared bundle is missing $file"
 done
@@ -496,6 +510,17 @@ jq -e '
     ($process.snapshot.network_interface == $process.claimed.probe.data_interface)
   )
 ' "$output/remote-node-evidence.json" >/dev/null || fail "remote node evidence contract mismatch"
+jq -e '
+  .schema_version == 1 and .selected_backend == "rocksdb" and
+  ([.managed_processes[].role] | unique) == ["data_node", "gateway"] and
+  all(.managed_processes[];
+    (.identity.pid > 1) and
+    (.identity.host_id | length > 0) and
+    (.identity.boot_id | length > 0) and
+    (.identity.process_start_id | length > 0)
+  ) and
+  .backend_service == {ownership: "embedded", managed_by: "data_node"}
+' "$output/managed-process-evidence.json" >/dev/null || fail "managed process evidence contract mismatch"
 (cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "sealed checksums do not verify"
 assert_selected_bundle "$output" rocksdb 9.7.4
 printf 'PASS prepared formal bundle without running a matrix\n'

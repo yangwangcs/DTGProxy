@@ -1207,6 +1207,253 @@ pub struct VerificationReport {
     pub regenerated_directory: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombinedVerification {
+    pub valid: bool,
+    pub run_id: String,
+    pub mode: RunMode,
+    pub raw_observations: usize,
+    pub summary_cells: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombinedBackendRun {
+    pub backend: Backend,
+    pub artifact: PathBuf,
+    pub artifact_sha256: String,
+    pub environment: EnvironmentFingerprint,
+    pub verification: CombinedVerification,
+    pub summary: ArtifactSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CombinedReport {
+    pub schema_version: u32,
+    pub backends: Vec<CombinedBackendRun>,
+}
+
+impl CombinedReport {
+    pub fn validate(&self) -> ArtifactResult<()> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(ArtifactError::new("invalid combined schema_version"));
+        }
+        let expected = [Backend::Rocksdb, Backend::Postgresql, Backend::Neo4j];
+        if self.backends.len() != expected.len()
+            || self.backends.iter().map(|entry| entry.backend).ne(expected)
+        {
+            return Err(ArtifactError::new(
+                "combined report must contain rocksdb, postgresql, and neo4j in fixed order",
+            ));
+        }
+        for entry in &self.backends {
+            if !entry.verification.valid
+                || entry.verification.run_id != entry.summary.run_id
+                || entry.verification.mode != entry.summary.mode
+                || entry.summary.schema_version != SCHEMA_VERSION
+                || entry.verification.summary_cells != entry.summary.cells.len()
+                || entry
+                    .summary
+                    .cells
+                    .iter()
+                    .any(|cell| cell.key.backend != entry.backend)
+            {
+                return Err(ArtifactError::new(
+                    "combined backend verification or summary identity mismatch",
+                ));
+            }
+            require_digest(&entry.artifact_sha256, "artifact_sha256")?;
+            entry.environment.validate(entry.verification.mode)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn combine_verified_runs(
+    inputs: &[(Backend, PathBuf)],
+    output: &Path,
+) -> ArtifactResult<CombinedReport> {
+    if inputs.len() != 3 {
+        return Err(ArtifactError::new(
+            "combined report requires exactly three backend runs",
+        ));
+    }
+    if output.exists() {
+        return Err(ArtifactError::new(format!(
+            "combined output already exists: {}",
+            output.display()
+        )));
+    }
+    let mut requested = BTreeSet::new();
+    for (backend, _) in inputs {
+        if !requested.insert(*backend) {
+            return Err(ArtifactError::new(format!(
+                "duplicate backend run: {backend}"
+            )));
+        }
+    }
+    if requested != BTreeSet::from([Backend::Rocksdb, Backend::Postgresql, Backend::Neo4j]) {
+        return Err(ArtifactError::new(
+            "combined report is missing a required backend run",
+        ));
+    }
+
+    let verification_root = create_private_temp_directory("paper-combine-verify")?;
+    let result = (|| -> ArtifactResult<CombinedReport> {
+        let mut backends = Vec::with_capacity(inputs.len());
+        let mut reference_manifest = None;
+        for (index, (expected_backend, artifact)) in inputs.iter().enumerate() {
+            let regenerate_dir = verification_root.join(format!("regenerated-{index}"));
+            let verification = verify_artifact(artifact, &regenerate_dir)?;
+            let manifest: ArtifactManifest = read_json(&artifact.join("manifest.json"))?;
+            if manifest.selected_backend != *expected_backend {
+                return Err(ArtifactError::new(format!(
+                    "artifact selected_backend is {}, expected {expected_backend}",
+                    manifest.selected_backend
+                )));
+            }
+            if let Some(reference) = &reference_manifest {
+                require_comparable_manifests(reference, &manifest)?;
+            } else {
+                reference_manifest = Some(manifest.clone());
+            }
+            let summary: ArtifactSummary = read_json(&artifact.join("summary/summary.json"))?;
+            let canonical_artifact = fs::canonicalize(artifact)?;
+            backends.push(CombinedBackendRun {
+                backend: *expected_backend,
+                artifact: canonical_artifact,
+                artifact_sha256: crate::sha256::sha256_file(&artifact.join("SHA256SUMS"))?,
+                environment: manifest.environment,
+                verification: CombinedVerification {
+                    valid: true,
+                    run_id: verification.run_id,
+                    mode: verification.mode,
+                    raw_observations: verification.raw_observations,
+                    summary_cells: verification.summary_cells,
+                },
+                summary,
+            });
+        }
+        backends.sort_by_key(|entry| entry.backend);
+        let report = CombinedReport {
+            schema_version: SCHEMA_VERSION,
+            backends,
+        };
+        report.validate()?;
+        publish_combined_report(&report, output)?;
+        Ok(report)
+    })();
+    let _ = fs::remove_dir_all(&verification_root);
+    result
+}
+
+fn publish_combined_report(report: &CombinedReport, output: &Path) -> ArtifactResult<()> {
+    let mut parent = output
+        .parent()
+        .ok_or_else(|| ArtifactError::new("combined output has no parent directory"))?;
+    if parent.as_os_str().is_empty() {
+        parent = Path::new(".");
+    }
+    fs::create_dir_all(parent)?;
+    let staging = create_private_directory_in(parent, "paper-combine-output")?;
+    let result = (|| -> ArtifactResult<()> {
+        publish_json(&staging.join("combined-report.json"), report)?;
+        publish_new(
+            &staging.join("combined-summary.csv"),
+            combined_summary_csv(report).as_bytes(),
+        )?;
+        write_checksums(&staging)?;
+        if output.exists() {
+            return Err(ArtifactError::new(format!(
+                "combined output already exists: {}",
+                output.display()
+            )));
+        }
+        fs::rename(&staging, output)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn require_comparable_manifests(
+    reference: &ArtifactManifest,
+    candidate: &ArtifactManifest,
+) -> ArtifactResult<()> {
+    let mut reference_matrix = reference.matrix.clone();
+    let mut candidate_matrix = candidate.matrix.clone();
+    for suite in &mut reference_matrix.suites {
+        suite.backends.clear();
+    }
+    for suite in &mut candidate_matrix.suites {
+        suite.backends.clear();
+    }
+    if reference.run.mode != candidate.run.mode
+        || reference.run.revision != candidate.run.revision
+        || reference.run.dirty_worktree_digest != candidate.run.dirty_worktree_digest
+        || reference.run.dataset_digest != candidate.run.dataset_digest
+        || reference.run.workload_digest != candidate.run.workload_digest
+        || reference.run.warmup_seconds != candidate.run.warmup_seconds
+        || reference.run.measurement_seconds != candidate.run.measurement_seconds
+        || reference.run.repetitions != candidate.run.repetitions
+        || reference.dataset != candidate.dataset
+        || reference.workloads != candidate.workloads
+        || reference_matrix != candidate_matrix
+        || reference.shuffle_seed != candidate.shuffle_seed
+        || reference.simulator != candidate.simulator
+    {
+        return Err(ArtifactError::new(
+            "verified backend runs are not comparable experiments",
+        ));
+    }
+    Ok(())
+}
+
+fn combined_summary_csv(report: &CombinedReport) -> String {
+    let mut output = String::new();
+    for (index, entry) in report.backends.iter().enumerate() {
+        let csv = summary_csv(&entry.summary);
+        let mut lines = csv.lines();
+        if index == 0 {
+            output.push_str("backend_run,");
+            output.push_str(lines.next().unwrap_or_default());
+            output.push('\n');
+        } else {
+            let _ = lines.next();
+        }
+        for line in lines {
+            output.push_str(&csv_escape(&entry.summary.run_id));
+            output.push(',');
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn create_private_temp_directory(label: &str) -> ArtifactResult<PathBuf> {
+    create_private_directory_in(&std::env::temp_dir(), label)
+}
+
+fn create_private_directory_in(parent: &Path, label: &str) -> ArtifactResult<PathBuf> {
+    for _ in 0..100 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".{label}-{}-{sequence}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ArtifactError::new(format!(
+        "cannot allocate private {label} directory"
+    )))
+}
+
 pub fn run_experiment(
     spec: ExperimentSpec,
     output_root: &Path,

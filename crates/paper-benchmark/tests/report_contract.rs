@@ -1,15 +1,20 @@
 use paper_benchmark::{
     AblationConfig, AblationCounters, AblationEvidence, AdapterDirectRunner, AdapterPrimitive,
     AdapterSnapshotRequest, Backend, BackendDirectRunner, BackendNativeRequest, BenchmarkRequest,
-    DatasetManifest, ExperimentPath, HostResourceEvidence, PathError, PathExecution,
-    ProcessTopologyEvidence, ProxyLoadgenReport, ProxyLoadgenRequest, ProxyRunner, RawObservation,
-    ResourceMetric, ResourceScope, ResultIdentity, RunManifest, RunMode, SCHEMA_VERSION,
-    TopologyDeploymentMode, TopologyEvidence, WorkloadManifest, ablation_config_for_label,
-    summarize_formal_repetitions, summarize_repetitions, summarize_samples,
+    CombinedReport, DatasetManifest, EnvironmentFingerprint, ExperimentMatrix, ExperimentPath,
+    ExperimentProtocol, ExperimentSpec, ExperimentSuite, ExperimentSuiteKind, HostResourceEvidence,
+    PathError, PathExecution, ProcessTopologyEvidence, ProxyLoadgenReport, ProxyLoadgenRequest,
+    ProxyRunner, RawObservation, ResourceMetric, ResourceScope, ResultIdentity, RunManifest,
+    RunMode, SCHEMA_VERSION, TopologyDeploymentMode, TopologyEvidence, WorkloadCase,
+    WorkloadManifest, ablation_config_for_label, combine_verified_runs, run_experiment,
+    sha256_file, summarize_formal_repetitions, summarize_repetitions, summarize_samples,
     validate_comparable_identities, validate_report_contract,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use storage_api::{AdapterFuture, KeySpan, KeyValue, LogicalKey, ReadSnapshot};
 
 fn valid_observation_value(path: &str) -> Value {
@@ -294,6 +299,249 @@ fn valid_workload_manifest() -> WorkloadManifest {
     };
     workload.digest = workload.computed_digest().expect("workload digest");
     workload
+}
+
+fn isolated_artifact_fixture(
+    root: &Path,
+    backend: Backend,
+    run_id: &str,
+    environment_marker: &str,
+) -> PathBuf {
+    isolated_artifact_fixture_with_dataset(root, backend, run_id, environment_marker, digest('1'))
+}
+
+fn isolated_artifact_fixture_with_dataset(
+    root: &Path,
+    backend: Backend,
+    run_id: &str,
+    environment_marker: &str,
+    dataset_digest: String,
+) -> PathBuf {
+    let mut environment = EnvironmentFingerprint::synthetic();
+    environment.os_name = environment_marker.into();
+    environment.digest = environment.computed_digest().unwrap();
+    let workload = valid_workload_manifest();
+    let dataset = DatasetManifest {
+        schema_version: SCHEMA_VERSION,
+        dataset_id: "tiny-combine-fixture".into(),
+        seed: 42,
+        vertex_count: 100,
+        edge_count: 500,
+        temporal_update_count: 60,
+        content_digest: dataset_digest,
+    };
+    let paths = vec![
+        ExperimentPath::BackendDirect,
+        ExperimentPath::AdapterDirect,
+        ExperimentPath::Proxy,
+    ];
+    let spec = ExperimentSpec {
+        schema_version: SCHEMA_VERSION,
+        run_id: run_id.into(),
+        selected_backend: backend,
+        revision: "combine-fixture".into(),
+        dirty_worktree_digest: digest('3'),
+        environment,
+        dataset,
+        workloads: vec![WorkloadCase {
+            manifest: workload,
+            snapshot: "as_of:100".into(),
+        }],
+        matrix: ExperimentMatrix {
+            suites: vec![ExperimentSuite {
+                kind: ExperimentSuiteKind::Comparison,
+                backends: vec![backend],
+                paths,
+                workloads: vec!["point_lookup".into()],
+                data_nodes: vec![1],
+                concurrencies: vec![1],
+                ablations: vec!["production".into()],
+                workload_ablations: BTreeMap::new(),
+            }],
+        },
+        protocol: ExperimentProtocol {
+            warmup_seconds: 1,
+            measurement_seconds: 1,
+            repetitions: 1,
+        },
+        shuffle_seed: 42,
+    };
+    run_experiment(spec, root, true, None).unwrap()
+}
+
+#[test]
+fn combined_report_rejects_verified_runs_with_different_experiment_identities() {
+    let scratch = tempfile::tempdir().unwrap();
+    let runs = scratch.path().join("runs");
+    let rocksdb = isolated_artifact_fixture(&runs, Backend::Rocksdb, "run-rocksdb", "env-rocksdb");
+    let postgresql = isolated_artifact_fixture_with_dataset(
+        &runs,
+        Backend::Postgresql,
+        "run-postgresql",
+        "env-postgresql",
+        digest('9'),
+    );
+    let neo4j = isolated_artifact_fixture(&runs, Backend::Neo4j, "run-neo4j", "env-neo4j");
+    let output = scratch.path().join("combined");
+
+    let error = combine_verified_runs(
+        &[
+            (Backend::Rocksdb, rocksdb),
+            (Backend::Postgresql, postgresql),
+            (Backend::Neo4j, neo4j),
+        ],
+        &output,
+    )
+    .expect_err("different dataset identities must not be combined");
+    assert!(error.to_string().contains("not comparable"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn verified_backend_runs_combine_in_fixed_order_without_cross_backend_averaging() {
+    let scratch = tempfile::tempdir().unwrap();
+    let runs = scratch.path().join("runs");
+    let rocksdb = isolated_artifact_fixture(&runs, Backend::Rocksdb, "run-rocksdb", "env-rocksdb");
+    let postgresql = isolated_artifact_fixture(
+        &runs,
+        Backend::Postgresql,
+        "run-postgresql",
+        "env-postgresql",
+    );
+    let neo4j = isolated_artifact_fixture(&runs, Backend::Neo4j, "run-neo4j", "env-neo4j");
+    let output = scratch.path().join("combined");
+
+    let report = combine_verified_runs(
+        &[
+            (Backend::Neo4j, neo4j.clone()),
+            (Backend::Rocksdb, rocksdb.clone()),
+            (Backend::Postgresql, postgresql.clone()),
+        ],
+        &output,
+    )
+    .unwrap();
+
+    assert_eq!(report.schema_version, SCHEMA_VERSION);
+    assert_eq!(report.backends.len(), 3);
+    assert_eq!(report.backends[0].backend, Backend::Rocksdb);
+    assert_eq!(report.backends[1].backend, Backend::Postgresql);
+    assert_eq!(report.backends[2].backend, Backend::Neo4j);
+    assert!(report.backends.iter().all(|entry| entry.verification.valid));
+    assert_eq!(report.backends[0].environment.os_name, "env-rocksdb");
+    assert_eq!(report.backends[1].environment.os_name, "env-postgresql");
+    assert_eq!(report.backends[2].environment.os_name, "env-neo4j");
+    for (entry, artifact) in report.backends.iter().zip([&rocksdb, &postgresql, &neo4j]) {
+        assert_eq!(
+            entry.artifact_sha256,
+            sha256_file(&artifact.join("SHA256SUMS")).unwrap()
+        );
+        assert_eq!(entry.summary.cells.len(), 3);
+    }
+
+    let persisted: CombinedReport =
+        serde_json::from_slice(&fs::read(output.join("combined-report.json")).unwrap()).unwrap();
+    assert_eq!(persisted, report);
+    let csv = fs::read_to_string(output.join("combined-summary.csv")).unwrap();
+    let lines = csv.lines().collect::<Vec<_>>();
+    assert!(lines[0].starts_with("backend_run,backend,path,"));
+    assert_eq!(lines.len(), 1 + 3 + 3 + 3);
+    assert!(
+        lines[1..4]
+            .iter()
+            .all(|line| line.starts_with("run-rocksdb,"))
+    );
+    assert!(
+        lines[4..7]
+            .iter()
+            .all(|line| line.starts_with("run-postgresql,"))
+    );
+    assert!(lines[7..].iter().all(|line| line.starts_with("run-neo4j,")));
+}
+
+#[test]
+fn combined_report_rejects_duplicate_or_missing_backend_runs_without_output() {
+    let scratch = tempfile::tempdir().unwrap();
+    let runs = scratch.path().join("runs");
+    let rocksdb = isolated_artifact_fixture(&runs, Backend::Rocksdb, "run-rocksdb", "env-rocksdb");
+    let neo4j = isolated_artifact_fixture(&runs, Backend::Neo4j, "run-neo4j", "env-neo4j");
+
+    let duplicate_output = scratch.path().join("duplicate-output");
+    let duplicate = combine_verified_runs(
+        &[
+            (Backend::Rocksdb, rocksdb.clone()),
+            (Backend::Rocksdb, rocksdb.clone()),
+            (Backend::Neo4j, neo4j.clone()),
+        ],
+        &duplicate_output,
+    )
+    .expect_err("duplicate backend must be rejected");
+    assert!(duplicate.to_string().contains("duplicate backend"));
+    assert!(!duplicate_output.exists());
+
+    let missing_output = scratch.path().join("missing-output");
+    let missing = combine_verified_runs(
+        &[(Backend::Rocksdb, rocksdb), (Backend::Neo4j, neo4j)],
+        &missing_output,
+    )
+    .expect_err("missing backend must be rejected");
+    assert!(missing.to_string().contains("exactly three"));
+    assert!(!missing_output.exists());
+}
+
+#[test]
+fn combine_command_binds_named_backend_inputs_and_writes_the_combined_package() {
+    let scratch = tempfile::tempdir().unwrap();
+    let runs = scratch.path().join("runs");
+    let rocksdb = isolated_artifact_fixture(&runs, Backend::Rocksdb, "run-rocksdb", "env-rocksdb");
+    let postgresql = isolated_artifact_fixture(
+        &runs,
+        Backend::Postgresql,
+        "run-postgresql",
+        "env-postgresql",
+    );
+    let neo4j = isolated_artifact_fixture(&runs, Backend::Neo4j, "run-neo4j", "env-neo4j");
+    let output = scratch.path().join("combined");
+    let binary = env!("CARGO_BIN_EXE_dtgproxy-paper-benchmark");
+
+    let completed = Command::new(binary)
+        .args(["combine", "--rocksdb"])
+        .arg(&rocksdb)
+        .arg("--postgresql")
+        .arg(&postgresql)
+        .arg("--neo4j")
+        .arg(&neo4j)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert!(output.join("combined-report.json").is_file());
+    assert!(output.join("combined-summary.csv").is_file());
+    assert!(output.join("SHA256SUMS").is_file());
+
+    let mismatch_output = scratch.path().join("mismatch");
+    let mismatch = Command::new(binary)
+        .args(["combine", "--rocksdb"])
+        .arg(&postgresql)
+        .arg("--postgresql")
+        .arg(&rocksdb)
+        .arg("--neo4j")
+        .arg(&neo4j)
+        .arg("--output")
+        .arg(&mismatch_output)
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch.stderr).contains("selected_backend"),
+        "{}",
+        String::from_utf8_lossy(&mismatch.stderr)
+    );
+    assert!(!mismatch_output.exists());
 }
 
 fn valid_run_manifest(dataset: &DatasetManifest, workload: &WorkloadManifest) -> RunManifest {

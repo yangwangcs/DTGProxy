@@ -1,7 +1,8 @@
 use paper_benchmark::{
     Backend, DatasetManifest, EnvironmentFingerprint, ExperimentMatrix, ExperimentPath,
     ExperimentProtocol, ExperimentSpec, ExperimentSuite, ExperimentSuiteKind, RunMode,
-    SCHEMA_VERSION, WorkloadCase, WorkloadManifest, run_experiment, verify_artifact,
+    SCHEMA_VERSION, WorkloadCase, WorkloadManifest, combine_verified_runs, run_experiment,
+    verify_artifact,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +15,7 @@ const USAGE: &str = r#"Usage:
   dtgproxy-paper-benchmark validate-spec --spec FILE --executor PROGRAM
   dtgproxy-paper-benchmark run --spec FILE --output-root DIR --executor PROGRAM
   dtgproxy-paper-benchmark verify --artifact DIR --regenerate-dir DIR
+  dtgproxy-paper-benchmark combine --rocksdb DIR --postgresql DIR --neo4j DIR --output DIR
 
 simulate options:
   --concurrencies LIST       Comma-separated positive integers (default: 1,2)
@@ -49,6 +51,7 @@ fn execute() -> Result<(), String> {
         "validate-spec" => validate_spec(options),
         "run" => run(options),
         "verify" => verify(options),
+        "combine" => combine(options),
         _ => Err(format!("unknown command: {command}\n\n{USAGE}")),
     }
 }
@@ -201,6 +204,29 @@ fn verify(mut options: BTreeMap<String, String>) -> Result<(), String> {
         report.raw_observations,
         report.summary_cells,
         report.regenerated_directory.display()
+    );
+    Ok(())
+}
+
+fn combine(mut options: BTreeMap<String, String>) -> Result<(), String> {
+    let rocksdb = required_path(&mut options, "--rocksdb")?;
+    let postgresql = required_path(&mut options, "--postgresql")?;
+    let neo4j = required_path(&mut options, "--neo4j")?;
+    let output = required_path(&mut options, "--output")?;
+    reject_unknown(options)?;
+    let report = combine_verified_runs(
+        &[
+            (Backend::Rocksdb, rocksdb),
+            (Backend::Postgresql, postgresql),
+            (Backend::Neo4j, neo4j),
+        ],
+        &output,
+    )
+    .map_err(|error| error.to_string())?;
+    println!(
+        "combined verified backends={} output={}",
+        report.backends.len(),
+        output.display()
     );
     Ok(())
 }

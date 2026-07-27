@@ -119,6 +119,43 @@ def live_process(pid, executable, label):
     except Exception as error:
         reject(f"failed to verify {label} PID executable: {error}")
 
+def local_boot_identity():
+    try:
+        if sys.platform == "linux":
+            value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        elif sys.platform == "darwin":
+            value = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True).strip()
+        else:
+            reject(f"local boot identity is unsupported on {sys.platform}")
+    except SystemExit:
+        raise
+    except Exception as error:
+        reject(f"failed to capture local boot identity: {error}")
+    if not value:
+        reject("local boot identity is empty")
+    return value
+
+def local_process_start_identity(pid):
+    try:
+        if sys.platform == "linux":
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            closing = stat_line.rfind(")")
+            fields = stat_line[closing + 2:].split()
+            value = f"linux-start-ticks:{fields[19]}"
+        elif sys.platform == "darwin":
+            value = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "lstart="], text=True
+            ).strip()
+        else:
+            reject(f"local process start identity is unsupported on {sys.platform}")
+    except SystemExit:
+        raise
+    except Exception as error:
+        reject(f"failed to capture local process start identity: {error}")
+    if not value:
+        reject(f"local process start identity is empty for PID {pid}")
+    return value
+
 def positive_integer(value):
     return type(value) is int and value > 0
 
@@ -406,6 +443,7 @@ if actual_targets != expected_targets or len(targets) != len(expected_targets):
 gateway_to_socket = {}
 socket_to_gateway = {}
 remote_evidence_targets = []
+managed_gateways = {}
 for target in targets:
     nodes = target["data_nodes"]
     processes = target.get("data_node_processes", [])
@@ -435,6 +473,23 @@ for target in targets:
     if Path(gateway_process.get("executable", "")) != gateway_path:
         reject("runtime Gateway executable does not match --gateway-bin")
     live_process(gateway_pid, gateway_path, "Gateway")
+    gateway_identity = {
+        "host_id": socket.gethostname(),
+        "boot_id": local_boot_identity(),
+        "process_start_id": local_process_start_identity(gateway_pid),
+        "pid": gateway_pid,
+    }
+    existing_gateway = managed_gateways.get(gateway_pid)
+    if existing_gateway is not None and existing_gateway["identity"] != gateway_identity:
+        reject("Gateway PID identity changed during preparation")
+    managed_gateways[gateway_pid] = {
+        "backend": selected_backend,
+        "role": "gateway",
+        "identity": gateway_identity,
+        "executable": str(gateway_path),
+        "executable_sha256": digest_file(gateway_path),
+        "probe": {"kind": "local"},
+    }
 
     host_ids = [item.get("probe", {}).get("host_id") for item in processes]
     if len(set(host_ids)) != nodes:
@@ -574,6 +629,63 @@ shutil.copyfile(gateway_evidence_path, output_path / "gateway-build-evidence.jso
         "schema_version": 1,
         "source": "remote_formal_preparation",
         "targets": remote_evidence_targets,
+    }, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+managed_processes = list(managed_gateways.values())
+seen_remote_identities = set()
+for target in remote_evidence_targets:
+    for process in target["processes"]:
+        claimed = process["claimed"]
+        snapshot = process["snapshot"]
+        probe = claimed["probe"]
+        identity_key = (
+            probe["ssh_target"], snapshot["pid"], snapshot["host_id"],
+            snapshot["boot_id"], snapshot["process_start_id"],
+        )
+        if identity_key in seen_remote_identities:
+            continue
+        seen_remote_identities.add(identity_key)
+        managed_processes.append({
+            "backend": selected_backend,
+            "role": "data_node",
+            "identity": {
+                "host_id": snapshot["host_id"],
+                "boot_id": snapshot["boot_id"],
+                "process_start_id": snapshot["process_start_id"],
+                "pid": snapshot["pid"],
+            },
+            "executable": snapshot["executable"],
+            "executable_sha256": snapshot["executable_sha256"],
+            "probe": {
+                "kind": "remote",
+                "ssh_target": probe["ssh_target"],
+                "probe_binary": probe["probe_binary"],
+                "network_interface": probe["data_interface"],
+            },
+        })
+managed_processes.sort(key=lambda item: (
+    item["role"], item["identity"]["host_id"], item["identity"]["pid"]
+))
+backend_service = (
+    {"ownership": "embedded", "managed_by": "data_node"}
+    if selected_backend == "rocksdb"
+    else {
+        "ownership": "external",
+        "managed": False,
+        "reason": "prepared runtime contains no exact backend service PID/start identity",
+    }
+)
+(output_path / "managed-process-evidence.json").write_text(
+    json.dumps({
+        "schema_version": 1,
+        "selected_backend": selected_backend,
+        "lifecycle_contract": (
+            "the sealed run command must retire every exact managed process before returning; "
+            "the sequential runner never sends process signals"
+        ),
+        "managed_processes": managed_processes,
+        "backend_service": backend_service,
     }, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
