@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-const MAGIC: &[u8; 4] = b"DTP1";
+pub(crate) const MAGIC: &[u8; 4] = b"DTP1";
 const MAX_NESTING: u8 = 64;
 
 const TAG_NULL: u8 = 0;
@@ -84,7 +84,8 @@ impl CanonicalElement {
         let mut properties = BTreeMap::new();
         for _ in 0..property_count {
             let property_id = decoder.read_u32()?;
-            let value = decoder.decode_value(0)?;
+            let value_len = encoded_value_len(decoder.remaining_bytes())?;
+            let value = decode_value(decoder.take(value_len)?)?;
             if properties.insert(property_id, value).is_some() {
                 return Err(CodecError::DuplicateProperty(property_id));
             }
@@ -137,6 +138,83 @@ impl Display for CodecError {
 }
 
 impl Error for CodecError {}
+
+pub(crate) fn encoded_value_len(encoded: &[u8]) -> Result<usize, CodecError> {
+    encoded_value_len_at_depth(encoded, 0)
+}
+
+fn encoded_value_len_at_depth(encoded: &[u8], depth: u8) -> Result<usize, CodecError> {
+    if depth > MAX_NESTING {
+        return Err(CodecError::NestingLimitExceeded);
+    }
+
+    let tag = *encoded.first().ok_or(CodecError::UnexpectedEnd)?;
+    match tag {
+        TAG_NULL | TAG_FALSE | TAG_TRUE => Ok(1),
+        TAG_INTEGER | TAG_FLOAT_BITS | TAG_TIMESTAMP_MICROS => fixed_value_len(encoded, 9),
+        TAG_STRING => {
+            let value_len = read_u32_at(encoded, 1)? as usize;
+            let end = 5usize
+                .checked_add(value_len)
+                .ok_or(CodecError::UnexpectedEnd)?;
+            let value = encoded.get(5..end).ok_or(CodecError::UnexpectedEnd)?;
+            std::str::from_utf8(value).map_err(|_| CodecError::InvalidUtf8)?;
+            Ok(end)
+        }
+        TAG_BYTES => {
+            let value_len = read_u32_at(encoded, 1)? as usize;
+            let end = 5usize
+                .checked_add(value_len)
+                .ok_or(CodecError::UnexpectedEnd)?;
+            encoded.get(5..end).ok_or(CodecError::UnexpectedEnd)?;
+            Ok(end)
+        }
+        TAG_LIST => {
+            let value_count = read_u32_at(encoded, 1)? as usize;
+            let mut position = 5;
+            let remaining = encoded.get(position..).ok_or(CodecError::UnexpectedEnd)?;
+            if value_count > remaining.len() {
+                return Err(CodecError::InvalidCollectionLength);
+            }
+
+            for _ in 0..value_count {
+                let value_len = encoded_value_len_at_depth(
+                    encoded.get(position..).ok_or(CodecError::UnexpectedEnd)?,
+                    depth.saturating_add(1),
+                )?;
+                position = position
+                    .checked_add(value_len)
+                    .ok_or(CodecError::UnexpectedEnd)?;
+            }
+            Ok(position)
+        }
+        tag => Err(CodecError::UnknownTag(tag)),
+    }
+}
+
+fn fixed_value_len(encoded: &[u8], len: usize) -> Result<usize, CodecError> {
+    encoded.get(..len).ok_or(CodecError::UnexpectedEnd)?;
+    Ok(len)
+}
+
+fn read_u32_at(encoded: &[u8], offset: usize) -> Result<u32, CodecError> {
+    let end = offset.checked_add(4).ok_or(CodecError::UnexpectedEnd)?;
+    let bytes: [u8; 4] = encoded
+        .get(offset..end)
+        .ok_or(CodecError::UnexpectedEnd)?
+        .try_into()
+        .map_err(|_| CodecError::UnexpectedEnd)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+pub(crate) fn decode_value(encoded: &[u8]) -> Result<GraphValue, CodecError> {
+    let mut decoder = Decoder::new(encoded);
+    let value = decode_value_from_decoder(&mut decoder, 0)?;
+    if !decoder.is_finished() {
+        return Err(CodecError::TrailingBytes);
+    }
+    Ok(value)
+}
 
 fn write_len(output: &mut Vec<u8>, len: usize) -> Result<(), CodecError> {
     let len = u32::try_from(len).map_err(|_| CodecError::LengthOverflow)?;
@@ -204,6 +282,10 @@ impl<'a> Decoder<'a> {
         self.bytes.len().saturating_sub(self.position)
     }
 
+    fn remaining_bytes(&self) -> &'a [u8] {
+        &self.bytes[self.position..]
+    }
+
     fn ensure_minimum_remaining(
         &self,
         count: usize,
@@ -258,40 +340,43 @@ impl<'a> Decoder<'a> {
             .map_err(|_| CodecError::UnexpectedEnd)?;
         Ok(i64::from_be_bytes(bytes))
     }
+}
 
-    fn decode_value(&mut self, depth: u8) -> Result<GraphValue, CodecError> {
-        if depth > MAX_NESTING {
-            return Err(CodecError::NestingLimitExceeded);
-        }
+fn decode_value_from_decoder(
+    decoder: &mut Decoder<'_>,
+    depth: u8,
+) -> Result<GraphValue, CodecError> {
+    if depth > MAX_NESTING {
+        return Err(CodecError::NestingLimitExceeded);
+    }
 
-        match self.read_u8()? {
-            TAG_NULL => Ok(GraphValue::Null),
-            TAG_FALSE => Ok(GraphValue::Boolean(false)),
-            TAG_TRUE => Ok(GraphValue::Boolean(true)),
-            TAG_INTEGER => Ok(GraphValue::Integer(self.read_i64()?)),
-            TAG_FLOAT_BITS => Ok(GraphValue::FloatBits(self.read_u64()?)),
-            TAG_STRING => {
-                let len = self.read_u32()? as usize;
-                let value = std::str::from_utf8(self.take(len)?)
-                    .map_err(|_| CodecError::InvalidUtf8)?
-                    .to_owned();
-                Ok(GraphValue::String(value))
-            }
-            TAG_BYTES => {
-                let len = self.read_u32()? as usize;
-                Ok(GraphValue::Bytes(self.take(len)?.to_vec()))
-            }
-            TAG_TIMESTAMP_MICROS => Ok(GraphValue::TimestampMicros(self.read_i64()?)),
-            TAG_LIST => {
-                let len = self.read_u32()? as usize;
-                self.ensure_minimum_remaining(len, 1)?;
-                let mut values = Vec::with_capacity(len);
-                for _ in 0..len {
-                    values.push(self.decode_value(depth.saturating_add(1))?);
-                }
-                Ok(GraphValue::List(values))
-            }
-            tag => Err(CodecError::UnknownTag(tag)),
+    match decoder.read_u8()? {
+        TAG_NULL => Ok(GraphValue::Null),
+        TAG_FALSE => Ok(GraphValue::Boolean(false)),
+        TAG_TRUE => Ok(GraphValue::Boolean(true)),
+        TAG_INTEGER => Ok(GraphValue::Integer(decoder.read_i64()?)),
+        TAG_FLOAT_BITS => Ok(GraphValue::FloatBits(decoder.read_u64()?)),
+        TAG_STRING => {
+            let len = decoder.read_u32()? as usize;
+            let value = std::str::from_utf8(decoder.take(len)?)
+                .map_err(|_| CodecError::InvalidUtf8)?
+                .to_owned();
+            Ok(GraphValue::String(value))
         }
+        TAG_BYTES => {
+            let len = decoder.read_u32()? as usize;
+            Ok(GraphValue::Bytes(decoder.take(len)?.to_vec()))
+        }
+        TAG_TIMESTAMP_MICROS => Ok(GraphValue::TimestampMicros(decoder.read_i64()?)),
+        TAG_LIST => {
+            let len = decoder.read_u32()? as usize;
+            decoder.ensure_minimum_remaining(len, 1)?;
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(decode_value_from_decoder(decoder, depth.saturating_add(1))?);
+            }
+            Ok(GraphValue::List(values))
+        }
+        tag => Err(CodecError::UnknownTag(tag)),
     }
 }
