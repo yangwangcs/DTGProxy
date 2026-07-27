@@ -7,6 +7,7 @@ mod key;
 mod mapping_tck;
 mod overlay;
 mod record;
+mod record_ref;
 mod rewrite;
 mod store;
 mod transaction;
@@ -30,6 +31,9 @@ pub use overlay::{OverlaySavepoint, TransactionOverlay, TransactionOverlayError}
 pub use record::{
     EdgeIdentity, HistoryAnchor, HistoryDelta, HistoryEntry, ProjectionRecord, RecordCodecError,
     ValidSegment, VertexIdentity,
+};
+pub use record_ref::{
+    HistoryAnchorRef, HistoryDeltaRef, HistoryEntryRef, HistoryOperationRef, ProjectionRecordRef,
 };
 pub use store::{
     CommitContext, EdgeMutation, EdgeTemporalSegment, EdgeView, PrepareContext, TemporalStore,

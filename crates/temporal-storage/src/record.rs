@@ -6,9 +6,9 @@ use temporal_types::{CanonicalElement, CodecError, Interval, TransactionTime, Va
 use crate::{EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, LabelId, PartitionId};
 
 const IDENTITY_MAGIC: &[u8; 4] = b"DTGI";
-const PROJECTION_MAGIC: &[u8; 4] = b"DTGP";
-const ANCHOR_MAGIC: &[u8; 4] = b"DTGA";
-const DELTA_MAGIC: &[u8; 4] = b"DTGD";
+pub(crate) const PROJECTION_MAGIC: &[u8; 4] = b"DTGP";
+pub(crate) const ANCHOR_MAGIC: &[u8; 4] = b"DTGA";
+pub(crate) const DELTA_MAGIC: &[u8; 4] = b"DTGD";
 const FORMAT_VERSION: u16 = 1;
 const EDGE_IDENTITY_FORMAT_VERSION: u16 = 2;
 
@@ -250,11 +250,11 @@ impl ProjectionRecord {
         decoder.expect_magic(PROJECTION_MAGIC)?;
         decoder.expect_version()?;
         let commit_ts = decoder.read_transaction_time()?;
-        let segment_count = decoder.read_u32()? as usize;
+        let segment_count = decoder.read_length()?;
         let mut segments = Vec::with_capacity(segment_count.min(1024));
         for _ in 0..segment_count {
             let valid = decoder.read_interval()?;
-            let payload_length = decoder.read_u32()? as usize;
+            let payload_length = decoder.read_length()?;
             let payload = CanonicalElement::decode(decoder.take(payload_length)?)
                 .map_err(RecordCodecError::Canonical)?;
             segments.push(ValidSegment::new(valid, payload));
@@ -321,7 +321,7 @@ impl HistoryAnchor {
         decoder.expect_version()?;
         let commit_ts = decoder.read_transaction_time()?;
         let changed_valid = decoder.read_interval()?;
-        let projection_length = decoder.read_u32()? as usize;
+        let projection_length = decoder.read_length()?;
         let projection = ProjectionRecord::decode(decoder.take(projection_length)?)?;
         decoder.verify_checksum_and_finish()?;
         Self::new(commit_ts, changed_valid, projection)
@@ -401,7 +401,7 @@ impl HistoryDelta {
         let replacement = match decoder.read_u8()? {
             0 => None,
             1 => {
-                let length = decoder.read_u32()? as usize;
+                let length = decoder.read_length()?;
                 Some(
                     CanonicalElement::decode(decoder.take(length)?)
                         .map_err(RecordCodecError::Canonical)?,
@@ -426,13 +426,9 @@ pub enum HistoryEntry {
 
 impl HistoryEntry {
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordCodecError> {
-        let magic = bytes.get(..4).ok_or(RecordCodecError::UnexpectedEnd)?;
-        if magic == ANCHOR_MAGIC {
-            Ok(Self::Anchor(HistoryAnchor::decode(bytes)?))
-        } else if magic == DELTA_MAGIC {
-            Ok(Self::Delta(HistoryDelta::decode(bytes)?))
-        } else {
-            Err(RecordCodecError::InvalidMagic)
+        match history_record_kind(bytes)? {
+            HistoryRecordKind::Anchor => Ok(Self::Anchor(HistoryAnchor::decode(bytes)?)),
+            HistoryRecordKind::Delta => Ok(Self::Delta(HistoryDelta::decode(bytes)?)),
         }
     }
 
@@ -543,13 +539,36 @@ fn identity_header_version(kind: ElementKind, element: ElementRef, version: u16)
 
 fn validate_segments(segments: &[ValidSegment]) -> Result<(), RecordCodecError> {
     for pair in segments.windows(2) {
-        let previous = pair[0].valid;
-        let next = pair[1].valid;
-        if previous.end().is_none_or(|end| next.start() < end) {
-            return Err(RecordCodecError::OverlappingOrUnsortedSegments);
-        }
+        validate_segment_order(pair[0].valid, pair[1].valid)?;
     }
     Ok(())
+}
+
+pub(crate) fn validate_segment_order(
+    previous: Interval<ValidTime>,
+    next: Interval<ValidTime>,
+) -> Result<(), RecordCodecError> {
+    if previous.end().is_none_or(|end| next.start() < end) {
+        return Err(RecordCodecError::OverlappingOrUnsortedSegments);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HistoryRecordKind {
+    Anchor,
+    Delta,
+}
+
+pub(crate) fn history_record_kind(bytes: &[u8]) -> Result<HistoryRecordKind, RecordCodecError> {
+    let magic = bytes.get(..4).ok_or(RecordCodecError::UnexpectedEnd)?;
+    if magic == ANCHOR_MAGIC {
+        Ok(HistoryRecordKind::Anchor)
+    } else if magic == DELTA_MAGIC {
+        Ok(HistoryRecordKind::Delta)
+    } else {
+        Err(RecordCodecError::InvalidMagic)
+    }
 }
 
 fn encode_transaction_time(output: &mut Vec<u8>, value: TransactionTime) {
@@ -627,17 +646,21 @@ impl<'a> IdentityDecoder<'a> {
     }
 }
 
-struct Decoder<'a> {
+pub(crate) struct Decoder<'a> {
     input: &'a [u8],
     position: usize,
 }
 
 impl<'a> Decoder<'a> {
-    const fn new(input: &'a [u8]) -> Self {
+    pub(crate) const fn new(input: &'a [u8]) -> Self {
         Self { input, position: 0 }
     }
 
-    fn take(&mut self, length: usize) -> Result<&'a [u8], RecordCodecError> {
+    pub(crate) const fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn take(&mut self, length: usize) -> Result<&'a [u8], RecordCodecError> {
         let end = self
             .position
             .checked_add(length)
@@ -656,7 +679,7 @@ impl<'a> Decoder<'a> {
             .map_err(|_| RecordCodecError::UnexpectedEnd)
     }
 
-    fn expect_magic(&mut self, expected: &[u8; 4]) -> Result<(), RecordCodecError> {
+    pub(crate) fn expect_magic(&mut self, expected: &[u8; 4]) -> Result<(), RecordCodecError> {
         if self.take(4)? == expected {
             Ok(())
         } else {
@@ -664,7 +687,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn expect_version(&mut self) -> Result<(), RecordCodecError> {
+    pub(crate) fn expect_version(&mut self) -> Result<(), RecordCodecError> {
         let version = self.read_u16()?;
         if version == FORMAT_VERSION {
             Ok(())
@@ -673,7 +696,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn read_u8(&mut self) -> Result<u8, RecordCodecError> {
+    pub(crate) fn read_u8(&mut self) -> Result<u8, RecordCodecError> {
         Ok(self.take(1)?[0])
     }
 
@@ -683,6 +706,10 @@ impl<'a> Decoder<'a> {
 
     fn read_u32(&mut self) -> Result<u32, RecordCodecError> {
         Ok(u32::from_be_bytes(self.take_array()?))
+    }
+
+    pub(crate) fn read_length(&mut self) -> Result<usize, RecordCodecError> {
+        usize::try_from(self.read_u32()?).map_err(|_| RecordCodecError::LengthOverflow)
     }
 
     fn read_u64(&mut self) -> Result<u64, RecordCodecError> {
@@ -697,11 +724,11 @@ impl<'a> Decoder<'a> {
         Ok(u128::from_be_bytes(self.take_array()?))
     }
 
-    fn read_transaction_time(&mut self) -> Result<TransactionTime, RecordCodecError> {
+    pub(crate) fn read_transaction_time(&mut self) -> Result<TransactionTime, RecordCodecError> {
         Ok(TransactionTime::new(self.read_i64()?, self.read_u32()?))
     }
 
-    fn read_interval(&mut self) -> Result<Interval<ValidTime>, RecordCodecError> {
+    pub(crate) fn read_interval(&mut self) -> Result<Interval<ValidTime>, RecordCodecError> {
         let start = ValidTime::from_micros(self.read_i64()?);
         let end = match self.read_u8()? {
             0 => None,
@@ -711,7 +738,7 @@ impl<'a> Decoder<'a> {
         Interval::new(start, end).map_err(|_| RecordCodecError::InvalidInterval)
     }
 
-    fn verify_checksum_and_finish(&mut self) -> Result<(), RecordCodecError> {
+    pub(crate) fn verify_checksum_and_finish(&mut self) -> Result<(), RecordCodecError> {
         let checksum_position = self.position;
         let stored = self.read_u64()?;
         if self.position != self.input.len() {
