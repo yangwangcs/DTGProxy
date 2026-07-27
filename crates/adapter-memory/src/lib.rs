@@ -5,8 +5,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use storage_api::{
     AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, ApplyReceipt,
-    BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, LogicalKey,
-    MutationOperation, SnapshotCapability, StorageAdapter,
+    BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalScanPage,
+    CanonicalScanRequest, ChangeScanPage, ChangeScanRequest, CommittedMutationBatch, Durability,
+    KeySpan, KeyValue, LogicalKey, MutationOperation, PushdownGuarantee,
+    QueryPrimitiveCapabilities, ReadSnapshot, SnapshotCapability, StorageAdapter,
 };
 
 #[derive(Default)]
@@ -110,6 +112,85 @@ impl MemoryAdapter {
     }
 }
 
+struct MemoryReadSnapshot {
+    data: BTreeMap<LogicalKey, Vec<u8>>,
+    applied_log_index: u64,
+}
+
+impl ReadSnapshot for MemoryReadSnapshot {
+    fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move { Ok(keys.iter().map(|key| self.data.get(key).cloned()).collect()) })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move {
+            let start = LogicalKey::in_keyspace(span.keyspace(), span.start().to_vec());
+            let mut values = Vec::new();
+            let mut retained = 0_u64;
+            for (key, value) in self.data.range(start..) {
+                if key.keyspace() != span.keyspace() || !span.contains(key.as_bytes()) {
+                    break;
+                }
+                retained = storage_api::charge_scan_entry(span, retained, key.as_bytes(), value)?;
+                values.push(KeyValue::new(key.clone(), value.clone()));
+                if values.len() == span.limit().unwrap_or(usize::MAX) {
+                    break;
+                }
+            }
+            Ok(values)
+        })
+    }
+
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            let (entries, next_start) = bounded_page(&self.data, request.span(), request.bounds())?;
+            CanonicalScanPage::new(request, self.applied_log_index, entries, next_start)
+                .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            let (entries, next_start) = bounded_page(&self.data, request.span(), request.bounds())?;
+            CandidateScanPage::new(
+                request,
+                self.applied_log_index,
+                PushdownGuarantee::Candidate,
+                entries,
+                next_start,
+            )
+            .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move {
+            let (entries, next_start) = bounded_page(&self.data, request.span(), request.bounds())?;
+            ChangeScanPage::new(
+                request,
+                self.applied_log_index,
+                PushdownGuarantee::Candidate,
+                entries,
+                next_start,
+            )
+            .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+}
+
 impl StorageAdapter for MemoryAdapter {
     fn descriptor(&self) -> AdapterDescriptorV1 {
         AdapterDescriptorV1::new(
@@ -131,10 +212,19 @@ impl StorageAdapter for MemoryAdapter {
             snapshot: SnapshotCapability::None,
             logical_export: false,
             logical_restore: false,
-            predicate_pushdown: false,
+            predicate_pushdown: true,
             adjacency_pushdown: false,
             change_feed: false,
         }
+    }
+
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        QueryPrimitiveCapabilities::new(
+            PushdownGuarantee::Candidate,
+            PushdownGuarantee::Unsupported,
+            PushdownGuarantee::Unsupported,
+            PushdownGuarantee::Candidate,
+        )
     }
 
     fn apply_committed<'a>(
@@ -174,7 +264,148 @@ impl StorageAdapter for MemoryAdapter {
         })
     }
 
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            let state = self.lock_state()?;
+            let (entries, next_start) =
+                bounded_page(&state.data, request.span(), request.bounds())?;
+            CanonicalScanPage::new(request, state.applied_log_index, entries, next_start)
+                .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            let state = self.lock_state()?;
+            let span = request.span();
+            let bounds = request.bounds();
+            let start = LogicalKey::in_keyspace(span.keyspace(), span.start().to_vec());
+            let mut entries = Vec::new();
+            let mut retained = 0_u64;
+            let mut next_start = None;
+
+            for (key, value) in state.data.range(start..) {
+                if key.keyspace() != span.keyspace() || !span.contains(key.as_bytes()) {
+                    break;
+                }
+                if entries.len() == bounds.max_items() {
+                    next_start = Some(key.clone());
+                    break;
+                }
+
+                let entry_bytes = u64::try_from(key.as_bytes().len())
+                    .ok()
+                    .and_then(|key_bytes| {
+                        u64::try_from(value.len())
+                            .ok()
+                            .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+                    })
+                    .unwrap_or(u64::MAX);
+                let required = retained.saturating_add(entry_bytes);
+                if required > bounds.max_bytes() {
+                    if entries.is_empty() {
+                        return Err(AdapterError::ScanByteLimit {
+                            limit: bounds.max_bytes(),
+                            required,
+                        });
+                    }
+                    next_start = Some(key.clone());
+                    break;
+                }
+
+                retained = required;
+                entries.push(KeyValue::new(key.clone(), value.clone()));
+            }
+
+            CandidateScanPage::new(
+                request,
+                state.applied_log_index,
+                PushdownGuarantee::Candidate,
+                entries,
+                next_start,
+            )
+            .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move {
+            let state = self.lock_state()?;
+            let (entries, next_start) =
+                bounded_page(&state.data, request.span(), request.bounds())?;
+            ChangeScanPage::new(
+                request,
+                state.applied_log_index,
+                PushdownGuarantee::Candidate,
+                entries,
+                next_start,
+            )
+            .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(async move {
+            let state = self.lock_state()?;
+            Ok(Box::new(MemoryReadSnapshot {
+                data: state.data.clone(),
+                applied_log_index: state.applied_log_index,
+            }) as Box<dyn ReadSnapshot + 'a>)
+        })
+    }
+
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         Ok(self.lock_state()?.applied_log_index)
     }
+}
+
+fn bounded_page(
+    data: &BTreeMap<LogicalKey, Vec<u8>>,
+    span: &KeySpan,
+    bounds: storage_api::QueryPageBounds,
+) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+    let start = LogicalKey::in_keyspace(span.keyspace(), span.start().to_vec());
+    let mut entries = Vec::new();
+    let mut retained = 0_u64;
+    let mut next_start = None;
+    for (key, value) in data.range(start..) {
+        if key.keyspace() != span.keyspace() || !span.contains(key.as_bytes()) {
+            break;
+        }
+        if entries.len() == bounds.max_items() {
+            next_start = Some(key.clone());
+            break;
+        }
+        let entry_bytes = u64::try_from(key.as_bytes().len())
+            .ok()
+            .and_then(|key_bytes| {
+                u64::try_from(value.len())
+                    .ok()
+                    .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+            })
+            .unwrap_or(u64::MAX);
+        let required = retained.saturating_add(entry_bytes);
+        if required > bounds.max_bytes() {
+            if entries.is_empty() {
+                return Err(AdapterError::ScanByteLimit {
+                    limit: bounds.max_bytes(),
+                    required,
+                });
+            }
+            next_start = Some(key.clone());
+            break;
+        }
+        retained = required;
+        entries.push(KeyValue::new(key.clone(), value.clone()));
+    }
+    Ok((entries, next_start))
 }

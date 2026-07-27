@@ -9,6 +9,7 @@ const IDENTITY_MAGIC: &[u8; 4] = b"DTGI";
 pub(crate) const PROJECTION_MAGIC: &[u8; 4] = b"DTGP";
 pub(crate) const ANCHOR_MAGIC: &[u8; 4] = b"DTGA";
 pub(crate) const DELTA_MAGIC: &[u8; 4] = b"DTGD";
+const EVENT_MAGIC: &[u8; 4] = b"DTGE";
 const FORMAT_VERSION: u16 = 1;
 const EDGE_IDENTITY_FORMAT_VERSION: u16 = 2;
 
@@ -424,6 +425,251 @@ pub enum HistoryEntry {
     Delta(HistoryDelta),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemporalEventOperation {
+    Put,
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TemporalEventMetadata {
+    Vertex {
+        label: LabelId,
+    },
+    Edge {
+        edge_type: EdgeTypeId,
+        source: ElementRef,
+        destination: ElementRef,
+    },
+}
+
+impl TemporalEventMetadata {
+    #[must_use]
+    pub const fn vertex(label: LabelId) -> Self {
+        Self::Vertex { label }
+    }
+
+    #[must_use]
+    pub const fn edge(edge_type: EdgeTypeId, source: ElementRef, destination: ElementRef) -> Self {
+        Self::Edge {
+            edge_type,
+            source,
+            destination,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalTemporalEvent {
+    element: ElementRef,
+    operation: TemporalEventOperation,
+    valid: Interval<ValidTime>,
+    commit_ts: TransactionTime,
+    ordinal: u32,
+    payload: Option<CanonicalElement>,
+    metadata: Option<TemporalEventMetadata>,
+}
+
+impl CanonicalTemporalEvent {
+    pub fn new(
+        element: ElementRef,
+        operation: TemporalEventOperation,
+        valid: Interval<ValidTime>,
+        commit_ts: TransactionTime,
+        ordinal: u32,
+        payload: Option<CanonicalElement>,
+    ) -> Result<Self, RecordCodecError> {
+        match (operation, payload.is_some()) {
+            (TemporalEventOperation::Put, true) | (TemporalEventOperation::Delete, false) => {}
+            _ => return Err(RecordCodecError::InvalidEventPayload),
+        }
+        Ok(Self {
+            element,
+            operation,
+            valid,
+            commit_ts,
+            ordinal,
+            payload,
+            metadata: None,
+        })
+    }
+
+    pub fn put(
+        element: ElementRef,
+        valid: Interval<ValidTime>,
+        commit_ts: TransactionTime,
+        ordinal: u32,
+        payload: CanonicalElement,
+    ) -> Result<Self, RecordCodecError> {
+        Self::new(
+            element,
+            TemporalEventOperation::Put,
+            valid,
+            commit_ts,
+            ordinal,
+            Some(payload),
+        )
+    }
+
+    pub fn put_with_metadata(
+        element: ElementRef,
+        valid: Interval<ValidTime>,
+        commit_ts: TransactionTime,
+        ordinal: u32,
+        payload: CanonicalElement,
+        metadata: TemporalEventMetadata,
+    ) -> Result<Self, RecordCodecError> {
+        let mut event = Self::put(element, valid, commit_ts, ordinal, payload)?;
+        event.set_metadata(metadata)?;
+        Ok(event)
+    }
+
+    pub fn delete(
+        element: ElementRef,
+        valid: Interval<ValidTime>,
+        commit_ts: TransactionTime,
+        ordinal: u32,
+    ) -> Result<Self, RecordCodecError> {
+        Self::new(
+            element,
+            TemporalEventOperation::Delete,
+            valid,
+            commit_ts,
+            ordinal,
+            None,
+        )
+    }
+
+    pub fn delete_with_metadata(
+        element: ElementRef,
+        valid: Interval<ValidTime>,
+        commit_ts: TransactionTime,
+        ordinal: u32,
+        metadata: TemporalEventMetadata,
+    ) -> Result<Self, RecordCodecError> {
+        let mut event = Self::delete(element, valid, commit_ts, ordinal)?;
+        event.set_metadata(metadata)?;
+        Ok(event)
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        metadata: TemporalEventMetadata,
+    ) -> Result<(), RecordCodecError> {
+        validate_event_metadata(self.element, &metadata)?;
+        self.metadata = Some(metadata);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn element(&self) -> ElementRef {
+        self.element
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> TemporalEventOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub const fn valid(&self) -> Interval<ValidTime> {
+        self.valid
+    }
+
+    #[must_use]
+    pub const fn commit_ts(&self) -> TransactionTime {
+        self.commit_ts
+    }
+
+    #[must_use]
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> Option<&CanonicalElement> {
+        self.payload.as_ref()
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> Option<&TemporalEventMetadata> {
+        self.metadata.as_ref()
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, RecordCodecError> {
+        let mut output = Vec::new();
+        output.extend_from_slice(EVENT_MAGIC);
+        output.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+        output.push(self.element.kind() as u8);
+        output.extend_from_slice(&self.element.graph().value().to_be_bytes());
+        output.extend_from_slice(&self.element.partition().value().to_be_bytes());
+        output.extend_from_slice(&self.element.id().value().to_be_bytes());
+        encode_interval(&mut output, self.valid);
+        encode_transaction_time(&mut output, self.commit_ts);
+        output.extend_from_slice(&self.ordinal.to_be_bytes());
+        output.push(match self.operation {
+            TemporalEventOperation::Put => 1,
+            TemporalEventOperation::Delete => 2,
+        });
+        encode_event_metadata(&mut output, self.metadata.as_ref());
+        if let Some(payload) = &self.payload {
+            let payload = payload.encode().map_err(RecordCodecError::Canonical)?;
+            write_len(&mut output, payload.len())?;
+            output.extend_from_slice(&payload);
+        }
+        append_checksum(&mut output);
+        Ok(output)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, RecordCodecError> {
+        let mut decoder = Decoder::new(bytes);
+        decoder.expect_magic(EVENT_MAGIC)?;
+        decoder.expect_version()?;
+        let kind = match decoder.read_u8()? {
+            1 => ElementKind::Vertex,
+            2 => ElementKind::Edge,
+            _ => return Err(RecordCodecError::WrongElementKind),
+        };
+        let element = match kind {
+            ElementKind::Vertex => ElementRef::vertex(
+                GraphId::new(decoder.read_u64()?),
+                PartitionId::new(decoder.read_u32()?),
+                ElementId::new(decoder.read_u128()?),
+            ),
+            ElementKind::Edge => ElementRef::edge(
+                GraphId::new(decoder.read_u64()?),
+                PartitionId::new(decoder.read_u32()?),
+                ElementId::new(decoder.read_u128()?),
+            ),
+        };
+        let valid = decoder.read_interval()?;
+        let commit_ts = decoder.read_transaction_time()?;
+        let ordinal = decoder.read_u32()?;
+        let operation = match decoder.read_u8()? {
+            1 => TemporalEventOperation::Put,
+            2 => TemporalEventOperation::Delete,
+            _ => return Err(RecordCodecError::InvalidEventOperation),
+        };
+        let metadata = decode_event_metadata(&mut decoder)?;
+        let payload = match operation {
+            TemporalEventOperation::Put => {
+                let length = decoder.read_u32()? as usize;
+                Some(
+                    CanonicalElement::decode(decoder.take(length)?)
+                        .map_err(RecordCodecError::Canonical)?,
+                )
+            }
+            TemporalEventOperation::Delete => None,
+        };
+        decoder.verify_checksum_and_finish()?;
+        let mut event = Self::new(element, operation, valid, commit_ts, ordinal, payload)?;
+        if let Some(metadata) = metadata {
+            event.set_metadata(metadata)?;
+        }
+        Ok(event)
+    }
+}
+
 impl HistoryEntry {
     pub fn decode(bytes: &[u8]) -> Result<Self, RecordCodecError> {
         match history_record_kind(bytes)? {
@@ -471,6 +717,87 @@ impl HistoryEntry {
     }
 }
 
+fn validate_event_metadata(
+    element: ElementRef,
+    metadata: &TemporalEventMetadata,
+) -> Result<(), RecordCodecError> {
+    match metadata {
+        TemporalEventMetadata::Vertex { .. } if element.kind() == ElementKind::Vertex => Ok(()),
+        TemporalEventMetadata::Edge {
+            source,
+            destination,
+            ..
+        } if element.kind() == ElementKind::Edge
+            && source.kind() == ElementKind::Vertex
+            && destination.kind() == ElementKind::Vertex
+            && source.graph() == element.graph()
+            && destination.graph() == element.graph() =>
+        {
+            Ok(())
+        }
+        _ => Err(RecordCodecError::InvalidEventMetadata),
+    }
+}
+
+fn encode_event_metadata(output: &mut Vec<u8>, metadata: Option<&TemporalEventMetadata>) {
+    match metadata {
+        None => output.push(0),
+        Some(TemporalEventMetadata::Vertex { label }) => {
+            output.push(1);
+            output.extend_from_slice(&label.value().to_be_bytes());
+        }
+        Some(TemporalEventMetadata::Edge {
+            edge_type,
+            source,
+            destination,
+        }) => {
+            output.push(2);
+            output.extend_from_slice(&edge_type.value().to_be_bytes());
+            encode_event_element_ref(output, *source);
+            encode_event_element_ref(output, *destination);
+        }
+    }
+}
+
+fn encode_event_element_ref(output: &mut Vec<u8>, element: ElementRef) {
+    output.extend_from_slice(&element.graph().value().to_be_bytes());
+    output.extend_from_slice(&element.partition().value().to_be_bytes());
+    output.push(element.kind() as u8);
+    output.extend_from_slice(&element.id().value().to_be_bytes());
+}
+
+fn decode_event_metadata(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<TemporalEventMetadata>, RecordCodecError> {
+    match decoder.read_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(TemporalEventMetadata::vertex(LabelId::new(
+            decoder.read_u32()?,
+        )))),
+        2 => Ok(Some(TemporalEventMetadata::edge(
+            EdgeTypeId::new(decoder.read_u32()?),
+            decode_event_element_ref(decoder)?,
+            decode_event_element_ref(decoder)?,
+        ))),
+        _ => Err(RecordCodecError::InvalidEventMetadata),
+    }
+}
+
+fn decode_event_element_ref(decoder: &mut Decoder<'_>) -> Result<ElementRef, RecordCodecError> {
+    let graph = GraphId::new(decoder.read_u64()?);
+    let partition = PartitionId::new(decoder.read_u32()?);
+    let kind = match decoder.read_u8()? {
+        1 => ElementKind::Vertex,
+        2 => ElementKind::Edge,
+        _ => return Err(RecordCodecError::WrongElementKind),
+    };
+    let id = ElementId::new(decoder.read_u128()?);
+    Ok(match kind {
+        ElementKind::Vertex => ElementRef::vertex(graph, partition, id),
+        ElementKind::Edge => ElementRef::edge(graph, partition, id),
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordCodecError {
     InvalidMagic,
@@ -482,6 +809,9 @@ pub enum RecordCodecError {
     LengthOverflow,
     InvalidInterval,
     InvalidHistoryOperation,
+    InvalidEventOperation,
+    InvalidEventPayload,
+    InvalidEventMetadata,
     OverlappingOrUnsortedSegments,
     CommitTimestampMismatch,
     ChecksumMismatch,
@@ -508,6 +838,9 @@ impl Display for RecordCodecError {
             Self::InvalidHistoryOperation => {
                 formatter.write_str("history delta contains an invalid operation")
             }
+            Self::InvalidEventOperation => formatter.write_str("temporal event contains an invalid operation"),
+            Self::InvalidEventPayload => formatter.write_str("temporal event operation has an invalid payload"),
+            Self::InvalidEventMetadata => formatter.write_str("temporal event has invalid identity metadata"),
             Self::OverlappingOrUnsortedSegments => {
                 formatter.write_str("projection segments overlap or are not ordered")
             }

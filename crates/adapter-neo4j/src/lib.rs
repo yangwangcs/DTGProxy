@@ -17,19 +17,23 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 use serde_json::{Value, json};
 use storage_api::{
     ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
-    AdapterFuture, ApplyReceipt, BackendFamily, CanonicalRestoreSession, CommittedMutationBatch,
-    Durability, KeySpan, KeyValue, Keyspace, LogicalKey, LogicalSnapshotAccumulator,
-    LogicalSnapshotChunkV1, LogicalSnapshotError, LogicalSnapshotExportRequest,
-    LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1, LogicalSnapshotReader,
-    MappingBackedAdapter, MappingCapabilities, MappingDescriptorV1, MappingFuture,
-    MappingRequirement, MutationOperation, PreparedMappingTransaction, SnapshotCapability,
-    StorageAdapter, TemporalBackendMapping, new_logical_snapshot_id,
+    AdapterFuture, AdjacencyEntry, AdjacencyExpandPage, AdjacencyExpandRequest, ApplyReceipt,
+    BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalRestoreSession,
+    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
+    CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
+    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
+    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
+    LogicalSnapshotReader, MappingCapabilities, MappingDescriptorV1, MappingFuture,
+    MutationOperation, PreparedMappingTransaction, PropertyGatherPage, PropertyGatherRequest,
+    PropertyRow, PushdownGuarantee, QueryPageBounds, QueryPrimitiveCapabilities, ReadSnapshot,
+    SnapshotCapability, StorageAdapter, TemporalBackendMapping, new_logical_snapshot_id,
 };
 use temporal_storage::{
-    CanonicalGraphEntry, GraphKey, decode_canonical_graph_entry, decode_graph_key,
+    CanonicalGraphEntry, GraphKey, HistoryEntry, ProjectionRecord, decode_canonical_graph_entry,
+    decode_graph_key,
 };
 
-pub const NEO4J_SCHEMA_VERSION: u16 = 1;
+pub const NEO4J_SCHEMA_VERSION: u16 = 2;
 pub const NEO4J_INSTANCE_CONSTRAINT: &str = "CREATE CONSTRAINT dtgproxy_instance_v1 IF NOT EXISTS FOR (n:DTGProxyInstance) REQUIRE n.instance_id IS UNIQUE";
 pub const NEO4J_RECORD_CONSTRAINT: &str = "CREATE CONSTRAINT dtgproxy_record_v1 IF NOT EXISTS FOR (n:DTGCanonicalRecord) REQUIRE (n.instance_id, n.keyspace, n.logical_key_hex) IS UNIQUE";
 pub const NEO4J_ENDPOINT_CONSTRAINT: &str = "CREATE CONSTRAINT dtgproxy_endpoint_v1 IF NOT EXISTS FOR (n:DTGVertexEndpoint) REQUIRE (n.instance_id, n.graph_hex, n.partition_hex, n.element_hex) IS UNIQUE";
@@ -38,7 +42,7 @@ pub const NEO4J_MUTATION_CONSTRAINT: &str = "CREATE CONSTRAINT dtgproxy_mutation
 
 fn neo4j_mapping_descriptor() -> MappingDescriptorV1 {
     let mut hasher = Hasher::new();
-    hasher.update(b"DTGProxy/Neo4jNativeTemporalMapping/1");
+    hasher.update(b"DTGProxy/Neo4jNativeTemporalMapping/2");
     for statement in [
         NEO4J_INSTANCE_CONSTRAINT,
         NEO4J_RECORD_CONSTRAINT,
@@ -50,7 +54,7 @@ fn neo4j_mapping_descriptor() -> MappingDescriptorV1 {
     }
     MappingDescriptorV1::new(
         "neo4j-native-temporal",
-        "1.0.0",
+        "1.1.0",
         BackendFamily::PropertyGraph,
         *hasher.finalize().as_bytes(),
         MappingCapabilities {
@@ -65,8 +69,8 @@ fn neo4j_mapping_descriptor() -> MappingDescriptorV1 {
             canonical_export: true,
             canonical_restore: true,
             native_temporal_layout: true,
-            predicate_pushdown: false,
-            adjacency_pushdown: false,
+            predicate_pushdown: true,
+            adjacency_pushdown: true,
             change_feed: false,
         },
     )
@@ -75,6 +79,8 @@ fn neo4j_mapping_descriptor() -> MappingDescriptorV1 {
 
 pub const APPLY_CYPHER: &str = r#"
 MATCH (instance:DTGProxyInstance {instance_id: $instance_id, published: true})
+SET instance.__dtgproxy_snapshot_fence = instance.applied_index_hex
+WITH instance
 OPTIONAL MATCH (existing_log:DTGProxyAppliedLog {instance_id: $instance_id, log_index_hex: $log_index_hex})
 WITH instance, existing_log, instance.applied_index_hex AS previous_index_hex,
      (instance.applied_index_hex = $expected_index_hex AND existing_log IS NULL) AS log_can_apply
@@ -116,6 +122,9 @@ FOREACH (_ IN CASE WHEN should_apply THEN [1] ELSE [] END |
       record.kind = mutation.kind,
       record.present = mutation.present,
       record.value_base64 = mutation.value_base64,
+      record.valid_min_micros = mutation.valid_min_micros,
+      record.valid_max_micros = mutation.valid_max_micros,
+      record.property_equal_tokens = mutation.property_equal_tokens,
       record.graph_hex = mutation.graph_hex,
       record.partition_hex = mutation.partition_hex,
       record.element_hex = mutation.element_hex,
@@ -177,6 +186,8 @@ RETURN previous_index_hex, existing_log.fingerprint_hex, should_apply, conflicti
 
 const APPLY_EMPTY_CYPHER: &str = r#"
 MATCH (instance:DTGProxyInstance {instance_id: $instance_id, published: true})
+SET instance.__dtgproxy_snapshot_fence = instance.applied_index_hex
+WITH instance
 OPTIONAL MATCH (existing_log:DTGProxyAppliedLog {
   instance_id: $instance_id,
   log_index_hex: $log_index_hex
@@ -203,6 +214,9 @@ SET record:$(mutation.label),
     record.kind = mutation.kind,
     record.present = true,
     record.value_base64 = mutation.value_base64,
+    record.valid_min_micros = mutation.valid_min_micros,
+    record.valid_max_micros = mutation.valid_max_micros,
+    record.property_equal_tokens = mutation.property_equal_tokens,
     record.graph_hex = mutation.graph_hex,
     record.partition_hex = mutation.partition_hex,
     record.element_hex = mutation.element_hex,
@@ -246,6 +260,11 @@ RETURN count(record)
 
 const MULTI_GET_CYPHER: &str = "UNWIND $keys AS requested OPTIONAL MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: requested.keyspace, logical_key_hex: requested.logical_key_hex, present: true}) RETURN requested.ordinal, record.value_base64 ORDER BY requested.ordinal";
 const SCAN_CYPHER: &str = "MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= $start_hex AND ($end_hex IS NULL OR record.logical_key_hex < $end_hex) RETURN record.logical_key_hex, record.value_base64 ORDER BY record.logical_key_hex LIMIT $limit";
+const CANDIDATE_SCAN_CYPHER: &str = "MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= $start_hex AND ($end_hex IS NULL OR record.logical_key_hex < $end_hex) AND (record.valid_min_micros IS NULL OR record.valid_min_micros <= $valid_time_micros) AND (record.valid_max_micros IS NULL OR $valid_time_micros < record.valid_max_micros) AND all(constraint IN $constraints WHERE constraint.operator <> 'equal' OR record.property_equal_tokens IS NULL OR constraint.token IN record.property_equal_tokens) RETURN record.logical_key_hex, record.value_base64 ORDER BY record.logical_key_hex LIMIT $limit";
+const PROPERTY_GATHER_CYPHER: &str = "UNWIND $keys AS requested OPTIONAL MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: requested.keyspace, logical_key_hex: requested.logical_key_hex, present: true}) RETURN requested.ordinal, record.value_base64 ORDER BY requested.ordinal";
+const ADJACENCY_EXPAND_CYPHER: &str = "UNWIND $spans AS requested MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= requested.start_hex AND (requested.end_hex IS NULL OR record.logical_key_hex < requested.end_hex) RETURN requested.ordinal, record.logical_key_hex, record.value_base64 ORDER BY requested.ordinal, record.logical_key_hex LIMIT $limit";
+const CHANGE_SCAN_CYPHER: &str = "MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= $start_hex AND ($end_hex IS NULL OR record.logical_key_hex < $end_hex) RETURN record.logical_key_hex, record.value_base64 ORDER BY record.logical_key_hex LIMIT $limit";
+const BEGIN_READ_SNAPSHOT_CYPHER: &str = "MATCH (instance:DTGProxyInstance {instance_id: $instance_id, published: true}) SET instance.__dtgproxy_snapshot_fence = instance.applied_index_hex RETURN instance.applied_index_hex";
 const EXPORT_CYPHER: &str = "MATCH (instance:DTGProxyInstance {instance_id: $instance_id, published: true}) OPTIONAL MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, present: true}) RETURN instance.applied_index_hex, record.keyspace, record.logical_key_hex, record.value_base64 ORDER BY record.keyspace, record.logical_key_hex";
 const DELETE_UNPUBLISHED_NAMESPACE_CYPHER: &str = "MATCH (instance:DTGProxyInstance {instance_id: $instance_id, published: false}) OPTIONAL MATCH (n {instance_id: $instance_id}) WHERE n:DTGProxyInstance OR n:DTGCanonicalRecord OR n:DTGVertexEndpoint OR n:DTGProxyAppliedLog OR n:DTGProxyMutation DETACH DELETE n RETURN count(n)";
 const MAX_NEO4J_SCAN_BODY_BYTES: u64 = 64 * 1024 * 1024;
@@ -336,14 +355,6 @@ impl AdapterFactory for Neo4jAdapterFactory {
             let adapter =
                 Neo4jAdapter::connect(configuration, request.instance_id(), OpenMode::Serving)
                     .map_err(factory_error)?;
-            let implementation_version = env!("CARGO_PKG_VERSION");
-            let adapter = MappingBackedAdapter::with_runtime_identity(
-                "neo4j-query-api",
-                implementation_version,
-                Arc::new(adapter),
-                MappingRequirement::HotPluggableReplica,
-            )
-            .map_err(factory_error)?;
             Ok(Arc::new(adapter) as Arc<dyn StorageAdapter>)
         })
     }
@@ -530,8 +541,8 @@ impl Neo4jAdapter {
             snapshot: SnapshotCapability::LogicalExport,
             logical_export: true,
             logical_restore: true,
-            predicate_pushdown: false,
-            adjacency_pushdown: false,
+            predicate_pushdown: true,
+            adjacency_pushdown: true,
             change_feed: false,
         }
     }
@@ -809,6 +820,22 @@ impl Neo4jAdapter {
         )?;
         Ok(())
     }
+
+    fn begin_query_snapshot(&self) -> Result<Neo4jReadSnapshot<'_>, AdapterError> {
+        let (transaction, rows) = self.client.begin_transaction(
+            BEGIN_READ_SNAPSHOT_CYPHER,
+            json!({"instance_id": self.instance_id}),
+        )?;
+        let applied_log_index = parse_u64_hex(value_string(
+            rows.first().and_then(|row| row.first()),
+            "applied index",
+        )?)?;
+        Ok(Neo4jReadSnapshot {
+            transaction: Mutex::new(transaction),
+            instance_id: self.instance_id.clone(),
+            applied_log_index,
+        })
+    }
 }
 
 impl StorageAdapter for Neo4jAdapter {
@@ -825,11 +852,27 @@ impl StorageAdapter for Neo4jAdapter {
         Neo4jAdapter::capabilities(self)
     }
 
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        QueryPrimitiveCapabilities::new(
+            PushdownGuarantee::Candidate,
+            PushdownGuarantee::Candidate,
+            PushdownGuarantee::Candidate,
+            PushdownGuarantee::Candidate,
+        )
+    }
+
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        Some(neo4j_mapping_descriptor())
+    }
+
     fn apply_committed<'a>(
         &'a self,
         batch: CommittedMutationBatch,
     ) -> AdapterFuture<'a, ApplyReceipt> {
-        Box::pin(async move { self.apply(batch) })
+        Box::pin(async move {
+            self.validate_durable_batch(&batch)?;
+            self.apply(batch)
+        })
     }
 
     fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
@@ -838,6 +881,40 @@ impl StorageAdapter for Neo4jAdapter {
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
         Box::pin(async move { self.scan_values(span) })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move { self.begin_query_snapshot()?.scan_candidates_page(request) })
+    }
+
+    fn gather_properties<'a>(
+        &'a self,
+        request: &'a PropertyGatherRequest,
+    ) -> AdapterFuture<'a, PropertyGatherPage> {
+        Box::pin(async move { self.begin_query_snapshot()?.gather_properties_page(request) })
+    }
+
+    fn expand_adjacency<'a>(
+        &'a self,
+        request: &'a AdjacencyExpandRequest,
+    ) -> AdapterFuture<'a, AdjacencyExpandPage> {
+        Box::pin(async move { self.begin_query_snapshot()?.expand_adjacency_page(request) })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move { self.begin_query_snapshot()?.scan_changes_page(request) })
+    }
+
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(
+            async move { Ok(Box::new(self.begin_query_snapshot()?) as Box<dyn ReadSnapshot + 'a>) },
+        )
     }
 
     fn begin_logical_export<'a>(
@@ -1019,6 +1096,10 @@ impl TemporalBackendMapping for Neo4jAdapter {
         Box::pin(async move { self.scan_values(span) })
     }
 
+    fn begin_read_snapshot<'a>(&'a self) -> MappingFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        <Self as StorageAdapter>::begin_read_snapshot(self)
+    }
+
     fn export_canonical<'a>(
         &'a self,
         request: LogicalSnapshotExportRequest,
@@ -1093,26 +1174,23 @@ impl QueryApiClient {
     }
 
     fn execute(&self, statement: &str, parameters: Value) -> Result<Vec<Vec<Value>>, AdapterError> {
-        let response = self
-            .agent
-            .post(&self.url)
-            .set("Accept", "application/json")
-            .set("Authorization", &self.authorization)
-            .send_json(json!({"statement": statement, "parameters": parameters}));
+        let response = self.post(&self.url, None, statement, parameters);
         let response = match response {
             Ok(response) => response,
-            Err(ureq::Error::Status(_, response)) => {
-                let status = response.status();
-                let body = response.into_string().unwrap_or_default();
-                return Err(AdapterError::Backend(format!(
-                    "Neo4j Query API returned HTTP {status}: {body}"
-                )));
-            }
-            Err(ureq::Error::Transport(error)) => {
-                return Err(AdapterError::Backend(format!(
-                    "Neo4j Query API transport failed: {error}"
-                )));
-            }
+            Err(error) => match *error {
+                ureq::Error::Status(_, response) => {
+                    let status = response.status();
+                    let body = response.into_string().unwrap_or_default();
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API returned HTTP {status}: {body}"
+                    )));
+                }
+                ureq::Error::Transport(error) => {
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API transport failed: {error}"
+                    )));
+                }
+            },
         };
         let body: Value = response.into_json().map_err(|error| {
             AdapterError::Backend(format!("invalid Neo4j Query API JSON: {error}"))
@@ -1140,6 +1218,173 @@ impl QueryApiClient {
             .map(Option::unwrap_or_default)
     }
 
+    fn begin_transaction(
+        &self,
+        statement: &str,
+        parameters: Value,
+    ) -> Result<(QueryApiTransaction<'_>, Vec<Vec<Value>>), AdapterError> {
+        let url = format!("{}/tx", self.url);
+        let response = self.post(&url, None, statement, parameters);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => match *error {
+                ureq::Error::Status(_, response) => {
+                    let status = response.status();
+                    let body = response.into_string().unwrap_or_default();
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API returned HTTP {status}: {body}"
+                    )));
+                }
+                ureq::Error::Transport(error) => {
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API transport failed: {error}"
+                    )));
+                }
+            },
+        };
+        let affinity = response.header("neo4j-cluster-affinity").map(str::to_owned);
+        let body: Value = response.into_json().map_err(|error| {
+            AdapterError::Backend(format!("invalid Neo4j Query API JSON: {error}"))
+        })?;
+        let transaction_id = body
+            .pointer("/transaction/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                AdapterError::Backend(
+                    "Neo4j Query API transaction response omitted transaction ID".into(),
+                )
+            })?;
+        let transaction = QueryApiTransaction {
+            client: self,
+            url: format!("{url}/{transaction_id}"),
+            affinity,
+            open: true,
+        };
+        reject_query_errors(&body)?;
+        let rows = query_rows(&body)?;
+        Ok((transaction, rows))
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        affinity: Option<&str>,
+        statement: &str,
+        parameters: Value,
+    ) -> Result<ureq::Response, Box<ureq::Error>> {
+        let mut request = self
+            .agent
+            .post(url)
+            .set("Accept", "application/json")
+            .set("Authorization", &self.authorization);
+        if let Some(affinity) = affinity {
+            request = request.set("neo4j-cluster-affinity", affinity);
+        }
+        request
+            .send_json(json!({"statement": statement, "parameters": parameters}))
+            .map_err(Box::new)
+    }
+
+    fn execute_scan(
+        &self,
+        statement: &str,
+        parameters: Value,
+        span: &KeySpan,
+    ) -> Result<Vec<KeyValue>, AdapterError> {
+        let body_limit = neo4j_scan_body_limit(span)?;
+        let response = self.post(&self.url, None, statement, parameters);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => match *error {
+                ureq::Error::Status(_, response) => {
+                    let status = response.status();
+                    let body = bounded_error_body(response)?;
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API returned HTTP {status}: {body}"
+                    )));
+                }
+                ureq::Error::Transport(error) => {
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API transport failed: {error}"
+                    )));
+                }
+            },
+        };
+        decode_scan_body(response.into_reader(), span, body_limit)
+    }
+}
+
+struct QueryApiTransaction<'a> {
+    client: &'a QueryApiClient,
+    url: String,
+    affinity: Option<String>,
+    open: bool,
+}
+
+impl QueryApiTransaction<'_> {
+    fn execute(&self, statement: &str, parameters: Value) -> Result<Vec<Vec<Value>>, AdapterError> {
+        let response = self
+            .client
+            .post(&self.url, self.affinity.as_deref(), statement, parameters);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => match *error {
+                ureq::Error::Status(_, response) => {
+                    let status = response.status();
+                    let body = response.into_string().unwrap_or_default();
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API returned HTTP {status}: {body}"
+                    )));
+                }
+                ureq::Error::Transport(error) => {
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API transport failed: {error}"
+                    )));
+                }
+            },
+        };
+        let body: Value = response.into_json().map_err(|error| {
+            AdapterError::Backend(format!("invalid Neo4j Query API JSON: {error}"))
+        })?;
+        reject_query_errors(&body)?;
+        query_rows(&body)
+    }
+
+    fn execute_bounded(
+        &self,
+        statement: &str,
+        parameters: Value,
+        body_limit: u64,
+    ) -> Result<Vec<Vec<Value>>, AdapterError> {
+        let response = self
+            .client
+            .post(&self.url, self.affinity.as_deref(), statement, parameters);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => match *error {
+                ureq::Error::Status(_, response) => {
+                    let status = response.status();
+                    let body = bounded_error_body(response)?;
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API returned HTTP {status}: {body}"
+                    )));
+                }
+                ureq::Error::Transport(error) => {
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API transport failed: {error}"
+                    )));
+                }
+            },
+        };
+        let body = read_bounded_body(response.into_reader(), body_limit)?;
+        let body: Value = serde_json::from_slice(&body).map_err(|error| {
+            AdapterError::Backend(format!("invalid Neo4j typed query JSON: {error}"))
+        })?;
+        reject_query_errors(&body)?;
+        query_rows(&body)
+    }
+
     fn execute_scan(
         &self,
         statement: &str,
@@ -1148,28 +1393,390 @@ impl QueryApiClient {
     ) -> Result<Vec<KeyValue>, AdapterError> {
         let body_limit = neo4j_scan_body_limit(span)?;
         let response = self
-            .agent
-            .post(&self.url)
-            .set("Accept", "application/json")
-            .set("Authorization", &self.authorization)
-            .send_json(json!({"statement": statement, "parameters": parameters}));
+            .client
+            .post(&self.url, self.affinity.as_deref(), statement, parameters);
         let response = match response {
             Ok(response) => response,
-            Err(ureq::Error::Status(_, response)) => {
-                let status = response.status();
-                let body = bounded_error_body(response)?;
-                return Err(AdapterError::Backend(format!(
-                    "Neo4j Query API returned HTTP {status}: {body}"
-                )));
-            }
-            Err(ureq::Error::Transport(error)) => {
-                return Err(AdapterError::Backend(format!(
-                    "Neo4j Query API transport failed: {error}"
-                )));
-            }
+            Err(error) => match *error {
+                ureq::Error::Status(_, response) => {
+                    let status = response.status();
+                    let body = bounded_error_body(response)?;
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API returned HTTP {status}: {body}"
+                    )));
+                }
+                ureq::Error::Transport(error) => {
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API transport failed: {error}"
+                    )));
+                }
+            },
         };
         decode_scan_body(response.into_reader(), span, body_limit)
     }
+
+    fn execute_canonical_scan(
+        &self,
+        parameters: Value,
+        request: &CanonicalScanRequest,
+    ) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+        let body_limit = canonical_scan_body_limit(request);
+        let response =
+            self.client
+                .post(&self.url, self.affinity.as_deref(), SCAN_CYPHER, parameters);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => match *error {
+                ureq::Error::Status(_, response) => {
+                    let status = response.status();
+                    let body = bounded_error_body(response)?;
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API returned HTTP {status}: {body}"
+                    )));
+                }
+                ureq::Error::Transport(error) => {
+                    return Err(AdapterError::Backend(format!(
+                        "Neo4j Query API transport failed: {error}"
+                    )));
+                }
+            },
+        };
+        let body = read_bounded_body(response.into_reader(), body_limit)?;
+        let body: Value = serde_json::from_slice(&body)
+            .map_err(|error| AdapterError::Backend(format!("invalid Neo4j scan JSON: {error}")))?;
+        reject_query_errors(&body)?;
+        bounded_canonical_page(query_rows(&body)?, request)
+    }
+
+    fn rollback(&mut self) -> Result<(), AdapterError> {
+        if !self.open {
+            return Ok(());
+        }
+        let mut request = self
+            .client
+            .agent
+            .delete(&self.url)
+            .set("Accept", "application/json")
+            .set("Authorization", &self.client.authorization);
+        if let Some(affinity) = self.affinity.as_deref() {
+            request = request.set("neo4j-cluster-affinity", affinity);
+        }
+        match request.call() {
+            Ok(_) => {
+                self.open = false;
+                Ok(())
+            }
+            Err(ureq::Error::Status(_, response)) => {
+                let status = response.status();
+                let body = response.into_string().unwrap_or_default();
+                Err(AdapterError::Backend(format!(
+                    "Neo4j Query API rollback returned HTTP {status}: {body}"
+                )))
+            }
+            Err(ureq::Error::Transport(error)) => Err(AdapterError::Backend(format!(
+                "Neo4j Query API rollback transport failed: {error}"
+            ))),
+        }
+    }
+}
+
+impl Drop for QueryApiTransaction<'_> {
+    fn drop(&mut self) {
+        let _ = self.rollback();
+    }
+}
+
+struct Neo4jReadSnapshot<'a> {
+    transaction: Mutex<QueryApiTransaction<'a>>,
+    instance_id: String,
+    applied_log_index: u64,
+}
+
+impl Neo4jReadSnapshot<'_> {
+    fn scan_candidates_page(
+        &self,
+        request: &CandidateScanRequest,
+    ) -> Result<CandidateScanPage, AdapterError> {
+        let span = request.span();
+        let rows = self
+            .transaction
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?
+            .execute_bounded(
+                CANDIDATE_SCAN_CYPHER,
+                json!({
+                    "instance_id": self.instance_id,
+                    "keyspace": span.keyspace().tag(),
+                    "start_hex": hex(span.start()),
+                    "end_hex": span.end().map(hex),
+                    "valid_time_micros": request.valid_time().as_micros(),
+                    "constraints": candidate_constraint_parameters(request.constraints()),
+                    "limit": primitive_query_limit(request.bounds())?,
+                }),
+                primitive_query_body_limit(request.bounds()),
+            )?;
+        let (entries, next_start) = bounded_key_value_rows(rows, span, request.bounds(), 0, 1)?;
+        CandidateScanPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Candidate,
+            entries,
+            next_start,
+        )
+        .map_err(query_page_error)
+    }
+
+    fn scan_changes_page(
+        &self,
+        request: &ChangeScanRequest,
+    ) -> Result<ChangeScanPage, AdapterError> {
+        let span = request.span();
+        let rows = self
+            .transaction
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?
+            .execute_bounded(
+                CHANGE_SCAN_CYPHER,
+                json!({
+                    "instance_id": self.instance_id,
+                    "keyspace": span.keyspace().tag(),
+                    "start_hex": hex(span.start()),
+                    "end_hex": span.end().map(hex),
+                    "limit": primitive_query_limit(request.bounds())?,
+                }),
+                primitive_query_body_limit(request.bounds()),
+            )?;
+        let (entries, next_start) = bounded_key_value_rows(rows, span, request.bounds(), 0, 1)?;
+        ChangeScanPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Candidate,
+            entries,
+            next_start,
+        )
+        .map_err(query_page_error)
+    }
+
+    fn gather_properties_page(
+        &self,
+        request: &PropertyGatherRequest,
+    ) -> Result<PropertyGatherPage, AdapterError> {
+        let keys = request
+            .keys()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, key)| {
+                json!({
+                    "ordinal": ordinal,
+                    "keyspace": key.keyspace().tag(),
+                    "logical_key_hex": hex(key.as_bytes()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let rows = self
+            .transaction
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?
+            .execute_bounded(
+                PROPERTY_GATHER_CYPHER,
+                json!({"instance_id": self.instance_id, "keys": keys}),
+                primitive_query_body_limit(request.bounds()),
+            )?;
+        if rows.len() != request.keys().len() {
+            return Err(AdapterError::Backend(
+                "Neo4j property gather returned an unexpected row count".into(),
+            ));
+        }
+        let mut property_rows = Vec::with_capacity(rows.len());
+        for (expected_ordinal, (key, row)) in request.keys().iter().zip(rows).enumerate() {
+            let ordinal = row.first().and_then(Value::as_u64).ok_or_else(|| {
+                AdapterError::Backend("Neo4j property gather omitted an ordinal".into())
+            })?;
+            if ordinal != u64::try_from(expected_ordinal).unwrap_or(u64::MAX) {
+                return Err(AdapterError::Backend(
+                    "Neo4j property gather returned rows out of request order".into(),
+                ));
+            }
+            let raw = decode_optional_base64(row.get(1))?;
+            let values = gathered_property_values(key.keyspace(), raw.as_deref(), request)?;
+            property_rows.push(PropertyRow::new(key.clone(), values));
+        }
+        PropertyGatherPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Candidate,
+            property_rows,
+        )
+        .map_err(query_page_error)
+    }
+
+    fn expand_adjacency_page(
+        &self,
+        request: &AdjacencyExpandRequest,
+    ) -> Result<AdjacencyExpandPage, AdapterError> {
+        let spans = request
+            .spans()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, span)| {
+                json!({
+                    "ordinal": ordinal,
+                    "start_hex": hex(span.start()),
+                    "end_hex": span.end().map(hex),
+                })
+            })
+            .collect::<Vec<_>>();
+        let rows = self
+            .transaction
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?
+            .execute_bounded(
+                ADJACENCY_EXPAND_CYPHER,
+                json!({
+                    "instance_id": self.instance_id,
+                    "keyspace": request.spans()[0].keyspace().tag(),
+                    "spans": spans,
+                    "limit": primitive_query_limit(request.bounds())?,
+                }),
+                primitive_query_body_limit(request.bounds()),
+            )?;
+        let (entries, next) = bounded_adjacency_rows(rows, request)?;
+        AdjacencyExpandPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Candidate,
+            entries,
+            next,
+        )
+        .map_err(query_page_error)
+    }
+}
+
+impl ReadSnapshot for Neo4jReadSnapshot<'_> {
+    fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            if keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            let requested = keys
+                .iter()
+                .enumerate()
+                .map(|(ordinal, key)| {
+                    json!({"ordinal": ordinal, "keyspace": key.keyspace().tag(), "logical_key_hex": hex(key.as_bytes())})
+                })
+                .collect::<Vec<_>>();
+            let rows = self
+                .transaction
+                .lock()
+                .map_err(|_| AdapterError::LockPoisoned)?
+                .execute(
+                    MULTI_GET_CYPHER,
+                    json!({"instance_id": self.instance_id, "keys": requested}),
+                )?;
+            if rows.len() != keys.len() {
+                return Err(AdapterError::Backend(
+                    "Neo4j multi-get returned an unexpected row count".into(),
+                ));
+            }
+            rows.iter()
+                .map(|row| decode_optional_base64(row.get(1)))
+                .collect()
+        })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move {
+            let limit = span.limit().unwrap_or(usize::MAX.min(i64::MAX as usize));
+            self.transaction
+                .lock()
+                .map_err(|_| AdapterError::LockPoisoned)?
+                .execute_scan(
+                    SCAN_CYPHER,
+                    json!({
+                        "instance_id": self.instance_id,
+                        "keyspace": span.keyspace().tag(),
+                        "start_hex": hex(span.start()),
+                        "end_hex": span.end().map(hex),
+                        "limit": limit,
+                    }),
+                    span,
+                )
+        })
+    }
+
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            let span = request.span();
+            let limit = request.bounds().max_items().checked_add(1).ok_or_else(|| {
+                AdapterError::Backend("Neo4j canonical scan limit overflow".into())
+            })?;
+            let (entries, next_start) = self
+                .transaction
+                .lock()
+                .map_err(|_| AdapterError::LockPoisoned)?
+                .execute_canonical_scan(
+                    json!({
+                        "instance_id": self.instance_id,
+                        "keyspace": span.keyspace().tag(),
+                        "start_hex": hex(span.start()),
+                        "end_hex": span.end().map(hex),
+                        "limit": limit,
+                    }),
+                    request,
+                )?;
+            CanonicalScanPage::new(request, self.applied_log_index, entries, next_start)
+                .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move { self.scan_candidates_page(request) })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move { self.scan_changes_page(request) })
+    }
+}
+
+fn reject_query_errors(body: &Value) -> Result<(), AdapterError> {
+    if let Some(errors) = body.get("errors").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        return Err(AdapterError::Backend(format!(
+            "Neo4j Query API error: {}",
+            errors[0]
+        )));
+    }
+    Ok(())
+}
+
+fn query_rows(body: &Value) -> Result<Vec<Vec<Value>>, AdapterError> {
+    body.pointer("/data/values")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array().cloned().ok_or_else(|| {
+                        AdapterError::Backend("Neo4j result row is not an array".into())
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 fn neo4j_scan_body_limit(span: &KeySpan) -> Result<u64, AdapterError> {
@@ -1197,6 +1804,331 @@ fn bounded_error_body(response: ureq::Response) -> Result<String, AdapterError> 
         .read_to_string(&mut body)
         .map_err(|error| AdapterError::Backend(format!("Neo4j error body read failed: {error}")))?;
     Ok(body)
+}
+
+fn canonical_scan_body_limit(request: &CanonicalScanRequest) -> u64 {
+    let bounds = request.bounds();
+    let rows = u64::try_from(bounds.max_items())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    NEO4J_SCAN_ENVELOPE_BYTES
+        .saturating_add(bounds.max_bytes().saturating_mul(2))
+        .saturating_add(rows.saturating_mul(NEO4J_SCAN_ROW_OVERHEAD_BYTES))
+        .min(MAX_NEO4J_SCAN_BODY_BYTES)
+}
+
+fn primitive_query_limit(bounds: QueryPageBounds) -> Result<usize, AdapterError> {
+    bounds
+        .max_items()
+        .checked_add(1)
+        .ok_or_else(|| AdapterError::Backend("Neo4j typed query limit overflow".into()))
+}
+
+fn primitive_query_body_limit(bounds: QueryPageBounds) -> u64 {
+    let rows = u64::try_from(bounds.max_items())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    NEO4J_SCAN_ENVELOPE_BYTES
+        .saturating_add(bounds.max_bytes().saturating_mul(3))
+        .saturating_add(rows.saturating_mul(NEO4J_SCAN_ROW_OVERHEAD_BYTES))
+        .min(MAX_NEO4J_SCAN_BODY_BYTES)
+}
+
+fn candidate_constraint_parameters(constraints: &[storage_api::PropertyConstraint]) -> Vec<Value> {
+    constraints
+        .iter()
+        .map(|constraint| {
+            let operator = match constraint.operator() {
+                storage_api::ComparisonOperator::Equal => "equal",
+                storage_api::ComparisonOperator::NotEqual => "not_equal",
+                storage_api::ComparisonOperator::LessThan => "less_than",
+                storage_api::ComparisonOperator::LessThanOrEqual => "less_than_or_equal",
+                storage_api::ComparisonOperator::GreaterThan => "greater_than",
+                storage_api::ComparisonOperator::GreaterThanOrEqual => "greater_than_or_equal",
+            };
+            json!({
+                "property_id": constraint.property().value(),
+                "operator": operator,
+                "value": graph_value_parameter(constraint.value()),
+                "token": property_equal_token(constraint.property().value(), constraint.value()),
+            })
+        })
+        .collect()
+}
+
+fn graph_value_parameter(value: &temporal_types::GraphValue) -> Value {
+    match value {
+        temporal_types::GraphValue::Null => json!({"type": "null", "value": null}),
+        temporal_types::GraphValue::Boolean(value) => {
+            json!({"type": "boolean", "value": value})
+        }
+        temporal_types::GraphValue::Integer(value) => json!({"type": "integer", "value": value}),
+        temporal_types::GraphValue::FloatBits(value) => {
+            json!({"type": "float_bits", "value": u64_hex(*value)})
+        }
+        temporal_types::GraphValue::String(value) => json!({"type": "string", "value": value}),
+        temporal_types::GraphValue::Bytes(value) => {
+            json!({"type": "bytes", "value": BASE64.encode(value)})
+        }
+        temporal_types::GraphValue::TimestampMicros(value) => {
+            json!({"type": "timestamp_micros", "value": value})
+        }
+        temporal_types::GraphValue::List(values) => json!({
+            "type": "list",
+            "value": values.iter().map(graph_value_parameter).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn query_page_error(error: impl ToString) -> AdapterError {
+    AdapterError::Backend(error.to_string())
+}
+
+fn stable_projection_property(
+    projection: Option<&ProjectionRecord>,
+    property_id: u32,
+) -> Option<temporal_types::GraphValue> {
+    let mut segments = projection?.segments().iter();
+    let first = segments.next()?.payload().property(property_id)?.clone();
+    segments
+        .all(|segment| segment.payload().property(property_id) == Some(&first))
+        .then_some(first)
+}
+
+fn gathered_property_values(
+    keyspace: Keyspace,
+    raw: Option<&[u8]>,
+    request: &PropertyGatherRequest,
+) -> Result<Vec<Option<temporal_types::GraphValue>>, AdapterError> {
+    let Some(raw) = raw else {
+        return Ok(vec![None; request.properties().len()]);
+    };
+    match keyspace {
+        Keyspace::Current => {
+            let projection = ProjectionRecord::decode(raw)
+                .map_err(|error| AdapterError::Backend(error.to_string()))?;
+            Ok(request
+                .properties()
+                .iter()
+                .map(|property| stable_projection_property(Some(&projection), property.value()))
+                .collect())
+        }
+        Keyspace::History => {
+            let history = HistoryEntry::decode(raw)
+                .map_err(|error| AdapterError::Backend(error.to_string()))?;
+            Ok(request
+                .properties()
+                .iter()
+                .map(|property| {
+                    history
+                        .replacement()
+                        .and_then(|element| element.property(property.value()))
+                        .cloned()
+                })
+                .collect())
+        }
+        _ => Err(AdapterError::Backend(
+            "Neo4j property gather received an unsupported keyspace".into(),
+        )),
+    }
+}
+
+fn bounded_key_value_rows(
+    rows: Vec<Vec<Value>>,
+    span: &KeySpan,
+    bounds: QueryPageBounds,
+    key_column: usize,
+    value_column: usize,
+) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+    let mut entries = Vec::new();
+    let mut retained = 0_u64;
+    let mut previous: Option<Vec<u8>> = None;
+    for row in rows {
+        let key = decode_hex(value_string(row.get(key_column), "logical key")?)?;
+        if !span.contains(&key) {
+            return Err(AdapterError::Backend(
+                "Neo4j typed query returned a key outside the requested span".into(),
+            ));
+        }
+        if previous
+            .as_deref()
+            .is_some_and(|previous| previous >= key.as_slice())
+        {
+            return Err(AdapterError::Backend(
+                "Neo4j typed query returned keys out of canonical order".into(),
+            ));
+        }
+        previous = Some(key.clone());
+        let logical_key = LogicalKey::in_keyspace(span.keyspace(), key);
+        if entries.len() == bounds.max_items() {
+            return Ok((entries, Some(logical_key)));
+        }
+        let value = decode_base64(row.get(value_column).ok_or_else(|| {
+            AdapterError::Backend("Neo4j typed query row is missing value".into())
+        })?)?;
+        let required = retained.saturating_add(entry_retained_bytes(&logical_key, &value));
+        if required > bounds.max_bytes() {
+            if entries.is_empty() {
+                return Err(AdapterError::ScanByteLimit {
+                    limit: bounds.max_bytes(),
+                    required,
+                });
+            }
+            return Ok((entries, Some(logical_key)));
+        }
+        retained = required;
+        entries.push(KeyValue::new(logical_key, value));
+    }
+    Ok((entries, None))
+}
+
+fn bounded_adjacency_rows(
+    rows: Vec<Vec<Value>>,
+    request: &AdjacencyExpandRequest,
+) -> Result<(Vec<AdjacencyEntry>, Option<storage_api::AdjacencyCursor>), AdapterError> {
+    let mut entries = Vec::new();
+    let mut retained = 0_u64;
+    let mut previous: Option<(usize, Vec<u8>)> = None;
+    for row in rows {
+        let ordinal = row
+            .first()
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                AdapterError::Backend("Neo4j adjacency query omitted an ordinal".into())
+            })?;
+        let span = request.spans().get(ordinal).ok_or_else(|| {
+            AdapterError::Backend("Neo4j adjacency query returned an unknown ordinal".into())
+        })?;
+        let key = decode_hex(value_string(row.get(1), "logical key")?)?;
+        if !span.contains(&key) {
+            return Err(AdapterError::Backend(
+                "Neo4j adjacency query returned a key outside its input span".into(),
+            ));
+        }
+        if previous.as_ref().is_some_and(|previous| {
+            (previous.0, previous.1.as_slice()) >= (ordinal, key.as_slice())
+        }) {
+            return Err(AdapterError::Backend(
+                "Neo4j adjacency query returned keys out of request order".into(),
+            ));
+        }
+        previous = Some((ordinal, key.clone()));
+        let logical_key = LogicalKey::in_keyspace(span.keyspace(), key);
+        if entries.len() == request.bounds().max_items() {
+            return Ok((
+                entries,
+                Some(storage_api::AdjacencyCursor::new(ordinal, logical_key)),
+            ));
+        }
+        let value = decode_base64(row.get(2).ok_or_else(|| {
+            AdapterError::Backend("Neo4j adjacency query row is missing value".into())
+        })?)?;
+        let required = retained.saturating_add(entry_retained_bytes(&logical_key, &value));
+        if required > request.bounds().max_bytes() {
+            if entries.is_empty() {
+                return Err(AdapterError::ScanByteLimit {
+                    limit: request.bounds().max_bytes(),
+                    required,
+                });
+            }
+            return Ok((
+                entries,
+                Some(storage_api::AdjacencyCursor::new(ordinal, logical_key)),
+            ));
+        }
+        retained = required;
+        entries.push(AdjacencyEntry::new(
+            ordinal,
+            KeyValue::new(logical_key, value),
+        ));
+    }
+    Ok((entries, None))
+}
+
+fn entry_retained_bytes(key: &LogicalKey, value: &[u8]) -> u64 {
+    u64::try_from(key.as_bytes().len())
+        .ok()
+        .and_then(|key_bytes| {
+            u64::try_from(value.len())
+                .ok()
+                .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+        })
+        .unwrap_or(u64::MAX)
+}
+
+fn read_bounded_body(reader: impl Read, limit: u64) -> Result<Vec<u8>, AdapterError> {
+    let read_limit = limit
+        .checked_add(1)
+        .ok_or_else(|| AdapterError::Backend("Neo4j scan response bound overflow".into()))?;
+    let mut body = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut body)
+        .map_err(|error| AdapterError::Backend(format!("Neo4j scan body read failed: {error}")))?;
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > limit {
+        return Err(AdapterError::ScanResponseByteLimit {
+            limit,
+            required: read_limit,
+        });
+    }
+    Ok(body)
+}
+
+fn bounded_canonical_page(
+    rows: Vec<Vec<Value>>,
+    request: &CanonicalScanRequest,
+) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+    let span = request.span();
+    let bounds = request.bounds();
+    let mut entries = Vec::new();
+    let mut retained = 0_u64;
+    let mut previous: Option<Vec<u8>> = None;
+    for row in rows {
+        let key = decode_hex(value_string(row.first(), "logical key")?)?;
+        if !span.contains(&key) {
+            return Err(AdapterError::Backend(
+                "Neo4j canonical scan returned a key outside the requested span".into(),
+            ));
+        }
+        if previous
+            .as_deref()
+            .is_some_and(|previous| previous >= key.as_slice())
+        {
+            return Err(AdapterError::Backend(
+                "Neo4j canonical scan returned keys out of canonical order".into(),
+            ));
+        }
+        previous = Some(key.clone());
+        let logical_key = LogicalKey::in_keyspace(span.keyspace(), key);
+        if entries.len() == bounds.max_items() {
+            return Ok((entries, Some(logical_key)));
+        }
+        let value = decode_base64(row.get(1).ok_or_else(|| {
+            AdapterError::Backend("Neo4j canonical scan row is missing value".into())
+        })?)?;
+        let entry_bytes = u64::try_from(logical_key.as_bytes().len())
+            .ok()
+            .and_then(|key_bytes| {
+                u64::try_from(value.len())
+                    .ok()
+                    .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+            })
+            .unwrap_or(u64::MAX);
+        let required = retained.saturating_add(entry_bytes);
+        if required > bounds.max_bytes() {
+            if entries.is_empty() {
+                return Err(AdapterError::ScanByteLimit {
+                    limit: bounds.max_bytes(),
+                    required,
+                });
+            }
+            return Ok((entries, Some(logical_key)));
+        }
+        retained = required;
+        entries.push(KeyValue::new(logical_key, value));
+    }
+    Ok((entries, None))
 }
 
 fn decode_scan_body(
@@ -1564,14 +2496,6 @@ impl AdapterRestoreSession for Neo4jRestoreSession {
                 .publish_restore(self.header.applied_log_index())
                 .map_err(factory_error)?;
             self.published = true;
-            let implementation_version = env!("CARGO_PKG_VERSION");
-            let adapter = MappingBackedAdapter::with_runtime_identity(
-                "neo4j-query-api",
-                implementation_version,
-                Arc::new(adapter),
-                MappingRequirement::HotPluggableReplica,
-            )
-            .map_err(factory_error)?;
             Ok(Arc::new(adapter) as Arc<dyn StorageAdapter>)
         })
     }
@@ -1616,6 +2540,9 @@ struct Neo4jNativeFields {
     transaction_logical_hex: String,
     segment_hex: String,
     has_edge_endpoints: bool,
+    valid_min_micros: Option<i64>,
+    valid_max_micros: Option<i64>,
+    property_equal_tokens: Vec<String>,
 }
 
 fn native_mutation_json(
@@ -1654,6 +2581,9 @@ fn native_record_json(
         "logical_key_hex": hex(key.as_bytes()),
         "present": present,
         "value_base64": value.map_or_else(String::new, |bytes| BASE64.encode(bytes)),
+        "valid_min_micros": fields.valid_min_micros,
+        "valid_max_micros": fields.valid_max_micros,
+        "property_equal_tokens": fields.property_equal_tokens,
         "kind": fields.kind,
         "label": fields.label,
         "graph_hex": fields.graph_hex,
@@ -1688,16 +2618,24 @@ fn native_fields_from_entry(entry: &CanonicalGraphEntry) -> Neo4jNativeFields {
             fields.has_edge_endpoints = true;
             fields
         }
-        CanonicalGraphEntry::Current { key, .. } => match *key {
-            GraphKey::CurrentVertex(element) => {
-                element_fields("vertex_current", "DTGVertexCurrent", element)
-            }
-            GraphKey::CurrentEdge(element) => {
-                element_fields("edge_current", "DTGEdgeCurrent", element)
-            }
-            _ => unreachable!("canonical Current entry has a Current key"),
-        },
-        CanonicalGraphEntry::Adjacency { key, .. } => adjacency_fields(*key),
+        CanonicalGraphEntry::Current { key, value } => {
+            let mut fields = match *key {
+                GraphKey::CurrentVertex(element) => {
+                    element_fields("vertex_current", "DTGVertexCurrent", element)
+                }
+                GraphKey::CurrentEdge(element) => {
+                    element_fields("edge_current", "DTGEdgeCurrent", element)
+                }
+                _ => unreachable!("canonical Current entry has a Current key"),
+            };
+            add_projection_query_fields(&mut fields, value);
+            fields
+        }
+        CanonicalGraphEntry::Adjacency { key, value } => {
+            let mut fields = adjacency_fields(*key);
+            add_projection_query_fields(&mut fields, value);
+            fields
+        }
         CanonicalGraphEntry::History { key, .. } => history_fields(*key),
         CanonicalGraphEntry::Opaque { .. } => Neo4jNativeFields {
             kind: "opaque",
@@ -1735,6 +2673,11 @@ fn native_fields_from_key(key: &LogicalKey) -> Result<Neo4jNativeFields, Adapter
         | GraphKey::CrossOutAdjacency { .. }
         | GraphKey::CrossInAdjacency { .. }) => adjacency_fields(key),
         key @ GraphKey::HistoryAnchor { .. } => history_fields(key),
+        GraphKey::TemporalEvent { .. } | GraphKey::TemporalEventValid { .. } => Neo4jNativeFields {
+            kind: "opaque",
+            label: "DTGOpaqueRecord",
+            ..Neo4jNativeFields::default()
+        },
     })
 }
 
@@ -1751,6 +2694,32 @@ fn element_fields(
         element_hex: hex(&element.id().value().to_be_bytes()),
         ..Neo4jNativeFields::default()
     }
+}
+
+fn add_projection_query_fields(fields: &mut Neo4jNativeFields, projection: &ProjectionRecord) {
+    fields.valid_min_micros = projection
+        .segments()
+        .first()
+        .map(|segment| segment.valid().start().as_micros());
+    fields.valid_max_micros = projection
+        .segments()
+        .last()
+        .and_then(|segment| segment.valid().end())
+        .map(temporal_types::ValidTime::as_micros);
+    let mut tokens = BTreeSet::new();
+    for segment in projection.segments() {
+        for (property_id, value) in segment.payload().properties() {
+            tokens.insert(property_equal_token(*property_id, value));
+        }
+    }
+    fields.property_equal_tokens = tokens.into_iter().collect();
+}
+
+fn property_equal_token(property_id: u32, value: &temporal_types::GraphValue) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(&property_id.to_be_bytes());
+    hasher.update(format!("{value:?}").as_bytes());
+    hex(hasher.finalize().as_bytes())
 }
 
 fn history_fields(key: GraphKey) -> Neo4jNativeFields {
@@ -1959,7 +2928,13 @@ fn snapshot_entry_bytes(entry: &KeyValue) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::future::Future;
+    use std::io::{Cursor, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread;
+    use std::time::Instant;
 
     #[test]
     fn graph_contract_uses_reserved_labels_constraints_and_parameterized_cypher() {
@@ -1972,6 +2947,24 @@ mod tests {
         assert!(APPLY_CYPHER.contains("$mutations"));
         assert!(APPLY_CYPHER.contains("$expected_index_hex"));
         assert!(!APPLY_CYPHER.contains("value_base64: '"));
+    }
+
+    #[test]
+    fn committed_apply_acquires_the_instance_fence_before_other_matches() {
+        for statement in [APPLY_CYPHER, APPLY_EMPTY_CYPHER] {
+            let fence = statement
+                .find("SET instance.__dtgproxy_snapshot_fence")
+                .expect("apply must acquire the snapshot write fence");
+            let next_match = statement[fence..]
+                .find("OPTIONAL MATCH")
+                .map(|offset| fence + offset)
+                .expect("apply includes its existing-log lookup");
+            let with_instance = statement[fence..next_match]
+                .find("WITH instance")
+                .map(|offset| fence + offset)
+                .expect("apply must carry the fenced instance into the next query part");
+            assert!(fence < with_instance && with_instance < next_match);
+        }
     }
 
     #[test]
@@ -2112,5 +3105,623 @@ mod tests {
                 required: MAX_NEO4J_SCAN_BODY_BYTES + 1,
             })
         );
+    }
+
+    #[test]
+    fn query_read_snapshot_reuses_one_transaction_and_rolls_back_on_drop() {
+        let (endpoint, requests, server) = mock_query_api(vec![
+            MockResponse::json_with_affinity(
+                r#"{"data":{"values":[["000000000000002a"]]},"errors":[],"transaction":{"id":"tx-42","expires":"2099-01-01T00:00:00Z"}}"#,
+                "member-7",
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[[0,"dmFsdWU="]]},"errors":[],"transaction":{"id":"tx-42"}}"#,
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[["6b","dmFsdWU="]]},"errors":[],"transaction":{"id":"tx-42"}}"#,
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[[0,"dmFsdWU="]]},"errors":[],"transaction":{"id":"tx-42"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+
+        let snapshot = block_on(TemporalBackendMapping::begin_read_snapshot(&adapter))
+            .expect("Neo4j should open an explicit read transaction");
+        assert_eq!(snapshot.applied_log_index(), 42);
+        assert_eq!(
+            block_on(snapshot.multi_get(&[test_key(b"k")])).unwrap(),
+            vec![Some(b"value".to_vec())]
+        );
+        assert_eq!(
+            block_on(snapshot.scan(&KeySpan::prefix(Keyspace::TemporalIndex, b"k".to_vec(),)))
+                .unwrap(),
+            vec![KeyValue::new(test_key(b"k"), b"value".to_vec())]
+        );
+        assert_eq!(
+            block_on(snapshot.multi_get(&[test_key(b"k")])).unwrap(),
+            vec![Some(b"value".to_vec())]
+        );
+        drop(snapshot);
+
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/db/neo4j/query/v2/tx");
+        assert!(
+            requests[0]
+                .body
+                .contains("SET instance.__dtgproxy_snapshot_fence")
+        );
+        for request in &requests[1..4] {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/db/neo4j/query/v2/tx/tx-42");
+            assert_eq!(request.header("neo4j-cluster-affinity"), Some("member-7"));
+        }
+        assert_eq!(requests[4].method, "DELETE");
+        assert_eq!(requests[4].path, "/db/neo4j/query/v2/tx/tx-42");
+        assert_eq!(
+            requests[4].header("neo4j-cluster-affinity"),
+            Some("member-7")
+        );
+    }
+
+    #[test]
+    fn canonical_scan_uses_transaction_limit_and_strict_continuation() {
+        let (endpoint, requests, server) = mock_query_api(vec![
+            MockResponse::json_with_affinity(
+                r#"{"data":{"values":[["000000000000002a"]]},"errors":[],"transaction":{"id":"tx-page"}}"#,
+                "member-9",
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[["61","MQ=="],["62","Mg=="],["63","Mw=="]]},"errors":[],"transaction":{"id":"tx-page"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+        let snapshot = block_on(StorageAdapter::begin_read_snapshot(&adapter)).unwrap();
+        let request = CanonicalScanRequest::new(
+            KeySpan::prefix(Keyspace::TemporalIndex, Vec::new()),
+            storage_api::QueryPageBounds::new(2, 64).unwrap(),
+        )
+        .unwrap();
+
+        let page = block_on(snapshot.scan_canonical(&request)).unwrap();
+
+        assert_eq!(page.applied_log_index(), 42);
+        assert_eq!(
+            page.entries(),
+            &[
+                KeyValue::new(test_key(b"a"), b"1".to_vec()),
+                KeyValue::new(test_key(b"b"), b"2".to_vec()),
+            ]
+        );
+        assert_eq!(page.next_start(), Some(&test_key(b"c")));
+        drop(snapshot);
+        server.join().unwrap();
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        assert_eq!(requests[1].path, "/db/neo4j/query/v2/tx/tx-page");
+        assert_eq!(
+            requests[1].header("neo4j-cluster-affinity"),
+            Some("member-9")
+        );
+        let body: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(body["parameters"]["limit"], 3);
+        assert!(
+            body["statement"]
+                .as_str()
+                .unwrap()
+                .contains("ORDER BY record.logical_key_hex LIMIT $limit")
+        );
+    }
+
+    #[test]
+    fn canonical_scan_stops_before_exceeding_byte_budget() {
+        let (endpoint, _requests, server) = mock_query_api(vec![
+            MockResponse::json(
+                r#"{"data":{"values":[["0000000000000007"]]},"errors":[],"transaction":{"id":"tx-bytes"}}"#,
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[["61","MTI="],["62","MzQ1Ng=="]]},"errors":[],"transaction":{"id":"tx-bytes"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+        let snapshot = block_on(StorageAdapter::begin_read_snapshot(&adapter)).unwrap();
+        let request = CanonicalScanRequest::new(
+            KeySpan::prefix(Keyspace::TemporalIndex, Vec::new()),
+            storage_api::QueryPageBounds::new(8, 4).unwrap(),
+        )
+        .unwrap();
+
+        let page = block_on(snapshot.scan_canonical(&request)).unwrap();
+
+        assert_eq!(
+            page.entries(),
+            &[KeyValue::new(test_key(b"a"), b"12".to_vec())]
+        );
+        assert_eq!(page.next_start(), Some(&test_key(b"b")));
+        drop(snapshot);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn canonical_scan_rejects_first_entry_over_byte_budget() {
+        let request = CanonicalScanRequest::new(
+            KeySpan::prefix(Keyspace::TemporalIndex, Vec::new()),
+            storage_api::QueryPageBounds::new(8, 2).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bounded_canonical_page(
+                vec![vec![
+                    Value::String("61".into()),
+                    Value::String("MTI=".into())
+                ]],
+                &request,
+            ),
+            Err(AdapterError::ScanByteLimit {
+                limit: 2,
+                required: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_scan_rejects_noncanonical_backend_order() {
+        let request = CanonicalScanRequest::new(
+            KeySpan::prefix(Keyspace::TemporalIndex, Vec::new()),
+            storage_api::QueryPageBounds::new(8, 64).unwrap(),
+        )
+        .unwrap();
+        let rows = vec![
+            vec![Value::String("62".into()), Value::String("Mg==".into())],
+            vec![Value::String("61".into()), Value::String("MQ==".into())],
+        ];
+
+        assert!(matches!(
+            bounded_canonical_page(rows, &request),
+            Err(AdapterError::Backend(message)) if message.contains("canonical order")
+        ));
+    }
+
+    #[test]
+    fn typed_query_primitives_are_parameterized_bounded_candidates() {
+        for statement in [
+            CANDIDATE_SCAN_CYPHER,
+            PROPERTY_GATHER_CYPHER,
+            ADJACENCY_EXPAND_CYPHER,
+            CHANGE_SCAN_CYPHER,
+        ] {
+            assert!(statement.contains("$instance_id"));
+            assert!(!statement.contains("snapshot-test"));
+            assert!(!statement.contains(" LIMIT 100"));
+        }
+        assert!(CANDIDATE_SCAN_CYPHER.contains("$start_hex"));
+        assert!(CANDIDATE_SCAN_CYPHER.contains("$end_hex"));
+        assert!(CANDIDATE_SCAN_CYPHER.contains("$valid_time_micros"));
+        assert!(CANDIDATE_SCAN_CYPHER.contains("all(constraint IN $constraints"));
+        assert!(CANDIDATE_SCAN_CYPHER.contains("record.property_equal_tokens IS NULL"));
+        assert!(CANDIDATE_SCAN_CYPHER.contains("ORDER BY record.logical_key_hex"));
+        assert!(CANDIDATE_SCAN_CYPHER.contains("LIMIT $limit"));
+        assert!(PROPERTY_GATHER_CYPHER.contains("UNWIND $keys"));
+        assert!(PROPERTY_GATHER_CYPHER.contains("ORDER BY requested.ordinal"));
+        assert!(ADJACENCY_EXPAND_CYPHER.contains("UNWIND $spans"));
+        assert!(ADJACENCY_EXPAND_CYPHER.contains("ORDER BY requested.ordinal"));
+        assert!(ADJACENCY_EXPAND_CYPHER.contains("LIMIT $limit"));
+        assert!(CHANGE_SCAN_CYPHER.contains("$keyspace"));
+        assert!(APPLY_CYPHER.contains("record.valid_min_micros"));
+        assert!(APPLY_CYPHER.contains("record.property_equal_tokens"));
+        assert!(RESTORE_CYPHER.contains("record.valid_min_micros"));
+        assert!(RESTORE_CYPHER.contains("record.property_equal_tokens"));
+        assert!(BEGIN_READ_SNAPSHOT_CYPHER.contains("$instance_id"));
+        assert!(BEGIN_READ_SNAPSHOT_CYPHER.contains("instance.applied_index_hex"));
+    }
+
+    #[test]
+    fn candidate_scan_passes_typed_constraints_as_parameters() {
+        let (endpoint, requests, server) = mock_query_api(vec![
+            MockResponse::json(
+                r#"{"data":{"values":[["0000000000000003"]]},"errors":[],"transaction":{"id":"tx-constraints"}}"#,
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[]},"errors":[],"transaction":{"id":"tx-constraints"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+        let snapshot = block_on(StorageAdapter::begin_read_snapshot(&adapter)).unwrap();
+        let request = CandidateScanRequest::new(
+            KeySpan::prefix(Keyspace::Current, Vec::new()),
+            temporal_types::ValidTime::from_micros(17),
+            vec![storage_api::PropertyConstraint::new(
+                storage_api::PropertyId::new(9),
+                storage_api::ComparisonOperator::Equal,
+                temporal_types::GraphValue::String("active".into()),
+            )],
+            QueryPageBounds::new(4, 256).unwrap(),
+        )
+        .unwrap();
+
+        block_on(snapshot.scan_candidates(&request)).unwrap();
+        drop(snapshot);
+
+        server.join().unwrap();
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        let body: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(body["parameters"]["valid_time_micros"], 17);
+        assert_eq!(body["parameters"]["constraints"][0]["property_id"], 9);
+        assert_eq!(body["parameters"]["constraints"][0]["operator"], "equal");
+        assert_eq!(
+            body["parameters"]["constraints"][0]["value"],
+            serde_json::json!({"type": "string", "value": "active"})
+        );
+        assert!(!body["statement"].as_str().unwrap().contains("active"));
+    }
+
+    #[test]
+    fn typed_query_primitives_advertise_only_candidate_guarantees() {
+        let adapter = test_adapter("http://127.0.0.1:1");
+        let capabilities = adapter.query_primitive_capabilities();
+        assert_eq!(capabilities.candidate_scan(), PushdownGuarantee::Candidate);
+        assert_eq!(capabilities.property_gather(), PushdownGuarantee::Candidate);
+        assert_eq!(
+            capabilities.adjacency_expand(),
+            PushdownGuarantee::Candidate
+        );
+        assert_eq!(capabilities.change_scan(), PushdownGuarantee::Candidate);
+        assert!(adapter.capabilities().predicate_pushdown);
+        assert!(adapter.capabilities().adjacency_pushdown);
+        assert!(!adapter.capabilities().change_feed);
+        assert!(neo4j_mapping_descriptor().capabilities().predicate_pushdown);
+        assert!(neo4j_mapping_descriptor().capabilities().adjacency_pushdown);
+        assert!(!neo4j_mapping_descriptor().capabilities().change_feed);
+    }
+
+    #[test]
+    fn typed_candidate_and_change_pages_preserve_bounds_continuations_and_snapshot_index() {
+        let (endpoint, requests, server) = mock_query_api(vec![
+            MockResponse::json_with_affinity(
+                r#"{"data":{"values":[["000000000000002a"]]},"errors":[],"transaction":{"id":"tx-typed"}}"#,
+                "member-typed",
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[["61","MQ=="],["62","Mg=="],["63","Mw=="]]},"errors":[],"transaction":{"id":"tx-typed"}}"#,
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[["78","NA=="],["79","NQ=="]]},"errors":[],"transaction":{"id":"tx-typed"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+        let snapshot = block_on(StorageAdapter::begin_read_snapshot(&adapter)).unwrap();
+        let candidate = CandidateScanRequest::new(
+            KeySpan::prefix(Keyspace::Current, Vec::new()),
+            temporal_types::ValidTime::from_micros(7),
+            Vec::new(),
+            QueryPageBounds::new(2, 64).unwrap(),
+        )
+        .unwrap();
+        let changes = ChangeScanRequest::new(
+            KeySpan::prefix(Keyspace::TemporalIndex, Vec::new()),
+            QueryPageBounds::new(8, 64).unwrap(),
+        )
+        .unwrap();
+
+        let candidate_page = block_on(snapshot.scan_candidates(&candidate)).unwrap();
+        let change_page = block_on(snapshot.scan_changes(&changes)).unwrap();
+
+        assert_eq!(candidate_page.applied_log_index(), 42);
+        assert_eq!(candidate_page.guarantee(), PushdownGuarantee::Candidate);
+        assert_eq!(candidate_page.entries().len(), 2);
+        assert_eq!(
+            candidate_page.next_start(),
+            Some(&LogicalKey::in_keyspace(Keyspace::Current, b"c".to_vec()))
+        );
+        assert_eq!(change_page.applied_log_index(), 42);
+        assert_eq!(change_page.guarantee(), PushdownGuarantee::Candidate);
+        assert_eq!(change_page.entries().len(), 2);
+        assert_eq!(change_page.next_start(), None);
+        drop(snapshot);
+
+        server.join().unwrap();
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        let candidate_body: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(candidate_body["parameters"]["limit"], 3);
+        assert_eq!(
+            candidate_body["parameters"]["keyspace"],
+            Keyspace::Current.tag()
+        );
+        let change_body: Value = serde_json::from_str(&requests[2].body).unwrap();
+        assert_eq!(change_body["parameters"]["limit"], 9);
+        assert_eq!(
+            change_body["parameters"]["keyspace"],
+            Keyspace::TemporalIndex.tag()
+        );
+        assert_eq!(requests[3].method, "DELETE");
+    }
+
+    #[test]
+    fn typed_property_and_adjacency_queries_preserve_request_order_and_candidate_status() {
+        let (endpoint, requests, server) = mock_query_api(vec![
+            MockResponse::json_with_affinity(
+                r#"{"data":{"values":[["000000000000000b"]]},"errors":[],"transaction":{"id":"tx-properties"}}"#,
+                "member-properties",
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[[0,null],[1,null]]},"errors":[],"transaction":{"id":"tx-properties"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+            MockResponse::json_with_affinity(
+                r#"{"data":{"values":[["000000000000000b"]]},"errors":[],"transaction":{"id":"tx-adjacency"}}"#,
+                "member-adjacency",
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[[0,"61","MQ=="],[1,"6261","Mg=="],[1,"6262","Mw=="]]},"errors":[],"transaction":{"id":"tx-adjacency"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+        let property_request = PropertyGatherRequest::new(
+            vec![
+                LogicalKey::in_keyspace(Keyspace::Current, b"first".to_vec()),
+                LogicalKey::in_keyspace(Keyspace::Current, b"second".to_vec()),
+            ],
+            vec![storage_api::PropertyId::new(1)],
+            QueryPageBounds::new(4, 256).unwrap(),
+        )
+        .unwrap();
+        let adjacency_request = AdjacencyExpandRequest::new(
+            vec![
+                KeySpan::prefix(Keyspace::AdjOut, b"a".to_vec()),
+                KeySpan::prefix(Keyspace::AdjOut, b"b".to_vec()),
+            ],
+            QueryPageBounds::new(2, 64).unwrap(),
+        )
+        .unwrap();
+
+        let properties = block_on(adapter.gather_properties(&property_request)).unwrap();
+        let adjacency = block_on(adapter.expand_adjacency(&adjacency_request)).unwrap();
+
+        assert_eq!(properties.applied_log_index(), 11);
+        assert_eq!(properties.guarantee(), PushdownGuarantee::Candidate);
+        assert_eq!(properties.rows().len(), 2);
+        assert!(properties.rows().iter().all(|row| row.values() == [None]));
+        assert_eq!(adjacency.applied_log_index(), 11);
+        assert_eq!(adjacency.guarantee(), PushdownGuarantee::Candidate);
+        assert_eq!(adjacency.entries().len(), 2);
+        assert_eq!(adjacency.entries()[0].input_ordinal(), 0);
+        assert_eq!(adjacency.entries()[1].input_ordinal(), 1);
+        assert_eq!(
+            adjacency.next(),
+            Some(&storage_api::AdjacencyCursor::new(
+                1,
+                LogicalKey::in_keyspace(Keyspace::AdjOut, b"bb".to_vec())
+            ))
+        );
+
+        server.join().unwrap();
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        let property_body: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(property_body["parameters"]["keys"][0]["ordinal"], 0);
+        assert_eq!(property_body["parameters"]["keys"][1]["ordinal"], 1);
+        let adjacency_body: Value = serde_json::from_str(&requests[4].body).unwrap();
+        assert_eq!(adjacency_body["parameters"]["limit"], 3);
+        assert_eq!(adjacency_body["parameters"]["spans"][0]["ordinal"], 0);
+        assert_eq!(adjacency_body["parameters"]["spans"][1]["ordinal"], 1);
+    }
+
+    #[test]
+    fn failed_snapshot_begin_rolls_back_the_open_transaction() {
+        let (endpoint, requests, server) = mock_query_api(vec![
+            MockResponse::json_with_affinity(
+                r#"{"data":{"values":[]},"errors":[{"code":"Neo.ClientError.Statement.SyntaxError"}],"transaction":{"id":"tx-failed"}}"#,
+                "member-8",
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+
+        let result = block_on(StorageAdapter::begin_read_snapshot(&adapter));
+        assert!(matches!(result, Err(AdapterError::Backend(_))));
+
+        server.join().unwrap();
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method, "DELETE");
+        assert_eq!(requests[1].path, "/db/neo4j/query/v2/tx/tx-failed");
+        assert_eq!(
+            requests[1].header("neo4j-cluster-affinity"),
+            Some("member-8")
+        );
+    }
+
+    #[test]
+    fn fenced_scan_reports_the_index_pinned_by_its_transaction() {
+        let (endpoint, requests, server) = mock_query_api(vec![
+            MockResponse::json(
+                r#"{"data":{"values":[["0000000000000007"]]},"errors":[],"transaction":{"id":"tx-scan"}}"#,
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[["6b","dmFsdWU="]]},"errors":[],"transaction":{"id":"tx-scan"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+
+        let scan = block_on(StorageAdapter::scan_fenced(
+            &adapter,
+            &KeySpan::prefix(Keyspace::TemporalIndex, b"k".to_vec()),
+        ))
+        .unwrap();
+
+        assert_eq!(scan.applied_log_index(), 7);
+        assert_eq!(
+            scan.entries(),
+            &[KeyValue::new(test_key(b"k"), b"value".to_vec())]
+        );
+        server.join().unwrap();
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].path, "/db/neo4j/query/v2/tx");
+        assert_eq!(requests[1].path, "/db/neo4j/query/v2/tx/tx-scan");
+        assert_eq!(requests[2].method, "DELETE");
+    }
+
+    fn test_adapter(endpoint: &str) -> Neo4jAdapter {
+        Neo4jAdapter {
+            client: QueryApiClient::new(Neo4jConfiguration {
+                endpoint: endpoint.to_owned(),
+                database: "neo4j".into(),
+                username: "neo4j".into(),
+                password: "secret".into(),
+                timeout: Duration::from_secs(2),
+            })
+            .unwrap(),
+            instance_id: "snapshot-test".into(),
+            apply_guard: Mutex::new(()),
+        }
+    }
+
+    fn test_key(bytes: &[u8]) -> LogicalKey {
+        LogicalKey::in_keyspace(Keyspace::TemporalIndex, bytes.to_vec())
+    }
+
+    #[derive(Debug)]
+    struct MockRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl MockRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    struct MockResponse {
+        body: &'static str,
+        affinity: Option<&'static str>,
+    }
+
+    impl MockResponse {
+        const fn json(body: &'static str) -> Self {
+            Self {
+                body,
+                affinity: None,
+            }
+        }
+
+        const fn json_with_affinity(body: &'static str, affinity: &'static str) -> Self {
+            Self {
+                body,
+                affinity: Some(affinity),
+            }
+        }
+    }
+
+    fn mock_query_api(
+        responses: Vec<MockResponse>,
+    ) -> (String, mpsc::Receiver<MockRequest>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            break stream;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("mock Query API accept failed: {error}"),
+                    }
+                };
+                let request = read_mock_request(&mut stream);
+                sender.send(request).unwrap();
+                let affinity = response.affinity.map_or_else(String::new, |value| {
+                    format!("neo4j-cluster-affinity: {value}\r\n")
+                });
+                write!(
+                    stream,
+                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+                    response.body.len(),
+                    affinity,
+                    response.body,
+                )
+                .unwrap();
+            }
+        });
+        (endpoint, receiver, server)
+    }
+
+    fn read_mock_request(stream: &mut impl Read) -> MockRequest {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "request ended before headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+        let mut lines = headers.split("\r\n");
+        let mut request_line = lines.next().unwrap().split_whitespace();
+        let method = request_line.next().unwrap().to_owned();
+        let path = request_line.next().unwrap().to_owned();
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+            .collect::<Vec<_>>();
+        let content_length = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, value)| value.parse().unwrap());
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "request ended before body");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        MockRequest {
+            method,
+            path,
+            headers,
+            body: String::from_utf8(bytes[header_end..header_end + content_length].to_vec())
+                .unwrap(),
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct NoopWake;
+        impl Wake for NoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            thread::yield_now();
+        }
     }
 }

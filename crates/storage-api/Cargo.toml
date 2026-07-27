@@ -10,6 +10,7 @@ mapping-tck = []
 
 [dependencies]
 blake3 = "=1.8.5"
+temporal-types = { path = "../temporal-types" }
 
 [lints]
 workspace = true

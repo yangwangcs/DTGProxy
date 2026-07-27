@@ -3,6 +3,7 @@
 mod mapping;
 #[cfg(feature = "mapping-tck")]
 mod mapping_tck;
+mod query;
 
 pub use mapping::{
     CanonicalRestoreSession, MAPPING_SPI_VERSION, MappingBackedAdapter, MappingCapabilities,
@@ -11,6 +12,7 @@ pub use mapping::{
 };
 #[cfg(feature = "mapping-tck")]
 pub use mapping_tck::{run_mapping_restore_tck, run_mapping_tck};
+pub use query::*;
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -529,6 +531,41 @@ impl KeyValue {
     #[must_use]
     pub fn into_parts(self) -> (LogicalKey, Vec<u8>) {
         (self.key, self.value)
+    }
+}
+
+/// One bounded KV scan together with the exact committed prefix it observed.
+///
+/// Unlike [`ReadSnapshot`], this value makes no claim that a later operation
+/// can reuse the same backend view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FencedScan {
+    applied_log_index: u64,
+    entries: Vec<KeyValue>,
+}
+
+impl FencedScan {
+    #[must_use]
+    pub const fn new(applied_log_index: u64, entries: Vec<KeyValue>) -> Self {
+        Self {
+            applied_log_index,
+            entries,
+        }
+    }
+
+    #[must_use]
+    pub const fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[KeyValue] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub fn into_entries(self) -> Vec<KeyValue> {
+        self.entries
     }
 }
 
@@ -1074,6 +1111,7 @@ pub enum AdapterError {
     LogicalSnapshot(LogicalSnapshotError),
     ScanByteLimit { limit: u64, required: u64 },
     ScanResponseByteLimit { limit: u64, required: u64 },
+    InvalidCapabilityGeneration { generation: u64 },
     Mapping(MappingCompatibilityError),
     Unavailable(String),
     Backend(String),
@@ -1120,6 +1158,10 @@ impl Display for AdapterError {
             Self::ScanResponseByteLimit { limit, required } => write!(
                 formatter,
                 "scan response body requires {required} wire bytes above limit {limit}"
+            ),
+            Self::InvalidCapabilityGeneration { generation } => write!(
+                formatter,
+                "query capability generation {generation} must be non-zero"
             ),
             Self::Mapping(error) => Display::fmt(error, formatter),
             Self::Unavailable(message) => {
@@ -1174,6 +1216,115 @@ pub fn charge_scan_entry(
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
 
+/// A backend read view pinned to one committed adapter prefix.
+///
+/// This is deliberately a canonical key/value boundary. Temporal semantics,
+/// query planning, and columnar execution remain above the adapter layer.
+pub trait ReadSnapshot: Send + Sync {
+    fn applied_log_index(&self) -> u64;
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>>;
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>>;
+
+    fn scan_canonical<'a>(
+        &'a self,
+        _request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "snapshot canonical scan",
+            })
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        _request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "snapshot candidate scan",
+            })
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        _request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "snapshot change scan",
+            })
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct ReadSnapshotBinding {
+    capability_generation: u64,
+    owner: Arc<dyn StorageAdapter>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryCapabilitySnapshot {
+    generation: u64,
+    capabilities: QueryPrimitiveCapabilities,
+}
+
+impl QueryCapabilitySnapshot {
+    #[must_use]
+    pub const fn new(generation: u64, capabilities: QueryPrimitiveCapabilities) -> Self {
+        Self {
+            generation,
+            capabilities,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn capabilities(self) -> QueryPrimitiveCapabilities {
+        self.capabilities
+    }
+}
+
+impl ReadSnapshotBinding {
+    pub fn new(
+        capability_generation: u64,
+        owner: Arc<dyn StorageAdapter>,
+    ) -> Result<Self, AdapterError> {
+        if capability_generation == 0 {
+            return Err(AdapterError::InvalidCapabilityGeneration {
+                generation: capability_generation,
+            });
+        }
+        Ok(Self {
+            capability_generation,
+            owner,
+        })
+    }
+
+    #[must_use]
+    pub const fn capability_generation(&self) -> u64 {
+        self.capability_generation
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &dyn StorageAdapter {
+        self.owner.as_ref()
+    }
+
+    #[must_use]
+    pub fn owner_arc(&self) -> Arc<dyn StorageAdapter> {
+        Arc::clone(&self.owner)
+    }
+}
+
 pub trait LogicalSnapshotReader: Send {
     fn header(&self) -> &LogicalSnapshotHeaderV1;
 
@@ -1196,6 +1347,36 @@ pub trait StorageAdapter: Send + Sync {
 
     fn capabilities(&self) -> AdapterCapabilities;
 
+    /// Storage-domain query primitives this adapter can execute.
+    ///
+    /// A caller must preserve residual evaluation unless the selected
+    /// primitive reports [`PushdownGuarantee::Exact`].
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        QueryPrimitiveCapabilities::NONE
+    }
+
+    /// Monotonically identifies the active query capability set.
+    ///
+    /// Hot-swappable adapters must change this value when a plan-visible
+    /// primitive guarantee can change.
+    fn query_capability_generation(&self) -> u64 {
+        1
+    }
+
+    fn query_capability_snapshot(&self) -> QueryCapabilitySnapshot {
+        QueryCapabilitySnapshot::new(
+            self.query_capability_generation(),
+            self.query_primitive_capabilities(),
+        )
+    }
+
+    /// Atomically captures the Adapter owner and query capability generation
+    /// that must remain paired while opening and using a borrowed read snapshot.
+    /// Stable adapters can return `None` and open the snapshot directly.
+    fn read_snapshot_binding(&self) -> Result<Option<ReadSnapshotBinding>, AdapterError> {
+        Ok(None)
+    }
+
     fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
         None
     }
@@ -1208,6 +1389,83 @@ pub trait StorageAdapter: Send + Sync {
     fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>>;
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>>;
+
+    fn scan_canonical<'a>(
+        &'a self,
+        _request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "canonical scan",
+            })
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        _request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "candidate scan",
+            })
+        })
+    }
+
+    fn gather_properties<'a>(
+        &'a self,
+        _request: &'a PropertyGatherRequest,
+    ) -> AdapterFuture<'a, PropertyGatherPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "property gather",
+            })
+        })
+    }
+
+    fn expand_adjacency<'a>(
+        &'a self,
+        _request: &'a AdjacencyExpandRequest,
+    ) -> AdapterFuture<'a, AdjacencyExpandPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "adjacency expand",
+            })
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        _request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "change scan",
+            })
+        })
+    }
+
+    /// Executes one bounded scan and reports the exact committed prefix read.
+    /// Backends without reusable snapshots can implement this primitive
+    /// without claiming support for [`Self::begin_read_snapshot`].
+    fn scan_fenced<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, FencedScan> {
+        Box::pin(async move {
+            let read = self.begin_read_snapshot().await?;
+            let entries = read.scan(span).await?;
+            Ok(FencedScan::new(read.applied_log_index(), entries))
+        })
+    }
+
+    /// Opens a stable read view that pins every following point and range read
+    /// to the same committed prefix. Implementations that cannot provide a
+    /// real backend read view must reject this operation.
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "query read snapshot",
+            })
+        })
+    }
 
     fn begin_logical_export<'a>(
         &'a self,
@@ -1241,6 +1499,22 @@ where
         (**self).capabilities()
     }
 
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        (**self).query_primitive_capabilities()
+    }
+
+    fn query_capability_generation(&self) -> u64 {
+        (**self).query_capability_generation()
+    }
+
+    fn query_capability_snapshot(&self) -> QueryCapabilitySnapshot {
+        (**self).query_capability_snapshot()
+    }
+
+    fn read_snapshot_binding(&self) -> Result<Option<ReadSnapshotBinding>, AdapterError> {
+        (**self).read_snapshot_binding()
+    }
+
     fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
         (**self).mapping_descriptor()
     }
@@ -1258,6 +1532,49 @@ where
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
         (**self).scan(span)
+    }
+
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        (**self).scan_canonical(request)
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        (**self).scan_candidates(request)
+    }
+
+    fn gather_properties<'a>(
+        &'a self,
+        request: &'a PropertyGatherRequest,
+    ) -> AdapterFuture<'a, PropertyGatherPage> {
+        (**self).gather_properties(request)
+    }
+
+    fn expand_adjacency<'a>(
+        &'a self,
+        request: &'a AdjacencyExpandRequest,
+    ) -> AdapterFuture<'a, AdjacencyExpandPage> {
+        (**self).expand_adjacency(request)
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        (**self).scan_changes(request)
+    }
+
+    fn scan_fenced<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, FencedScan> {
+        (**self).scan_fenced(span)
+    }
+
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        (**self).begin_read_snapshot()
     }
 
     fn create_physical_checkpoint(&self, destination: &Path) -> Result<(), AdapterError> {
@@ -1281,6 +1598,22 @@ where
         (**self).capabilities()
     }
 
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        (**self).query_primitive_capabilities()
+    }
+
+    fn query_capability_generation(&self) -> u64 {
+        (**self).query_capability_generation()
+    }
+
+    fn query_capability_snapshot(&self) -> QueryCapabilitySnapshot {
+        (**self).query_capability_snapshot()
+    }
+
+    fn read_snapshot_binding(&self) -> Result<Option<ReadSnapshotBinding>, AdapterError> {
+        (**self).read_snapshot_binding()
+    }
+
     fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
         (**self).mapping_descriptor()
     }
@@ -1298,6 +1631,49 @@ where
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
         (**self).scan(span)
+    }
+
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        (**self).scan_canonical(request)
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        (**self).scan_candidates(request)
+    }
+
+    fn gather_properties<'a>(
+        &'a self,
+        request: &'a PropertyGatherRequest,
+    ) -> AdapterFuture<'a, PropertyGatherPage> {
+        (**self).gather_properties(request)
+    }
+
+    fn expand_adjacency<'a>(
+        &'a self,
+        request: &'a AdjacencyExpandRequest,
+    ) -> AdapterFuture<'a, AdjacencyExpandPage> {
+        (**self).expand_adjacency(request)
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        (**self).scan_changes(request)
+    }
+
+    fn scan_fenced<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, FencedScan> {
+        (**self).scan_fenced(span)
+    }
+
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        (**self).begin_read_snapshot()
     }
 
     fn begin_logical_export<'a>(

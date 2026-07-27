@@ -10,6 +10,7 @@ adapter-registry = { path = "../adapter-registry" }
 blake3 = "=1.8.5"
 rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "multi-threaded-cf"] }
 storage-api = { path = "../storage-api" }
+temporal-types = { path = "../temporal-types" }
 
 [dev-dependencies]
 storage-api = { path = "../storage-api", features = ["mapping-tck"] }

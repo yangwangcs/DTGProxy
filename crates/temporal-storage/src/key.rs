@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use storage_api::{Keyspace, LogicalKey};
-use temporal_types::TransactionTime;
+use temporal_types::{TransactionTime, ValidTime};
 
 const TAG_VERTEX_IDENTITY: u8 = 0x01;
 const TAG_EDGE_IDENTITY: u8 = 0x02;
@@ -13,6 +13,8 @@ const TAG_ADJ_IN: u8 = 0x11;
 const TAG_CROSS_ADJ_OUT: u8 = 0x12;
 const TAG_CROSS_ADJ_IN: u8 = 0x13;
 const TAG_HISTORY_ANCHOR: u8 = 0x20;
+const TAG_TEMPORAL_EVENT: u8 = 0x21;
+const TAG_TEMPORAL_EVENT_VALID: u8 = 0x22;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GraphId(u64);
@@ -197,6 +199,17 @@ pub enum GraphKey {
         transaction_time: TransactionTime,
         segment_id: u32,
     },
+    TemporalEvent {
+        element: ElementRef,
+        commit_ts: TransactionTime,
+        ordinal: u32,
+    },
+    TemporalEventValid {
+        element: ElementRef,
+        valid_from: ValidTime,
+        commit_ts: TransactionTime,
+        ordinal: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,6 +317,46 @@ pub fn history_anchor_key(
     key.extend_from_slice(&reversed);
     key.extend_from_slice(&segment_id.to_be_bytes());
     LogicalKey::in_keyspace(Keyspace::History, key)
+}
+
+#[must_use]
+pub fn temporal_event_graph_prefix(graph: GraphId) -> Vec<u8> {
+    graph_prefix(TAG_TEMPORAL_EVENT, graph)
+}
+
+pub(crate) fn temporal_event_commit_prefix(graph: GraphId, commit_ts: TransactionTime) -> Vec<u8> {
+    let mut key = temporal_event_graph_prefix(graph);
+    key.extend_from_slice(&encode_transaction_time(commit_ts));
+    key
+}
+
+#[must_use]
+pub fn temporal_event_key(event: &crate::CanonicalTemporalEvent) -> LogicalKey {
+    let element = event.element();
+    let mut key = temporal_event_commit_prefix(element.graph(), event.commit_ts());
+    key.extend_from_slice(&event.ordinal().to_be_bytes());
+    key.extend_from_slice(&element.partition().value().to_be_bytes());
+    key.push(element.kind() as u8);
+    key.extend_from_slice(&element.id().value().to_be_bytes());
+    LogicalKey::in_keyspace(Keyspace::TemporalIndex, key)
+}
+
+pub(crate) fn temporal_event_valid_prefix(graph: GraphId, valid_from: ValidTime) -> Vec<u8> {
+    let mut key = graph_prefix(TAG_TEMPORAL_EVENT_VALID, graph);
+    key.extend_from_slice(&encode_ordered_i64(valid_from.as_micros()));
+    key
+}
+
+#[must_use]
+pub fn temporal_event_valid_key(event: &crate::CanonicalTemporalEvent) -> LogicalKey {
+    let element = event.element();
+    let mut key = temporal_event_valid_prefix(element.graph(), event.valid().start());
+    key.extend_from_slice(&encode_transaction_time(event.commit_ts()));
+    key.extend_from_slice(&event.ordinal().to_be_bytes());
+    key.extend_from_slice(&element.partition().value().to_be_bytes());
+    key.push(element.kind() as u8);
+    key.extend_from_slice(&element.id().value().to_be_bytes());
+    LogicalKey::in_keyspace(Keyspace::TemporalIndex, key)
 }
 
 #[must_use]
@@ -555,6 +608,32 @@ pub fn decode_graph_key(key: &LogicalKey) -> Result<GraphKey, KeyCodecError> {
                 segment_id,
             }
         }
+        TAG_TEMPORAL_EVENT => {
+            require_keyspace(key, Keyspace::TemporalIndex)?;
+            let graph = GraphId::new(decoder.read_u64()?);
+            let commit_ts = decode_transaction_time(decoder.take_array()?);
+            let ordinal = decoder.read_u32()?;
+            let element = decoder.read_event_element(graph)?;
+            GraphKey::TemporalEvent {
+                element,
+                commit_ts,
+                ordinal,
+            }
+        }
+        TAG_TEMPORAL_EVENT_VALID => {
+            require_keyspace(key, Keyspace::TemporalIndex)?;
+            let graph = GraphId::new(decoder.read_u64()?);
+            let valid_from = ValidTime::from_micros(decode_ordered_i64(decoder.take_array()?));
+            let commit_ts = decode_transaction_time(decoder.take_array()?);
+            let ordinal = decoder.read_u32()?;
+            let element = decoder.read_event_element(graph)?;
+            GraphKey::TemporalEventValid {
+                element,
+                valid_from,
+                commit_ts,
+                ordinal,
+            }
+        }
         other => return Err(KeyCodecError::UnknownTag(other)),
     };
     if decoder.finished() {
@@ -564,6 +643,45 @@ pub fn decode_graph_key(key: &LogicalKey) -> Result<GraphKey, KeyCodecError> {
     }
 }
 
+pub fn graph_key_prefix_scope(
+    keyspace: Keyspace,
+    prefix: &[u8],
+) -> Result<Option<(GraphId, PartitionId)>, KeyCodecError> {
+    let Some(&tag) = prefix.first() else {
+        return Err(KeyCodecError::UnexpectedEnd);
+    };
+    let expected_keyspace = match tag {
+        TAG_VERTEX_IDENTITY | TAG_EDGE_IDENTITY => Keyspace::Identity,
+        TAG_CURRENT_VERTEX | TAG_CURRENT_EDGE => Keyspace::Current,
+        TAG_ADJ_OUT | TAG_CROSS_ADJ_OUT => Keyspace::AdjOut,
+        TAG_ADJ_IN | TAG_CROSS_ADJ_IN => Keyspace::AdjIn,
+        TAG_HISTORY_ANCHOR => Keyspace::History,
+        TAG_TEMPORAL_EVENT | TAG_TEMPORAL_EVENT_VALID => Keyspace::TemporalIndex,
+        other => return Err(KeyCodecError::UnknownTag(other)),
+    };
+    if keyspace != expected_keyspace {
+        return Err(KeyCodecError::WrongKeyspace);
+    }
+
+    let key = LogicalKey::in_keyspace(keyspace, prefix.to_vec());
+    match decode_graph_key(&key) {
+        Ok(graph_key) => return Ok(Some(graph_key_scope(graph_key))),
+        Err(KeyCodecError::UnexpectedEnd) => {}
+        Err(error) => return Err(error),
+    }
+
+    if matches!(tag, TAG_TEMPORAL_EVENT | TAG_TEMPORAL_EVENT_VALID) || prefix.len() < 13 {
+        return Ok(None);
+    }
+    let graph = GraphId::new(u64::from_be_bytes(
+        prefix[1..9].try_into().expect("bounded graph prefix"),
+    ));
+    let partition = PartitionId::new(u32::from_be_bytes(
+        prefix[9..13].try_into().expect("bounded partition prefix"),
+    ));
+    Ok(Some((graph, partition)))
+}
+
 #[must_use]
 pub const fn graph_key_scope(key: GraphKey) -> (GraphId, PartitionId) {
     match key {
@@ -571,7 +689,9 @@ pub const fn graph_key_scope(key: GraphKey) -> (GraphId, PartitionId) {
         | GraphKey::EdgeIdentity(element)
         | GraphKey::CurrentVertex(element)
         | GraphKey::CurrentEdge(element)
-        | GraphKey::HistoryAnchor { element, .. } => (element.graph(), element.partition()),
+        | GraphKey::HistoryAnchor { element, .. }
+        | GraphKey::TemporalEvent { element, .. }
+        | GraphKey::TemporalEventValid { element, .. } => (element.graph(), element.partition()),
         GraphKey::OutAdjacency {
             graph, partition, ..
         }
@@ -665,11 +785,15 @@ fn adjacency_prefix(tag: u8, graph: GraphId, partition: PartitionId, first: Elem
 }
 
 fn encode_transaction_time(value: TransactionTime) -> [u8; 12] {
-    let ordered_physical = (value.physical_micros() as u64) ^ (1_u64 << 63);
+    let ordered_physical = encode_ordered_i64(value.physical_micros());
     let mut encoded = [0; 12];
-    encoded[..8].copy_from_slice(&ordered_physical.to_be_bytes());
+    encoded[..8].copy_from_slice(&ordered_physical);
     encoded[8..].copy_from_slice(&value.logical().to_be_bytes());
     encoded
+}
+
+fn encode_ordered_i64(value: i64) -> [u8; 8] {
+    ((value as u64) ^ (1_u64 << 63)).to_be_bytes()
 }
 
 fn decode_transaction_time(value: [u8; 12]) -> TransactionTime {
@@ -677,6 +801,10 @@ fn decode_transaction_time(value: [u8; 12]) -> TransactionTime {
     let physical = (physical ^ (1_u64 << 63)) as i64;
     let logical = u32::from_be_bytes(value[8..].try_into().expect("fixed-width slice"));
     TransactionTime::new(physical, logical)
+}
+
+fn decode_ordered_i64(value: [u8; 8]) -> i64 {
+    (u64::from_be_bytes(value) ^ (1_u64 << 63)) as i64
 }
 
 fn require_keyspace(key: &LogicalKey, expected: Keyspace) -> Result<(), KeyCodecError> {
@@ -777,6 +905,22 @@ impl<'a> Decoder<'a> {
             }
         } else {
             implicit_kind
+        };
+        let id = ElementId::new(self.read_u128()?);
+        Ok(ElementRef {
+            graph,
+            partition,
+            kind,
+            id,
+        })
+    }
+
+    fn read_event_element(&mut self, graph: GraphId) -> Result<ElementRef, KeyCodecError> {
+        let partition = PartitionId::new(self.read_u32()?);
+        let kind = match self.read_u8()? {
+            1 => ElementKind::Vertex,
+            2 => ElementKind::Edge,
+            kind => return Err(KeyCodecError::InvalidElementKind(kind)),
         };
         let id = ElementId::new(self.read_u128()?);
         Ok(ElementRef {

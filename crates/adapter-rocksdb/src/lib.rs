@@ -15,15 +15,19 @@ use rocksdb::{
 };
 use storage_api::{
     ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
-    AdapterFuture, ApplyReceipt, BackendFamily, CanonicalRestoreSession, CommittedMutationBatch,
-    Durability, KeySpan, KeyValue, Keyspace, LogicalKey, LogicalSnapshotAccumulator,
-    LogicalSnapshotChunkV1, LogicalSnapshotError, LogicalSnapshotExportRequest,
-    LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1, LogicalSnapshotReader,
-    MappingBackedAdapter, MappingCapabilities, MappingDescriptorV1, MappingFuture,
-    MappingRequirement, MutationOperation, PreparedMappingTransaction, SnapshotCapability,
-    StorageAdapter, TemporalBackendMapping, adapter_log_fingerprint_key,
+    AdapterFuture, AdjacencyCursor, AdjacencyEntry, AdjacencyExpandPage, AdjacencyExpandRequest,
+    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalRestoreSession,
+    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
+    CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
+    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
+    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
+    LogicalSnapshotReader, MappingCapabilities, MappingDescriptorV1, MappingFuture,
+    MutationOperation, PreparedMappingTransaction, PropertyGatherPage, PropertyGatherRequest,
+    PropertyRow, PushdownGuarantee, QueryPageBounds, QueryPrimitiveCapabilities, ReadSnapshot,
+    SnapshotCapability, StorageAdapter, TemporalBackendMapping, adapter_log_fingerprint_key,
     adapter_mutation_fingerprint_key, new_logical_snapshot_id,
 };
+use temporal_types::CanonicalElement;
 
 type RocksDb = DBWithThreadMode<MultiThreaded>;
 
@@ -43,17 +47,11 @@ impl AdapterFactory for RocksAdapterFactory {
             let path = request.parameter("path").ok_or_else(|| {
                 AdapterFactoryError::new("RocksDB Adapter requires the public parameter path")
             })?;
-            let mapping = Arc::new(
-                RocksAdapter::open(path)
-                    .map_err(|error| AdapterFactoryError::new(error.to_string()))?,
-            );
-            let adapter = MappingBackedAdapter::with_runtime_identity(
-                "rocksdb",
-                env!("CARGO_PKG_VERSION"),
-                mapping,
-                MappingRequirement::HotPluggableReplica,
-            )
-            .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
+            let adapter = RocksAdapter::open(path)
+                .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
+            adapter
+                .validate_mapping()
+                .map_err(|error| AdapterFactoryError::new(error.to_string()))?;
             Ok(Arc::new(adapter) as Arc<dyn StorageAdapter>)
         })
     }
@@ -156,9 +154,9 @@ impl RocksAdapter {
             snapshot: SnapshotCapability::PhysicalCheckpoint,
             logical_export: true,
             logical_restore: true,
-            predicate_pushdown: false,
-            adjacency_pushdown: false,
-            change_feed: false,
+            predicate_pushdown: true,
+            adjacency_pushdown: true,
+            change_feed: true,
         }
     }
 
@@ -504,6 +502,10 @@ impl TemporalBackendMapping for RocksAdapter {
         <Self as StorageAdapter>::scan(self, span)
     }
 
+    fn begin_read_snapshot<'a>(&'a self) -> MappingFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        <Self as StorageAdapter>::begin_read_snapshot(self)
+    }
+
     fn export_canonical<'a>(
         &'a self,
         request: LogicalSnapshotExportRequest,
@@ -639,9 +641,9 @@ fn rocks_mapping_descriptor() -> MappingDescriptorV1 {
             canonical_export: true,
             canonical_restore: true,
             native_temporal_layout: true,
-            predicate_pushdown: false,
-            adjacency_pushdown: false,
-            change_feed: false,
+            predicate_pushdown: true,
+            adjacency_pushdown: true,
+            change_feed: true,
         },
     )
     .expect("static RocksDB Mapping descriptor is valid")
@@ -806,6 +808,10 @@ impl StorageAdapter for RocksAdapter {
         RocksAdapter::capabilities(self)
     }
 
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        rocks_query_primitive_capabilities()
+    }
+
     fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
         Some(rocks_mapping_descriptor())
     }
@@ -863,6 +869,52 @@ impl StorageAdapter for RocksAdapter {
         })
     }
 
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            let read = self.open_read_snapshot()?;
+            read.scan_candidates(request).await
+        })
+    }
+
+    fn gather_properties<'a>(
+        &'a self,
+        request: &'a PropertyGatherRequest,
+    ) -> AdapterFuture<'a, PropertyGatherPage> {
+        Box::pin(async move {
+            let read = self.open_read_snapshot()?;
+            read.gather_properties(request)
+        })
+    }
+
+    fn expand_adjacency<'a>(
+        &'a self,
+        request: &'a AdjacencyExpandRequest,
+    ) -> AdapterFuture<'a, AdjacencyExpandPage> {
+        Box::pin(async move {
+            let read = self.open_read_snapshot()?;
+            read.expand_adjacency(request)
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move {
+            let read = self.open_read_snapshot()?;
+            read.scan_changes(request).await
+        })
+    }
+
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(
+            async move { Ok(Box::new(self.open_read_snapshot()?) as Box<dyn ReadSnapshot + 'a>) },
+        )
+    }
+
     fn begin_logical_export<'a>(
         &'a self,
         request: LogicalSnapshotExportRequest,
@@ -897,6 +949,385 @@ impl StorageAdapter for RocksAdapter {
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         self.current_applied_log_index()
     }
+}
+
+struct RocksReadSnapshot<'a> {
+    adapter: &'a RocksAdapter,
+    snapshot: SnapshotWithThreadMode<'a, RocksDb>,
+    applied_log_index: u64,
+}
+
+impl ReadSnapshot for RocksReadSnapshot<'_> {
+    fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            let handles: Vec<_> = keys
+                .iter()
+                .map(|key| self.adapter.cf(key.keyspace()))
+                .collect::<Result<_, _>>()?;
+            self.snapshot
+                .multi_get_cf(
+                    handles
+                        .iter()
+                        .zip(keys)
+                        .map(|(cf, key)| (cf, key.as_bytes())),
+                )
+                .into_iter()
+                .map(|result| result.map_err(backend_error))
+                .collect()
+        })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move {
+            let cf = self.adapter.cf(span.keyspace())?;
+            let iterator = self
+                .snapshot
+                .iterator_cf(&cf, IteratorMode::From(span.start(), Direction::Forward));
+            let mut values = Vec::new();
+            let mut retained = 0_u64;
+            for item in iterator {
+                let (key, value) = item.map_err(backend_error)?;
+                if !span.contains(&key) {
+                    break;
+                }
+                retained = storage_api::charge_scan_entry(span, retained, &key, &value)?;
+                values.push(KeyValue::new(
+                    LogicalKey::in_keyspace(span.keyspace(), key.into_vec()),
+                    value.into_vec(),
+                ));
+                if values.len() == span.limit().unwrap_or(usize::MAX) {
+                    break;
+                }
+            }
+            Ok(values)
+        })
+    }
+
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            let cf = self.adapter.cf(request.span().keyspace())?;
+            let iterator = self.snapshot.iterator_cf(
+                &cf,
+                IteratorMode::From(request.span().start(), Direction::Forward),
+            );
+            let (entries, next_start) =
+                bounded_rocks_page(iterator, request.span(), request.bounds())?;
+            CanonicalScanPage::new(request, self.applied_log_index, entries, next_start)
+                .map_err(|error| AdapterError::Backend(error.to_string()))
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            let (entries, next_start) = self.scan_page(request.span(), request.bounds())?;
+            CandidateScanPage::new(
+                request,
+                self.applied_log_index,
+                PushdownGuarantee::Candidate,
+                entries,
+                next_start,
+            )
+            .map_err(query_error)
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move {
+            let (entries, next_start) = self.scan_page(request.span(), request.bounds())?;
+            ChangeScanPage::new(
+                request,
+                self.applied_log_index,
+                PushdownGuarantee::Exact,
+                entries,
+                next_start,
+            )
+            .map_err(query_error)
+        })
+    }
+}
+
+impl RocksAdapter {
+    fn open_read_snapshot(&self) -> Result<RocksReadSnapshot<'_>, AdapterError> {
+        let apply_guard = self
+            .apply_guard
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?;
+        let applied_log_index = self.current_applied_log_index()?;
+        let snapshot = self.db.snapshot();
+        drop(apply_guard);
+        Ok(RocksReadSnapshot {
+            adapter: self,
+            snapshot,
+            applied_log_index,
+        })
+    }
+}
+
+impl RocksReadSnapshot<'_> {
+    fn scan_page(
+        &self,
+        span: &KeySpan,
+        bounds: QueryPageBounds,
+    ) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+        let cf = self.adapter.cf(span.keyspace())?;
+        let iterator = self
+            .snapshot
+            .iterator_cf(&cf, IteratorMode::From(span.start(), Direction::Forward));
+        bounded_rocks_page(iterator, span, bounds)
+    }
+
+    fn gather_properties(
+        &self,
+        request: &PropertyGatherRequest,
+    ) -> Result<PropertyGatherPage, AdapterError> {
+        let handles = request
+            .keys()
+            .iter()
+            .map(|key| self.adapter.cf(key.keyspace()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let values = self.snapshot.multi_get_cf(
+            handles
+                .iter()
+                .zip(request.keys())
+                .map(|(cf, key)| (cf, key.as_bytes())),
+        );
+        let rows = request
+            .keys()
+            .iter()
+            .zip(values)
+            .map(|(key, value)| {
+                let value = value.map_err(backend_error)?;
+                let properties = value
+                    .as_deref()
+                    .and_then(stable_projection_payload)
+                    .map_or_else(
+                        || vec![None; request.properties().len()],
+                        |payload| {
+                            request
+                                .properties()
+                                .iter()
+                                .map(|property| payload.property(property.value()).cloned())
+                                .collect()
+                        },
+                    );
+                Ok(PropertyRow::new(key.clone(), properties))
+            })
+            .collect::<Result<Vec<_>, AdapterError>>()?;
+        PropertyGatherPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Candidate,
+            rows,
+        )
+        .map_err(query_error)
+    }
+
+    fn expand_adjacency(
+        &self,
+        request: &AdjacencyExpandRequest,
+    ) -> Result<AdjacencyExpandPage, AdapterError> {
+        let mut entries = Vec::new();
+        let mut retained = 0_u64;
+        let mut next = None;
+        'spans: for (input_ordinal, span) in request.spans().iter().enumerate() {
+            let cf = self.adapter.cf(span.keyspace())?;
+            let iterator = self
+                .snapshot
+                .iterator_cf(&cf, IteratorMode::From(span.start(), Direction::Forward));
+            for item in iterator {
+                let (key, value) = item.map_err(backend_error)?;
+                if !span.contains(&key) {
+                    break;
+                }
+                let entry_bytes = query_entry_bytes(&key, &value);
+                if entries.len() == request.bounds().max_items()
+                    || retained.saturating_add(entry_bytes) > request.bounds().max_bytes()
+                {
+                    if entries.is_empty() {
+                        return Err(AdapterError::ScanByteLimit {
+                            limit: request.bounds().max_bytes(),
+                            required: entry_bytes,
+                        });
+                    }
+                    next = Some(AdjacencyCursor::new(
+                        input_ordinal,
+                        LogicalKey::in_keyspace(span.keyspace(), key.into_vec()),
+                    ));
+                    break 'spans;
+                }
+                retained = retained.saturating_add(entry_bytes);
+                entries.push(AdjacencyEntry::new(
+                    input_ordinal,
+                    KeyValue::new(
+                        LogicalKey::in_keyspace(span.keyspace(), key.into_vec()),
+                        value.into_vec(),
+                    ),
+                ));
+            }
+        }
+        AdjacencyExpandPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Exact,
+            entries,
+            next,
+        )
+        .map_err(query_error)
+    }
+}
+
+fn bounded_rocks_page(
+    iterator: rocksdb::DBIteratorWithThreadMode<'_, RocksDb>,
+    span: &KeySpan,
+    bounds: QueryPageBounds,
+) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+    let mut entries = Vec::new();
+    let mut retained = 0_u64;
+    let mut next_start = None;
+    for item in iterator {
+        let (key, value) = item.map_err(backend_error)?;
+        if !span.contains(&key) {
+            break;
+        }
+        if entries.len() == bounds.max_items() {
+            next_start = Some(LogicalKey::in_keyspace(span.keyspace(), key.into_vec()));
+            break;
+        }
+        let entry_bytes = query_entry_bytes(&key, &value);
+        let required = retained.saturating_add(entry_bytes);
+        if required > bounds.max_bytes() {
+            if entries.is_empty() {
+                return Err(AdapterError::ScanByteLimit {
+                    limit: bounds.max_bytes(),
+                    required,
+                });
+            }
+            next_start = Some(LogicalKey::in_keyspace(span.keyspace(), key.into_vec()));
+            break;
+        }
+        retained = required;
+        entries.push(KeyValue::new(
+            LogicalKey::in_keyspace(span.keyspace(), key.into_vec()),
+            value.into_vec(),
+        ));
+    }
+    Ok((entries, next_start))
+}
+
+const fn rocks_query_primitive_capabilities() -> QueryPrimitiveCapabilities {
+    QueryPrimitiveCapabilities::new(
+        PushdownGuarantee::Candidate,
+        PushdownGuarantee::Candidate,
+        PushdownGuarantee::Exact,
+        PushdownGuarantee::Exact,
+    )
+}
+
+fn query_entry_bytes(key: &[u8], value: &[u8]) -> u64 {
+    u64::try_from(key.len())
+        .ok()
+        .and_then(|key_bytes| {
+            u64::try_from(value.len())
+                .ok()
+                .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+        })
+        .unwrap_or(u64::MAX)
+}
+
+fn stable_projection_payload(bytes: &[u8]) -> Option<CanonicalElement> {
+    let mut decoder = ProjectionDecoder::new(bytes);
+    decoder.expect(b"DTGP")?;
+    if decoder.read_u16()? != 1 {
+        return None;
+    }
+    decoder.skip(12)?;
+    let segment_count = decoder.read_u32()? as usize;
+    let mut stable = None;
+    for _ in 0..segment_count {
+        decoder.skip(8)?;
+        match decoder.read_u8()? {
+            0 => {}
+            1 => decoder.skip(8)?,
+            _ => return None,
+        }
+        let payload_length = decoder.read_u32()? as usize;
+        let payload = CanonicalElement::decode(decoder.take(payload_length)?).ok()?;
+        if stable.as_ref().is_some_and(|stable| stable != &payload) {
+            return None;
+        }
+        stable = Some(payload);
+    }
+    let checksum_position = decoder.position;
+    let stored_checksum = decoder.read_u64()?;
+    if decoder.position != bytes.len() || stored_checksum != fnv1a(&bytes[..checksum_position]) {
+        return None;
+    }
+    stable
+}
+
+struct ProjectionDecoder<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> ProjectionDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Option<&'a [u8]> {
+        let end = self.position.checked_add(length)?;
+        let bytes = self.bytes.get(self.position..end)?;
+        self.position = end;
+        Some(bytes)
+    }
+
+    fn expect(&mut self, expected: &[u8]) -> Option<()> {
+        (self.take(expected.len())? == expected).then_some(())
+    }
+
+    fn skip(&mut self, length: usize) -> Option<()> {
+        self.take(length).map(|_| ())
+    }
+
+    fn read_u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Option<u16> {
+        Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn read_u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |value, byte| {
+        (value ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn query_error(error: storage_api::QueryPrimitiveError) -> AdapterError {
+    AdapterError::Backend(error.to_string())
 }
 
 struct RocksLogicalSnapshotReader<'a> {

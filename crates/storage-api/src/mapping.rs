@@ -9,7 +9,8 @@ use crate::{
     AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, AdapterRequirement,
     ApplyReceipt, BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, LogicalKey,
     LogicalSnapshotChunkV1, LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1,
-    LogicalSnapshotManifestV1, LogicalSnapshotReader, SnapshotCapability, StorageAdapter,
+    LogicalSnapshotManifestV1, LogicalSnapshotReader, ReadSnapshot, SnapshotCapability,
+    StorageAdapter,
 };
 
 pub const MAPPING_SPI_VERSION: u16 = 1;
@@ -331,6 +332,14 @@ pub trait TemporalBackendMapping: Send + Sync {
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> MappingFuture<'a, Vec<KeyValue>>;
 
+    fn begin_read_snapshot<'a>(&'a self) -> MappingFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(async move {
+            Err(AdapterError::UnsupportedOperation {
+                operation: "Mapping query read snapshot",
+            })
+        })
+    }
+
     fn export_canonical<'a>(
         &'a self,
         _request: LogicalSnapshotExportRequest,
@@ -445,6 +454,10 @@ impl StorageAdapter for MappingBackedAdapter {
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
         self.mapping.scan(span)
+    }
+
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        self.mapping.begin_read_snapshot()
     }
 
     fn begin_logical_export<'a>(

@@ -13,14 +13,18 @@ use adapter_registry::{
 use postgres::{Client, GenericClient, IsolationLevel, NoTls, Transaction};
 use storage_api::{
     ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
-    AdapterFuture, ApplyReceipt, BackendFamily, CanonicalRestoreSession, CommittedMutationBatch,
-    Durability, KeySpan, KeyValue, Keyspace, LogicalKey, LogicalSnapshotAccumulator,
-    LogicalSnapshotChunkV1, LogicalSnapshotError, LogicalSnapshotExportRequest,
-    LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1, LogicalSnapshotReader,
-    MappingBackedAdapter, MappingCapabilities, MappingDescriptorV1, MappingFuture,
-    MappingRequirement, MutationOperation, PreparedMappingTransaction, SnapshotCapability,
-    StorageAdapter, TemporalBackendMapping, adapter_log_fingerprint_key,
-    adapter_mutation_fingerprint_key, new_logical_snapshot_id,
+    AdapterFuture, AdjacencyCursor, AdjacencyEntry, AdjacencyExpandPage, AdjacencyExpandRequest,
+    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalRestoreSession,
+    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
+    CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
+    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
+    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
+    LogicalSnapshotReader, MappingBackedAdapter, MappingCapabilities, MappingDescriptorV1,
+    MappingFuture, MappingRequirement, MutationOperation, PreparedMappingTransaction,
+    PropertyGatherPage, PropertyGatherRequest, PropertyRow, PushdownGuarantee, QueryPageBounds,
+    QueryPrimitiveCapabilities, ReadSnapshot, SnapshotCapability, StorageAdapter,
+    TemporalBackendMapping, adapter_log_fingerprint_key, adapter_mutation_fingerprint_key,
+    new_logical_snapshot_id,
 };
 use temporal_storage::{
     CanonicalGraphEntry, EdgeIdentity, ElementKind, GraphKey, HistoryEntry, ProjectionRecord,
@@ -28,11 +32,19 @@ use temporal_storage::{
     current_vertex_key, decode_canonical_graph_entry, decode_graph_key, edge_identity_key,
     history_anchor_key, in_adjacency_key, out_adjacency_key, vertex_identity_key,
 };
-use temporal_types::TransactionTime;
+use temporal_types::{GraphValue, TransactionTime};
 
 pub const POSTGRES_SCHEMA_VERSION: i32 = 1;
 pub const DEFAULT_POOL_SIZE: usize = 8;
 pub const MAX_POOL_SIZE: usize = 128;
+
+pub const POSTGRES_QUERY_PRIMITIVE_CAPABILITIES: QueryPrimitiveCapabilities =
+    QueryPrimitiveCapabilities::new(
+        PushdownGuarantee::Candidate,
+        PushdownGuarantee::Candidate,
+        PushdownGuarantee::Exact,
+        PushdownGuarantee::Exact,
+    );
 
 pub const POSTGRES_SCHEMA: &str = r#"
 CREATE SCHEMA IF NOT EXISTS dtgproxy;
@@ -289,6 +301,135 @@ const REQUIRED_SCHEMA_COLUMNS: &[(&str, &[&str])] = &[
 
 const SELECT_INSTANCE_FOR_UPDATE: &str = "SELECT schema_version, mapping_fingerprint, applied_log_index, has_applied_index_record, published FROM dtgproxy.adapter_instance WHERE instance_id = $1 FOR UPDATE";
 const SELECT_INSTANCE: &str = "SELECT schema_version, mapping_fingerprint, applied_log_index, has_applied_index_record, published FROM dtgproxy.adapter_instance WHERE instance_id = $1";
+pub const POSTGRES_CANONICAL_SCAN_SQL: &str = r#"
+WITH canonical_keys(keyspace, logical_key, canonical_value) AS (
+    SELECT 1::smallint, decode('01', 'hex') || graph_id || partition_id || vertex_id, NULL::bytea
+      FROM dtgproxy.vertex_identity WHERE instance_id = $1
+    UNION ALL
+    SELECT 1::smallint, decode('02', 'hex') || graph_id || partition_id || edge_id, NULL::bytea
+      FROM dtgproxy.edge_identity WHERE instance_id = $1
+    UNION ALL
+    SELECT 2::smallint, decode('08', 'hex') || graph_id || partition_id || vertex_id, projection
+      FROM dtgproxy.vertex_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 2::smallint, decode('09', 'hex') || graph_id || partition_id || edge_id, projection
+      FROM dtgproxy.edge_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 3::smallint, decode(lpad(to_hex(key_tag::integer), 2, '0'), 'hex') || graph_id ||
+           local_partition || local_endpoint || edge_type || bucket ||
+           CASE WHEN key_tag = 18 THEN remote_partition ELSE ''::bytea END || remote_endpoint ||
+           CASE WHEN key_tag = 18 THEN edge_partition ELSE ''::bytea END || edge_id, NULL::bytea
+      FROM dtgproxy.out_adjacency WHERE instance_id = $1
+    UNION ALL
+    SELECT 4::smallint, decode(lpad(to_hex(key_tag::integer), 2, '0'), 'hex') || graph_id ||
+           local_partition || local_endpoint || edge_type || bucket ||
+           CASE WHEN key_tag = 19 THEN remote_partition ELSE ''::bytea END || remote_endpoint ||
+           CASE WHEN key_tag = 19 THEN edge_partition ELSE ''::bytea END || edge_id, NULL::bytea
+      FROM dtgproxy.in_adjacency WHERE instance_id = $1
+    UNION ALL
+    SELECT 5::smallint, decode('20', 'hex') || graph_id || partition_id ||
+           decode(lpad(to_hex(element_kind::integer), 2, '0'), 'hex') || element_id ||
+           decode(translate(encode(int8send(transaction_physical # '-9223372036854775808'::bigint) || transaction_logical, 'hex'),
+                            '0123456789abcdef', 'fedcba9876543210'), 'hex') || segment_id, history_value
+      FROM dtgproxy.history WHERE instance_id = $1
+    UNION ALL
+    SELECT keyspace, logical_key, value FROM dtgproxy.opaque_records WHERE instance_id = $1
+    UNION ALL
+    SELECT 7::smallint, decode('01', 'hex') || log_index, NULL::bytea
+      FROM dtgproxy.replay_log WHERE instance_id = $1
+    UNION ALL
+    SELECT 7::smallint, decode('02', 'hex') || txn_id || sequence, NULL::bytea
+      FROM dtgproxy.replay_mutation WHERE instance_id = $1
+    UNION ALL
+    SELECT 0::smallint, $6::bytea, NULL::bytea FROM dtgproxy.adapter_instance
+      WHERE instance_id = $1 AND has_applied_index_record
+)
+SELECT logical_key, canonical_value FROM canonical_keys
+ WHERE keyspace = $2 AND logical_key >= $3
+   AND ($4::bytea IS NULL OR logical_key < $4)
+ ORDER BY logical_key
+ LIMIT $5
+"#;
+pub const POSTGRES_TYPED_CANDIDATE_SCAN_SQL: &str = r#"
+WITH candidate_keys(keyspace, logical_key) AS (
+    SELECT 2::smallint, decode('08', 'hex') || graph_id || partition_id || vertex_id
+      FROM dtgproxy.vertex_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 2::smallint, decode('09', 'hex') || graph_id || partition_id || edge_id
+      FROM dtgproxy.edge_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 5::smallint, decode('20', 'hex') || graph_id || partition_id ||
+           decode(lpad(to_hex(element_kind::integer), 2, '0'), 'hex') || element_id ||
+           decode(translate(encode(int8send(transaction_physical # '-9223372036854775808'::bigint) || transaction_logical, 'hex'),
+                            '0123456789abcdef', 'fedcba9876543210'), 'hex') || segment_id
+      FROM dtgproxy.history WHERE instance_id = $1
+    UNION ALL
+    SELECT keyspace, logical_key FROM dtgproxy.opaque_records
+      WHERE instance_id = $1 AND keyspace = 6
+)
+SELECT logical_key FROM candidate_keys
+ WHERE keyspace = $2 AND logical_key >= $3
+   AND ($4::bytea IS NULL OR logical_key < $4)
+ ORDER BY logical_key
+ LIMIT $5
+"#;
+pub const POSTGRES_TYPED_PROPERTY_GATHER_SQL: &str = r#"
+WITH input(keyspace, logical_key, input_ordinal) AS (
+    SELECT keyspace, logical_key, input_ordinal
+      FROM unnest($2::smallint[], $3::bytea[]) WITH ORDINALITY
+           AS requested(keyspace, logical_key, input_ordinal)
+), native_projection(keyspace, logical_key, projection) AS (
+    SELECT 2::smallint, decode('08', 'hex') || graph_id || partition_id || vertex_id, projection
+      FROM dtgproxy.vertex_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 2::smallint, decode('09', 'hex') || graph_id || partition_id || edge_id, projection
+      FROM dtgproxy.edge_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 5::smallint, decode('20', 'hex') || graph_id || partition_id ||
+           decode(lpad(to_hex(element_kind::integer), 2, '0'), 'hex') || element_id ||
+           decode(translate(encode(int8send(transaction_physical # '-9223372036854775808'::bigint) || transaction_logical, 'hex'),
+                            '0123456789abcdef', 'fedcba9876543210'), 'hex') || segment_id,
+           history_value
+      FROM dtgproxy.history WHERE instance_id = $1
+), joined AS (
+    SELECT input.input_ordinal, native_projection.projection,
+           sum(coalesce(octet_length(native_projection.projection), 0))
+               OVER (ORDER BY input.input_ordinal) AS retained_bytes
+      FROM input
+      LEFT JOIN native_projection USING (keyspace, logical_key)
+)
+SELECT input_ordinal,
+       CASE WHEN retained_bytes <= $4::bigint THEN projection ELSE NULL::bytea END
+  FROM joined
+ ORDER BY input_ordinal
+"#;
+pub const POSTGRES_TYPED_ADJACENCY_EXPAND_SQL: &str = r#"
+WITH adjacency_keys(keyspace, logical_key) AS (
+    SELECT 3::smallint, decode(lpad(to_hex(key_tag::integer), 2, '0'), 'hex') || graph_id ||
+           local_partition || local_endpoint || edge_type || bucket ||
+           CASE WHEN key_tag = 18 THEN remote_partition ELSE ''::bytea END || remote_endpoint ||
+           CASE WHEN key_tag = 18 THEN edge_partition ELSE ''::bytea END || edge_id
+      FROM dtgproxy.out_adjacency WHERE instance_id = $1
+    UNION ALL
+    SELECT 4::smallint, decode(lpad(to_hex(key_tag::integer), 2, '0'), 'hex') || graph_id ||
+           local_partition || local_endpoint || edge_type || bucket ||
+           CASE WHEN key_tag = 19 THEN remote_partition ELSE ''::bytea END || remote_endpoint ||
+           CASE WHEN key_tag = 19 THEN edge_partition ELSE ''::bytea END || edge_id
+      FROM dtgproxy.in_adjacency WHERE instance_id = $1
+)
+SELECT logical_key FROM adjacency_keys
+ WHERE keyspace = $2 AND logical_key >= $3
+   AND ($4::bytea IS NULL OR logical_key < $4)
+ ORDER BY logical_key
+ LIMIT $5
+"#;
+pub const POSTGRES_TYPED_CHANGE_SCAN_SQL: &str = r#"
+SELECT logical_key FROM dtgproxy.opaque_records
+ WHERE instance_id = $1 AND keyspace = $2 AND logical_key >= $3
+   AND ($4::bytea IS NULL OR logical_key < $4)
+ ORDER BY logical_key
+ LIMIT $5
+"#;
 const INSERT_INSTANCE: &str = "INSERT INTO dtgproxy.adapter_instance(instance_id, schema_version, mapping_fingerprint, applied_log_index, has_applied_index_record, published) VALUES ($1, $2, $3, $4, $5, $6)";
 const UPDATE_APPLIED_INDEX: &str = "UPDATE dtgproxy.adapter_instance SET applied_log_index = $2, has_applied_index_record = TRUE WHERE instance_id = $1 AND published = TRUE";
 const PUBLISH_RESTORE: &str = "UPDATE dtgproxy.adapter_instance SET applied_log_index = $2, has_applied_index_record = $3, published = TRUE WHERE instance_id = $1 AND published = FALSE";
@@ -442,8 +583,8 @@ fn postgres_mapping_descriptor() -> MappingDescriptorV1 {
             canonical_restore: true,
             native_temporal_layout: true,
             predicate_pushdown: false,
-            adjacency_pushdown: false,
-            change_feed: false,
+            adjacency_pushdown: true,
+            change_feed: true,
         },
     )
     .expect("static PostgreSQL Mapping descriptor is valid")
@@ -927,6 +1068,29 @@ impl PostgresAdapter {
         })
     }
 
+    fn begin_read_view(&self) -> Result<PostgresReadSnapshot, AdapterError> {
+        let read_slot = self.export_slots.try_acquire()?;
+        let mut client =
+            Client::connect(&self.connection_string, NoTls).map_err(adapter_pg_error)?;
+        client
+            .batch_execute(CONFIGURE_CONNECTION)
+            .map_err(adapter_pg_error)?;
+        client
+            .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .map_err(adapter_pg_error)?;
+        let row = client
+            .query_one(SELECT_INSTANCE, &[&self.instance_id])
+            .map_err(adapter_pg_error)?;
+        let (_, applied_log_index) = validate_instance_row_for_adapter(&row)?;
+        Ok(PostgresReadSnapshot {
+            client: Mutex::new(client),
+            instance_id: self.instance_id.clone(),
+            applied_log_index,
+            finished: false,
+            _read_slot: read_slot,
+        })
+    }
+
     fn restore_entries(
         &self,
         entries: &[KeyValue],
@@ -1104,9 +1268,13 @@ impl StorageAdapter for PostgresAdapter {
             logical_export: true,
             logical_restore: true,
             predicate_pushdown: false,
-            adjacency_pushdown: false,
-            change_feed: false,
+            adjacency_pushdown: true,
+            change_feed: true,
         }
+    }
+
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        POSTGRES_QUERY_PRIMITIVE_CAPABILITIES
     }
 
     fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
@@ -1126,6 +1294,50 @@ impl StorageAdapter for PostgresAdapter {
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
         Box::pin(async move { self.scan_values(span) })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            let snapshot = self.begin_read_view()?;
+            snapshot.scan_candidate_page(request)
+        })
+    }
+
+    fn gather_properties<'a>(
+        &'a self,
+        request: &'a PropertyGatherRequest,
+    ) -> AdapterFuture<'a, PropertyGatherPage> {
+        Box::pin(async move {
+            let snapshot = self.begin_read_view()?;
+            snapshot.gather_property_page(request)
+        })
+    }
+
+    fn expand_adjacency<'a>(
+        &'a self,
+        request: &'a AdjacencyExpandRequest,
+    ) -> AdapterFuture<'a, AdjacencyExpandPage> {
+        Box::pin(async move {
+            let snapshot = self.begin_read_view()?;
+            snapshot.expand_adjacency_page(request)
+        })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move {
+            let snapshot = self.begin_read_view()?;
+            snapshot.scan_change_page(request)
+        })
+    }
+
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(async move { Ok(Box::new(self.begin_read_view()?) as Box<dyn ReadSnapshot + 'a>) })
     }
 
     fn begin_logical_export<'a>(
@@ -1303,6 +1515,10 @@ impl TemporalBackendMapping for PostgresAdapter {
         Box::pin(async move { self.scan_values(span) })
     }
 
+    fn begin_read_snapshot<'a>(&'a self) -> MappingFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        <Self as StorageAdapter>::begin_read_snapshot(self)
+    }
+
     fn export_canonical<'a>(
         &'a self,
         request: LogicalSnapshotExportRequest,
@@ -1377,6 +1593,487 @@ struct PostgresLogicalSnapshotReader {
     exhausted: bool,
     finished: bool,
     _export_slot: ExportSlot,
+}
+
+struct PostgresReadSnapshot {
+    client: Mutex<Client>,
+    instance_id: String,
+    applied_log_index: u64,
+    finished: bool,
+    _read_slot: ExportSlot,
+}
+
+impl PostgresReadSnapshot {
+    fn client(&self) -> Result<MutexGuard<'_, Client>, AdapterError> {
+        self.client.lock().map_err(|_| AdapterError::LockPoisoned)
+    }
+
+    fn multi_get_values(&self, keys: &[LogicalKey]) -> Result<Vec<Option<Vec<u8>>>, AdapterError> {
+        let mut client = self.client()?;
+        let entries = load_all_entries(&mut *client, &self.instance_id)?;
+        Ok(keys
+            .iter()
+            .map(|key| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.key().keyspace() == key.keyspace()
+                            && entry.key().as_bytes() == key.as_bytes()
+                    })
+                    .map(|entry| entry.value().to_vec())
+            })
+            .collect())
+    }
+
+    fn scan_values(&self, span: &KeySpan) -> Result<Vec<KeyValue>, AdapterError> {
+        let mut client = self.client()?;
+        let entries = load_all_entries(&mut *client, &self.instance_id)?;
+        let mut values = Vec::new();
+        let mut retained = 0_u64;
+        for entry in entries {
+            if entry.key().keyspace() != span.keyspace() || !span.contains(entry.key().as_bytes()) {
+                continue;
+            }
+            retained = storage_api::charge_scan_entry(
+                span,
+                retained,
+                entry.key().as_bytes(),
+                entry.value(),
+            )?;
+            values.push(entry);
+            if span.limit().is_some_and(|limit| values.len() >= limit) {
+                break;
+            }
+        }
+        Ok(values)
+    }
+
+    fn scan_canonical_page(
+        &self,
+        request: &CanonicalScanRequest,
+    ) -> Result<CanonicalScanPage, AdapterError> {
+        let span = request.span();
+        let bounds = request.bounds();
+        let keyspace = i16::from(span.keyspace().tag());
+        let query_limit = i64::try_from(bounds.max_items())
+            .ok()
+            .and_then(|limit| limit.checked_add(1))
+            .ok_or_else(|| AdapterError::Backend("canonical scan limit overflow".to_owned()))?;
+        let mut client = self.client()?;
+        let rows = client
+            .query(
+                POSTGRES_CANONICAL_SCAN_SQL,
+                &[
+                    &self.instance_id,
+                    &keyspace,
+                    &span.start(),
+                    &span.end(),
+                    &query_limit,
+                    &ADAPTER_META_APPLIED_LOG_INDEX_KEY,
+                ],
+            )
+            .map_err(adapter_pg_error)?;
+        let mut entries = Vec::with_capacity(rows.len().min(bounds.max_items()));
+        let mut retained = 0_u64;
+        let mut next_start = None;
+        for row in rows {
+            let key = LogicalKey::in_keyspace(span.keyspace(), row.get(0));
+            if entries.len() == bounds.max_items() {
+                next_start = Some(key);
+                break;
+            }
+            let entry = match row.get::<_, Option<Vec<u8>>>(1) {
+                Some(value) => KeyValue::new(key, value),
+                None => load_canonical_entry(&mut *client, &self.instance_id, key)?.ok_or_else(
+                    || AdapterError::Backend("canonical scan key disappeared".to_owned()),
+                )?,
+            };
+            let entry_bytes = u64::try_from(entry.key().as_bytes().len())
+                .ok()
+                .and_then(|key_bytes| {
+                    u64::try_from(entry.value().len())
+                        .ok()
+                        .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+                })
+                .unwrap_or(u64::MAX);
+            let required = retained.saturating_add(entry_bytes);
+            if required > bounds.max_bytes() {
+                if entries.is_empty() {
+                    return Err(AdapterError::ScanByteLimit {
+                        limit: bounds.max_bytes(),
+                        required,
+                    });
+                }
+                next_start = Some(entry.key().clone());
+                break;
+            }
+            retained = required;
+            entries.push(entry);
+        }
+        CanonicalScanPage::new(request, self.applied_log_index, entries, next_start)
+            .map_err(|error| AdapterError::Backend(error.to_string()))
+    }
+
+    fn scan_candidate_page(
+        &self,
+        request: &CandidateScanRequest,
+    ) -> Result<CandidateScanPage, AdapterError> {
+        let (entries, next_start) = self.scan_key_page(
+            POSTGRES_TYPED_CANDIDATE_SCAN_SQL,
+            request.span(),
+            request.bounds(),
+            false,
+        )?;
+        CandidateScanPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Candidate,
+            entries,
+            next_start,
+        )
+        .map_err(query_primitive_error)
+    }
+
+    fn gather_property_page(
+        &self,
+        request: &PropertyGatherRequest,
+    ) -> Result<PropertyGatherPage, AdapterError> {
+        let mut client = self.client()?;
+        let keyspaces: Vec<i16> = request
+            .keys()
+            .iter()
+            .map(|key| i16::from(key.keyspace().tag()))
+            .collect();
+        let logical_keys: Vec<Vec<u8>> = request
+            .keys()
+            .iter()
+            .map(|key| key.as_bytes().to_vec())
+            .collect();
+        let response_limit = i64::try_from(request.bounds().max_bytes())
+            .map_err(|_| AdapterError::Backend("property gather byte limit overflow".to_owned()))?;
+        let query_rows = client
+            .query(
+                POSTGRES_TYPED_PROPERTY_GATHER_SQL,
+                &[
+                    &self.instance_id,
+                    &keyspaces,
+                    &logical_keys,
+                    &response_limit,
+                ],
+            )
+            .map_err(adapter_pg_error)?;
+        if query_rows.len() != request.keys().len() {
+            return Err(AdapterError::Backend(
+                "property gather set query changed input cardinality".to_owned(),
+            ));
+        }
+        let mut retained = request
+            .keys()
+            .iter()
+            .try_fold(0_u64, |retained, key| {
+                retained.checked_add(u64::try_from(key.as_bytes().len()).ok()?)
+            })
+            .ok_or_else(|| AdapterError::Backend("property gather size overflow".to_owned()))?;
+        let mut rows = Vec::with_capacity(request.keys().len());
+        for (input_ordinal, (key, query_row)) in request.keys().iter().zip(query_rows).enumerate() {
+            let returned_ordinal: i64 = query_row.get(0);
+            if returned_ordinal != i64::try_from(input_ordinal + 1).unwrap_or(i64::MAX) {
+                return Err(AdapterError::Backend(
+                    "property gather set query changed input order".to_owned(),
+                ));
+            }
+            let projection: Option<Vec<u8>> = query_row.get(1);
+            let projection = projection
+                .as_deref()
+                .map(|projection| decode_typed_projection(key, projection))
+                .transpose()?;
+            let values = request
+                .properties()
+                .iter()
+                .map(|property| {
+                    projection
+                        .as_ref()
+                        .and_then(|projection| consistent_property(projection, property.value()))
+                })
+                .map(|value| retain_bounded_property(value, &mut retained, request.bounds()))
+                .collect();
+            rows.push(PropertyRow::new(key.clone(), values));
+        }
+        PropertyGatherPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Candidate,
+            rows,
+        )
+        .map_err(query_primitive_error)
+    }
+
+    fn expand_adjacency_page(
+        &self,
+        request: &AdjacencyExpandRequest,
+    ) -> Result<AdjacencyExpandPage, AdapterError> {
+        let mut entries = Vec::new();
+        let mut next = None;
+        for (input_ordinal, span) in request.spans().iter().enumerate() {
+            let remaining_items = request.bounds().max_items().saturating_sub(entries.len());
+            if remaining_items == 0 {
+                next = Some(AdjacencyCursor::new(input_ordinal, span_start_key(span)));
+                break;
+            }
+            let remaining_bytes = request
+                .bounds()
+                .max_bytes()
+                .saturating_sub(adjacency_entries_bytes(&entries));
+            if remaining_bytes == 0 {
+                next = Some(AdjacencyCursor::new(input_ordinal, span_start_key(span)));
+                break;
+            }
+            let bounds = QueryPageBounds::new(remaining_items, remaining_bytes)
+                .map_err(query_primitive_error)?;
+            let (page_entries, page_next) = self.scan_key_page(
+                POSTGRES_TYPED_ADJACENCY_EXPAND_SQL,
+                span,
+                bounds,
+                !entries.is_empty(),
+            )?;
+            entries.extend(
+                page_entries
+                    .into_iter()
+                    .map(|entry| AdjacencyEntry::new(input_ordinal, entry)),
+            );
+            if let Some(page_next) = page_next {
+                next = Some(AdjacencyCursor::new(input_ordinal, page_next));
+                break;
+            }
+        }
+        AdjacencyExpandPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Exact,
+            entries,
+            next,
+        )
+        .map_err(query_primitive_error)
+    }
+
+    fn scan_change_page(
+        &self,
+        request: &ChangeScanRequest,
+    ) -> Result<ChangeScanPage, AdapterError> {
+        let (entries, next_start) = self.scan_key_page(
+            POSTGRES_TYPED_CHANGE_SCAN_SQL,
+            request.span(),
+            request.bounds(),
+            false,
+        )?;
+        ChangeScanPage::new(
+            request,
+            self.applied_log_index,
+            PushdownGuarantee::Exact,
+            entries,
+            next_start,
+        )
+        .map_err(query_primitive_error)
+    }
+
+    fn scan_key_page(
+        &self,
+        statement: &str,
+        span: &KeySpan,
+        bounds: QueryPageBounds,
+        allow_empty_byte_page: bool,
+    ) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+        let keyspace = i16::from(span.keyspace().tag());
+        let query_limit = page_query_limit(bounds)?;
+        let mut client = self.client()?;
+        let rows = client
+            .query(
+                statement,
+                &[
+                    &self.instance_id,
+                    &keyspace,
+                    &span.start(),
+                    &span.end(),
+                    &query_limit,
+                ],
+            )
+            .map_err(adapter_pg_error)?;
+        let mut entries = Vec::with_capacity(rows.len().min(bounds.max_items()));
+        let mut retained = 0_u64;
+        let mut next_start = None;
+        for row in rows {
+            let key = LogicalKey::in_keyspace(span.keyspace(), row.get(0));
+            if entries.len() == bounds.max_items() {
+                next_start = Some(key);
+                break;
+            }
+            let entry = load_canonical_entry(&mut *client, &self.instance_id, key)?
+                .ok_or_else(|| AdapterError::Backend("typed scan key disappeared".to_owned()))?;
+            let required = retained.saturating_add(key_value_bytes(&entry));
+            if required > bounds.max_bytes() {
+                if entries.is_empty() && !allow_empty_byte_page {
+                    return Err(AdapterError::ScanByteLimit {
+                        limit: bounds.max_bytes(),
+                        required,
+                    });
+                }
+                next_start = Some(entry.key().clone());
+                break;
+            }
+            retained = required;
+            entries.push(entry);
+        }
+        Ok((entries, next_start))
+    }
+}
+
+impl ReadSnapshot for PostgresReadSnapshot {
+    fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move { self.multi_get_values(keys) })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move { self.scan_values(span) })
+    }
+
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move { self.scan_canonical_page(request) })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move { self.scan_candidate_page(request) })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        Box::pin(async move { self.scan_change_page(request) })
+    }
+}
+
+impl Drop for PostgresReadSnapshot {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Ok(mut client) = self.client.lock() {
+                let _ = client.batch_execute("ROLLBACK");
+            }
+            self.finished = true;
+        }
+    }
+}
+
+fn page_query_limit(bounds: QueryPageBounds) -> Result<i64, AdapterError> {
+    i64::try_from(bounds.max_items())
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| AdapterError::Backend("typed query page limit overflow".to_owned()))
+}
+
+fn key_value_bytes(entry: &KeyValue) -> u64 {
+    u64::try_from(entry.key().as_bytes().len())
+        .ok()
+        .and_then(|key_bytes| {
+            u64::try_from(entry.value().len())
+                .ok()
+                .and_then(|value_bytes| key_bytes.checked_add(value_bytes))
+        })
+        .unwrap_or(u64::MAX)
+}
+
+fn adjacency_entries_bytes(entries: &[AdjacencyEntry]) -> u64 {
+    entries.iter().fold(0_u64, |bytes, entry| {
+        bytes.saturating_add(key_value_bytes(entry.entry()))
+    })
+}
+
+fn span_start_key(span: &KeySpan) -> LogicalKey {
+    LogicalKey::in_keyspace(span.keyspace(), span.start().to_vec())
+}
+
+fn query_primitive_error(error: impl Display) -> AdapterError {
+    AdapterError::Backend(error.to_string())
+}
+
+fn decode_typed_projection(
+    key: &LogicalKey,
+    bytes: &[u8],
+) -> Result<ProjectionRecord, AdapterError> {
+    match decode_canonical_graph_entry(key, bytes)
+        .map_err(|error| AdapterError::Backend(error.to_string()))?
+    {
+        CanonicalGraphEntry::Current { value, .. } => Ok(value),
+        CanonicalGraphEntry::History { value, .. } => {
+            let commit_ts = value.commit_ts();
+            let segments = match value {
+                HistoryEntry::Anchor(anchor) => anchor.projection().segments().to_vec(),
+                HistoryEntry::Delta(delta) => delta
+                    .replacement()
+                    .cloned()
+                    .map(|payload| {
+                        vec![temporal_storage::ValidSegment::new(
+                            delta.changed_valid(),
+                            payload,
+                        )]
+                    })
+                    .unwrap_or_default(),
+            };
+            ProjectionRecord::new(commit_ts, segments)
+                .map_err(|error| AdapterError::Backend(error.to_string()))
+        }
+        _ => Err(AdapterError::Backend(
+            "property gather requires Current or History graph keys".to_owned(),
+        )),
+    }
+}
+
+fn consistent_property(projection: &ProjectionRecord, property_id: u32) -> Option<GraphValue> {
+    let mut values = projection
+        .segments()
+        .iter()
+        .map(|segment| segment.payload().property(property_id));
+    let first = values.next()?.cloned();
+    values
+        .all(|value| value == first.as_ref())
+        .then_some(first)
+        .flatten()
+}
+
+fn retain_bounded_property(
+    value: Option<GraphValue>,
+    retained: &mut u64,
+    bounds: QueryPageBounds,
+) -> Option<GraphValue> {
+    let value = value?;
+    let required = retained.saturating_add(graph_value_bytes(&value));
+    if required > bounds.max_bytes() {
+        return None;
+    }
+    *retained = required;
+    Some(value)
+}
+
+fn graph_value_bytes(value: &GraphValue) -> u64 {
+    match value {
+        GraphValue::Null => 0,
+        GraphValue::Boolean(_) => 1,
+        GraphValue::Integer(_) | GraphValue::FloatBits(_) | GraphValue::TimestampMicros(_) => 8,
+        GraphValue::String(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+        GraphValue::Bytes(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+        GraphValue::List(values) => values.iter().fold(0_u64, |retained, value| {
+            retained.saturating_add(graph_value_bytes(value))
+        }),
+    }
 }
 
 impl PostgresLogicalSnapshotReader {
@@ -1629,6 +2326,211 @@ fn validate_instance_row_for_restore(row: &postgres::Row) -> Result<(i32, u64), 
         ));
     }
     Ok((version, index))
+}
+
+fn load_canonical_entry<C: GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+    key: LogicalKey,
+) -> Result<Option<KeyValue>, AdapterError> {
+    let value = match key.keyspace() {
+        Keyspace::Identity => match decode_graph_key(&key)
+            .map_err(|error| AdapterError::Backend(error.to_string()))?
+        {
+            GraphKey::VertexIdentity(element) => client
+                .query_opt(
+                    "SELECT label_id FROM dtgproxy.vertex_identity WHERE instance_id = $1 AND graph_id = $2 AND partition_id = $3 AND vertex_id = $4",
+                    &[&instance_id, &element.graph().value().to_be_bytes().as_slice(), &element.partition().value().to_be_bytes().as_slice(), &element.id().value().to_be_bytes().as_slice()],
+                )
+                .map_err(adapter_pg_error)?
+                .map(|row| {
+                    VertexIdentity::new(
+                        element,
+                        temporal_storage::LabelId::new(read_u32(row.get(0), "label_id")?),
+                    )
+                    .map(|value| value.encode())
+                    .map_err(|error| AdapterError::Backend(error.to_string()))
+                })
+                .transpose()?,
+            GraphKey::EdgeIdentity(element) => client
+                .query_opt(
+                    "SELECT edge_type, source_partition, source_id, destination_partition, destination_id FROM dtgproxy.edge_identity WHERE instance_id = $1 AND graph_id = $2 AND partition_id = $3 AND edge_id = $4",
+                    &[&instance_id, &element.graph().value().to_be_bytes().as_slice(), &element.partition().value().to_be_bytes().as_slice(), &element.id().value().to_be_bytes().as_slice()],
+                )
+                .map_err(adapter_pg_error)?
+                .map(|row| {
+                    let source = temporal_storage::ElementRef::vertex(
+                        element.graph(),
+                        temporal_storage::PartitionId::new(read_u32(row.get(1), "source_partition")?),
+                        temporal_storage::ElementId::new(read_u128(row.get(2), "source_id")?),
+                    );
+                    let destination = temporal_storage::ElementRef::vertex(
+                        element.graph(),
+                        temporal_storage::PartitionId::new(read_u32(row.get(3), "destination_partition")?),
+                        temporal_storage::ElementId::new(read_u128(row.get(4), "destination_id")?),
+                    );
+                    EdgeIdentity::new_between(
+                        element,
+                        temporal_storage::EdgeTypeId::new(read_u32(row.get(0), "edge_type")?),
+                        source,
+                        destination,
+                    )
+                    .map(|value| value.encode())
+                    .map_err(|error| AdapterError::Backend(error.to_string()))
+                })
+                .transpose()?,
+            _ => return Err(AdapterError::Backend("invalid Identity canonical key".to_owned())),
+        },
+        Keyspace::Current => load_current_value(client, instance_id, &key)?,
+        Keyspace::AdjOut | Keyspace::AdjIn => load_adjacency_value(client, instance_id, &key)?,
+        Keyspace::History => load_history_value(client, instance_id, &key)?,
+        Keyspace::Meta if key.as_bytes() == ADAPTER_META_APPLIED_LOG_INDEX_KEY => client
+            .query_opt(
+                "SELECT applied_log_index FROM dtgproxy.adapter_instance WHERE instance_id = $1 AND has_applied_index_record",
+                &[&instance_id],
+            )
+            .map_err(adapter_pg_error)?
+            .map(|row| row.get(0)),
+        Keyspace::Txn if key.as_bytes().len() == 9 && key.as_bytes()[0] == 1 => client
+            .query_opt(
+                "SELECT fingerprint FROM dtgproxy.replay_log WHERE instance_id = $1 AND log_index = $2",
+                &[&instance_id, &&key.as_bytes()[1..]],
+            )
+            .map_err(adapter_pg_error)?
+            .map(|row| row.get(0)),
+        Keyspace::Txn if key.as_bytes().len() == 21 && key.as_bytes()[0] == 2 => client
+            .query_opt(
+                "SELECT fingerprint FROM dtgproxy.replay_mutation WHERE instance_id = $1 AND txn_id = $2 AND sequence = $3",
+                &[&instance_id, &&key.as_bytes()[1..17], &&key.as_bytes()[17..21]],
+            )
+            .map_err(adapter_pg_error)?
+            .map(|row| row.get(0)),
+        Keyspace::Meta | Keyspace::TemporalIndex | Keyspace::Txn => {
+            let keyspace = i16::from(key.keyspace().tag());
+            client
+                .query_opt(
+                    "SELECT value FROM dtgproxy.opaque_records WHERE instance_id = $1 AND keyspace = $2 AND logical_key = $3",
+                    &[&instance_id, &keyspace, &key.as_bytes()],
+                )
+                .map_err(adapter_pg_error)?
+                .map(|row| row.get(0))
+        }
+    };
+    Ok(value.map(|value| KeyValue::new(key, value)))
+}
+
+fn load_current_value<C: GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+    key: &LogicalKey,
+) -> Result<Option<Vec<u8>>, AdapterError> {
+    let (table, element) =
+        match decode_graph_key(key).map_err(|error| AdapterError::Backend(error.to_string()))? {
+            GraphKey::CurrentVertex(element) => ("vertex_current", element),
+            GraphKey::CurrentEdge(element) => ("edge_current", element),
+            _ => {
+                return Err(AdapterError::Backend(
+                    "invalid Current canonical key".to_owned(),
+                ));
+            }
+        };
+    let id_column = if table == "vertex_current" {
+        "vertex_id"
+    } else {
+        "edge_id"
+    };
+    let statement = format!(
+        "SELECT projection FROM dtgproxy.{table} WHERE instance_id = $1 AND graph_id = $2 AND partition_id = $3 AND {id_column} = $4"
+    );
+    client
+        .query_opt(
+            &statement,
+            &[
+                &instance_id,
+                &element.graph().value().to_be_bytes().as_slice(),
+                &element.partition().value().to_be_bytes().as_slice(),
+                &element.id().value().to_be_bytes().as_slice(),
+            ],
+        )
+        .map_err(adapter_pg_error)
+        .map(|row| row.map(|row| row.get(0)))
+}
+
+fn load_adjacency_value<C: GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+    key: &LogicalKey,
+) -> Result<Option<Vec<u8>>, AdapterError> {
+    let graph_key =
+        decode_graph_key(key).map_err(|error| AdapterError::Backend(error.to_string()))?;
+    let (
+        table,
+        tag,
+        graph,
+        local_partition,
+        local_endpoint,
+        edge_type,
+        bucket,
+        remote_partition,
+        remote_endpoint,
+        edge_partition,
+        edge,
+    ) = adjacency_columns(graph_key)?;
+    let statement = format!(
+        "SELECT projection FROM dtgproxy.{table}_adjacency WHERE instance_id = $1 AND key_tag = $2 AND graph_id = $3 AND local_partition = $4 AND local_endpoint = $5 AND edge_type = $6 AND bucket = $7 AND remote_partition = $8 AND remote_endpoint = $9 AND edge_partition = $10 AND edge_id = $11"
+    );
+    client
+        .query_opt(
+            &statement,
+            &[
+                &instance_id,
+                &tag,
+                &graph.as_slice(),
+                &local_partition.as_slice(),
+                &local_endpoint.as_slice(),
+                &edge_type.as_slice(),
+                &bucket.as_slice(),
+                &remote_partition.as_slice(),
+                &remote_endpoint.as_slice(),
+                &edge_partition.as_slice(),
+                &edge.as_slice(),
+            ],
+        )
+        .map_err(adapter_pg_error)
+        .map(|row| row.map(|row| row.get(0)))
+}
+
+fn load_history_value<C: GenericClient>(
+    client: &mut C,
+    instance_id: &str,
+    key: &LogicalKey,
+) -> Result<Option<Vec<u8>>, AdapterError> {
+    let GraphKey::HistoryAnchor {
+        element,
+        transaction_time,
+        segment_id,
+    } = decode_graph_key(key).map_err(|error| AdapterError::Backend(error.to_string()))?
+    else {
+        return Err(AdapterError::Backend(
+            "invalid History canonical key".to_owned(),
+        ));
+    };
+    client
+        .query_opt(
+            "SELECT history_value FROM dtgproxy.history WHERE instance_id = $1 AND graph_id = $2 AND partition_id = $3 AND element_kind = $4 AND element_id = $5 AND transaction_physical = $6 AND transaction_logical = $7 AND segment_id = $8",
+            &[
+                &instance_id,
+                &element.graph().value().to_be_bytes().as_slice(),
+                &element.partition().value().to_be_bytes().as_slice(),
+                &(element.kind() as i16),
+                &element.id().value().to_be_bytes().as_slice(),
+                &transaction_time.physical_micros(),
+                &transaction_time.logical().to_be_bytes().as_slice(),
+                &segment_id.to_be_bytes().as_slice(),
+            ],
+        )
+        .map_err(adapter_pg_error)
+        .map(|row| row.map(|row| row.get(0)))
 }
 
 fn load_all_entries<C: GenericClient>(
@@ -2497,6 +3399,11 @@ fn delete_native(
                     ],
                 )
                 .map_err(adapter_pg_error)?;
+        }
+        GraphKey::TemporalEvent { .. } | GraphKey::TemporalEventValid { .. } => {
+            return Err(AdapterError::Backend(
+                "temporal event indexes must use the opaque-record path".to_owned(),
+            ));
         }
     }
     Ok(())

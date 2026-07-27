@@ -5,28 +5,62 @@ use std::future::Future;
 use std::pin::Pin;
 
 use storage_api::{
-    AdapterError, ApplyReceipt, KeySpan, Keyspace, Mutation, MutationOperation,
-    PreparedMutationBatch, StorageAdapter,
+    AdapterError, ApplyReceipt, CandidateScanRequest, ChangeScanRequest, KeySpan, KeyValue,
+    Keyspace, LogicalKey, MAX_QUERY_PAGE_BYTES, MAX_QUERY_PAGE_ITEMS, Mutation, MutationOperation,
+    PreparedMutationBatch, PropertyConstraint, PushdownGuarantee, QueryPageBounds, ReadSnapshot,
+    ReadSnapshotBinding, StorageAdapter,
 };
 use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
 use crate::diff::{TemporalChange, diff_projections};
 use crate::history::{MAX_CHAIN_ENTRIES, entry_for_commit, reconstruct};
+use crate::key::temporal_event_commit_prefix;
+use crate::key::temporal_event_valid_prefix;
 use crate::rewrite::rewrite_projection;
 use crate::transaction::TemporalOperation;
 use crate::{
-    EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, HistoryAnchor,
-    HistoryEntry, KeyCodecError, LabelId, PartitionId, ProjectionRecord, RecordCodecError,
-    TemporalTransaction, VertexIdentity, cross_in_adjacency_key, cross_in_adjacency_prefix,
-    cross_out_adjacency_key, cross_out_adjacency_prefix, current_edge_graph_prefix,
-    current_edge_key, current_vertex_graph_prefix, current_vertex_key, decode_graph_key,
-    edge_identity_graph_prefix, edge_identity_key, edge_identity_prefix, history_anchor_key,
-    history_prefix, in_adjacency_key, in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix,
-    vertex_identity_graph_prefix, vertex_identity_key,
+    CanonicalTemporalEvent, EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId,
+    GraphKey, HistoryAnchor, HistoryEntry, KeyCodecError, LabelId, PartitionId, ProjectionRecord,
+    RecordCodecError, TemporalEventMetadata, TemporalEventOperation, TemporalTransaction,
+    VertexIdentity, cross_in_adjacency_key, cross_in_adjacency_prefix, cross_out_adjacency_key,
+    cross_out_adjacency_prefix, current_edge_graph_prefix, current_edge_key,
+    current_vertex_graph_prefix, current_vertex_key, decode_graph_key, edge_identity_graph_prefix,
+    edge_identity_key, edge_identity_prefix, history_anchor_key, history_prefix, in_adjacency_key,
+    in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix, temporal_event_key,
+    temporal_event_valid_key, vertex_identity_graph_prefix, vertex_identity_key,
 };
 
 pub type TemporalStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, TemporalStoreError>> + Send + 'a>>;
+
+const DEFAULT_MATERIALIZATION_MAX_ITEMS: usize = 256;
+const DEFAULT_MATERIALIZATION_MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TemporalScanBudget {
+    max_rows: usize,
+    max_bytes: u64,
+}
+
+impl TemporalScanBudget {
+    #[must_use]
+    pub const fn new(max_rows: usize, max_bytes: u64) -> Self {
+        Self {
+            max_rows,
+            max_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_rows(self) -> usize {
+        self.max_rows
+    }
+
+    #[must_use]
+    pub const fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitContext {
@@ -250,6 +284,41 @@ pub struct VertexView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VertexCandidateScanPage {
+    views: Vec<VertexView>,
+    next_start: Option<LogicalKey>,
+    scanned_rows: usize,
+    scanned_bytes: u64,
+}
+
+impl VertexCandidateScanPage {
+    #[must_use]
+    pub fn views(&self) -> &[VertexView] {
+        &self.views
+    }
+
+    #[must_use]
+    pub fn into_views(self) -> Vec<VertexView> {
+        self.views
+    }
+
+    #[must_use]
+    pub const fn next_start(&self) -> Option<&LogicalKey> {
+        self.next_start.as_ref()
+    }
+
+    #[must_use]
+    pub const fn scanned_rows(&self) -> usize {
+        self.scanned_rows
+    }
+
+    #[must_use]
+    pub const fn scanned_bytes(&self) -> u64 {
+        self.scanned_bytes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VertexTemporalSegment {
     element: ElementRef,
     label: LabelId,
@@ -402,6 +471,27 @@ where
         &self.adapter
     }
 
+    #[must_use]
+    pub fn observed<O>(
+        &self,
+        observer: std::sync::Arc<O>,
+    ) -> TemporalStore<crate::ObservedStorageAdapter<&A>>
+    where
+        O: crate::AdapterCallObserver + 'static,
+    {
+        TemporalStore::new(crate::ObservedStorageAdapter::new(&self.adapter, observer))
+    }
+
+    pub fn begin_read_snapshot<'a>(
+        &'a self,
+    ) -> TemporalStoreFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(async move { Ok(self.adapter.begin_read_snapshot().await?) })
+    }
+
+    pub fn read_snapshot_binding(&self) -> Result<Option<ReadSnapshotBinding>, TemporalStoreError> {
+        Ok(self.adapter.read_snapshot_binding()?)
+    }
+
     pub fn commit_transaction<'a>(
         &'a self,
         context: CommitContext,
@@ -476,15 +566,19 @@ where
             return Err(TemporalStoreError::InvalidCommitOrder);
         }
         let allow_repeated_elements = transaction.allows_repeated_elements();
-        let mut operations = transaction.into_operations();
+        let mut operations = transaction
+            .into_operations()
+            .into_iter()
+            .enumerate()
+            .collect::<Vec<_>>();
         if operations.is_empty() {
             return Err(TemporalStoreError::EmptyTransaction);
         }
-        operations.sort_by_key(TemporalOperation::element);
+        operations.sort_by_key(|(_, operation)| operation.element());
         let multi_operation_elements = operations
             .windows(2)
             .filter_map(|pair| {
-                (pair[0].element() == pair[1].element()).then_some(pair[0].element())
+                (pair[0].1.element() == pair[1].1.element()).then_some(pair[0].1.element())
             })
             .collect::<std::collections::BTreeSet<_>>();
         if !allow_repeated_elements && !multi_operation_elements.is_empty() {
@@ -500,7 +594,9 @@ where
         let mut endpoint_guards = BTreeMap::new();
         let mut staged_edges = BTreeMap::<ElementRef, ProjectionRecord>::new();
         let mut writes = Vec::new();
-        for operation in operations {
+        for (operation_index, operation) in operations {
+            let event_ordinal =
+                u32::try_from(operation_index).map_err(|_| TemporalStoreError::TooManyMutations)?;
             match operation {
                 TemporalOperation::Vertex(mutation) => {
                     let removes_valid_time = mutation.replacement.is_none();
@@ -530,6 +626,14 @@ where
                         mutation.valid,
                         mutation.replacement.clone(),
                     )?;
+                    let event = canonical_event(
+                        mutation.element,
+                        mutation.valid,
+                        context.commit_ts,
+                        event_ordinal,
+                        mutation.replacement.clone(),
+                        Some(TemporalEventMetadata::vertex(mutation.label)),
+                    )?;
                     let history = if multi_operation_elements.contains(&mutation.element) {
                         HistoryEntry::Anchor(HistoryAnchor::new(
                             context.commit_ts,
@@ -556,6 +660,14 @@ where
                     writes.push(MutationOperation::Put {
                         key: history_anchor_key(mutation.element, context.commit_ts, 0),
                         value: history.encode()?,
+                    });
+                    writes.push(MutationOperation::Put {
+                        key: temporal_event_key(&event),
+                        value: event.encode()?,
+                    });
+                    writes.push(MutationOperation::Put {
+                        key: temporal_event_valid_key(&event),
+                        value: event.encode()?,
                     });
                     if removes_valid_time {
                         guarded_vertices.insert(mutation.element, projection.clone());
@@ -621,6 +733,18 @@ where
                         context.commit_ts,
                         mutation.valid,
                         mutation.replacement.clone(),
+                    )?;
+                    let event = canonical_event(
+                        mutation.element,
+                        mutation.valid,
+                        context.commit_ts,
+                        event_ordinal,
+                        mutation.replacement.clone(),
+                        Some(TemporalEventMetadata::edge(
+                            mutation.edge_type,
+                            mutation.source,
+                            mutation.destination,
+                        )),
                     )?;
                     let history = if multi_operation_elements.contains(&mutation.element) {
                         HistoryEntry::Anchor(HistoryAnchor::new(
@@ -699,6 +823,14 @@ where
                         key: history_anchor_key(mutation.element, context.commit_ts, 0),
                         value: history.encode()?,
                     });
+                    writes.push(MutationOperation::Put {
+                        key: temporal_event_key(&event),
+                        value: event.encode()?,
+                    });
+                    writes.push(MutationOperation::Put {
+                        key: temporal_event_valid_key(&event),
+                        value: event.encode()?,
+                    });
                     if projection.segments().is_empty() {
                         writes.push(MutationOperation::Delete { key: out_key });
                         writes.push(MutationOperation::Delete { key: in_key });
@@ -771,6 +903,263 @@ where
         mutation: EdgeMutation,
     ) -> TemporalStoreFuture<'a, ApplyReceipt> {
         self.commit_transaction(context, TemporalTransaction::new().with_edge(mutation))
+    }
+
+    pub fn scan_events_by_valid_from<'a>(
+        &'a self,
+        graph: GraphId,
+        start: ValidTime,
+        end: ValidTime,
+        snapshot: TransactionTime,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64)> {
+        Box::pin(async move {
+            let (events, scanned_bytes, _) = self
+                .scan_events_by_valid_from_fenced(graph, start, end, snapshot, max_rows, max_bytes)
+                .await?;
+            Ok((events, scanned_bytes))
+        })
+    }
+
+    pub fn scan_events_by_valid_from_fenced<'a>(
+        &'a self,
+        graph: GraphId,
+        start: ValidTime,
+        end: ValidTime,
+        snapshot: TransactionTime,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64, u64)> {
+        Box::pin(async move {
+            if start >= end {
+                return Err(TemporalStoreError::InvalidScanBudget);
+            }
+            let (entries, scanned_bytes, applied_log_index) = self
+                .scan_temporal_event_entries_fenced(
+                    KeySpan::range(
+                        Keyspace::TemporalIndex,
+                        temporal_event_valid_prefix(graph, start),
+                        Some(temporal_event_valid_prefix(graph, end)),
+                    )
+                    .expect("ordered valid event bounds are non-empty"),
+                    max_rows,
+                    max_bytes,
+                )
+                .await?;
+            let events = decode_events(entries)?
+                .into_iter()
+                .filter(|event| {
+                    event.commit_ts() <= snapshot
+                        && event.valid().start() >= start
+                        && event.valid().start() < end
+                })
+                .collect();
+            Ok((events, scanned_bytes, applied_log_index))
+        })
+    }
+
+    pub fn scan_events_by_valid_from_in_snapshot<'a>(
+        &'a self,
+        read: &'a dyn ReadSnapshot,
+        graph: GraphId,
+        start: ValidTime,
+        end: ValidTime,
+        snapshot: TransactionTime,
+        budget: TemporalScanBudget,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64)> {
+        Box::pin(async move {
+            if start >= end {
+                return Err(TemporalStoreError::InvalidScanBudget);
+            }
+            let (entries, scanned_bytes) = self
+                .scan_temporal_event_entries(
+                    read,
+                    KeySpan::range(
+                        Keyspace::TemporalIndex,
+                        temporal_event_valid_prefix(graph, start),
+                        Some(temporal_event_valid_prefix(graph, end)),
+                    )
+                    .expect("ordered valid event bounds are non-empty"),
+                    budget.max_rows(),
+                    budget.max_bytes(),
+                )
+                .await?;
+            let events = decode_events(entries)?
+                .into_iter()
+                .filter(|event| {
+                    event.element().graph() == graph
+                        && event.commit_ts() <= snapshot
+                        && event.valid().start() >= start
+                        && event.valid().start() < end
+                })
+                .collect();
+            Ok((events, scanned_bytes))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_events_by_valid_from_primitive_in_snapshot<'a>(
+        &'a self,
+        read: &'a dyn ReadSnapshot,
+        graph: GraphId,
+        start: ValidTime,
+        end: ValidTime,
+        snapshot: TransactionTime,
+        budget: TemporalScanBudget,
+        required: PushdownGuarantee,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64)> {
+        Box::pin(async move {
+            if start >= end {
+                return Err(TemporalStoreError::InvalidScanBudget);
+            }
+            let (entries, scanned_bytes) = self
+                .scan_temporal_event_entries_paged(
+                    read,
+                    KeySpan::range(
+                        Keyspace::TemporalIndex,
+                        temporal_event_valid_prefix(graph, start),
+                        Some(temporal_event_valid_prefix(graph, end)),
+                    )
+                    .expect("ordered valid event bounds are non-empty"),
+                    budget,
+                    required,
+                )
+                .await?;
+            let events = decode_events(entries)?
+                .into_iter()
+                .filter(|event| {
+                    event.element().graph() == graph
+                        && event.commit_ts() <= snapshot
+                        && event.valid().start() >= start
+                        && event.valid().start() < end
+                })
+                .collect();
+            Ok((events, scanned_bytes))
+        })
+    }
+
+    pub fn scan_events_by_commit<'a>(
+        &'a self,
+        graph: GraphId,
+        start: TransactionTime,
+        end: TransactionTime,
+        snapshot: TransactionTime,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64)> {
+        Box::pin(async move {
+            let (events, scanned_bytes, _) = self
+                .scan_events_by_commit_fenced(graph, start, end, snapshot, max_rows, max_bytes)
+                .await?;
+            Ok((events, scanned_bytes))
+        })
+    }
+
+    pub fn scan_events_by_commit_fenced<'a>(
+        &'a self,
+        graph: GraphId,
+        start: TransactionTime,
+        end: TransactionTime,
+        snapshot: TransactionTime,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64, u64)> {
+        Box::pin(async move {
+            if start >= end {
+                return Err(TemporalStoreError::InvalidScanBudget);
+            }
+            let span = KeySpan::range(
+                Keyspace::TemporalIndex,
+                temporal_event_commit_prefix(graph, start),
+                Some(temporal_event_commit_prefix(graph, end)),
+            )
+            .expect("ordered event commit bounds are non-empty");
+            let (entries, scanned_bytes, applied_log_index) = self
+                .scan_temporal_event_entries_fenced(span, max_rows, max_bytes)
+                .await?;
+            let events = decode_events(entries)?
+                .into_iter()
+                .filter(|event| event.commit_ts() <= snapshot)
+                .collect();
+            Ok((events, scanned_bytes, applied_log_index))
+        })
+    }
+
+    pub fn scan_events_by_commit_in_snapshot<'a>(
+        &'a self,
+        read: &'a dyn ReadSnapshot,
+        graph: GraphId,
+        start: TransactionTime,
+        end: TransactionTime,
+        snapshot: TransactionTime,
+        budget: TemporalScanBudget,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64)> {
+        Box::pin(async move {
+            if start >= end {
+                return Err(TemporalStoreError::InvalidScanBudget);
+            }
+            let span = KeySpan::range(
+                Keyspace::TemporalIndex,
+                temporal_event_commit_prefix(graph, start),
+                Some(temporal_event_commit_prefix(graph, end)),
+            )
+            .expect("ordered event commit bounds are non-empty");
+            let (entries, scanned_bytes) = self
+                .scan_temporal_event_entries(read, span, budget.max_rows(), budget.max_bytes())
+                .await?;
+            let events = decode_events(entries)?
+                .into_iter()
+                .filter(|event| {
+                    event.element().graph() == graph
+                        && event.commit_ts() >= start
+                        && event.commit_ts() < end
+                        && event.commit_ts() <= snapshot
+                })
+                .collect();
+            Ok((events, scanned_bytes))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_events_by_commit_primitive_in_snapshot<'a>(
+        &'a self,
+        read: &'a dyn ReadSnapshot,
+        graph: GraphId,
+        start: TransactionTime,
+        end: TransactionTime,
+        snapshot: TransactionTime,
+        budget: TemporalScanBudget,
+        required: PushdownGuarantee,
+    ) -> TemporalStoreFuture<'a, (Vec<CanonicalTemporalEvent>, u64)> {
+        Box::pin(async move {
+            if start >= end {
+                return Err(TemporalStoreError::InvalidScanBudget);
+            }
+            let (entries, scanned_bytes) = self
+                .scan_temporal_event_entries_paged(
+                    read,
+                    KeySpan::range(
+                        Keyspace::TemporalIndex,
+                        temporal_event_commit_prefix(graph, start),
+                        Some(temporal_event_commit_prefix(graph, end)),
+                    )
+                    .expect("ordered event commit bounds are non-empty"),
+                    budget,
+                    required,
+                )
+                .await?;
+            let events = decode_events(entries)?
+                .into_iter()
+                .filter(|event| {
+                    event.element().graph() == graph
+                        && event.commit_ts() >= start
+                        && event.commit_ts() < end
+                        && event.commit_ts() <= snapshot
+                })
+                .collect();
+            Ok((events, scanned_bytes))
+        })
     }
 
     pub fn vertex_current<'a>(
@@ -940,6 +1329,21 @@ where
         graph: GraphId,
         valid_time: ValidTime,
     ) -> TemporalStoreFuture<'a, Vec<VertexView>> {
+        self.scan_vertex_views_current_batched(
+            graph,
+            valid_time,
+            DEFAULT_MATERIALIZATION_MAX_ITEMS,
+            DEFAULT_MATERIALIZATION_MAX_REQUEST_BYTES,
+        )
+    }
+
+    pub fn scan_vertex_views_current_batched<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+        max_items: usize,
+        max_request_bytes: u64,
+    ) -> TemporalStoreFuture<'a, Vec<VertexView>> {
         Box::pin(async move {
             let entries = self
                 .adapter
@@ -948,22 +1352,346 @@ where
                     current_vertex_graph_prefix(graph),
                 ))
                 .await?;
-            let mut vertices = Vec::new();
+            let mut decoded = Vec::with_capacity(entries.len());
             for entry in entries {
                 let GraphKey::CurrentVertex(element) = decode_graph_key(entry.key())? else {
                     return Err(TemporalStoreError::UnexpectedCurrentKey);
                 };
                 let projection = ProjectionRecord::decode(entry.value())?;
+                if projection.visible_at(valid_time).is_some() {
+                    decoded.push((element, projection));
+                }
+            }
+            let keys = decoded
+                .iter()
+                .map(|(element, _)| vertex_identity_key(*element))
+                .collect::<Vec<_>>();
+            let identities =
+                materialize_keys_batched(&self.adapter, &keys, max_items, max_request_bytes, None)
+                    .await?;
+            let mut vertices = Vec::new();
+            for ((element, projection), identity) in decoded.into_iter().zip(identities) {
+                let Some(identity) = identity else {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                };
+                let identity = VertexIdentity::decode(identity.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
                 if let Some(payload) = projection.visible_at(valid_time) {
-                    let identity = self
-                        .load_vertex_identity(element)
-                        .await?
-                        .ok_or(TemporalStoreError::IdentityMismatch)?;
                     vertices.push(vertex_view(identity, payload.clone()));
                 }
             }
             Ok(vertices)
         })
+    }
+
+    pub fn scan_vertex_views_current_candidate_in_snapshot<'a>(
+        &'a self,
+        read: &'a dyn ReadSnapshot,
+        graph: GraphId,
+        valid_time: ValidTime,
+        budget: TemporalScanBudget,
+        required: PushdownGuarantee,
+        constraints: &'a [PropertyConstraint],
+    ) -> TemporalStoreFuture<'a, Vec<VertexView>> {
+        Box::pin(async move {
+            let original = KeySpan::prefix(Keyspace::Current, current_vertex_graph_prefix(graph));
+            let original_prefix = original
+                .required_prefix()
+                .expect("candidate scan uses a prefix span")
+                .to_vec();
+            let mut current = original;
+            let mut scanned_entries = 0_usize;
+            let mut scanned_bytes = 0_u64;
+            let mut vertices = Vec::new();
+
+            loop {
+                let remaining = budget.max_rows().saturating_sub(scanned_entries);
+                let page_items = remaining.saturating_add(1).clamp(1, MAX_QUERY_PAGE_ITEMS);
+                let page = self
+                    .scan_vertex_views_current_candidate_page_in_snapshot(
+                        read,
+                        graph,
+                        valid_time,
+                        current.clone(),
+                        QueryPageBounds::new(page_items, MAX_QUERY_PAGE_BYTES)
+                            .map_err(|error| AdapterError::Backend(error.to_string()))?,
+                        TemporalScanBudget::new(
+                            remaining,
+                            budget.max_bytes().saturating_sub(scanned_bytes),
+                        ),
+                        required,
+                        constraints,
+                    )
+                    .await?;
+                scanned_entries = scanned_entries
+                    .checked_add(page.scanned_rows())
+                    .ok_or(TemporalStoreError::ScanEntryLimit)?;
+                scanned_bytes = scanned_bytes
+                    .checked_add(page.scanned_bytes())
+                    .ok_or(TemporalStoreError::ScanByteLimit)?;
+                let next_start = page.next_start().cloned();
+                vertices.extend(page.into_views());
+
+                let Some(next_start) = next_start else {
+                    return Ok(vertices);
+                };
+                if scanned_entries == budget.max_rows() {
+                    return Err(TemporalStoreError::ScanEntryLimit);
+                }
+                if scanned_bytes == budget.max_bytes() {
+                    return Err(TemporalStoreError::ScanByteLimit);
+                }
+                current = KeySpan::prefix_from(
+                    Keyspace::Current,
+                    original_prefix.clone(),
+                    next_start.as_bytes().to_vec(),
+                )
+                .expect("validated candidate continuation remains in the vertex prefix");
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_vertex_views_current_candidate_page_in_snapshot<'a>(
+        &'a self,
+        read: &'a dyn ReadSnapshot,
+        graph: GraphId,
+        valid_time: ValidTime,
+        span: KeySpan,
+        bounds: QueryPageBounds,
+        remaining_budget: TemporalScanBudget,
+        required: PushdownGuarantee,
+        constraints: &'a [PropertyConstraint],
+    ) -> TemporalStoreFuture<'a, VertexCandidateScanPage> {
+        Box::pin(async move {
+            if required == PushdownGuarantee::Unsupported {
+                return Err(TemporalStoreError::CandidateScanGuaranteeMismatch {
+                    required,
+                    actual: PushdownGuarantee::Unsupported,
+                });
+            }
+            let expected_prefix = current_vertex_graph_prefix(graph);
+            if span.keyspace() != Keyspace::Current
+                || span.required_prefix() != Some(expected_prefix.as_slice())
+            {
+                return Err(TemporalStoreError::UnexpectedCurrentKey);
+            }
+            let request =
+                CandidateScanRequest::new(span.clone(), valid_time, constraints.to_vec(), bounds)
+                    .map_err(|error| AdapterError::Backend(error.to_string()))?;
+            let expected_applied_log_index = read.applied_log_index();
+            let page = read.scan_candidates(&request).await?;
+            if page.applied_log_index() != expected_applied_log_index {
+                return Err(TemporalStoreError::CandidateScanAppliedIndexMismatch {
+                    expected: expected_applied_log_index,
+                    actual: page.applied_log_index(),
+                });
+            }
+            if !pushdown_guarantee_satisfies(required, page.guarantee()) {
+                return Err(TemporalStoreError::CandidateScanGuaranteeMismatch {
+                    required,
+                    actual: page.guarantee(),
+                });
+            }
+            let next_start = page.next_start().cloned();
+            if next_start
+                .as_ref()
+                .is_some_and(|next_start| next_start.as_bytes() <= span.start())
+            {
+                return Err(TemporalStoreError::CandidateScanContinuationNotAdvancing);
+            }
+
+            let entries = page.into_entries();
+            let scanned_rows = entries.len();
+            if entries.len() > remaining_budget.max_rows() {
+                return Err(TemporalStoreError::ScanEntryLimit);
+            }
+            let mut scanned_bytes = 0_u64;
+            let mut decoded = Vec::new();
+            for entry in entries {
+                let entry_bytes = entry
+                    .key()
+                    .as_bytes()
+                    .len()
+                    .checked_add(entry.value().len())
+                    .ok_or(TemporalStoreError::ScanByteLimit)?;
+                scanned_bytes =
+                    charge_scan_bytes(scanned_bytes, entry_bytes, remaining_budget.max_bytes())?;
+                let GraphKey::CurrentVertex(element) = decode_graph_key(entry.key())? else {
+                    return Err(TemporalStoreError::UnexpectedCurrentKey);
+                };
+                if element.graph() != graph {
+                    return Err(TemporalStoreError::UnexpectedCurrentKey);
+                }
+                let projection = ProjectionRecord::decode(entry.value())?;
+                if projection.visible_at(valid_time).is_some() {
+                    decoded.push((element, projection));
+                }
+            }
+            let identity_keys = decoded
+                .iter()
+                .map(|(element, _)| vertex_identity_key(*element))
+                .collect::<Vec<_>>();
+            let remaining_identity_bytes = remaining_budget
+                .max_bytes()
+                .checked_sub(scanned_bytes)
+                .ok_or(TemporalStoreError::ScanByteLimit)?;
+            if !identity_keys.is_empty() && remaining_identity_bytes == 0 {
+                return Err(TemporalStoreError::ScanByteLimit);
+            }
+            let identities = materialize_keys_batched(
+                &self.adapter,
+                &identity_keys,
+                remaining_budget.max_rows().max(1),
+                remaining_identity_bytes.max(1),
+                Some(read),
+            )
+            .await?;
+            for (key, identity) in identity_keys.iter().zip(&identities) {
+                let identity_bytes = key
+                    .as_bytes()
+                    .len()
+                    .checked_add(identity.as_ref().map_or(0, |value| value.value().len()))
+                    .ok_or(TemporalStoreError::ScanByteLimit)?;
+                scanned_bytes =
+                    charge_scan_bytes(scanned_bytes, identity_bytes, remaining_budget.max_bytes())?;
+            }
+            let views = decoded
+                .into_iter()
+                .zip(identities)
+                .map(|((element, projection), identity)| {
+                    let Some(identity) = identity else {
+                        return Err(TemporalStoreError::IdentityMismatch);
+                    };
+                    let identity = VertexIdentity::decode(identity.value())?;
+                    if identity.element() != element {
+                        return Err(TemporalStoreError::IdentityMismatch);
+                    }
+                    let payload = projection
+                        .visible_at(valid_time)
+                        .expect("candidate visibility was checked")
+                        .clone();
+                    Ok(vertex_view(identity, payload))
+                })
+                .collect::<Result<Vec<_>, TemporalStoreError>>()?;
+            Ok(VertexCandidateScanPage {
+                views,
+                next_start,
+                scanned_rows,
+                scanned_bytes,
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_vertex_views_current_candidate_page_after_in_snapshot<'a>(
+        &'a self,
+        read: &'a dyn ReadSnapshot,
+        graph: GraphId,
+        valid_time: ValidTime,
+        continuation: Option<&'a LogicalKey>,
+        bounds: QueryPageBounds,
+        remaining_budget: TemporalScanBudget,
+        required: PushdownGuarantee,
+        constraints: &'a [PropertyConstraint],
+    ) -> TemporalStoreFuture<'a, VertexCandidateScanPage> {
+        Box::pin(async move {
+            let prefix = current_vertex_graph_prefix(graph);
+            let span = match continuation {
+                Some(continuation) => KeySpan::prefix_from(
+                    Keyspace::Current,
+                    prefix,
+                    continuation.as_bytes().to_vec(),
+                )
+                .map_err(|_| TemporalStoreError::CandidateScanContinuationNotAdvancing)?,
+                None => KeySpan::prefix(Keyspace::Current, prefix),
+            };
+            self.scan_vertex_views_current_candidate_page_in_snapshot(
+                read,
+                graph,
+                valid_time,
+                span,
+                bounds,
+                remaining_budget,
+                required,
+                constraints,
+            )
+            .await
+        })
+    }
+
+    pub fn vertex_views_current_batched<'a>(
+        &'a self,
+        elements: &'a [ElementRef],
+        valid_time: ValidTime,
+        max_items: usize,
+        max_request_bytes: u64,
+    ) -> TemporalStoreFuture<'a, Vec<Option<VertexView>>> {
+        Box::pin(async move {
+            for &element in elements {
+                require_vertex(element)?;
+            }
+            let projection_keys = elements
+                .iter()
+                .map(|element| current_vertex_key(*element))
+                .collect::<Vec<_>>();
+            let identity_keys = elements
+                .iter()
+                .map(|element| vertex_identity_key(*element))
+                .collect::<Vec<_>>();
+            let projections = materialize_keys_batched(
+                &self.adapter,
+                &projection_keys,
+                max_items,
+                max_request_bytes,
+                None,
+            )
+            .await?;
+            let identities = materialize_keys_batched(
+                &self.adapter,
+                &identity_keys,
+                max_items,
+                max_request_bytes,
+                None,
+            )
+            .await?;
+            elements
+                .iter()
+                .zip(projections.into_iter().zip(identities))
+                .map(|(element, (projection, identity))| {
+                    let projection = projection
+                        .map(|value| ProjectionRecord::decode(value.value()))
+                        .transpose()?;
+                    let identity = identity
+                        .map(|value| VertexIdentity::decode(value.value()))
+                        .transpose()?;
+                    let Some(projection) = projection else {
+                        return Ok(None);
+                    };
+                    let Some(identity) = identity else {
+                        return Err(TemporalStoreError::IdentityMismatch);
+                    };
+                    if identity.element() != *element {
+                        return Err(TemporalStoreError::IdentityMismatch);
+                    }
+                    Ok(projection
+                        .visible_at(valid_time)
+                        .cloned()
+                        .map(|payload| vertex_view(identity, payload)))
+                })
+                .collect()
+        })
+    }
+
+    pub fn vertex_views_current_one_at_a_time<'a>(
+        &'a self,
+        elements: &'a [ElementRef],
+        valid_time: ValidTime,
+        max_request_bytes: u64,
+    ) -> TemporalStoreFuture<'a, Vec<Option<VertexView>>> {
+        self.vertex_views_current_batched(elements, valid_time, 1, max_request_bytes)
     }
 
     pub fn scan_vertices_as_of<'a>(
@@ -1323,6 +2051,21 @@ where
         graph: GraphId,
         valid_time: ValidTime,
     ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
+        self.scan_edges_current_batched(
+            graph,
+            valid_time,
+            DEFAULT_MATERIALIZATION_MAX_ITEMS,
+            DEFAULT_MATERIALIZATION_MAX_REQUEST_BYTES,
+        )
+    }
+
+    pub fn scan_edges_current_batched<'a>(
+        &'a self,
+        graph: GraphId,
+        valid_time: ValidTime,
+        max_items: usize,
+        max_request_bytes: u64,
+    ) -> TemporalStoreFuture<'a, Vec<EdgeView>> {
         Box::pin(async move {
             let entries = self
                 .adapter
@@ -1331,7 +2074,7 @@ where
                     current_edge_graph_prefix(graph),
                 ))
                 .await?;
-            let mut edges = Vec::new();
+            let mut decoded = Vec::new();
             for entry in entries {
                 let GraphKey::CurrentEdge(element) = decode_graph_key(entry.key())? else {
                     return Err(TemporalStoreError::UnexpectedCurrentKey);
@@ -1340,10 +2083,24 @@ where
                 let Some(payload) = projection.visible_at(valid_time).cloned() else {
                     continue;
                 };
-                let identity = self
-                    .load_edge_identity(element)
-                    .await?
-                    .ok_or(TemporalStoreError::MissingEdgeIdentity { edge: element })?;
+                decoded.push((element, payload));
+            }
+            let keys = decoded
+                .iter()
+                .map(|(element, _)| edge_identity_key(*element))
+                .collect::<Vec<_>>();
+            let identities =
+                materialize_keys_batched(&self.adapter, &keys, max_items, max_request_bytes, None)
+                    .await?;
+            let mut edges = Vec::new();
+            for ((element, payload), identity) in decoded.into_iter().zip(identities) {
+                let Some(identity) = identity else {
+                    return Err(TemporalStoreError::MissingEdgeIdentity { edge: element });
+                };
+                let identity = EdgeIdentity::decode(identity.value())?;
+                if identity.element() != element {
+                    return Err(TemporalStoreError::IdentityMismatch);
+                }
                 edges.push(edge_view(identity, payload));
             }
             Ok(edges)
@@ -2051,6 +2808,206 @@ where
         Ok((entries, scanned_bytes))
     }
 
+    async fn scan_temporal_event_entries(
+        &self,
+        read: &dyn ReadSnapshot,
+        span: KeySpan,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<(Vec<storage_api::KeyValue>, u64), TemporalStoreError> {
+        if max_rows == 0 {
+            let probe = span
+                .with_limit(1)
+                .expect("event emptiness probe limit is positive");
+            return if read.scan(&probe).await?.is_empty() {
+                Ok((Vec::new(), 0))
+            } else {
+                Err(TemporalStoreError::ScanEntryLimit)
+            };
+        }
+        if max_bytes == 0 {
+            let probe = span
+                .with_limit(1)
+                .expect("event emptiness probe limit is positive")
+                .with_max_bytes(1)
+                .expect("event emptiness probe byte limit is positive");
+            return match read.scan(&probe).await {
+                Ok(entries) if entries.is_empty() => Ok((Vec::new(), 0)),
+                Ok(_) | Err(AdapterError::ScanByteLimit { .. }) => {
+                    Err(TemporalStoreError::ScanByteLimit)
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
+        let limit = max_rows
+            .checked_add(1)
+            .ok_or(TemporalStoreError::InvalidScanBudget)?;
+        let bounded = span
+            .with_limit(limit)
+            .expect("bounded event scan limit is positive")
+            .with_max_bytes(max_bytes)
+            .expect("bounded event scan byte limit is positive");
+        let entries = read.scan(&bounded).await?;
+        if entries.len() > max_rows {
+            return Err(TemporalStoreError::ScanEntryLimit);
+        }
+        let mut scanned_bytes = 0_u64;
+        for entry in &entries {
+            let entry_bytes = entry
+                .key()
+                .as_bytes()
+                .len()
+                .checked_add(entry.value().len())
+                .ok_or(TemporalStoreError::ScanByteLimit)?;
+            scanned_bytes = charge_scan_bytes(scanned_bytes, entry_bytes, max_bytes)?;
+        }
+        Ok((entries, scanned_bytes))
+    }
+
+    async fn scan_temporal_event_entries_paged(
+        &self,
+        read: &dyn ReadSnapshot,
+        span: KeySpan,
+        budget: TemporalScanBudget,
+        required: PushdownGuarantee,
+    ) -> Result<(Vec<KeyValue>, u64), TemporalStoreError> {
+        if required == PushdownGuarantee::Unsupported {
+            return Err(TemporalStoreError::ChangeScanGuaranteeMismatch {
+                required,
+                actual: PushdownGuarantee::Unsupported,
+            });
+        }
+        let expected_applied_log_index = read.applied_log_index();
+        let original_end = span.end().map(<[u8]>::to_vec);
+        let required_prefix = span.required_prefix().map(<[u8]>::to_vec);
+        let mut current = span;
+        let mut entries = Vec::new();
+        let mut scanned_bytes = 0_u64;
+
+        loop {
+            let remaining = budget.max_rows().saturating_sub(entries.len());
+            let page_items = remaining.saturating_add(1).clamp(1, MAX_QUERY_PAGE_ITEMS);
+            let request = ChangeScanRequest::new(
+                current.clone(),
+                QueryPageBounds::new(page_items, MAX_QUERY_PAGE_BYTES)
+                    .map_err(|error| AdapterError::Backend(error.to_string()))?,
+            )
+            .map_err(|error| AdapterError::Backend(error.to_string()))?;
+            let page = read.scan_changes(&request).await?;
+            if page.applied_log_index() != expected_applied_log_index {
+                return Err(TemporalStoreError::ChangeScanAppliedIndexMismatch {
+                    expected: expected_applied_log_index,
+                    actual: page.applied_log_index(),
+                });
+            }
+            if !pushdown_guarantee_satisfies(required, page.guarantee()) {
+                return Err(TemporalStoreError::ChangeScanGuaranteeMismatch {
+                    required,
+                    actual: page.guarantee(),
+                });
+            }
+            let next_start = page.next_start().cloned();
+            for entry in page.into_entries() {
+                if entries.len() == budget.max_rows() {
+                    return Err(TemporalStoreError::ScanEntryLimit);
+                }
+                let entry_bytes = entry
+                    .key()
+                    .as_bytes()
+                    .len()
+                    .checked_add(entry.value().len())
+                    .ok_or(TemporalStoreError::ScanByteLimit)?;
+                scanned_bytes = charge_scan_bytes(scanned_bytes, entry_bytes, budget.max_bytes())?;
+                entries.push(entry);
+            }
+
+            let Some(next_start) = next_start else {
+                return Ok((entries, scanned_bytes));
+            };
+            if next_start.as_bytes() <= current.start() {
+                return Err(TemporalStoreError::ChangeScanContinuationNotAdvancing);
+            }
+            if entries.len() == budget.max_rows() {
+                return Err(TemporalStoreError::ScanEntryLimit);
+            }
+            if scanned_bytes == budget.max_bytes() {
+                return Err(TemporalStoreError::ScanByteLimit);
+            }
+            current = if let Some(prefix) = required_prefix.clone() {
+                KeySpan::prefix_from(current.keyspace(), prefix, next_start.as_bytes().to_vec())
+                    .expect("validated continuation remains inside the original prefix")
+            } else {
+                KeySpan::range(
+                    current.keyspace(),
+                    next_start.as_bytes().to_vec(),
+                    original_end.clone(),
+                )
+                .expect("validated continuation remains before the original range end")
+            };
+        }
+    }
+
+    async fn scan_temporal_event_entries_fenced(
+        &self,
+        span: KeySpan,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<(Vec<storage_api::KeyValue>, u64, u64), TemporalStoreError> {
+        if max_rows == 0 {
+            let probe = span
+                .with_limit(1)
+                .expect("event emptiness probe limit is positive");
+            let scan = self.adapter.scan_fenced(&probe).await?;
+            let applied_log_index = scan.applied_log_index();
+            return if scan.entries().is_empty() {
+                Ok((Vec::new(), 0, applied_log_index))
+            } else {
+                Err(TemporalStoreError::ScanEntryLimit)
+            };
+        }
+        if max_bytes == 0 {
+            let probe = span
+                .with_limit(1)
+                .expect("event emptiness probe limit is positive")
+                .with_max_bytes(1)
+                .expect("event emptiness probe byte limit is positive");
+            return match self.adapter.scan_fenced(&probe).await {
+                Ok(scan) if scan.entries().is_empty() => {
+                    Ok((Vec::new(), 0, scan.applied_log_index()))
+                }
+                Ok(_) | Err(AdapterError::ScanByteLimit { .. }) => {
+                    Err(TemporalStoreError::ScanByteLimit)
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
+        let limit = max_rows
+            .checked_add(1)
+            .ok_or(TemporalStoreError::InvalidScanBudget)?;
+        let bounded = span
+            .with_limit(limit)
+            .expect("bounded event scan limit is positive")
+            .with_max_bytes(max_bytes)
+            .expect("bounded event scan byte limit is positive");
+        let scan = self.adapter.scan_fenced(&bounded).await?;
+        let applied_log_index = scan.applied_log_index();
+        let entries = scan.into_entries();
+        if entries.len() > max_rows {
+            return Err(TemporalStoreError::ScanEntryLimit);
+        }
+        let mut scanned_bytes = 0_u64;
+        for entry in &entries {
+            let entry_bytes = entry
+                .key()
+                .as_bytes()
+                .len()
+                .checked_add(entry.value().len())
+                .ok_or(TemporalStoreError::ScanByteLimit)?;
+            scanned_bytes = charge_scan_bytes(scanned_bytes, entry_bytes, max_bytes)?;
+        }
+        Ok((entries, scanned_bytes, applied_log_index))
+    }
+
     async fn load_projection_at(
         &self,
         element: ElementRef,
@@ -2077,6 +3034,111 @@ where
     }
 }
 
+async fn materialize_keys_batched<A: StorageAdapter + ?Sized>(
+    adapter: &A,
+    keys: &[LogicalKey],
+    max_items: usize,
+    max_request_bytes: u64,
+    snapshot: Option<&dyn ReadSnapshot>,
+) -> Result<Vec<Option<KeyValue>>, TemporalStoreError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    if max_items == 0 || max_request_bytes == 0 {
+        return Err(TemporalStoreError::InvalidScanBudget);
+    }
+
+    let mut unique = Vec::new();
+    let mut ordinals = Vec::with_capacity(keys.len());
+    let mut positions = BTreeMap::new();
+    for key in keys {
+        let ordinal = if let Some(&ordinal) = positions.get(key) {
+            ordinal
+        } else {
+            let ordinal = unique.len();
+            positions.insert(key.clone(), ordinal);
+            unique.push(key.clone());
+            ordinal
+        };
+        ordinals.push(ordinal);
+    }
+
+    let mut unique_values = Vec::with_capacity(unique.len());
+    let mut start = 0;
+    while start < unique.len() {
+        let mut end = start;
+        let mut request_bytes = 0_u64;
+        while end < unique.len() && end - start < max_items {
+            let key_bytes = u64::try_from(unique[end].as_bytes().len())
+                .map_err(|_| TemporalStoreError::ScanByteLimit)?;
+            let next_bytes = request_bytes
+                .checked_add(key_bytes)
+                .ok_or(TemporalStoreError::ScanByteLimit)?;
+            if next_bytes > max_request_bytes {
+                if end == start {
+                    return Err(TemporalStoreError::ScanByteLimit);
+                }
+                break;
+            }
+            request_bytes = next_bytes;
+            end += 1;
+        }
+        let page = &unique[start..end];
+        let values = if let Some(snapshot) = snapshot {
+            snapshot.multi_get(page).await?
+        } else {
+            adapter.multi_get(page).await?
+        };
+        if values.len() != page.len() {
+            return Err(TemporalStoreError::Adapter(AdapterError::Backend(
+                "multi_get returned a different number of values than keys".into(),
+            )));
+        }
+        unique_values.extend(
+            page.iter()
+                .cloned()
+                .zip(values)
+                .map(|(key, value)| value.map(|value| KeyValue::new(key, value))),
+        );
+        start = end;
+    }
+
+    Ok(ordinals
+        .into_iter()
+        .map(|ordinal| unique_values[ordinal].clone())
+        .collect())
+}
+
+fn canonical_event(
+    element: ElementRef,
+    valid: Interval<ValidTime>,
+    commit_ts: TransactionTime,
+    ordinal: u32,
+    payload: Option<CanonicalElement>,
+    metadata: Option<TemporalEventMetadata>,
+) -> Result<CanonicalTemporalEvent, TemporalStoreError> {
+    let operation = if payload.is_some() {
+        TemporalEventOperation::Put
+    } else {
+        TemporalEventOperation::Delete
+    };
+    let mut event =
+        CanonicalTemporalEvent::new(element, operation, valid, commit_ts, ordinal, payload)?;
+    if let Some(metadata) = metadata {
+        event.set_metadata(metadata)?;
+    }
+    Ok(event)
+}
+
+fn decode_events(
+    entries: Vec<storage_api::KeyValue>,
+) -> Result<Vec<CanonicalTemporalEvent>, TemporalStoreError> {
+    entries
+        .into_iter()
+        .map(|entry| CanonicalTemporalEvent::decode(entry.value()).map_err(Into::into))
+        .collect()
+}
+
 fn charge_scan_bytes(
     current: u64,
     additional: usize,
@@ -2089,6 +3151,15 @@ fn charge_scan_bytes(
         return Err(TemporalStoreError::ScanByteLimit);
     }
     Ok(next)
+}
+
+fn pushdown_guarantee_satisfies(required: PushdownGuarantee, actual: PushdownGuarantee) -> bool {
+    matches!(
+        (required, actual),
+        (PushdownGuarantee::Candidate, PushdownGuarantee::Candidate)
+            | (PushdownGuarantee::Candidate, PushdownGuarantee::Exact)
+            | (PushdownGuarantee::Exact, PushdownGuarantee::Exact)
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2132,6 +3203,24 @@ pub enum TemporalStoreError {
         limit: u64,
         required: u64,
     },
+    CandidateScanAppliedIndexMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    CandidateScanGuaranteeMismatch {
+        required: PushdownGuarantee,
+        actual: PushdownGuarantee,
+    },
+    CandidateScanContinuationNotAdvancing,
+    ChangeScanAppliedIndexMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    ChangeScanGuaranteeMismatch {
+        required: PushdownGuarantee,
+        actual: PushdownGuarantee,
+    },
+    ChangeScanContinuationNotAdvancing,
     Adapter(AdapterError),
     Record(RecordCodecError),
     Key(KeyCodecError),
@@ -2218,6 +3307,28 @@ impl Display for TemporalStoreError {
                 formatter,
                 "scan response body requires {required} wire bytes above limit {limit}"
             ),
+            Self::CandidateScanAppliedIndexMismatch { expected, actual } => write!(
+                formatter,
+                "candidate scan page applied index {actual} does not match snapshot {expected}"
+            ),
+            Self::CandidateScanGuaranteeMismatch { required, actual } => write!(
+                formatter,
+                "candidate scan guarantee {actual:?} does not satisfy {required:?}"
+            ),
+            Self::CandidateScanContinuationNotAdvancing => {
+                formatter.write_str("candidate scan continuation does not advance")
+            }
+            Self::ChangeScanAppliedIndexMismatch { expected, actual } => write!(
+                formatter,
+                "change scan page applied index {actual} does not match snapshot {expected}"
+            ),
+            Self::ChangeScanGuaranteeMismatch { required, actual } => write!(
+                formatter,
+                "change scan guarantee {actual:?} does not satisfy {required:?}"
+            ),
+            Self::ChangeScanContinuationNotAdvancing => {
+                formatter.write_str("change scan continuation does not advance")
+            }
             Self::Adapter(error) => Display::fmt(error, formatter),
             Self::Record(error) => Display::fmt(error, formatter),
             Self::Key(error) => Display::fmt(error, formatter),

@@ -6,9 +6,11 @@ use adapter_sidecar::{
 };
 use storage_api::{
     ADAPTER_SPI_VERSION, AdapterCapabilities, AdapterDescriptorV1, ApplyReceipt, BackendFamily,
-    CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey, Mutation,
-    SnapshotCapability,
+    CandidateScanRequest, CommittedMutationBatch, ComparisonOperator, Durability, KeySpan,
+    KeyValue, Keyspace, LogicalKey, Mutation, PropertyConstraint, PropertyId, PushdownGuarantee,
+    QueryPageBounds, SnapshotCapability,
 };
+use temporal_types::{GraphValue, ValidTime};
 
 fn key(keyspace: Keyspace, value: &[u8]) -> LogicalKey {
     LogicalKey::in_keyspace(keyspace, value.to_vec())
@@ -63,6 +65,10 @@ fn every_request_round_trips_through_a_versioned_checksummed_frame() {
         ),
         Request::AppliedLogIndex,
         Request::Health,
+        Request::ReadViewCandidateScan {
+            session_id: 17,
+            request: candidate_request(),
+        },
     ];
     for (ordinal, request) in requests.into_iter().enumerate() {
         let request_id = u128::try_from(ordinal).unwrap().saturating_add(1);
@@ -92,6 +98,16 @@ fn every_response_round_trips_without_losing_empty_and_missing_values() {
             ready: true,
             detail: "ready".to_owned(),
         }),
+        Response::ReadViewCandidateScan {
+            session_id: 17,
+            applied_log_index: 44,
+            guarantee: PushdownGuarantee::Candidate,
+            entries: vec![KeyValue::new(
+                key(Keyspace::Current, b"vertex/1"),
+                b"row".to_vec(),
+            )],
+            next_start: Some(key(Keyspace::Current, b"vertex/2")),
+        },
         Response::Error(RemoteError {
             code: 503,
             message: "retry later".to_owned(),
@@ -119,6 +135,27 @@ fn every_response_round_trips_without_losing_empty_and_missing_values() {
         assert_eq!(decoded.request_id(), request_id);
         assert_eq!(decoded.message(), &response);
     }
+}
+
+fn candidate_request() -> CandidateScanRequest {
+    CandidateScanRequest::new(
+        KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec()),
+        ValidTime::from_micros(123_456),
+        vec![
+            PropertyConstraint::new(
+                PropertyId::new(7),
+                ComparisonOperator::Equal,
+                GraphValue::Boolean(true),
+            ),
+            PropertyConstraint::new(
+                PropertyId::new(9),
+                ComparisonOperator::GreaterThanOrEqual,
+                GraphValue::String("active".to_owned()),
+            ),
+        ],
+        QueryPageBounds::new(2, 4_096).unwrap(),
+    )
+    .unwrap()
 }
 
 #[test]

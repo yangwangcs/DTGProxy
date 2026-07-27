@@ -17,12 +17,15 @@ use std::time::Duration;
 use prost::Message;
 use storage_api::{
     ADAPTER_SPI_VERSION, AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture,
-    ApplyReceipt, BackendFamily, CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace,
-    LOGICAL_SNAPSHOT_FORMAT_VERSION, LogicalKey, LogicalSnapshotChunkV1,
+    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalScanPage,
+    CanonicalScanRequest, CommittedMutationBatch, ComparisonOperator, Durability, KeySpan,
+    KeyValue, Keyspace, LOGICAL_SNAPSHOT_FORMAT_VERSION, LogicalKey, LogicalSnapshotChunkV1,
     LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
     LogicalSnapshotReader, MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES, MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES,
-    Mutation, MutationOperation, SnapshotCapability, StorageAdapter,
+    Mutation, MutationOperation, PropertyConstraint, PropertyId, PushdownGuarantee,
+    QueryPageBounds, QueryPrimitiveCapabilities, ReadSnapshot, SnapshotCapability, StorageAdapter,
 };
+use temporal_types::{GraphValue, ValidTime};
 
 mod service;
 pub use service::{
@@ -46,11 +49,17 @@ impl FeatureSet {
     pub const LOGICAL_EXPORT_SESSION_V1: Self = Self(1 << 1);
     pub const LOGICAL_RESTORE_SESSION_V1: Self = Self(1 << 2);
     pub const RESUMABLE_ORDINAL_REPLAY_V1: Self = Self(1 << 3);
+    pub const READ_VIEW_SESSION_V1: Self = Self(1 << 4);
+    pub const CANONICAL_SCAN_READ_VIEW_V1: Self = Self(1 << 5);
+    pub const CANDIDATE_SCAN_READ_VIEW_V1: Self = Self(1 << 6);
     pub const ALL: Self = Self(
         Self::BASE_ADAPTER_V1.0
             | Self::LOGICAL_EXPORT_SESSION_V1.0
             | Self::LOGICAL_RESTORE_SESSION_V1.0
-            | Self::RESUMABLE_ORDINAL_REPLAY_V1.0,
+            | Self::RESUMABLE_ORDINAL_REPLAY_V1.0
+            | Self::READ_VIEW_SESSION_V1.0
+            | Self::CANONICAL_SCAN_READ_VIEW_V1.0
+            | Self::CANDIDATE_SCAN_READ_VIEW_V1.0,
     );
     pub const EMPTY: Self = Self(0);
 
@@ -99,7 +108,10 @@ impl HelloRequest {
             required_features: FeatureSet::BASE_ADAPTER_V1,
             optional_features: FeatureSet::LOGICAL_EXPORT_SESSION_V1
                 .union(FeatureSet::LOGICAL_RESTORE_SESSION_V1)
-                .union(FeatureSet::RESUMABLE_ORDINAL_REPLAY_V1),
+                .union(FeatureSet::RESUMABLE_ORDINAL_REPLAY_V1)
+                .union(FeatureSet::READ_VIEW_SESSION_V1)
+                .union(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1)
+                .union(FeatureSet::CANDIDATE_SCAN_READ_VIEW_V1),
             max_payload_bytes: u32::try_from(MAX_FRAME_PAYLOAD_BYTES)
                 .expect("frame maximum fits in u32"),
         }
@@ -222,7 +234,7 @@ pub enum FrameKind {
     Response = 2,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     Hello(HelloRequest),
     Describe,
@@ -248,6 +260,46 @@ pub enum Request {
     AbortSession {
         session_id: u128,
     },
+    BeginReadView,
+    ReadViewMultiGet {
+        session_id: u128,
+        keys: Vec<LogicalKey>,
+    },
+    ReadViewScan {
+        session_id: u128,
+        span: KeySpan,
+    },
+    ReadViewCanonicalScan {
+        session_id: u128,
+        request: CanonicalScanRequest,
+    },
+    ReadViewCandidateScan {
+        session_id: u128,
+        request: CandidateScanRequest,
+    },
+    EndReadView {
+        session_id: u128,
+    },
+}
+
+impl Request {
+    fn retry_safe_after_ambiguous_transport_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Hello(_)
+                | Self::Describe
+                | Self::Apply(_)
+                | Self::MultiGet(_)
+                | Self::Scan(_)
+                | Self::AppliedLogIndex
+                | Self::Health
+                | Self::RestoreChunk { .. }
+                | Self::ReadViewMultiGet { .. }
+                | Self::ReadViewScan { .. }
+                | Self::ReadViewCanonicalScan { .. }
+                | Self::ReadViewCandidateScan { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,6 +328,34 @@ pub enum Response {
     },
     RestoreComplete(RestoreComplete),
     SessionAborted {
+        session_id: u128,
+    },
+    ReadViewStarted {
+        session_id: u128,
+        applied_log_index: u64,
+    },
+    ReadViewMultiGet {
+        session_id: u128,
+        values: Vec<Option<Vec<u8>>>,
+    },
+    ReadViewScan {
+        session_id: u128,
+        values: Vec<KeyValue>,
+    },
+    ReadViewCanonicalScan {
+        session_id: u128,
+        applied_log_index: u64,
+        entries: Vec<KeyValue>,
+        next_start: Option<LogicalKey>,
+    },
+    ReadViewCandidateScan {
+        session_id: u128,
+        applied_log_index: u64,
+        guarantee: PushdownGuarantee,
+        entries: Vec<KeyValue>,
+        next_start: Option<LogicalKey>,
+    },
+    ReadViewEnded {
         session_id: u128,
     },
     Error(RemoteError),
@@ -445,6 +525,9 @@ impl TcpSidecarTransport {
             Err(error @ SidecarClientError::ScanByteLimit { .. }) => Err(error),
             Err(first_error) => {
                 *connection = None;
+                if !request.retry_safe_after_ambiguous_transport_failure() {
+                    return Err(first_error);
+                }
                 let mut replacement = connect_tcp_stream(self.config)?;
                 match exchange_once(&mut replacement, request_id, request) {
                     Ok(response) => {
@@ -504,8 +587,9 @@ fn exchange_once(
 }
 
 fn scan_response_payload_limit(request: &Request) -> Result<usize, ProtocolError> {
-    let Request::Scan(span) = request else {
-        return Ok(MAX_FRAME_PAYLOAD_BYTES);
+    let span = match request {
+        Request::Scan(span) | Request::ReadViewScan { span, .. } => span,
+        _ => return Ok(MAX_FRAME_PAYLOAD_BYTES),
     };
     let (Some(max_bytes), Some(limit)) = (span.max_bytes(), span.limit()) else {
         return Ok(MAX_FRAME_PAYLOAD_BYTES);
@@ -903,7 +987,13 @@ pub async fn dispatch_request(adapter: &dyn StorageAdapter, request: Request) ->
         | Request::BeginRestore(_)
         | Request::RestoreChunk { .. }
         | Request::FinishRestore { .. }
-        | Request::AbortSession { .. } => Response::Error(RemoteError {
+        | Request::AbortSession { .. }
+        | Request::BeginReadView
+        | Request::ReadViewMultiGet { .. }
+        | Request::ReadViewScan { .. }
+        | Request::ReadViewCanonicalScan { .. }
+        | Request::ReadViewCandidateScan { .. }
+        | Request::EndReadView { .. } => Response::Error(RemoteError {
             code: RemoteErrorCode::FeatureUnsupported as u32,
             message: "snapshot sessions require a stateful Sidecar service".to_owned(),
             retryable: false,
@@ -929,6 +1019,9 @@ fn encode_adapter_error(error: &AdapterError) -> RemoteError {
         AdapterError::ScanByteLimit { .. } => (9, false),
         AdapterError::ScanResponseByteLimit { .. } => (10, false),
         AdapterError::Mapping(_) => (RemoteErrorCode::MappingIncompatible as u32, false),
+        AdapterError::InvalidCapabilityGeneration { .. } => {
+            (RemoteErrorCode::ServiceFaulted as u32, false)
+        }
     };
     RemoteError {
         code,
@@ -1069,11 +1162,32 @@ impl From<SidecarClientError> for AdapterError {
 pub struct SidecarAdapter<T> {
     transport: T,
     descriptor: AdapterDescriptorV1,
+    negotiated_features: FeatureSet,
     applied_log_index: AtomicU64,
 }
 
 impl<T: SidecarTransport> SidecarAdapter<T> {
     pub async fn connect(transport: T) -> Result<Self, SidecarClientError> {
+        let hello_request = HelloRequest::adapter_client();
+        let negotiated_features = match transport
+            .call(Request::Hello(hello_request.clone()))
+            .await?
+        {
+            Response::Hello(response)
+                if response
+                    .negotiated_features
+                    .contains(hello_request.required_features) =>
+            {
+                response.negotiated_features
+            }
+            Response::Hello(_) => {
+                return Err(SidecarClientError::NotReady(
+                    "Sidecar omitted a required protocol feature".into(),
+                ));
+            }
+            Response::Error(error) => return Err(SidecarClientError::Remote(error)),
+            response => return Err(unexpected_response("hello", &response)),
+        };
         let descriptor = match transport.call(Request::Describe).await? {
             Response::Descriptor(descriptor) => descriptor,
             Response::Error(error) => return Err(SidecarClientError::Remote(error)),
@@ -1102,6 +1216,7 @@ impl<T: SidecarTransport> SidecarAdapter<T> {
         Ok(Self {
             transport,
             descriptor,
+            negotiated_features,
             applied_log_index: AtomicU64::new(applied_log_index),
         })
     }
@@ -1126,6 +1241,24 @@ impl<T: SidecarTransport> StorageAdapter for SidecarAdapter<T> {
 
     fn capabilities(&self) -> AdapterCapabilities {
         self.descriptor.capabilities()
+    }
+
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        let candidate_scan = if self.descriptor.capabilities().predicate_pushdown
+            && self
+                .negotiated_features
+                .contains(FeatureSet::CANDIDATE_SCAN_READ_VIEW_V1)
+        {
+            PushdownGuarantee::Candidate
+        } else {
+            PushdownGuarantee::Unsupported
+        };
+        QueryPrimitiveCapabilities::new(
+            candidate_scan,
+            PushdownGuarantee::Unsupported,
+            PushdownGuarantee::Unsupported,
+            PushdownGuarantee::Unsupported,
+        )
     }
 
     fn apply_committed<'a>(
@@ -1269,8 +1402,301 @@ impl<T: SidecarTransport> StorageAdapter for SidecarAdapter<T> {
         })
     }
 
+    fn begin_read_snapshot<'a>(&'a self) -> AdapterFuture<'a, Box<dyn ReadSnapshot + 'a>> {
+        Box::pin(async move {
+            if !self
+                .negotiated_features
+                .contains(FeatureSet::READ_VIEW_SESSION_V1)
+            {
+                return Err(AdapterError::UnsupportedOperation {
+                    operation: "query read snapshot",
+                });
+            }
+            let response = self
+                .transport
+                .call(Request::BeginReadView)
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ReadViewStarted {
+                    session_id,
+                    applied_log_index,
+                } => {
+                    let required = self.applied_log_index.load(Ordering::Acquire);
+                    if let Err(error) = self.validate_index(required, applied_log_index) {
+                        let _ = self
+                            .transport
+                            .call(Request::EndReadView { session_id })
+                            .await;
+                        return Err(AdapterError::from(error));
+                    }
+                    Ok(Box::new(SidecarReadSnapshot {
+                        transport: &self.transport,
+                        session_id,
+                        applied_log_index,
+                        canonical_scan: self
+                            .negotiated_features
+                            .contains(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1),
+                        candidate_scan: self.descriptor.capabilities().predicate_pushdown
+                            && self
+                                .negotiated_features
+                                .contains(FeatureSet::CANDIDATE_SCAN_READ_VIEW_V1),
+                    }) as Box<dyn ReadSnapshot + 'a>)
+                }
+                Response::Error(error)
+                    if error.code == RemoteErrorCode::FeatureUnsupported as u32 =>
+                {
+                    Err(AdapterError::UnsupportedOperation {
+                        operation: "query read snapshot",
+                    })
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "begin-read-view",
+                    &response,
+                ))),
+            }
+        })
+    }
+
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         Ok(self.applied_log_index.load(Ordering::Acquire))
+    }
+}
+
+struct SidecarReadSnapshot<'transport, T: SidecarTransport> {
+    transport: &'transport T,
+    session_id: u128,
+    applied_log_index: u64,
+    canonical_scan: bool,
+    candidate_scan: bool,
+}
+
+impl<T: SidecarTransport> ReadSnapshot for SidecarReadSnapshot<'_, T> {
+    fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    fn multi_get<'a>(&'a self, keys: &'a [LogicalKey]) -> AdapterFuture<'a, Vec<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            let expected = keys.len();
+            let response = self
+                .transport
+                .call(Request::ReadViewMultiGet {
+                    session_id: self.session_id,
+                    keys: keys.to_vec(),
+                })
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ReadViewMultiGet { session_id, values }
+                    if session_id == self.session_id && values.len() == expected =>
+                {
+                    Ok(values)
+                }
+                Response::ReadViewMultiGet { session_id, values }
+                    if session_id == self.session_id =>
+                {
+                    Err(AdapterError::from(
+                        SidecarClientError::InvalidMultiGetCount {
+                            expected,
+                            actual: values.len(),
+                        },
+                    ))
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "read-view-multi-get",
+                    &response,
+                ))),
+            }
+        })
+    }
+
+    fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move {
+            let response = self
+                .transport
+                .call(Request::ReadViewScan {
+                    session_id: self.session_id,
+                    span: span.clone(),
+                })
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ReadViewScan { session_id, values } if session_id == self.session_id => {
+                    validate_scan_response(span, &values).map_err(AdapterError::from)?;
+                    let mut retained = 0_u64;
+                    for value in &values {
+                        retained = storage_api::charge_scan_entry(
+                            span,
+                            retained,
+                            value.key().as_bytes(),
+                            value.value(),
+                        )?;
+                    }
+                    Ok(values)
+                }
+                Response::Error(error) if error.code == 9 => {
+                    match (error.scan_limit, error.scan_required) {
+                        (Some(limit), Some(required)) => {
+                            Err(AdapterError::ScanByteLimit { limit, required })
+                        }
+                        _ => Err(AdapterError::from(SidecarClientError::Remote(error))),
+                    }
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "read-view-scan",
+                    &response,
+                ))),
+            }
+        })
+    }
+
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            if !self.canonical_scan {
+                return Err(AdapterError::UnsupportedOperation {
+                    operation: "snapshot canonical scan",
+                });
+            }
+            let response = self
+                .transport
+                .call(Request::ReadViewCanonicalScan {
+                    session_id: self.session_id,
+                    request: request.clone(),
+                })
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ReadViewCanonicalScan {
+                    session_id,
+                    applied_log_index,
+                    entries,
+                    next_start,
+                } if session_id == self.session_id => {
+                    if applied_log_index != self.applied_log_index {
+                        return Err(AdapterError::from(
+                            SidecarClientError::InvalidSnapshotResponse(format!(
+                                "read-view canonical scan index {applied_log_index} differs from fixed index {}",
+                                self.applied_log_index
+                            )),
+                        ));
+                    }
+                    CanonicalScanPage::new(request, applied_log_index, entries, next_start).map_err(
+                        |error| {
+                            AdapterError::from(SidecarClientError::InvalidSnapshotResponse(
+                                error.to_string(),
+                            ))
+                        },
+                    )
+                }
+                Response::Error(error)
+                    if error.code == RemoteErrorCode::FeatureUnsupported as u32
+                        || error.code == 7 =>
+                {
+                    Err(AdapterError::UnsupportedOperation {
+                        operation: "snapshot canonical scan",
+                    })
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "read-view-canonical-scan",
+                    &response,
+                ))),
+            }
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            if !self.candidate_scan {
+                return Err(AdapterError::UnsupportedOperation {
+                    operation: "snapshot candidate scan",
+                });
+            }
+            let response = self
+                .transport
+                .call(Request::ReadViewCandidateScan {
+                    session_id: self.session_id,
+                    request: request.clone(),
+                })
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ReadViewCandidateScan {
+                    session_id,
+                    applied_log_index,
+                    guarantee,
+                    entries,
+                    next_start,
+                } if session_id == self.session_id => {
+                    if applied_log_index != self.applied_log_index {
+                        return Err(AdapterError::from(
+                            SidecarClientError::InvalidSnapshotResponse(format!(
+                                "read-view candidate scan index {applied_log_index} differs from fixed index {}",
+                                self.applied_log_index
+                            )),
+                        ));
+                    }
+                    CandidateScanPage::new(
+                        request,
+                        applied_log_index,
+                        match guarantee {
+                            PushdownGuarantee::Candidate | PushdownGuarantee::Exact => {
+                                PushdownGuarantee::Candidate
+                            }
+                            PushdownGuarantee::Unsupported => PushdownGuarantee::Unsupported,
+                        },
+                        entries,
+                        next_start,
+                    )
+                    .map_err(|error| {
+                        AdapterError::from(SidecarClientError::InvalidSnapshotResponse(
+                            error.to_string(),
+                        ))
+                    })
+                }
+                Response::Error(error)
+                    if error.code == RemoteErrorCode::FeatureUnsupported as u32
+                        || error.code == 7 =>
+                {
+                    Err(AdapterError::UnsupportedOperation {
+                        operation: "snapshot candidate scan",
+                    })
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "read-view-candidate-scan",
+                    &response,
+                ))),
+            }
+        })
+    }
+}
+
+impl<T: SidecarTransport> Drop for SidecarReadSnapshot<'_, T> {
+    fn drop(&mut self) {
+        let _ = block_on_dispatch(self.transport.call(Request::EndReadView {
+            session_id: self.session_id,
+        }));
     }
 }
 
@@ -1400,6 +1826,12 @@ const fn response_name(response: &Response) -> &'static str {
         Response::RestoreChunkAccepted { .. } => "restore-chunk-accepted",
         Response::RestoreComplete(_) => "restore-complete",
         Response::SessionAborted { .. } => "session-aborted",
+        Response::ReadViewStarted { .. } => "read-view-started",
+        Response::ReadViewMultiGet { .. } => "read-view-multi-get",
+        Response::ReadViewScan { .. } => "read-view-scan",
+        Response::ReadViewCanonicalScan { .. } => "read-view-canonical-scan",
+        Response::ReadViewCandidateScan { .. } => "read-view-candidate-scan",
+        Response::ReadViewEnded { .. } => "read-view-ended",
         Response::Error(_) => "error",
     }
 }
@@ -1671,6 +2103,44 @@ impl ProtocolMessage for Request {
                     session_id: encode_u128(*session_id),
                 })
             }
+            Self::BeginReadView => {
+                wire::request_envelope::Body::BeginReadView(wire::BeginReadViewRequest {})
+            }
+            Self::ReadViewMultiGet { session_id, keys } => {
+                wire::request_envelope::Body::ReadViewMultiGet(wire::ReadViewMultiGetRequest {
+                    session_id: encode_u128(*session_id),
+                    keys: keys.iter().map(encode_key).collect(),
+                })
+            }
+            Self::ReadViewScan { session_id, span } => {
+                wire::request_envelope::Body::ReadViewScan(wire::ReadViewScanRequest {
+                    session_id: encode_u128(*session_id),
+                    span: Some(encode_span(span)?),
+                })
+            }
+            Self::ReadViewCanonicalScan {
+                session_id,
+                request,
+            } => wire::request_envelope::Body::ReadViewCanonicalScan(
+                wire::ReadViewCanonicalScanRequest {
+                    session_id: encode_u128(*session_id),
+                    request: Some(encode_canonical_scan_request(request)?),
+                },
+            ),
+            Self::ReadViewCandidateScan {
+                session_id,
+                request,
+            } => wire::request_envelope::Body::ReadViewCandidateScan(
+                wire::ReadViewCandidateScanRequest {
+                    session_id: encode_u128(*session_id),
+                    request: Some(encode_candidate_scan_request(request)?),
+                },
+            ),
+            Self::EndReadView { session_id } => {
+                wire::request_envelope::Body::EndReadView(wire::EndReadViewRequest {
+                    session_id: encode_u128(*session_id),
+                })
+            }
         };
         encode_protobuf(&wire::RequestEnvelope {
             spi_version: u32::from(ADAPTER_SPI_VERSION),
@@ -1752,6 +2222,42 @@ impl ProtocolMessage for Request {
                 )?,
             }),
             wire::request_envelope::Body::AbortSession(request) => Ok(Self::AbortSession {
+                session_id: decode_session_id(&request.session_id)?,
+            }),
+            wire::request_envelope::Body::BeginReadView(_) => Ok(Self::BeginReadView),
+            wire::request_envelope::Body::ReadViewMultiGet(request) => Ok(Self::ReadViewMultiGet {
+                session_id: decode_session_id(&request.session_id)?,
+                keys: request
+                    .keys
+                    .into_iter()
+                    .map(decode_key)
+                    .collect::<Result<_, _>>()?,
+            }),
+            wire::request_envelope::Body::ReadViewScan(request) => Ok(Self::ReadViewScan {
+                session_id: decode_session_id(&request.session_id)?,
+                span: decode_span(
+                    request
+                        .span
+                        .ok_or(ProtocolError::MissingSnapshotField("read-view scan span"))?,
+                )?,
+            }),
+            wire::request_envelope::Body::ReadViewCanonicalScan(request) => {
+                Ok(Self::ReadViewCanonicalScan {
+                    session_id: decode_session_id(&request.session_id)?,
+                    request: decode_canonical_scan_request(request.request.ok_or(
+                        ProtocolError::MissingSnapshotField("read-view canonical scan request"),
+                    )?)?,
+                })
+            }
+            wire::request_envelope::Body::ReadViewCandidateScan(request) => {
+                Ok(Self::ReadViewCandidateScan {
+                    session_id: decode_session_id(&request.session_id)?,
+                    request: decode_candidate_scan_request(request.request.ok_or(
+                        ProtocolError::MissingSnapshotField("read-view candidate scan request"),
+                    )?)?,
+                })
+            }
+            wire::request_envelope::Body::EndReadView(request) => Ok(Self::EndReadView {
                 session_id: decode_session_id(&request.session_id)?,
             }),
             _ => Err(ProtocolError::NonCanonicalBody),
@@ -1863,6 +2369,64 @@ impl ProtocolMessage for Response {
             }
             Self::SessionAborted { session_id } => {
                 wire::response_envelope::Body::SessionAborted(wire::SessionAbortedResponse {
+                    session_id: encode_u128(*session_id),
+                })
+            }
+            Self::ReadViewStarted {
+                session_id,
+                applied_log_index,
+            } => wire::response_envelope::Body::ReadViewStarted(wire::ReadViewStartedResponse {
+                session_id: encode_u128(*session_id),
+                applied_log_index: *applied_log_index,
+            }),
+            Self::ReadViewMultiGet { session_id, values } => {
+                wire::response_envelope::Body::ReadViewMultiGet(wire::ReadViewMultiGetResponse {
+                    session_id: encode_u128(*session_id),
+                    values: values
+                        .iter()
+                        .map(|value| wire::OptionalBytes {
+                            present: value.is_some(),
+                            value: value.clone().unwrap_or_default(),
+                        })
+                        .collect(),
+                })
+            }
+            Self::ReadViewScan { session_id, values } => {
+                wire::response_envelope::Body::ReadViewScan(wire::ReadViewScanResponse {
+                    session_id: encode_u128(*session_id),
+                    values: values.iter().map(encode_key_value).collect(),
+                })
+            }
+            Self::ReadViewCanonicalScan {
+                session_id,
+                applied_log_index,
+                entries,
+                next_start,
+            } => wire::response_envelope::Body::ReadViewCanonicalScan(
+                wire::ReadViewCanonicalScanResponse {
+                    session_id: encode_u128(*session_id),
+                    applied_log_index: *applied_log_index,
+                    entries: entries.iter().map(encode_key_value).collect(),
+                    next_start: next_start.as_ref().map(encode_key),
+                },
+            ),
+            Self::ReadViewCandidateScan {
+                session_id,
+                applied_log_index,
+                guarantee,
+                entries,
+                next_start,
+            } => wire::response_envelope::Body::ReadViewCandidateScan(
+                wire::ReadViewCandidateScanResponse {
+                    session_id: encode_u128(*session_id),
+                    applied_log_index: *applied_log_index,
+                    guarantee: encode_pushdown_guarantee(*guarantee),
+                    entries: entries.iter().map(encode_key_value).collect(),
+                    next_start: next_start.as_ref().map(encode_key),
+                },
+            ),
+            Self::ReadViewEnded { session_id } => {
+                wire::response_envelope::Body::ReadViewEnded(wire::ReadViewEndedResponse {
                     session_id: encode_u128(*session_id),
                 })
             }
@@ -2017,6 +2581,56 @@ impl ProtocolMessage for Response {
                 }))
             }
             wire::response_envelope::Body::SessionAborted(response) => Ok(Self::SessionAborted {
+                session_id: decode_session_id(&response.session_id)?,
+            }),
+            wire::response_envelope::Body::ReadViewStarted(response) => Ok(Self::ReadViewStarted {
+                session_id: decode_session_id(&response.session_id)?,
+                applied_log_index: response.applied_log_index,
+            }),
+            wire::response_envelope::Body::ReadViewMultiGet(response) => {
+                Ok(Self::ReadViewMultiGet {
+                    session_id: decode_session_id(&response.session_id)?,
+                    values: response
+                        .values
+                        .into_iter()
+                        .map(|value| value.present.then_some(value.value))
+                        .collect(),
+                })
+            }
+            wire::response_envelope::Body::ReadViewScan(response) => Ok(Self::ReadViewScan {
+                session_id: decode_session_id(&response.session_id)?,
+                values: response
+                    .values
+                    .into_iter()
+                    .map(decode_key_value)
+                    .collect::<Result<_, _>>()?,
+            }),
+            wire::response_envelope::Body::ReadViewCanonicalScan(response) => {
+                Ok(Self::ReadViewCanonicalScan {
+                    session_id: decode_session_id(&response.session_id)?,
+                    applied_log_index: response.applied_log_index,
+                    entries: response
+                        .entries
+                        .into_iter()
+                        .map(decode_key_value)
+                        .collect::<Result<_, _>>()?,
+                    next_start: response.next_start.map(decode_key).transpose()?,
+                })
+            }
+            wire::response_envelope::Body::ReadViewCandidateScan(response) => {
+                Ok(Self::ReadViewCandidateScan {
+                    session_id: decode_session_id(&response.session_id)?,
+                    applied_log_index: response.applied_log_index,
+                    guarantee: decode_pushdown_guarantee(response.guarantee)?,
+                    entries: response
+                        .entries
+                        .into_iter()
+                        .map(decode_key_value)
+                        .collect::<Result<_, _>>()?,
+                    next_start: response.next_start.map(decode_key).transpose()?,
+                })
+            }
+            wire::response_envelope::Body::ReadViewEnded(response) => Ok(Self::ReadViewEnded {
                 session_id: decode_session_id(&response.session_id)?,
             }),
             wire::response_envelope::Body::Error(error) => {
@@ -2483,6 +3097,178 @@ fn decode_span(span: wire::ScanRequest) -> Result<KeySpan, ProtocolError> {
     }
 }
 
+fn encode_canonical_scan_request(
+    request: &CanonicalScanRequest,
+) -> Result<wire::CanonicalScanRequest, ProtocolError> {
+    Ok(wire::CanonicalScanRequest {
+        span: Some(encode_span(request.span())?),
+        max_items: u64::try_from(request.bounds().max_items())
+            .map_err(|_| ProtocolError::LengthOverflow)?,
+        max_bytes: request.bounds().max_bytes(),
+    })
+}
+
+fn decode_canonical_scan_request(
+    request: wire::CanonicalScanRequest,
+) -> Result<CanonicalScanRequest, ProtocolError> {
+    let span = decode_span(
+        request
+            .span
+            .ok_or(ProtocolError::MissingSnapshotField("canonical scan span"))?,
+    )?;
+    let bounds = QueryPageBounds::new(
+        usize::try_from(request.max_items).map_err(|_| ProtocolError::LengthOverflow)?,
+        request.max_bytes,
+    )
+    .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))?;
+    CanonicalScanRequest::new(span, bounds)
+        .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))
+}
+
+fn encode_candidate_scan_request(
+    request: &CandidateScanRequest,
+) -> Result<wire::CandidateScanRequest, ProtocolError> {
+    Ok(wire::CandidateScanRequest {
+        span: Some(encode_span(request.span())?),
+        valid_time_micros: request.valid_time().as_micros(),
+        constraints: request
+            .constraints()
+            .iter()
+            .map(encode_property_constraint)
+            .collect(),
+        max_items: u64::try_from(request.bounds().max_items())
+            .map_err(|_| ProtocolError::LengthOverflow)?,
+        max_bytes: request.bounds().max_bytes(),
+    })
+}
+
+fn decode_candidate_scan_request(
+    request: wire::CandidateScanRequest,
+) -> Result<CandidateScanRequest, ProtocolError> {
+    let span = decode_span(
+        request
+            .span
+            .ok_or(ProtocolError::MissingSnapshotField("candidate scan span"))?,
+    )?;
+    let constraints = request
+        .constraints
+        .into_iter()
+        .map(decode_property_constraint)
+        .collect::<Result<Vec<_>, _>>()?;
+    let bounds = QueryPageBounds::new(
+        usize::try_from(request.max_items).map_err(|_| ProtocolError::LengthOverflow)?,
+        request.max_bytes,
+    )
+    .map_err(|error| ProtocolError::InvalidQueryPrimitive(error.to_string()))?;
+    CandidateScanRequest::new(
+        span,
+        ValidTime::from_micros(request.valid_time_micros),
+        constraints,
+        bounds,
+    )
+    .map_err(|error| ProtocolError::InvalidQueryPrimitive(error.to_string()))
+}
+
+fn encode_property_constraint(constraint: &PropertyConstraint) -> wire::PropertyConstraint {
+    wire::PropertyConstraint {
+        property_id: constraint.property().value(),
+        operator: encode_comparison_operator(constraint.operator()),
+        value: Some(encode_graph_value(constraint.value())),
+    }
+}
+
+fn decode_property_constraint(
+    constraint: wire::PropertyConstraint,
+) -> Result<PropertyConstraint, ProtocolError> {
+    Ok(PropertyConstraint::new(
+        PropertyId::new(constraint.property_id),
+        decode_comparison_operator(constraint.operator)?,
+        decode_graph_value(constraint.value.ok_or(ProtocolError::MissingSnapshotField(
+            "property constraint value",
+        ))?)?,
+    ))
+}
+
+const fn encode_comparison_operator(operator: ComparisonOperator) -> u32 {
+    match operator {
+        ComparisonOperator::Equal => 1,
+        ComparisonOperator::NotEqual => 2,
+        ComparisonOperator::LessThan => 3,
+        ComparisonOperator::LessThanOrEqual => 4,
+        ComparisonOperator::GreaterThan => 5,
+        ComparisonOperator::GreaterThanOrEqual => 6,
+    }
+}
+
+fn decode_comparison_operator(tag: u32) -> Result<ComparisonOperator, ProtocolError> {
+    match tag {
+        1 => Ok(ComparisonOperator::Equal),
+        2 => Ok(ComparisonOperator::NotEqual),
+        3 => Ok(ComparisonOperator::LessThan),
+        4 => Ok(ComparisonOperator::LessThanOrEqual),
+        5 => Ok(ComparisonOperator::GreaterThan),
+        6 => Ok(ComparisonOperator::GreaterThanOrEqual),
+        _ => Err(ProtocolError::UnknownComparisonOperator { tag }),
+    }
+}
+
+fn encode_graph_value(value: &GraphValue) -> wire::GraphValue {
+    use wire::graph_value::Kind;
+
+    let kind = match value {
+        GraphValue::Null => Kind::NullValue(true),
+        GraphValue::Boolean(value) => Kind::BooleanValue(*value),
+        GraphValue::Integer(value) => Kind::IntegerValue(*value),
+        GraphValue::FloatBits(value) => Kind::FloatBits(*value),
+        GraphValue::String(value) => Kind::StringValue(value.clone()),
+        GraphValue::Bytes(value) => Kind::BytesValue(value.clone()),
+        GraphValue::TimestampMicros(value) => Kind::TimestampMicros(*value),
+        GraphValue::List(values) => Kind::ListValue(wire::GraphValueList {
+            values: values.iter().map(encode_graph_value).collect(),
+        }),
+    };
+    wire::GraphValue { kind: Some(kind) }
+}
+
+fn decode_graph_value(value: wire::GraphValue) -> Result<GraphValue, ProtocolError> {
+    use wire::graph_value::Kind;
+
+    match value.kind.ok_or(ProtocolError::MissingGraphValue)? {
+        Kind::NullValue(true) => Ok(GraphValue::Null),
+        Kind::NullValue(false) => Err(ProtocolError::NonCanonicalBody),
+        Kind::BooleanValue(value) => Ok(GraphValue::Boolean(value)),
+        Kind::IntegerValue(value) => Ok(GraphValue::Integer(value)),
+        Kind::FloatBits(value) => Ok(GraphValue::FloatBits(value)),
+        Kind::StringValue(value) => Ok(GraphValue::String(value)),
+        Kind::BytesValue(value) => Ok(GraphValue::Bytes(value)),
+        Kind::TimestampMicros(value) => Ok(GraphValue::TimestampMicros(value)),
+        Kind::ListValue(values) => Ok(GraphValue::List(
+            values
+                .values
+                .into_iter()
+                .map(decode_graph_value)
+                .collect::<Result<_, _>>()?,
+        )),
+    }
+}
+
+const fn encode_pushdown_guarantee(guarantee: PushdownGuarantee) -> u32 {
+    match guarantee {
+        PushdownGuarantee::Unsupported => 1,
+        PushdownGuarantee::Candidate => 2,
+        PushdownGuarantee::Exact => 3,
+    }
+}
+
+fn decode_pushdown_guarantee(tag: u32) -> Result<PushdownGuarantee, ProtocolError> {
+    match tag {
+        1 => Ok(PushdownGuarantee::Unsupported),
+        2 => Ok(PushdownGuarantee::Candidate),
+        3 => Ok(PushdownGuarantee::Exact),
+        _ => Err(ProtocolError::UnknownPushdownGuarantee { tag }),
+    }
+}
+
 fn decode_keyspace(tag: u32) -> Result<Keyspace, ProtocolError> {
     match tag {
         0 => Ok(Keyspace::Meta),
@@ -2673,6 +3459,7 @@ pub enum ProtocolError {
         tag: u32,
     },
     InvalidSpan(String),
+    InvalidQueryPrimitive(String),
     ScanByteLimit {
         limit: u64,
         required: u64,
@@ -2688,6 +3475,13 @@ pub enum ProtocolError {
     UnknownSnapshotCapability {
         tag: u32,
     },
+    UnknownComparisonOperator {
+        tag: u32,
+    },
+    UnknownPushdownGuarantee {
+        tag: u32,
+    },
+    MissingGraphValue,
 }
 
 impl Display for ProtocolError {
@@ -2770,6 +3564,9 @@ impl Display for ProtocolError {
             }
             Self::UnknownKeyspace { tag } => write!(formatter, "unknown keyspace {tag}"),
             Self::InvalidSpan(message) => write!(formatter, "invalid key span: {message}"),
+            Self::InvalidQueryPrimitive(message) => {
+                write!(formatter, "invalid query primitive: {message}")
+            }
             Self::ScanByteLimit { limit, required } => write!(
                 formatter,
                 "scan requires {required} bytes, exceeding byte limit {limit}"
@@ -2783,6 +3580,13 @@ impl Display for ProtocolError {
             Self::UnknownSnapshotCapability { tag } => {
                 write!(formatter, "unknown snapshot capability {tag}")
             }
+            Self::UnknownComparisonOperator { tag } => {
+                write!(formatter, "unknown comparison operator {tag}")
+            }
+            Self::UnknownPushdownGuarantee { tag } => {
+                write!(formatter, "unknown pushdown guarantee {tag}")
+            }
+            Self::MissingGraphValue => formatter.write_str("graph value is missing"),
         }
     }
 }
@@ -3048,20 +3852,134 @@ mod wire {
     }
 
     #[derive(Clone, PartialEq, Message)]
+    pub struct BeginReadViewRequest {}
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewMultiGetRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, repeated, tag = "2")]
+        pub keys: Vec<LogicalKey>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewScanRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub span: Option<ScanRequest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct CanonicalScanRequest {
+        #[prost(message, optional, tag = "1")]
+        pub span: Option<ScanRequest>,
+        #[prost(uint64, tag = "2")]
+        pub max_items: u64,
+        #[prost(uint64, tag = "3")]
+        pub max_bytes: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewCanonicalScanRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub request: Option<CanonicalScanRequest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct GraphValueList {
+        #[prost(message, repeated, tag = "1")]
+        pub values: Vec<GraphValue>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct GraphValue {
+        #[prost(oneof = "graph_value::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+        pub kind: Option<graph_value::Kind>,
+    }
+
+    pub mod graph_value {
+        use super::GraphValueList;
+        use prost::Oneof;
+
+        #[derive(Clone, PartialEq, Oneof)]
+        pub enum Kind {
+            #[prost(bool, tag = "1")]
+            NullValue(bool),
+            #[prost(bool, tag = "2")]
+            BooleanValue(bool),
+            #[prost(int64, tag = "3")]
+            IntegerValue(i64),
+            #[prost(fixed64, tag = "4")]
+            FloatBits(u64),
+            #[prost(string, tag = "5")]
+            StringValue(String),
+            #[prost(bytes = "vec", tag = "6")]
+            BytesValue(Vec<u8>),
+            #[prost(int64, tag = "7")]
+            TimestampMicros(i64),
+            #[prost(message, tag = "8")]
+            ListValue(GraphValueList),
+        }
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct PropertyConstraint {
+        #[prost(uint32, tag = "1")]
+        pub property_id: u32,
+        #[prost(uint32, tag = "2")]
+        pub operator: u32,
+        #[prost(message, optional, tag = "3")]
+        pub value: Option<GraphValue>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct CandidateScanRequest {
+        #[prost(message, optional, tag = "1")]
+        pub span: Option<ScanRequest>,
+        #[prost(int64, tag = "2")]
+        pub valid_time_micros: i64,
+        #[prost(message, repeated, tag = "3")]
+        pub constraints: Vec<PropertyConstraint>,
+        #[prost(uint64, tag = "4")]
+        pub max_items: u64,
+        #[prost(uint64, tag = "5")]
+        pub max_bytes: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewCandidateScanRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub request: Option<CandidateScanRequest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct EndReadViewRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
     pub struct RequestEnvelope {
         #[prost(uint32, tag = "1")]
         pub spi_version: u32,
         #[prost(
             oneof = "request_envelope::Body",
-            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
         )]
         pub body: Option<request_envelope::Body>,
     }
 
     pub mod request_envelope {
         use super::{
-            AbortSessionRequest, ApplyRequest, BeginExportRequest, BeginRestoreRequest,
-            ExportNextRequest, FinishRestoreRequest, HelloRequest, MultiGetRequest,
+            AbortSessionRequest, ApplyRequest, BeginExportRequest, BeginReadViewRequest,
+            BeginRestoreRequest, EndReadViewRequest, ExportNextRequest, FinishRestoreRequest,
+            HelloRequest, MultiGetRequest, ReadViewCandidateScanRequest,
+            ReadViewCanonicalScanRequest, ReadViewMultiGetRequest, ReadViewScanRequest,
             RestoreChunkRequest, ScanRequest,
         };
         use prost::Oneof;
@@ -3094,6 +4012,18 @@ mod wire {
             FinishRestore(FinishRestoreRequest),
             #[prost(message, tag = "14")]
             AbortSession(AbortSessionRequest),
+            #[prost(message, tag = "15")]
+            BeginReadView(BeginReadViewRequest),
+            #[prost(message, tag = "16")]
+            ReadViewMultiGet(ReadViewMultiGetRequest),
+            #[prost(message, tag = "17")]
+            ReadViewScan(ReadViewScanRequest),
+            #[prost(message, tag = "18")]
+            EndReadView(EndReadViewRequest),
+            #[prost(message, tag = "19")]
+            ReadViewCanonicalScan(ReadViewCanonicalScanRequest),
+            #[prost(message, tag = "20")]
+            ReadViewCandidateScan(ReadViewCandidateScanRequest),
         }
     }
 
@@ -3286,12 +4216,68 @@ mod wire {
     }
 
     #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewStartedResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(uint64, tag = "2")]
+        pub applied_log_index: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewMultiGetResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, repeated, tag = "2")]
+        pub values: Vec<OptionalBytes>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewScanResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, repeated, tag = "2")]
+        pub values: Vec<KeyValue>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewCanonicalScanResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(uint64, tag = "2")]
+        pub applied_log_index: u64,
+        #[prost(message, repeated, tag = "3")]
+        pub entries: Vec<KeyValue>,
+        #[prost(message, optional, tag = "4")]
+        pub next_start: Option<LogicalKey>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewCandidateScanResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(uint64, tag = "2")]
+        pub applied_log_index: u64,
+        #[prost(uint32, tag = "3")]
+        pub guarantee: u32,
+        #[prost(message, repeated, tag = "4")]
+        pub entries: Vec<KeyValue>,
+        #[prost(message, optional, tag = "5")]
+        pub next_start: Option<LogicalKey>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewEndedResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
     pub struct ResponseEnvelope {
         #[prost(uint32, tag = "1")]
         pub spi_version: u32,
         #[prost(
             oneof = "response_envelope::Body",
-            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
+            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
         )]
         pub body: Option<response_envelope::Body>,
     }
@@ -3300,7 +4286,9 @@ mod wire {
         use super::{
             ApplyResponse, DescriptorResponse, ErrorResponse, ExportChunkResponse,
             ExportCompleteResponse, ExportStartedResponse, HealthResponse, HelloResponse,
-            MultiGetResponse, RestoreChunkAcceptedResponse, RestoreCompleteResponse,
+            MultiGetResponse, ReadViewCandidateScanResponse, ReadViewCanonicalScanResponse,
+            ReadViewEndedResponse, ReadViewMultiGetResponse, ReadViewScanResponse,
+            ReadViewStartedResponse, RestoreChunkAcceptedResponse, RestoreCompleteResponse,
             RestoreStartedResponse, ScanResponse, SessionAbortedResponse,
         };
         use prost::Oneof;
@@ -3337,6 +4325,18 @@ mod wire {
             RestoreComplete(RestoreCompleteResponse),
             #[prost(message, tag = "16")]
             SessionAborted(SessionAbortedResponse),
+            #[prost(message, tag = "17")]
+            ReadViewStarted(ReadViewStartedResponse),
+            #[prost(message, tag = "18")]
+            ReadViewMultiGet(ReadViewMultiGetResponse),
+            #[prost(message, tag = "19")]
+            ReadViewScan(ReadViewScanResponse),
+            #[prost(message, tag = "20")]
+            ReadViewEnded(ReadViewEndedResponse),
+            #[prost(message, tag = "21")]
+            ReadViewCanonicalScan(ReadViewCanonicalScanResponse),
+            #[prost(message, tag = "22")]
+            ReadViewCandidateScan(ReadViewCandidateScanResponse),
         }
     }
 }

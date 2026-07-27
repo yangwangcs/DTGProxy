@@ -11,9 +11,10 @@ use adapter_registry::{
     SecretString,
 };
 use storage_api::{
-    AdapterDescriptorV1, AdapterError, AdapterRequirement, LogicalSnapshotAccumulator,
-    LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
-    LogicalSnapshotReader, StorageAdapter,
+    AdapterDescriptorV1, AdapterError, AdapterRequirement, CandidateScanPage, CandidateScanRequest,
+    CanonicalScanPage, CanonicalScanRequest, KeySpan, KeyValue, LogicalKey,
+    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1,
+    LogicalSnapshotManifestV1, LogicalSnapshotReader, PushdownGuarantee, StorageAdapter,
 };
 
 use super::{
@@ -68,6 +69,7 @@ impl SidecarRestoreBackend {
 }
 
 pub const MAX_ACTIVE_SNAPSHOT_SESSIONS: usize = 64;
+pub const MAX_PENDING_READ_VIEW_COMMANDS: usize = 4;
 pub const SNAPSHOT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 enum SnapshotSession {
@@ -87,6 +89,10 @@ enum SnapshotSession {
         accumulator: Box<LogicalSnapshotAccumulator>,
         last_chunk: Option<(u64, [u8; 32])>,
     },
+    ReadView {
+        last_activity: Instant,
+        worker: ReadViewWorker,
+    },
 }
 
 impl SnapshotSession {
@@ -94,7 +100,8 @@ impl SnapshotSession {
         match self {
             Self::Reserved { last_activity }
             | Self::Export { last_activity, .. }
-            | Self::Restore { last_activity, .. } => *last_activity,
+            | Self::Restore { last_activity, .. }
+            | Self::ReadView { last_activity, .. } => *last_activity,
         }
     }
 
@@ -102,7 +109,174 @@ impl SnapshotSession {
         match self {
             Self::Reserved { last_activity }
             | Self::Export { last_activity, .. }
-            | Self::Restore { last_activity, .. } => *last_activity = now,
+            | Self::Restore { last_activity, .. }
+            | Self::ReadView { last_activity, .. } => *last_activity = now,
+        }
+    }
+}
+
+enum ReadViewCommand {
+    MultiGet {
+        keys: Vec<LogicalKey>,
+        reply: mpsc::SyncSender<Result<Vec<Option<Vec<u8>>>, RemoteError>>,
+    },
+    Scan {
+        span: KeySpan,
+        reply: mpsc::SyncSender<Result<Vec<KeyValue>, RemoteError>>,
+    },
+    CanonicalScan {
+        request: CanonicalScanRequest,
+        reply: mpsc::SyncSender<Result<CanonicalScanPage, RemoteError>>,
+    },
+    CandidateScan {
+        request: CandidateScanRequest,
+        reply: mpsc::SyncSender<Result<CandidateScanPage, RemoteError>>,
+    },
+}
+
+struct ReadViewWorker {
+    commands: Option<mpsc::SyncSender<ReadViewCommand>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct ReadViewHandle {
+    commands: mpsc::SyncSender<ReadViewCommand>,
+}
+
+impl ReadViewWorker {
+    fn spawn(adapter: Arc<dyn StorageAdapter>) -> Result<(Self, u64), RemoteError> {
+        let (commands, receiver) = mpsc::sync_channel(MAX_PENDING_READ_VIEW_COMMANDS);
+        let (started, startup) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("dtg-sidecar-read-view".into())
+            .spawn(move || {
+                let binding = match adapter.read_snapshot_binding() {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        let _ = started.send(Err(read_view_remote_error(error)));
+                        return;
+                    }
+                };
+                let snapshot = match binding.as_ref() {
+                    Some(binding) => block_on_dispatch(binding.owner().begin_read_snapshot()),
+                    None => block_on_dispatch(adapter.begin_read_snapshot()),
+                };
+                let snapshot = match snapshot {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ = started.send(Err(read_view_remote_error(error)));
+                        return;
+                    }
+                };
+                if started.send(Ok(snapshot.applied_log_index())).is_err() {
+                    return;
+                }
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ReadViewCommand::MultiGet { keys, reply } => {
+                            let result = block_on_dispatch(snapshot.multi_get(&keys))
+                                .map_err(|error| super::encode_adapter_error(&error));
+                            let _ = reply.send(result);
+                        }
+                        ReadViewCommand::Scan { span, reply } => {
+                            let result = block_on_dispatch(snapshot.scan(&span))
+                                .map_err(|error| super::encode_adapter_error(&error));
+                            let _ = reply.send(result);
+                        }
+                        ReadViewCommand::CanonicalScan { request, reply } => {
+                            let result = block_on_dispatch(snapshot.scan_canonical(&request))
+                                .map_err(|error| super::encode_adapter_error(&error));
+                            let _ = reply.send(result);
+                        }
+                        ReadViewCommand::CandidateScan { request, reply } => {
+                            let result = block_on_dispatch(snapshot.scan_candidates(&request))
+                                .map_err(|error| super::encode_adapter_error(&error));
+                            let _ = reply.send(result);
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                remote_error(
+                    RemoteErrorCode::ServiceFaulted,
+                    &format!("failed to start read-view worker: {error}"),
+                )
+            })?;
+        let applied_log_index = startup.recv().map_err(|_| {
+            remote_error(
+                RemoteErrorCode::ServiceFaulted,
+                "read-view worker stopped during startup",
+            )
+        })??;
+        Ok((
+            Self {
+                commands: Some(commands),
+                thread: Some(thread),
+            },
+            applied_log_index,
+        ))
+    }
+
+    fn handle(&self) -> Result<ReadViewHandle, RemoteError> {
+        Ok(ReadViewHandle {
+            commands: self
+                .commands
+                .as_ref()
+                .ok_or_else(worker_stopped_error)?
+                .clone(),
+        })
+    }
+}
+
+impl ReadViewHandle {
+    fn multi_get(&self, keys: Vec<LogicalKey>) -> Result<Vec<Option<Vec<u8>>>, RemoteError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.send(ReadViewCommand::MultiGet { keys, reply })?;
+        response.recv().map_err(|_| worker_stopped_error())?
+    }
+
+    fn scan(&self, span: KeySpan) -> Result<Vec<KeyValue>, RemoteError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.send(ReadViewCommand::Scan { span, reply })?;
+        response.recv().map_err(|_| worker_stopped_error())?
+    }
+
+    fn scan_canonical(
+        &self,
+        request: CanonicalScanRequest,
+    ) -> Result<CanonicalScanPage, RemoteError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.send(ReadViewCommand::CanonicalScan { request, reply })?;
+        response.recv().map_err(|_| worker_stopped_error())?
+    }
+
+    fn scan_candidates(
+        &self,
+        request: CandidateScanRequest,
+    ) -> Result<CandidateScanPage, RemoteError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.send(ReadViewCommand::CandidateScan { request, reply })?;
+        response.recv().map_err(|_| worker_stopped_error())?
+    }
+
+    fn send(&self, command: ReadViewCommand) -> Result<(), RemoteError> {
+        match self.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(remote_error(
+                RemoteErrorCode::SessionBusy,
+                "read-view session command queue is full",
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(worker_stopped_error()),
+        }
+    }
+}
+
+impl Drop for ReadViewWorker {
+    fn drop(&mut self) {
+        self.commands.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -142,7 +316,15 @@ impl SidecarService {
 
     fn supported_features(&self) -> Result<FeatureSet, RemoteError> {
         let active = self.active_adapter()?;
-        let mut features = FeatureSet::BASE_ADAPTER_V1;
+        let mut features = FeatureSet::BASE_ADAPTER_V1
+            .union(FeatureSet::READ_VIEW_SESSION_V1)
+            .union(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1);
+        if active.capabilities().predicate_pushdown
+            && active.query_primitive_capabilities().candidate_scan()
+                != PushdownGuarantee::Unsupported
+        {
+            features = features.union(FeatureSet::CANDIDATE_SCAN_READ_VIEW_V1);
+        }
         if active.capabilities().logical_export {
             features = features.union(FeatureSet::LOGICAL_EXPORT_SESSION_V1);
         }
@@ -163,10 +345,21 @@ impl SidecarService {
         let mut sessions = self.sessions.lock().map_err(|_| {
             remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
         })?;
-        sessions.retain(|_, session| {
-            now.saturating_duration_since(session.last_activity()) < SNAPSHOT_SESSION_IDLE_TIMEOUT
-        });
+        let expired_ids = sessions
+            .iter()
+            .filter_map(|(session_id, session)| {
+                (now.saturating_duration_since(session.last_activity())
+                    >= SNAPSHOT_SESSION_IDLE_TIMEOUT)
+                    .then_some(*session_id)
+            })
+            .collect::<Vec<_>>();
+        let expired = expired_ids
+            .into_iter()
+            .filter_map(|session_id| sessions.remove(&session_id))
+            .collect::<Vec<_>>();
         if sessions.len() >= MAX_ACTIVE_SNAPSHOT_SESSIONS {
+            drop(sessions);
+            drop(expired);
             return Err(remote_error(
                 RemoteErrorCode::ResourceExhausted,
                 "active snapshot-session capacity is exhausted",
@@ -174,13 +367,18 @@ impl SidecarService {
         }
         let session_id = self.session_id();
         sessions.insert(session_id, SnapshotSession::Reserved { last_activity: now });
+        drop(sessions);
+        drop(expired);
         Ok(session_id)
     }
 
     fn discard_session(&self, session_id: u128) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(&session_id);
-        }
+        let removed = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.remove(&session_id));
+        drop(removed);
     }
 
     pub async fn dispatch(&self, request: Request) -> Response {
@@ -229,8 +427,158 @@ impl SidecarService {
                 manifest,
             } => self.finish_restore(session_id, manifest).await,
             Request::AbortSession { session_id } => self.abort_session(session_id),
+            Request::BeginReadView => self.begin_read_view().await,
+            Request::ReadViewMultiGet { session_id, keys } => {
+                self.read_view_multi_get(session_id, keys)
+            }
+            Request::ReadViewScan { session_id, span } => self.read_view_scan(session_id, span),
+            Request::ReadViewCanonicalScan {
+                session_id,
+                request,
+            } => self.read_view_canonical_scan(session_id, request),
+            Request::ReadViewCandidateScan {
+                session_id,
+                request,
+            } => self.read_view_candidate_scan(session_id, request),
+            Request::EndReadView { session_id } => self.end_read_view(session_id),
             request => Ok(super::dispatch_request(self.active_adapter()?.as_ref(), request).await),
         }
+    }
+
+    async fn begin_read_view(&self) -> Result<Response, RemoteError> {
+        let session_id = self.reserve_session()?;
+        let started = ReadViewWorker::spawn(self.active_adapter()?);
+        let (worker, applied_log_index) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                self.discard_session(session_id);
+                return Err(error);
+            }
+        };
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
+        })?;
+        if !matches!(
+            sessions.get(&session_id),
+            Some(SnapshotSession::Reserved { .. })
+        ) {
+            drop(sessions);
+            drop(worker);
+            return Err(remote_error(
+                RemoteErrorCode::SessionExpired,
+                "read-view reservation expired before backend startup completed",
+            ));
+        }
+        sessions.insert(
+            session_id,
+            SnapshotSession::ReadView {
+                last_activity: Instant::now(),
+                worker,
+            },
+        );
+        drop(sessions);
+        Ok(Response::ReadViewStarted {
+            session_id,
+            applied_log_index,
+        })
+    }
+
+    fn read_view_multi_get(
+        &self,
+        session_id: u128,
+        keys: Vec<LogicalKey>,
+    ) -> Result<Response, RemoteError> {
+        let worker = self.read_view_handle(session_id)?;
+        let values = worker.multi_get(keys)?;
+        Ok(Response::ReadViewMultiGet { session_id, values })
+    }
+
+    fn read_view_scan(&self, session_id: u128, span: KeySpan) -> Result<Response, RemoteError> {
+        let worker = self.read_view_handle(session_id)?;
+        let values = worker.scan(span)?;
+        Ok(Response::ReadViewScan { session_id, values })
+    }
+
+    fn read_view_canonical_scan(
+        &self,
+        session_id: u128,
+        request: CanonicalScanRequest,
+    ) -> Result<Response, RemoteError> {
+        let worker = self.read_view_handle(session_id)?;
+        let page = worker.scan_canonical(request)?;
+        Ok(Response::ReadViewCanonicalScan {
+            session_id,
+            applied_log_index: page.applied_log_index(),
+            entries: page.entries().to_vec(),
+            next_start: page.next_start().cloned(),
+        })
+    }
+
+    fn read_view_candidate_scan(
+        &self,
+        session_id: u128,
+        request: CandidateScanRequest,
+    ) -> Result<Response, RemoteError> {
+        let worker = self.read_view_handle(session_id)?;
+        let page = worker.scan_candidates(request)?;
+        Ok(Response::ReadViewCandidateScan {
+            session_id,
+            applied_log_index: page.applied_log_index(),
+            guarantee: page.guarantee(),
+            entries: page.entries().to_vec(),
+            next_start: page.next_start().cloned(),
+        })
+    }
+
+    fn read_view_handle(&self, session_id: u128) -> Result<ReadViewHandle, RemoteError> {
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
+        })?;
+        let now = Instant::now();
+        if sessions.get(&session_id).is_some_and(|session| {
+            now.saturating_duration_since(session.last_activity()) >= SNAPSHOT_SESSION_IDLE_TIMEOUT
+        }) {
+            let expired = sessions.remove(&session_id);
+            drop(sessions);
+            drop(expired);
+            return Err(remote_error(
+                RemoteErrorCode::SessionExpired,
+                "read-view session expired",
+            ));
+        }
+        let session = sessions.get_mut(&session_id).ok_or_else(|| {
+            remote_error(RemoteErrorCode::SessionUnknown, "unknown read-view session")
+        })?;
+        session.touch(now);
+        let SnapshotSession::ReadView { worker, .. } = session else {
+            return Err(remote_error(
+                RemoteErrorCode::SessionKindMismatch,
+                "session is not a read view",
+            ));
+        };
+        worker.handle()
+    }
+
+    fn end_read_view(&self, session_id: u128) -> Result<Response, RemoteError> {
+        let session = {
+            let mut sessions = self.sessions.lock().map_err(|_| {
+                remote_error(RemoteErrorCode::ServiceFaulted, "session lock is poisoned")
+            })?;
+            let session = sessions.get(&session_id).ok_or_else(|| {
+                remote_error(RemoteErrorCode::SessionUnknown, "unknown read-view session")
+            })?;
+            if !matches!(session, SnapshotSession::ReadView { .. }) {
+                return Err(remote_error(
+                    RemoteErrorCode::SessionKindMismatch,
+                    "session is not a read view",
+                ));
+            }
+            sessions
+                .remove(&session_id)
+                .expect("checked session exists")
+        };
+        drop(session);
+        Ok(Response::ReadViewEnded { session_id })
     }
 
     async fn begin_export(
@@ -981,6 +1329,24 @@ fn adapter_remote_error(error: AdapterError) -> RemoteError {
         scan_response_limit: None,
         scan_response_required: None,
     }
+}
+
+fn read_view_remote_error(error: AdapterError) -> RemoteError {
+    if matches!(error, AdapterError::UnsupportedOperation { .. }) {
+        remote_error(
+            RemoteErrorCode::FeatureUnsupported,
+            "active Adapter does not support query read snapshots",
+        )
+    } else {
+        super::encode_adapter_error(&error)
+    }
+}
+
+fn worker_stopped_error() -> RemoteError {
+    remote_error(
+        RemoteErrorCode::ServiceFaulted,
+        "read-view worker stopped unexpectedly",
+    )
 }
 
 fn registry_remote_error(error: RegistryError) -> RemoteError {

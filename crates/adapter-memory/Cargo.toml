@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 storage-api = { path = "../storage-api" }
 
+[dev-dependencies]
+temporal-types = { path = "../temporal-types" }
+
 [lints]
 workspace = true
-

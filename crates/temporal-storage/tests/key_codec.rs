@@ -1,7 +1,8 @@
 use storage_api::Keyspace;
 use temporal_storage::{
     EdgeTypeId, ElementId, ElementRef, GraphId, GraphKey, KeyCodecError, LabelId, PartitionId,
-    cross_in_adjacency_key, cross_out_adjacency_key, current_vertex_key, decode_graph_key,
+    cross_in_adjacency_key, cross_out_adjacency_key, current_vertex_graph_prefix,
+    current_vertex_key, decode_graph_key, edge_identity_prefix, graph_key_prefix_scope,
     graph_key_scope, history_anchor_key, history_prefix, in_adjacency_key, out_adjacency_key,
     vertex_identity_key,
 };
@@ -9,6 +10,26 @@ use temporal_types::TransactionTime;
 
 fn vertex() -> ElementRef {
     ElementRef::vertex(GraphId::new(1), PartitionId::new(2), ElementId::new(3))
+}
+
+#[test]
+fn routing_scope_is_available_only_after_a_key_prefix_names_a_partition() {
+    let graph = GraphId::new(1);
+    let partition = PartitionId::new(2);
+
+    assert_eq!(
+        graph_key_prefix_scope(Keyspace::Current, &current_vertex_graph_prefix(graph)).unwrap(),
+        None
+    );
+    assert_eq!(
+        graph_key_prefix_scope(Keyspace::Identity, &edge_identity_prefix(graph, partition))
+            .unwrap(),
+        Some((graph, partition))
+    );
+    assert_eq!(
+        graph_key_prefix_scope(Keyspace::History, &history_prefix(vertex())).unwrap(),
+        Some((graph, partition))
+    );
 }
 
 #[test]

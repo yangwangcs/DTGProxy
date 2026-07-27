@@ -7,9 +7,9 @@ use adapter_sidecar::{
 };
 use prost::Message;
 use storage_api::{
-    AdapterCapabilities, AdapterDescriptorV1, BackendFamily, Durability, KeyValue, Keyspace,
-    LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotExportRequest,
-    LogicalSnapshotHeaderV1, SnapshotCapability,
+    AdapterCapabilities, AdapterDescriptorV1, BackendFamily, CanonicalScanRequest, Durability,
+    KeySpan, KeyValue, Keyspace, LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1,
+    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, QueryPageBounds, SnapshotCapability,
 };
 
 fn sample_chunk(snapshot_id: u128, ordinal: u64) -> LogicalSnapshotChunkV1 {
@@ -82,6 +82,27 @@ fn every_snapshot_request_round_trips_canonically() {
             manifest: sample_manifest(22, 9),
         },
         Request::AbortSession { session_id: 12 },
+        Request::BeginReadView,
+        Request::ReadViewMultiGet {
+            session_id: 13,
+            keys: vec![LogicalKey::in_keyspace(
+                Keyspace::Current,
+                b"key-1".to_vec(),
+            )],
+        },
+        Request::ReadViewScan {
+            session_id: 13,
+            span: storage_api::KeySpan::prefix(Keyspace::Current, b"key-".to_vec()),
+        },
+        Request::ReadViewCanonicalScan {
+            session_id: 13,
+            request: CanonicalScanRequest::new(
+                KeySpan::prefix(Keyspace::Current, b"key-".to_vec()),
+                QueryPageBounds::new(1, 128).unwrap(),
+            )
+            .unwrap(),
+        },
+        Request::EndReadView { session_id: 13 },
     ];
     for (ordinal, request) in requests.into_iter().enumerate() {
         let encoded = encode_frame(100 + ordinal as u128, &request).unwrap();
@@ -135,6 +156,34 @@ fn every_snapshot_response_round_trips_canonically() {
             applied_log_index: 9,
         }),
         Response::SessionAborted { session_id: 12 },
+        Response::ReadViewStarted {
+            session_id: 13,
+            applied_log_index: 9,
+        },
+        Response::ReadViewMultiGet {
+            session_id: 13,
+            values: vec![Some(b"value-1".to_vec()), None],
+        },
+        Response::ReadViewScan {
+            session_id: 13,
+            values: vec![KeyValue::new(
+                LogicalKey::in_keyspace(Keyspace::Current, b"key-1".to_vec()),
+                b"value-1".to_vec(),
+            )],
+        },
+        Response::ReadViewCanonicalScan {
+            session_id: 13,
+            applied_log_index: 9,
+            entries: vec![KeyValue::new(
+                LogicalKey::in_keyspace(Keyspace::Current, b"key-1".to_vec()),
+                b"value-1".to_vec(),
+            )],
+            next_start: Some(LogicalKey::in_keyspace(
+                Keyspace::Current,
+                b"key-2".to_vec(),
+            )),
+        },
+        Response::ReadViewEnded { session_id: 13 },
     ];
     for (ordinal, response) in responses.into_iter().enumerate() {
         let encoded = encode_frame(200 + ordinal as u128, &response).unwrap();
@@ -151,6 +200,18 @@ fn feature_bits_and_remote_error_codes_are_stable() {
     assert_eq!(FeatureSet::LOGICAL_EXPORT_SESSION_V1.bits(), 1 << 1);
     assert_eq!(FeatureSet::LOGICAL_RESTORE_SESSION_V1.bits(), 1 << 2);
     assert_eq!(FeatureSet::RESUMABLE_ORDINAL_REPLAY_V1.bits(), 1 << 3);
+    assert_eq!(FeatureSet::READ_VIEW_SESSION_V1.bits(), 1 << 4);
+    assert_eq!(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1.bits(), 1 << 5);
+    assert!(
+        HelloRequest::adapter_client()
+            .optional_features
+            .contains(FeatureSet::READ_VIEW_SESSION_V1)
+    );
+    assert!(
+        HelloRequest::adapter_client()
+            .optional_features
+            .contains(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1)
+    );
     assert!(FeatureSet::from_bits(1 << 63).is_err());
 
     assert_eq!(
