@@ -13,7 +13,7 @@ mod replica_actor;
 mod service;
 
 pub use config::{ConfigError, NodeConfig, TlsFiles, TransportSecurity};
-pub use file_config::{DataNodeRuntimeConfig, FileConfigError};
+pub use file_config::{DataNodeRuntimeConfig, FileConfigError, StartupBackend};
 pub use host::{
     BackendRuntimeStatus, DataNodeHost, EnsureReplicaOutcome, HostError, ProposalOutcome,
     ReplicaKey, ReplicaSpec, ReplicaStatus,

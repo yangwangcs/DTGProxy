@@ -2,6 +2,7 @@
   "version": 1,
   "cluster_id": "11111111111111111111111111111111",
   "node_id": 2,
+  "backend": "rocksdb",
   "listen_address": "127.0.0.1:7102",
   "advertise_address": "127.0.0.1:7102",
   "raft_listen_address": "127.0.0.1:7202",

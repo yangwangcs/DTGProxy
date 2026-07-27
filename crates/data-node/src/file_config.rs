@@ -15,9 +15,36 @@ const MAX_ACTOR_QUEUE_CAPACITY: usize = 65_536;
 const MIN_SHUTDOWN_GRACE_MS: u64 = 100;
 const MAX_SHUTDOWN_GRACE_MS: u64 = 300_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupBackend {
+    Rocksdb,
+    Postgresql,
+    Neo4j,
+}
+
+impl StartupBackend {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rocksdb => "rocksdb",
+            Self::Postgresql => "postgresql",
+            Self::Neo4j => "neo4j",
+        }
+    }
+
+    #[must_use]
+    pub const fn provider(self) -> &'static str {
+        match self {
+            Self::Rocksdb => "rocksdb",
+            Self::Postgresql | Self::Neo4j => "sidecar",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DataNodeRuntimeConfig {
     node: NodeConfig,
+    backend: StartupBackend,
     actor_queue_capacity: usize,
     shutdown_grace: Duration,
     raft_listen_address: Option<SocketAddr>,
@@ -40,6 +67,11 @@ impl DataNodeRuntimeConfig {
     #[must_use]
     pub const fn node(&self) -> &NodeConfig {
         &self.node
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> StartupBackend {
+        self.backend
     }
 
     #[must_use]
@@ -74,6 +106,7 @@ struct RawDataNodeConfig {
     version: u32,
     cluster_id: String,
     node_id: u64,
+    backend: RawStartupBackend,
     listen_address: SocketAddr,
     advertise_address: SocketAddr,
     data_directory: PathBuf,
@@ -148,13 +181,38 @@ impl RawDataNodeConfig {
             transport_security,
             Default::default(),
         )?;
+        let backend = self.backend.into_startup_backend()?;
         Ok(DataNodeRuntimeConfig {
             node,
+            backend,
             actor_queue_capacity: self.actor_queue_capacity,
             shutdown_grace: Duration::from_millis(self.shutdown_grace_ms),
             raft_listen_address: self.raft_listen_address,
             raft_peers: self.raft_peers,
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawStartupBackend {
+    Rocksdb,
+    Postgresql,
+    Neo4j,
+    #[serde(other)]
+    Unsupported,
+}
+
+impl RawStartupBackend {
+    fn into_startup_backend(self) -> Result<StartupBackend, FileConfigError> {
+        match self {
+            Self::Rocksdb => Ok(StartupBackend::Rocksdb),
+            Self::Postgresql => Ok(StartupBackend::Postgresql),
+            Self::Neo4j => Ok(StartupBackend::Neo4j),
+            Self::Unsupported => Err(FileConfigError::UnsupportedBackend {
+                actual: "unknown".to_owned(),
+            }),
+        }
     }
 }
 
@@ -191,6 +249,7 @@ pub enum FileConfigError {
     Json(String),
     InvalidFileSize { actual: usize },
     UnsupportedVersion { actual: u32 },
+    UnsupportedBackend { actual: String },
     InvalidClusterId,
     InvalidActorQueueCapacity { actual: usize },
     InvalidShutdownGrace { actual_ms: u64 },
@@ -217,6 +276,12 @@ impl Display for FileConfigError {
             }
             Self::UnsupportedVersion { actual } => {
                 write!(formatter, "unsupported Data node config version {actual}")
+            }
+            Self::UnsupportedBackend { actual } => {
+                write!(
+                    formatter,
+                    "unsupported Data node logical backend {actual:?}"
+                )
             }
             Self::InvalidClusterId => {
                 formatter.write_str("cluster_id must be a non-zero 32-digit hexadecimal value")

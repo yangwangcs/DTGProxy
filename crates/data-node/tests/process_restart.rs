@@ -77,6 +77,7 @@ fn write_config(path: &Path, data_directory: &Path, port: u16) {
         "version": 1,
         "cluster_id": "81818181818181818181818181818181",
         "node_id": 7,
+        "backend": "rocksdb",
         "listen_address": format!("127.0.0.1:{port}"),
         "advertise_address": format!("127.0.0.1:{port}"),
         "data_directory": data_directory,
