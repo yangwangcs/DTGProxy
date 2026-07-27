@@ -55,7 +55,10 @@ fn cli_init_and_status_open_the_persisted_primary_replica_service() {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["mode"], "primary_replica");
     assert_eq!(status["backend_provider"], "rocksdb");
-    assert_eq!(status["loaded_backend_providers"], serde_json::json!(["rocksdb"]));
+    assert_eq!(
+        status["loaded_backend_providers"],
+        serde_json::json!(["rocksdb"])
+    );
     assert_eq!(status["shards"][0]["leader_id"], 10);
 
     let verification = Command::new(env!("CARGO_BIN_EXE_dtgproxy"))
