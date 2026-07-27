@@ -55,6 +55,7 @@ fn cli_init_and_status_open_the_persisted_primary_replica_service() {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["mode"], "primary_replica");
     assert_eq!(status["backend_provider"], "rocksdb");
+    assert_eq!(status["loaded_backend_providers"], serde_json::json!(["rocksdb"]));
     assert_eq!(status["shards"][0]["leader_id"], 10);
 
     let verification = Command::new(env!("CARGO_BIN_EXE_dtgproxy"))
@@ -312,6 +313,10 @@ fn bounded_tcp_gateway_serves_a_canonical_status_frame() {
         serde_json::from_slice(&read_frame(&mut stream).unwrap()).unwrap();
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["graph_name"], "graph-7");
+    assert_eq!(
+        response["result"]["loaded_backend_providers"],
+        serde_json::json!(["rocksdb"])
+    );
     server.join().unwrap();
 }
 
