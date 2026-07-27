@@ -21,10 +21,11 @@ use cluster_protocol::CLUSTER_PROTOCOL_VERSION;
 use cluster_protocol::proto::gateway_service_server::GatewayService;
 use cluster_protocol::proto::meta_service_client::MetaServiceClient;
 use cluster_protocol::proto::meta_service_server::{MetaService, MetaServiceServer};
+use cluster_protocol::proto::node_admin_service_server::NodeAdminService;
 use cluster_protocol::proto::shard_service_server::ShardServiceServer;
 use cluster_protocol::proto::{
-    GatewaySubmitRequest, ListAnalyticsJobTombstonesRequest, ProposeAnalyticsJobRequest,
-    ProposeRequest, RequestContext,
+    GatewaySubmitRequest, GetBackendStatusRequest, ListAnalyticsJobTombstonesRequest,
+    ProposeAnalyticsJobRequest, ProposeRequest, RequestContext, ShardContext,
 };
 use control_plane::{
     BackendProfile as CatalogBackendProfile, CatalogCommand, DeploymentMode, GraphDefinition,
@@ -1676,6 +1677,26 @@ async fn run_surface(
         })
         .await
         .expect("Data Shard leader election");
+    }
+    for placement in &placements {
+        for &node_id in placement.voters() {
+            let status = DataNodeGrpcService::new(Arc::clone(&data_hosts[&node_id]))
+                .get_backend_status(Request::new(GetBackendStatusRequest {
+                    context: Some(ShardContext {
+                        request: Some(context(
+                            900_000 + u128::from(placement.shard_id()) * 100 + u128::from(node_id),
+                        )),
+                        graph_id: 7,
+                        shard_id: placement.shard_id(),
+                        placement_epoch: placement.epoch(),
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(status.logical_backend, backend.name());
+            assert_eq!(status.loaded_backends, vec![backend.name()]);
+        }
     }
 
     let router = GatewayCatalogRouter::new(
