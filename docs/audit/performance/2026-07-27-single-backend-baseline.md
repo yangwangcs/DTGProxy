@@ -129,3 +129,6 @@ Acceptance requires the same 4,096-vertex, concurrency-1, 1/3/3 diagnostic proto
 and unchanged result identity. PostgreSQL Adapter Direct must improve from 0.333333 ops/s and
 2,650.087042 ms p50; RocksDB and Neo4j are rerun in the same fixed order to expose environmental
 drift rather than being silently carried forward.
+
+The completed before/after analysis is recorded in
+`docs/audit/performance/2026-07-27-single-backend-optimization-report.md`.
