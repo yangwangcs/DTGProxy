@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+sdk_root="$(xcrun --sdk macosx --show-sdk-path)"
+compiler="$(xcrun --sdk macosx --find clang++)"
+exec "$compiler" -isysroot "$sdk_root" -isystem "$sdk_root/usr/include/c++/v1" "$@"
