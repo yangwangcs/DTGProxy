@@ -38,12 +38,16 @@ fn main() {
     measure("current_point_lookup", iterations, || {
         black_box(block_on(store.vertex_current(vertex, valid(50))).unwrap());
     });
-    measure("as_of_replay_depth_1", iterations, || {
-        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(99_300))).unwrap());
-    });
-    measure("as_of_replay_depth_16", iterations, || {
-        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(100_800))).unwrap());
-    });
+    for (name, snapshot) in [
+        ("as_of_replay_depth_0", 99_200_i64),
+        ("as_of_replay_depth_1", 99_300_i64),
+        ("as_of_replay_depth_8", 100_000_i64),
+        ("as_of_replay_depth_15", 100_700_i64),
+    ] {
+        measure(name, iterations, || {
+            black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(snapshot))).unwrap());
+        });
+    }
     measure("as_of_snapshot_age_1000", iterations, || {
         black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(800))).unwrap());
     });
