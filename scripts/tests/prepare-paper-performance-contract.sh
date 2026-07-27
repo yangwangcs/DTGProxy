@@ -3,7 +3,9 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 prepare="$root/scripts/prepare-paper-performance.sh"
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/dtgproxy-paper-prepare.XXXXXX")
+temporary_root=${TMPDIR:-/tmp}
+temporary_root=${temporary_root%/}
+scratch=$(mktemp -d "$temporary_root/dtgproxy-paper-prepare.XXXXXX")
 pids=""
 
 cleanup() {
@@ -30,7 +32,7 @@ expect_rejected() {
   if invoke_prepare "$output" "$@" >"$log" 2>&1; then
     fail "$name unexpectedly passed"
   fi
-  grep -F "$expected" "$log" >/dev/null || {
+  grep -F -- "$expected" "$log" >/dev/null || {
     cat "$log" >&2
     fail "$name failed for the wrong reason"
   }
@@ -79,11 +81,22 @@ assert_selected_bundle() {
     (if $backend == "rocksdb" then
        .backend_service == {ownership: "embedded", managed_by: "data_node"}
      else
-       .backend_service.ownership == "external" and
-       .backend_service.managed == false and
-       (.backend_service.reason | length > 0)
+       .backend_service == {
+         ownership: "lifecycle_runner",
+         runtime_role: "backend_service"
+       }
      end)
   ' "$output/managed-process-evidence.json" >/dev/null || fail "$selected_backend managed process evidence mismatch"
+  jq -e --arg path "$scratch/bin/dtgproxy-lifecycle-runner" \
+    --arg digest "$(sha256_file "$scratch/bin/dtgproxy-lifecycle-runner")" '
+    .formal_run.lifecycle_runner == {
+      protocol_version: 1,
+      path: $path,
+      sha256: $digest
+    }
+  ' "$output/READY.json" >/dev/null || {
+    fail "$selected_backend lifecycle runner seal mismatch"
+  }
   (cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "$selected_backend checksums do not verify"
 }
 
@@ -106,6 +119,10 @@ invoke_prepare() {
   local output=$1
   local selected_backend=${PREPARE_BACKEND:-rocksdb}
   shift
+  local lifecycle_args=()
+  if [[ ${OMIT_LIFECYCLE_RUNNER:-0} != 1 ]]; then
+    lifecycle_args=(--lifecycle-runner-bin "${LIFECYCLE_RUNNER_BIN:-$scratch/bin/dtgproxy-lifecycle-runner}")
+  fi
   PATH="$scratch/bin:$PATH" \
   FAKE_SSH_LOG="$scratch/ssh.log" \
   FAKE_REMOTE_DATA_DIGEST="$(sha256_file "$scratch/bin/dtgproxy-data-node")" \
@@ -123,6 +140,7 @@ invoke_prepare() {
     --meta-node-bin "$scratch/bin/dtgproxy-meta-node" \
     --bolt-loadgen-bin "$scratch/bin/dtgproxy-bolt-loadgen" \
     --orchestrator-bin "$scratch/bin/dtgproxy-paper-benchmark" \
+    "${lifecycle_args[@]}" \
     --output-dir "$output" \
     "$@"
 }
@@ -143,6 +161,9 @@ for binary in \
   dtgproxy-bolt-loadgen; do
   make_fake_binary "$scratch/bin/$binary"
 done
+printf '#!/bin/sh\nexit 0\n' >"$scratch/bin/dtgproxy-lifecycle-runner"
+chmod +x "$scratch/bin/dtgproxy-lifecycle-runner"
+printf '#!/bin/sh\nexit 0\n' >"$scratch/bin/non-executable-lifecycle-runner"
 make_fake_binary "$scratch/bin/unrelated-process"
 start_process "$scratch/bin/unrelated-process"
 unrelated_pid=$started_pid
@@ -444,6 +465,16 @@ jq -n \
   exit 1
 }
 
+OMIT_LIFECYCLE_RUNNER=1 expect_rejected \
+  missing-lifecycle-runner \
+  '--lifecycle-runner-bin is required'
+LIFECYCLE_RUNNER_BIN=relative-runner expect_rejected \
+  relative-lifecycle-runner \
+  'lifecycle runner must be an existing absolute executable file'
+LIFECYCLE_RUNNER_BIN="$scratch/bin/non-executable-lifecycle-runner" expect_rejected \
+  non-executable-lifecycle-runner \
+  'lifecycle runner must be an existing absolute executable file'
+
 output="$scratch/prepared"
 invoke_prepare "$output"
 for file in \
@@ -461,7 +492,10 @@ jq -e '
   (.formal_run.argv | index("--orchestrator-bin") != null) and
   .formal_run.environment.DTGPROXY_PAPER_RUNTIME_MANIFEST == "runtime-manifest.json" and
   (.formal_run.executor_sha256 | test("^[0-9a-f]{64}$")) and
-  (.formal_run.orchestrator_sha256 | test("^[0-9a-f]{64}$"))
+  (.formal_run.orchestrator_sha256 | test("^[0-9a-f]{64}$")) and
+  (.formal_run.lifecycle_runner.protocol_version == 1) and
+  (.formal_run.lifecycle_runner.path | startswith("/")) and
+  (.formal_run.lifecycle_runner.sha256 | test("^[0-9a-f]{64}$"))
 ' "$output/READY.json" >/dev/null || fail "READY.json contract mismatch"
 jq -e '
   .selected_backend == "rocksdb" and

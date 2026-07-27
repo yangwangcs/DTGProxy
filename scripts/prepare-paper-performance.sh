@@ -9,6 +9,7 @@ Usage: scripts/prepare-paper-performance.sh \
   --backend-evidence FILE --gateway-build-evidence FILE \
   --executor-bin FILE --gateway-bin FILE --data-node-bin FILE \
   --meta-node-bin FILE --bolt-loadgen-bin FILE --orchestrator-bin FILE \
+  --lifecycle-runner-bin FILE \
   --output-dir DIR
 
 Validates and seals formal experiment inputs. It never starts services, builds
@@ -20,9 +21,10 @@ backend= spec= runtime_manifest= dataset_evidence= backend_evidence=
 gateway_build_evidence= executor_bin= gateway_bin= data_node_bin=
 meta_node_bin= bolt_loadgen_bin= output_dir=
 orchestrator_bin=
+lifecycle_runner_bin=
 while (($#)); do
   case "$1" in
-    --backend|--spec|--runtime-manifest|--dataset-evidence|--backend-evidence|--gateway-build-evidence|--executor-bin|--gateway-bin|--data-node-bin|--meta-node-bin|--bolt-loadgen-bin|--orchestrator-bin|--output-dir)
+    --backend|--spec|--runtime-manifest|--dataset-evidence|--backend-evidence|--gateway-build-evidence|--executor-bin|--gateway-bin|--data-node-bin|--meta-node-bin|--bolt-loadgen-bin|--orchestrator-bin|--lifecycle-runner-bin|--output-dir)
       (($# >= 2)) || { printf 'missing value for %s\n' "$1" >&2; exit 2; }
       name=${1#--}; name=${name//-/_}; printf -v "$name" '%s' "$2"; shift 2
       ;;
@@ -31,7 +33,7 @@ while (($#)); do
   esac
 done
 
-for name in backend spec runtime_manifest dataset_evidence backend_evidence gateway_build_evidence executor_bin gateway_bin data_node_bin meta_node_bin bolt_loadgen_bin orchestrator_bin output_dir; do
+for name in backend spec runtime_manifest dataset_evidence backend_evidence gateway_build_evidence executor_bin gateway_bin data_node_bin meta_node_bin bolt_loadgen_bin orchestrator_bin lifecycle_runner_bin output_dir; do
   [[ -n ${!name} ]] || { printf '%s is required\n' "--${name//_/-}" >&2; exit 2; }
 done
 case "$backend" in
@@ -47,7 +49,8 @@ trap 'rm -rf "$temporary"' EXIT
 
 python3 - "$backend" "$spec" "$runtime_manifest" "$dataset_evidence" "$backend_evidence" \
   "$gateway_build_evidence" "$executor_bin" "$gateway_bin" "$data_node_bin" \
-  "$meta_node_bin" "$bolt_loadgen_bin" "$orchestrator_bin" "$temporary" <<'PY'
+  "$meta_node_bin" "$bolt_loadgen_bin" "$orchestrator_bin" "$lifecycle_runner_bin" \
+  "$temporary" <<'PY'
 import hashlib
 import ipaddress
 import json
@@ -62,12 +65,19 @@ from pathlib import Path
 
 (selected_backend, spec_path, runtime_path, dataset_path, backend_path, gateway_evidence_path,
  executor_path, gateway_path, data_path, meta_path, loadgen_path, orchestrator_path,
- output_path) = sys.argv[1:]
+ lifecycle_runner_path, output_path) = sys.argv[1:]
 spec_path, runtime_path, dataset_path, backend_path, gateway_evidence_path = map(
     Path, (spec_path, runtime_path, dataset_path, backend_path, gateway_evidence_path)
 )
-executor_path, gateway_path, data_path, meta_path, loadgen_path, orchestrator_path, output_path = map(
-    Path, (executor_path, gateway_path, data_path, meta_path, loadgen_path, orchestrator_path, output_path)
+(
+    executor_path, gateway_path, data_path, meta_path, loadgen_path,
+    orchestrator_path, lifecycle_runner_path, output_path,
+) = map(
+    Path,
+    (
+        executor_path, gateway_path, data_path, meta_path, loadgen_path,
+        orchestrator_path, lifecycle_runner_path, output_path,
+    ),
 )
 
 def reject(message):
@@ -354,6 +364,7 @@ binaries = {
 }
 for label, path in binaries.items():
     require_executable(path, label)
+require_executable(lifecycle_runner_path, "lifecycle runner")
 
 labels = ["production", "no_native_pushdown", "no_column_batch",
           "no_lazy_pages", "no_parallel_fanout", "no_batched_gather"]
@@ -671,9 +682,8 @@ backend_service = (
     {"ownership": "embedded", "managed_by": "data_node"}
     if selected_backend == "rocksdb"
     else {
-        "ownership": "external",
-        "managed": False,
-        "reason": "prepared runtime contains no exact backend service PID/start identity",
+        "ownership": "lifecycle_runner",
+        "runtime_role": "backend_service",
     }
 )
 (output_path / "managed-process-evidence.json").write_text(
@@ -707,6 +717,11 @@ ready = {
         "environment": {"DTGPROXY_PAPER_RUNTIME_MANIFEST": "runtime-manifest.json"},
         "executor_sha256": digest_file(executor_path),
         "orchestrator_sha256": digest_file(orchestrator_path),
+        "lifecycle_runner": {
+            "protocol_version": 1,
+            "path": str(lifecycle_runner_path),
+            "sha256": digest_file(lifecycle_runner_path),
+        },
     },
 }
 (output_path / "READY.json").write_text(json.dumps(ready, indent=2, sort_keys=True) + "\n", encoding="utf-8")

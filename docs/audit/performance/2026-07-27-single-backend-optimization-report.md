@@ -133,6 +133,41 @@ otherwise independent native-mapping tests; the failing test passed alone and th
 passed. This is a disposable-test concurrency limitation, not evidence of a semantic failure or a
 benchmark result, and real-backend certification remains serialized.
 
+## Formal lifecycle isolation control
+
+The shortened diagnostic data above was captured with explicit container sequencing. A subsequent
+formal-readiness review correctly identified that preparation-time Gateway/Data Node identities and
+an “external/unmanaged” PostgreSQL or Neo4j declaration were insufficient to prove which backend
+service a formal run actually used. The formal runner was therefore hardened without changing the
+reported diagnostic measurements:
+
+- Every prepared backend bundle now seals one executable lifecycle runner by absolute path,
+  protocol version 1, and SHA-256.
+- All three bundle preflights must pass before the first backend and again after each backend is
+  released. Only the selected backend lifecycle runner receives `run`.
+- Runtime evidence comes from the executed lifecycle operation, not from preparation-time PIDs.
+  PostgreSQL and Neo4j require exactly one `backend_service` identity; embedded RocksDB forbids one.
+- The isolated runner validates backend/run identity, role cardinality, executable digests, probe
+  schemas, and identity uniqueness. Gateway identities are checked against the sealed runtime and
+  preparation evidence; Data Node identities are checked against every verified raw Proxy topology
+  observation and the sealed runtime manifest. The runner then independently proves each exact
+  PID/start identity retired.
+- `combined/isolation-evidence.json` binds the normalized runtime-evidence digest to the verified
+  artifact `SHA256SUMS` digest for RocksDB, PostgreSQL, and Neo4j. The combined checksum inventory
+  covers this binding and rejects missing or extra files.
+- The failure contracts cover changed runner digests, failed preflights, wrong backend/run IDs,
+  duplicate identities, missing or forbidden backend services, live identities, changed artifact
+  contents, unbound Gateway/Data Node evidence, and corrupt, extra-directory, or symlinked combined
+  output. Each initially verified artifact is copied to a private read-only snapshot; combine,
+  final full verification, complete checksum-inventory recheck, and binding use only the snapshot.
+  The published report then replaces private snapshot paths with digest-checked persistent artifact
+  paths. Persistent artifacts receive the same closed-tree and per-file checksum verification both
+  before path publication and after combined validation, so no reference becomes invalid or points
+  to content that differs from the sealed snapshot when temporary state is removed.
+
+This closes the formal runner's service-identity and retirement-proof gap for future full-matrix
+runs. It does not relabel the existing one-second/three-second local captures as formal evidence.
+
 ## Reproduction
 
 RocksDB:
@@ -170,7 +205,9 @@ scripts/run-paper-diagnostic.sh \
 ```
 
 Every output directory must be new. Run one backend at a time and stop the previous managed service
-before advancing.
+before advancing. Formal runs must instead use the sealed lifecycle protocol documented in
+`docs/paper-performance-artifact.md`; manual service sequencing is not accepted as formal isolation
+proof.
 
 ## Limitations and next work
 

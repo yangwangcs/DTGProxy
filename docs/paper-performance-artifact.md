@@ -135,6 +135,7 @@ scripts/prepare-paper-performance.sh \
   --meta-node-bin /absolute/path/to/dtgproxy-meta \
   --bolt-loadgen-bin /absolute/path/to/dtgproxy-bolt-loadgen \
   --orchestrator-bin /absolute/path/to/dtgproxy-paper-benchmark \
+  --lifecycle-runner-bin /absolute/path/to/dtgproxy-backend-lifecycle \
   --output-dir /absolute/path/to/prepared/rocksdb
 ```
 
@@ -156,17 +157,40 @@ scripts/run-isolated-paper-performance.sh \
   --output-root /absolute/path/to/artifacts/paper-performance
 ```
 
-The isolated runner executes RocksDB, PostgreSQL, and Neo4j in that fixed order. It verifies each
-bundle and completed artifact, binds observations to the selected backend, and confirms that every
-exact managed Gateway/Data Node process from the prior run has exited or changed start identity
-before advancing. It never searches for or kills arbitrary processes by executable name. A failure
-stops the sequence and prevents publication of a combined success package.
+`READY.json` seals the lifecycle runner by absolute path, protocol version, and SHA-256. Before the
+first run and after every backend returns, the isolated runner verifies that identity and invokes
+`preflight --prepared-bundle <bundle>` for all three bundles. It invokes only the selected runner's
+`run --prepared-bundle <bundle> --output-root <root> --evidence-output <file>` operation; the
+lifecycle runner owns the exact start and stop operations for its stack.
+
+The isolated runner executes RocksDB, PostgreSQL, and Neo4j in that fixed order. Each lifecycle run
+must emit the actual Gateway and Data Node PID/start identities used by that run. PostgreSQL and
+Neo4j must additionally emit exactly one `backend_service` identity; RocksDB must not because it is
+embedded in the Data Node. Preparation-time PIDs are inventory evidence only and are never accepted
+as runtime isolation proof. After artifact verification, the runner independently probes every
+emitted exact identity and requires it to be absent or to have a different boot/start identity
+before advancing. Gateway PID/path/digest values must match the sealed runtime and preparation
+evidence. Data Node host, boot/start identity, PID, executable digest, and data interface must match
+the verified raw Proxy `topology_evidence` and the sealed runtime manifest. It never searches for or
+kills arbitrary processes by executable name. Any failure stops the sequence and prevents
+publication of a combined success package.
 
 With formal defaults, each backend artifact remains under
 `artifacts/paper-performance/<run-id>/`; the output root also receives a deterministic `combined/`
 package after all three artifacts verify. The combined report preserves separate backend summaries
-and never averages different backend families. If a cell fails, preserve the partial run and
-failure logs; do not rerun it under the same or a replacement run ID as formal evidence.
+and never averages different backend families. `combined/isolation-evidence.json` records, in fixed
+backend order, each run ID, the SHA-256 of that artifact's immutable `SHA256SUMS`, and the SHA-256 of
+the normalized actual runtime evidence. The file is itself covered by the combined `SHA256SUMS`.
+After the first successful verification, the runner copies each artifact to a private read-only
+snapshot. Combine, final verification, checksum binding, and publication use only these snapshots,
+not the mutable output directories. Before publication it validates the report's snapshot paths and
+rewrites them to the corresponding persistent `output-root/<run-id>` directories, checking that the
+persistent artifact still has the same `SHA256SUMS` digest and that every persistent file matches
+that inventory. The runner rechecks every snapshot file against its checksum inventory immediately
+before publication, repeats the persistent-artifact content check after combined validation, and
+rejects missing or extra combined entries, directories, symlinks, or special files. If a cell
+fails, preserve the partial run and failure logs; do not rerun it under the same or a replacement
+run ID as formal evidence.
 
 ## Offline Verification
 
