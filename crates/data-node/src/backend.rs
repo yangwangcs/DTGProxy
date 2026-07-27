@@ -9,18 +9,30 @@ use adapter_rocksdb::RocksAdapterFactory;
 use adapter_sidecar::TcpSidecarAdapterFactory;
 use storage_api::{AdapterRequirement, LogicalSnapshotExportRequest, StorageAdapter};
 
-use crate::{BackendProfile, BackendSlotState};
+use crate::{BackendProfile, BackendSlotState, StartupBackend};
 
 pub struct BackendManager {
-    registry: AdapterRegistry,
+    startup_backend: StartupBackend,
 }
 
 impl BackendManager {
-    pub fn production() -> Result<Self, BackendError> {
-        let mut registry = AdapterRegistry::new();
-        registry.register(Arc::new(RocksAdapterFactory))?;
-        registry.register(Arc::new(TcpSidecarAdapterFactory))?;
-        Ok(Self { registry })
+    pub fn production(startup_backend: StartupBackend) -> Result<Self, BackendError> {
+        Ok(Self { startup_backend })
+    }
+
+    pub fn validate_active_profile(&self, profile: &BackendProfile) -> Result<(), BackendError> {
+        let actual = logical_backend(profile)?;
+        if actual != self.startup_backend {
+            return Err(BackendError::ActiveBackendMismatch {
+                configured: self.startup_backend,
+                profile: actual,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_migration_target(&self, profile: &BackendProfile) -> Result<(), BackendError> {
+        logical_backend(profile).map(|_| ())
     }
 
     pub async fn open_slot(
@@ -33,6 +45,7 @@ impl BackendManager {
                 generation,
                 profile,
             } => {
+                self.validate_active_profile(profile)?;
                 let opened = self.open_profile(replica_directory, profile).await?;
                 Ok(Arc::new(HotSwapAdapter::recover_active(
                     opened,
@@ -47,6 +60,8 @@ impl BackendManager {
                 synchronized_index,
                 ..
             } => {
+                self.validate_active_profile(source)?;
+                self.validate_migration_target(target)?;
                 let active = self.open_profile(replica_directory, source).await?;
                 let shadow = self.open_profile(replica_directory, target).await?;
                 Ok(Arc::new(HotSwapAdapter::recover_dual_applying(
@@ -67,6 +82,7 @@ impl BackendManager {
         source: Arc<dyn StorageAdapter>,
         target: &BackendProfile,
     ) -> Result<(adapter_registry::OpenedAdapter, u64), BackendError> {
+        self.validate_migration_target(target)?;
         let source_index = source.applied_log_index()?;
         let reader = source
             .begin_logical_export(LogicalSnapshotExportRequest::default())
@@ -78,8 +94,8 @@ impl BackendManager {
             });
         }
         let request = self.open_request(replica_directory, target)?;
-        match self
-            .registry
+        let registry = registry_for(target)?;
+        match registry
             .restore(
                 target.provider(),
                 &request,
@@ -90,8 +106,7 @@ impl BackendManager {
         {
             Ok(opened) => Ok((opened, source_index)),
             Err(restore_error) => {
-                let opened = self
-                    .registry
+                let opened = registry
                     .open(
                         target.provider(),
                         &request,
@@ -120,7 +135,7 @@ impl BackendManager {
         profile: &BackendProfile,
     ) -> Result<adapter_registry::OpenedAdapter, BackendError> {
         let request = self.open_request(replica_directory, profile)?;
-        self.registry
+        registry_for(profile)?
             .open(
                 profile.provider(),
                 &request,
@@ -149,6 +164,33 @@ impl BackendManager {
         }
         Ok(request)
     }
+}
+
+fn logical_backend(profile: &BackendProfile) -> Result<StartupBackend, BackendError> {
+    match profile.provider() {
+        "rocksdb" => Ok(StartupBackend::Rocksdb),
+        "sidecar" => match profile
+            .public_parameters()
+            .get("target_provider")
+            .map(String::as_str)
+        {
+            Some("postgresql") => Ok(StartupBackend::Postgresql),
+            Some("neo4j") => Ok(StartupBackend::Neo4j),
+            _ => Err(BackendError::InvalidSidecarTargetProvider),
+        },
+        provider => Err(BackendError::UnsupportedProvider(provider.to_owned())),
+    }
+}
+
+fn registry_for(profile: &BackendProfile) -> Result<AdapterRegistry, BackendError> {
+    let mut registry = AdapterRegistry::new();
+    match logical_backend(profile)? {
+        StartupBackend::Rocksdb => registry.register(Arc::new(RocksAdapterFactory))?,
+        StartupBackend::Postgresql | StartupBackend::Neo4j => {
+            registry.register(Arc::new(TcpSidecarAdapterFactory))?;
+        }
+    }
+    Ok(registry)
 }
 
 fn resolve_rocks_path(replica_directory: &Path, configured: &str) -> Result<String, BackendError> {
@@ -192,10 +234,24 @@ pub enum BackendError {
     UnsafeRocksPath,
     MissingSidecarEndpoint,
     InvalidSidecarEndpoint,
-    NonLoopbackSidecarEndpoint { endpoint: SocketAddr },
+    NonLoopbackSidecarEndpoint {
+        endpoint: SocketAddr,
+    },
     Adapter(storage_api::AdapterError),
-    SnapshotFenceMismatch { source: u64, snapshot: u64 },
-    RestoreAndOpen { restore: String, open: String },
+    SnapshotFenceMismatch {
+        source: u64,
+        snapshot: u64,
+    },
+    RestoreAndOpen {
+        restore: String,
+        open: String,
+    },
+    UnsupportedProvider(String),
+    InvalidSidecarTargetProvider,
+    ActiveBackendMismatch {
+        configured: StartupBackend,
+        profile: StartupBackend,
+    },
 }
 
 impl Display for BackendError {
@@ -220,6 +276,20 @@ impl Display for BackendError {
             Self::RestoreAndOpen { restore, open } => write!(
                 formatter,
                 "target restore failed ({restore}) and idempotent open failed ({open})"
+            ),
+            Self::UnsupportedProvider(provider) => {
+                write!(formatter, "unsupported backend provider {provider}")
+            }
+            Self::InvalidSidecarTargetProvider => formatter
+                .write_str("Sidecar backend must declare target_provider as postgresql or neo4j"),
+            Self::ActiveBackendMismatch {
+                configured,
+                profile,
+            } => write!(
+                formatter,
+                "configured startup backend {} does not match active profile backend {}",
+                configured.name(),
+                profile.name()
             ),
         }
     }

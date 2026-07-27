@@ -15,7 +15,7 @@ use crate::{
     BackendManager, BackendSlotState, ChunkAppendOutcome, MigrationChunk, MigrationReceipt,
     MigrationReceiptStore, MigrationStorageError, NodeConfig, NodeIdentityStore,
     ReceiptWriteOutcome, ReplicaEntry, ReplicaManifestStore, ReplicaRole, SnapshotInbox,
-    StorageError,
+    StartupBackend, StorageError,
 };
 
 const MAX_QUEUE_CAPACITY: usize = 65_536;
@@ -399,6 +399,14 @@ impl DataNodeHost {
     }
 
     pub async fn open(config: NodeConfig, queue_capacity: usize) -> Result<Self, HostError> {
+        Self::open_with_backend(config, queue_capacity, StartupBackend::Rocksdb).await
+    }
+
+    pub async fn open_with_backend(
+        config: NodeConfig,
+        queue_capacity: usize,
+        startup_backend: StartupBackend,
+    ) -> Result<Self, HostError> {
         if queue_capacity == 0 || queue_capacity > MAX_QUEUE_CAPACITY {
             return Err(HostError::InvalidQueueCapacity);
         }
@@ -408,7 +416,8 @@ impl DataNodeHost {
         let migration_receipts = MigrationReceiptStore::open(config.data_directory())?;
         let snapshot_inbox = SnapshotInbox::open(config.data_directory())?;
         let backend_manager = Arc::new(
-            BackendManager::production().map_err(|error| HostError::Adapter(error.to_string()))?,
+            BackendManager::production(startup_backend)
+                .map_err(|error| HostError::Adapter(error.to_string()))?,
         );
         let entries = manifest_store
             .manifest()

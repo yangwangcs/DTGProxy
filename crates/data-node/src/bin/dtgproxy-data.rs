@@ -31,7 +31,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let shutdown_grace = runtime.shutdown_grace();
     let raft_listen_address = runtime.raft_listen_address();
     let raft_peers = runtime.raft_peers().clone();
-    let host = Arc::new(DataNodeHost::open(runtime.into_node(), queue_capacity).await?);
+    let backend = runtime.backend();
+    let host = Arc::new(
+        DataNodeHost::open_with_backend(runtime.into_node(), queue_capacity, backend).await?,
+    );
     let raft_runtime = match raft_listen_address {
         Some(address) => Some(
             DataRaftRuntime::start(
