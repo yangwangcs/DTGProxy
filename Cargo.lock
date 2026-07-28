@@ -622,6 +622,90 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtg-analytics"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-cluster-protocol"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-control"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-controller"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-data"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-execution"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-gateway"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-kernel"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-language"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-language-ir"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-meta"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-plan"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-query"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-shard"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-storage"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-storage-fjall"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-storage-neo4j"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-storage-postgres"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-storage-remote"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-storage-remote-protocol"
+version = "1.0.0"
+
+[[package]]
+name = "dtg-transaction"
+version = "1.0.0"
+
+[[package]]
 name = "dtgproxy"
 version = "1.0.0"
 dependencies = [
