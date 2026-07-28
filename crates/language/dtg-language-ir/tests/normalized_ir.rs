@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, AnalyticsExecutionMode, AnalyticsRequestIdentity,
     AnalyticsSubmission, BinaryOperator, BuiltInAlgorithmId, Expand, ExpandDirection, Field,
-    GraphId, GraphScope, IrError, IrVersion, Join, JoinKind, Limit, LogicalExpr, LogicalNode,
-    LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement, LogicalType,
-    LogicalWrite, NodeScan, Parameter, Projection, ReadScope, RelationshipLookup, RelationshipScan,
-    RowSchema, Sort, SortDirection, SortKey, Subquery, TemporalScope, TimeExpr, TransactionTime,
-    UnaryOperator, Unwind, ValidInterval, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate,
-    Value, VertexLookup, validate_program,
+    GraphId, GraphScope, IrError, IrVersion, Join, JoinKind, Limit, LogicalExpr, LogicalMutation,
+    LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement,
+    LogicalType, LogicalWrite, NodeScan, Parameter, Projection, ReadScope, RelationshipLookup,
+    RelationshipScan, RowSchema, Sort, SortDirection, SortKey, Subquery, TemporalScope, TimeExpr,
+    TransactionTime, UnaryOperator, Unwind, ValidInterval, ValidIntervalExpr, ValidTimeExpr,
+    ValidTimePredicate, Value, VertexLookup, validate_program,
 };
 
 fn parameter(name: &str) -> Parameter {
@@ -318,6 +318,101 @@ fn point_lookups_and_valid_time_read_scopes_are_public_and_validate_parameters()
 }
 
 #[test]
+fn valid_time_bounds_and_changes_validate_each_endpoint_parameter() {
+    for valid_time in [
+        ValidTimePredicate::Overlaps(ValidIntervalExpr::Bounds {
+            start: ValidTimeExpr::Parameter("known".into()),
+            end: ValidTimeExpr::Literal(20),
+        }),
+        ValidTimePredicate::Changes {
+            from: ValidTimeExpr::Literal(10),
+            to: ValidTimeExpr::Parameter("known".into()),
+        },
+    ] {
+        let valid_program = program(LogicalStatement::Query(plan(LogicalNodeKind::NodeScan(
+            NodeScan {
+                variable: "v".into(),
+                labels: Vec::new(),
+                read_scope: ReadScope {
+                    transaction_time: TemporalScope::Current,
+                    valid_time: Some(valid_time),
+                },
+            },
+        ))));
+        assert_eq!(validate_program(&valid_program), Ok(()));
+    }
+
+    for valid_time in [
+        ValidTimePredicate::Overlaps(ValidIntervalExpr::Bounds {
+            start: ValidTimeExpr::Parameter("unknown".into()),
+            end: ValidTimeExpr::Literal(20),
+        }),
+        ValidTimePredicate::Overlaps(ValidIntervalExpr::Bounds {
+            start: ValidTimeExpr::Literal(10),
+            end: ValidTimeExpr::Parameter("unknown".into()),
+        }),
+        ValidTimePredicate::Changes {
+            from: ValidTimeExpr::Parameter("unknown".into()),
+            to: ValidTimeExpr::Literal(20),
+        },
+        ValidTimePredicate::Changes {
+            from: ValidTimeExpr::Literal(10),
+            to: ValidTimeExpr::Parameter("unknown".into()),
+        },
+    ] {
+        let invalid_program = program(LogicalStatement::Query(plan(LogicalNodeKind::NodeScan(
+            NodeScan {
+                variable: "v".into(),
+                labels: Vec::new(),
+                read_scope: ReadScope {
+                    transaction_time: TemporalScope::Current,
+                    valid_time: Some(valid_time),
+                },
+            },
+        ))));
+        assert_eq!(
+            validate_program(&invalid_program),
+            Err(IrError::UnknownParameter("unknown".into()))
+        );
+    }
+}
+
+#[test]
+fn every_mutation_valid_from_parameter_is_validated() {
+    let mutations = vec![
+        LogicalMutation::CreateVertex {
+            variable: "v".into(),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+            valid_from: ValidTimeExpr::Parameter("unknown".into()),
+        },
+        LogicalMutation::CreateRelationship {
+            variable: "r".into(),
+            relationship_type: "KNOWS".into(),
+            source: "v".into(),
+            destination: "other".into(),
+            properties: BTreeMap::new(),
+            valid_from: ValidTimeExpr::Parameter("unknown".into()),
+        },
+        LogicalMutation::SetProperties {
+            variable: "v".into(),
+            properties: BTreeMap::new(),
+            valid_from: ValidTimeExpr::Parameter("unknown".into()),
+        },
+        LogicalMutation::Delete {
+            variable: "v".into(),
+            valid_from: ValidTimeExpr::Parameter("unknown".into()),
+        },
+    ];
+
+    for mutation in mutations {
+        assert_unknown_parameter(LogicalStatement::Write(LogicalWrite {
+            mutations: vec![mutation],
+        }));
+    }
+}
+
+#[test]
 fn analytics_submission_is_asynchronous_and_carries_schema_and_stable_identity() {
     let submission = AnalyticsSubmission {
         algorithm: BuiltInAlgorithmId::PageRank,
@@ -451,10 +546,10 @@ fn validation_recursively_rejects_unknown_expression_parameters_everywhere() {
         },
     ))));
     assert_unknown_parameter(LogicalStatement::Write(LogicalWrite {
-        mutations: vec![dtg_language_ir::LogicalMutation::SetProperties {
+        mutations: vec![LogicalMutation::SetProperties {
             variable: "v".into(),
             properties: BTreeMap::from([("property".into(), expression_with_unknown_parameter())]),
-            valid_interval: ValidInterval::new(1, 2).unwrap(),
+            valid_from: ValidTimeExpr::Literal(1),
         }],
     }));
     assert_unknown_parameter(LogicalStatement::SubmitAnalytics(AnalyticsSubmission {

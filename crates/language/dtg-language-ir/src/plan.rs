@@ -62,7 +62,7 @@ pub enum LogicalMutation {
         variable: String,
         labels: Vec<String>,
         properties: BTreeMap<String, LogicalExpr>,
-        valid_interval: ValidInterval,
+        valid_from: ValidTimeExpr,
     },
     CreateRelationship {
         variable: String,
@@ -70,16 +70,16 @@ pub enum LogicalMutation {
         source: String,
         destination: String,
         properties: BTreeMap<String, LogicalExpr>,
-        valid_interval: ValidInterval,
+        valid_from: ValidTimeExpr,
     },
     SetProperties {
         variable: String,
         properties: BTreeMap<String, LogicalExpr>,
-        valid_interval: ValidInterval,
+        valid_from: ValidTimeExpr,
     },
     Delete {
         variable: String,
-        valid_interval: ValidInterval,
+        valid_from: ValidTimeExpr,
     },
 }
 
@@ -318,6 +318,10 @@ impl ReadScope {
 pub enum ValidTimePredicate {
     At(ValidTimeExpr),
     Overlaps(ValidIntervalExpr),
+    Changes {
+        from: ValidTimeExpr,
+        to: ValidTimeExpr,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,6 +334,10 @@ pub enum ValidTimeExpr {
 pub enum ValidIntervalExpr {
     Literal(ValidInterval),
     Parameter(String),
+    Bounds {
+        start: ValidTimeExpr,
+        end: ValidTimeExpr,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

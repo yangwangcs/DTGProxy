@@ -239,10 +239,28 @@ fn validate_projections(
 fn validate_write(write: &crate::LogicalWrite, parameters: &BTreeSet<&str>) -> Result<(), IrError> {
     for mutation in &write.mutations {
         let properties = match mutation {
-            LogicalMutation::CreateVertex { properties, .. }
-            | LogicalMutation::CreateRelationship { properties, .. }
-            | LogicalMutation::SetProperties { properties, .. } => Some(properties),
-            LogicalMutation::Delete { .. } => None,
+            LogicalMutation::CreateVertex {
+                properties,
+                valid_from,
+                ..
+            }
+            | LogicalMutation::CreateRelationship {
+                properties,
+                valid_from,
+                ..
+            }
+            | LogicalMutation::SetProperties {
+                properties,
+                valid_from,
+                ..
+            } => {
+                validate_valid_time(valid_from, parameters)?;
+                Some(properties)
+            }
+            LogicalMutation::Delete { valid_from, .. } => {
+                validate_valid_time(valid_from, parameters)?;
+                None
+            }
         };
         if let Some(properties) = properties {
             for expression in properties.values() {
@@ -291,6 +309,10 @@ fn validate_read_scope(
         Some(ValidTimePredicate::Overlaps(interval)) => {
             validate_valid_interval(interval, parameters)
         }
+        Some(ValidTimePredicate::Changes { from, to }) => {
+            validate_valid_time(from, parameters)?;
+            validate_valid_time(to, parameters)
+        }
     }
 }
 
@@ -324,6 +346,10 @@ fn validate_valid_interval(
         ValidIntervalExpr::Literal(_) => Ok(()),
         ValidIntervalExpr::Parameter(name) if parameters.contains(name.as_str()) => Ok(()),
         ValidIntervalExpr::Parameter(name) => Err(IrError::UnknownParameter(name.clone())),
+        ValidIntervalExpr::Bounds { start, end } => {
+            validate_valid_time(start, parameters)?;
+            validate_valid_time(end, parameters)
+        }
     }
 }
 
