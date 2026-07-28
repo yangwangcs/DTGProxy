@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+tck = []
+
 [lints]
 workspace = true
 
@@ -15,3 +19,8 @@ fjall = "=3.1.8"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "storage_tck"
+path = "tests/storage_tck.rs"
+required-features = ["tck"]

@@ -35,14 +35,14 @@ pub use mutation::{
     VertexTombstone, VertexVersion,
 };
 pub use read::{
-    AdjacencyDirection, AdjacencyRead, ChangePage, ChangeRecord, ChangesRead, EdgeHistoryRead,
-    EdgeRead, EdgeScan, ReadFence, ReplicaStateStore, ScanPage, StoreFuture, TemporalReadView,
-    VertexHistoryRead, VertexRead, VertexScan,
+    AdjacencyDirection, AdjacencyRead, ChangeCursor, ChangePage, ChangeRecord, ChangesRead,
+    EdgeHistoryRead, EdgeRead, EdgeScan, ReadFence, ReplicaStateStore, ScanPage, StoreFuture,
+    TemporalReadView, VertexHistoryRead, VertexRead, VertexScan,
 };
 pub use snapshot::{
     LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
     SUPPORTED_SNAPSHOT_FORMAT_VERSION, SnapshotChunk, SnapshotHeader, SnapshotId, SnapshotManifest,
-    SnapshotRecord, SnapshotRequest, SnapshotRestoreReceipt,
+    SnapshotRecord, SnapshotReplayRecord, SnapshotRequest, SnapshotRestoreReceipt,
 };
 pub use tck::{StorageTckFactory, StorageTckStore, run_storage_tck};
 

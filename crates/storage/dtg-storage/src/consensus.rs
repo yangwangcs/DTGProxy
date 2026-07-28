@@ -128,6 +128,9 @@ pub struct ConsensusSnapshotMetadata {
 
 pub trait ConsensusStore: Send + Sync {
     fn binding(&self) -> &ReplicaBinding;
+    /// Appends one contiguous sequence. Exact overlap is idempotent. The first
+    /// divergent existing index is atomically replaced together with the
+    /// supplied suffix, and every higher stored entry is truncated.
     fn append(&self, entries: Vec<ConsensusEntry>) -> StoreFuture<'_, ()>;
     fn entries(&self, low: u64, high: u64, max_bytes: u64) -> StoreFuture<'_, Vec<ConsensusEntry>>;
     fn truncate_suffix(&self, from_index: u64) -> StoreFuture<'_, ()>;

@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{collections::BTreeMap, fmt, path::Path, sync::MutexGuard};
 
 use dtg_storage::{
     ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, RaftHardState, RaftMembership,
@@ -66,6 +66,7 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn append(&self, entries: Vec<ConsensusEntry>) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
             self.ensure_binding()?;
             if entries
                 .windows(2)
@@ -75,12 +76,45 @@ impl ConsensusStore for FjallConsensusStore {
                     "consensus append entries must be contiguous".into(),
                 ));
             }
+            if entries.is_empty() {
+                return Ok(());
+            }
+            let stored = self.load_log()?;
+            if let Some((first, last)) = stored.keys().next().zip(stored.keys().next_back())
+                && (entries[0].index() < *first || entries[0].index() > last.saturating_add(1))
+            {
+                return Err(StorageError::InvalidConsensus(
+                    "consensus append would create a discontiguous log".into(),
+                ));
+            }
+            let conflict = entries
+                .iter()
+                .find_map(|entry| match stored.get(&entry.index()) {
+                    Some(existing) if existing == entry => None,
+                    Some(_) | None => Some(entry.index()),
+                });
+            let Some(conflict) = conflict else {
+                return Ok(());
+            };
+            if let Some(last) = stored.keys().next_back()
+                && conflict > last.saturating_add(1)
+            {
+                return Err(StorageError::InvalidConsensus(
+                    "consensus append would create a log gap".into(),
+                ));
+            }
             let mut batch = self
                 .namespace
                 .db
                 .batch()
                 .durability(Some(PersistMode::SyncAll));
-            for entry in entries {
+            for index in stored.range(conflict..).map(|(index, _)| *index) {
+                batch.remove(&self.namespace.raft_log, index.to_be_bytes());
+            }
+            for entry in entries
+                .into_iter()
+                .filter(|entry| entry.index() >= conflict)
+            {
                 batch.insert(
                     &self.namespace.raft_log,
                     entry.index().to_be_bytes(),
@@ -93,6 +127,8 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn entries(&self, low: u64, high: u64, max_bytes: u64) -> StoreFuture<'_, Vec<ConsensusEntry>> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
             if low > high || max_bytes == 0 {
                 return Err(StorageError::InvalidConsensus(
                     "invalid consensus entry range".into(),
@@ -100,17 +136,27 @@ impl ConsensusStore for FjallConsensusStore {
             }
             let mut used = 0_u64;
             let mut rows = Vec::new();
+            let mut previous = None;
             for item in self
                 .namespace
                 .raft_log
                 .range(low.to_be_bytes()..high.to_be_bytes())
             {
-                let (_, value) = item.into_inner().map_err(fjall_error)?;
+                let (key, value) = item.into_inner().map_err(fjall_error)?;
                 let size = value.len() as u64;
                 if used.saturating_add(size) > max_bytes {
                     break;
                 }
-                rows.push(decode_consensus_entry(&value)?);
+                let index = decode_log_index(&key)?;
+                let entry = decode_consensus_entry(&value)?;
+                if entry.index() != index || previous.is_some_and(|previous| index != previous + 1)
+                {
+                    return Err(StorageError::InvalidConsensus(
+                        "stored consensus log is malformed or discontiguous".into(),
+                    ));
+                }
+                previous = Some(index);
+                rows.push(entry);
                 used += size;
             }
             Ok(rows)
@@ -119,6 +165,13 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn truncate_suffix(&self, from_index: u64) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
+            if from_index == 0 {
+                return Err(StorageError::InvalidConsensus(
+                    "consensus truncation index must be nonzero".into(),
+                ));
+            }
             let keys = self
                 .namespace
                 .raft_log
@@ -139,6 +192,8 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn hard_state(&self) -> StoreFuture<'_, RaftHardState> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
             self.namespace
                 .raft_state
                 .get(HARD_STATE_KEY)
@@ -151,6 +206,8 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn set_hard_state(&self, state: RaftHardState) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
             self.namespace
                 .raft_state
                 .insert(HARD_STATE_KEY, encode_hard_state(state)?)
@@ -164,6 +221,8 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn membership(&self) -> StoreFuture<'_, RaftMembership> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
             self.namespace
                 .raft_state
                 .get(MEMBERSHIP_KEY)
@@ -176,6 +235,8 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn set_membership(&self, membership: RaftMembership) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
             self.namespace
                 .raft_state
                 .insert(MEMBERSHIP_KEY, encode_membership(&membership)?)
@@ -189,6 +250,8 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn snapshot_metadata(&self) -> StoreFuture<'_, Option<ConsensusSnapshotMetadata>> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
             self.namespace
                 .raft_snapshot
                 .get(SNAPSHOT_KEY)
@@ -200,6 +263,8 @@ impl ConsensusStore for FjallConsensusStore {
 
     fn set_snapshot_metadata(&self, metadata: ConsensusSnapshotMetadata) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
             self.namespace
                 .raft_snapshot
                 .insert(SNAPSHOT_KEY, encode_consensus_snapshot(&metadata)?)
@@ -210,4 +275,44 @@ impl ConsensusStore for FjallConsensusStore {
                 .map_err(fjall_error)
         })
     }
+}
+
+impl FjallConsensusStore {
+    fn lock(&self) -> Result<MutexGuard<'_, ()>, StorageError> {
+        self.namespace
+            .consensus_guard
+            .lock()
+            .map_err(|_| StorageError::Internal("Fjall consensus lock is poisoned".into()))
+    }
+
+    fn load_log(&self) -> Result<BTreeMap<u64, ConsensusEntry>, StorageError> {
+        let mut entries = BTreeMap::new();
+        for item in self.namespace.raft_log.iter() {
+            let (key, value) = item.into_inner().map_err(fjall_error)?;
+            let index = decode_log_index(&key)?;
+            let entry = decode_consensus_entry(&value)?;
+            if entry.index() != index || entries.insert(index, entry).is_some() {
+                return Err(StorageError::InvalidConsensus(
+                    "stored consensus log identity is malformed".into(),
+                ));
+            }
+        }
+        if entries
+            .keys()
+            .zip(entries.keys().skip(1))
+            .any(|(left, right)| *right != left.saturating_add(1))
+        {
+            return Err(StorageError::InvalidConsensus(
+                "stored consensus log is discontiguous".into(),
+            ));
+        }
+        Ok(entries)
+    }
+}
+
+fn decode_log_index(bytes: &[u8]) -> Result<u64, StorageError> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| StorageError::InvalidConsensus("invalid consensus log key".into()))?;
+    Ok(u64::from_be_bytes(bytes))
 }

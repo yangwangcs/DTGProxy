@@ -1,9 +1,9 @@
 use dtg_kernel::Digest32;
 
 use crate::{
-    EdgeVersion, ReadFence, ReplicaBinding, ReplicaMetadata, StorageError, StoreFuture,
-    TransactionRecord, VertexVersion,
-    mutation::{encode_edge, encode_metadata, encode_transaction, encode_vertex},
+    ChangeRecord, CommandId, EdgeTombstone, EdgeVersion, ReadFence, ReplicaBinding,
+    ReplicaMetadata, StorageError, StoreFuture, TransactionRecord, VertexTombstone, VertexVersion,
+    mutation::{encode_edge, encode_metadata, encode_mutation, encode_transaction, encode_vertex},
 };
 
 pub const SUPPORTED_SNAPSHOT_FORMAT_VERSION: u32 = 1;
@@ -105,9 +105,58 @@ impl SnapshotHeader {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SnapshotRecord {
     Vertex(VertexVersion),
+    VertexTombstone(VertexTombstone),
     Edge(EdgeVersion),
+    EdgeTombstone(EdgeTombstone),
     Transaction(TransactionRecord),
     ReplicaMetadata(ReplicaMetadata),
+    Replay(SnapshotReplayRecord),
+    Change(ChangeRecord),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotReplayRecord {
+    raft_index: u64,
+    raft_term: u64,
+    command_id: CommandId,
+    mutation_digest: Digest32,
+}
+
+impl SnapshotReplayRecord {
+    pub fn new(
+        raft_index: u64,
+        raft_term: u64,
+        command_id: CommandId,
+        mutation_digest: Digest32,
+    ) -> Result<Self, StorageError> {
+        if raft_index == 0 || raft_term == 0 || mutation_digest.get() == [0; 32] {
+            return Err(StorageError::CorruptSnapshot(
+                "snapshot replay identity is incomplete".into(),
+            ));
+        }
+        Ok(Self {
+            raft_index,
+            raft_term,
+            command_id,
+            mutation_digest,
+        })
+    }
+
+    pub const fn raft_index(&self) -> u64 {
+        self.raft_index
+    }
+
+    pub const fn raft_term(&self) -> u64 {
+        self.raft_term
+    }
+
+    pub const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    pub const fn mutation_digest(&self) -> Digest32 {
+        self.mutation_digest
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,13 +372,38 @@ fn encode_record(hasher: &mut blake3::Hasher, record: &SnapshotRecord) {
             hasher.update(&[2]);
             encode_edge(hasher, edge);
         }
-        SnapshotRecord::Transaction(transaction) => {
+        SnapshotRecord::VertexTombstone(tombstone) => {
             hasher.update(&[3]);
+            hasher.update(&tombstone.id().get().to_be_bytes());
+            hasher.update(&tombstone.version().get().to_be_bytes());
+            hasher.update(&tombstone.transaction_time().get().to_be_bytes());
+        }
+        SnapshotRecord::EdgeTombstone(tombstone) => {
+            hasher.update(&[4]);
+            hasher.update(&tombstone.id().get().to_be_bytes());
+            hasher.update(&tombstone.version().get().to_be_bytes());
+            hasher.update(&tombstone.transaction_time().get().to_be_bytes());
+        }
+        SnapshotRecord::Transaction(transaction) => {
+            hasher.update(&[5]);
             encode_transaction(hasher, transaction);
         }
         SnapshotRecord::ReplicaMetadata(metadata) => {
-            hasher.update(&[4]);
+            hasher.update(&[6]);
             encode_metadata(hasher, metadata);
+        }
+        SnapshotRecord::Replay(replay) => {
+            hasher.update(&[7]);
+            hasher.update(&replay.raft_index.to_be_bytes());
+            hasher.update(&replay.raft_term.to_be_bytes());
+            hasher.update(&replay.command_id.get().to_be_bytes());
+            hasher.update(&replay.mutation_digest.get());
+        }
+        SnapshotRecord::Change(change) => {
+            hasher.update(&[8]);
+            hasher.update(&change.raft_index().to_be_bytes());
+            hasher.update(&change.mutation_ordinal().to_be_bytes());
+            encode_mutation(hasher, change.mutation());
         }
     }
 }

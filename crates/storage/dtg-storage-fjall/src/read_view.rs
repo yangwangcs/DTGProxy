@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use dtg_storage::{
-    AdjacencyRead, ChangePage, ChangeRecord, ChangesRead, EdgeHistoryRead, EdgeId, EdgeRead,
-    EdgeScan, EdgeVersion, LogicalMutation, ReadFence, ScanPage, StorageError, StoreFuture,
-    TemporalReadView, TransactionRecord, VertexHistoryRead, VertexId, VertexRead, VertexScan,
-    VertexVersion,
+    AdjacencyRead, ChangeCursor, ChangePage, ChangeRecord, ChangesRead, EdgeHistoryRead, EdgeId,
+    EdgeRead, EdgeScan, EdgeVersion, LogicalMutation, ReadFence, ScanPage, SnapshotReplayRecord,
+    StorageError, StoreFuture, TemporalReadView, TransactionRecord, VertexHistoryRead, VertexId,
+    VertexRead, VertexScan, VertexVersion,
 };
 use fjall::Readable;
 
@@ -14,6 +14,7 @@ pub(crate) struct FjallReadView {
     fence: ReadFence,
     history: Vec<LogicalMutation>,
     changes: Vec<ChangeRecord>,
+    replay: Vec<SnapshotReplayRecord>,
     transactions: Vec<TransactionRecord>,
     metadata: Vec<dtg_storage::ReplicaMetadata>,
 }
@@ -45,7 +46,33 @@ impl FjallReadView {
                         .try_into()
                         .map_err(|_| StorageError::Internal("invalid change index".into()))?,
                 );
-                Ok(ChangeRecord::new(index, decode_mutation(&value)?))
+                let ordinal = u64::from_be_bytes(
+                    key[9..17]
+                        .try_into()
+                        .map_err(|_| StorageError::Internal("invalid change ordinal".into()))?,
+                );
+                Ok(ChangeRecord::new(
+                    ChangeCursor::new(index, ordinal),
+                    decode_mutation(&value)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let replay = snapshot
+            .iter(&store.namespace().identity)
+            .map(|item| {
+                let (key, value) = item.into_inner().map_err(fjall_error)?;
+                let raft_index = u64::from_be_bytes(
+                    key.as_ref()
+                        .try_into()
+                        .map_err(|_| StorageError::Internal("invalid replay index key".into()))?,
+                );
+                let replay = crate::codec::decode_replay_identity(&value)?;
+                SnapshotReplayRecord::new(
+                    raft_index,
+                    replay.term,
+                    replay.command_id,
+                    replay.mutation_digest,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let transactions = snapshot
@@ -76,6 +103,7 @@ impl FjallReadView {
             fence,
             history,
             changes,
+            replay,
             transactions,
             metadata,
         })
@@ -88,13 +116,20 @@ impl FjallReadView {
                 LogicalMutation::PutVertex(vertex) => {
                     records.push(dtg_storage::SnapshotRecord::Vertex(vertex.clone()));
                 }
+                LogicalMutation::DeleteVertex(tombstone) => {
+                    records.push(dtg_storage::SnapshotRecord::VertexTombstone(
+                        tombstone.clone(),
+                    ));
+                }
                 LogicalMutation::PutEdge(edge) => {
                     records.push(dtg_storage::SnapshotRecord::Edge(edge.clone()));
                 }
-                LogicalMutation::DeleteVertex(_)
-                | LogicalMutation::DeleteEdge(_)
-                | LogicalMutation::PutTransaction(_)
-                | LogicalMutation::PutReplicaMetadata(_) => {}
+                LogicalMutation::DeleteEdge(tombstone) => {
+                    records.push(dtg_storage::SnapshotRecord::EdgeTombstone(
+                        tombstone.clone(),
+                    ));
+                }
+                LogicalMutation::PutTransaction(_) | LogicalMutation::PutReplicaMetadata(_) => {}
             }
         }
         records.extend(
@@ -108,6 +143,18 @@ impl FjallReadView {
                 .iter()
                 .cloned()
                 .map(dtg_storage::SnapshotRecord::ReplicaMetadata),
+        );
+        records.extend(
+            self.replay
+                .iter()
+                .cloned()
+                .map(dtg_storage::SnapshotRecord::Replay),
+        );
+        records.extend(
+            self.changes
+                .iter()
+                .cloned()
+                .map(dtg_storage::SnapshotRecord::Change),
         );
         records
     }
@@ -246,16 +293,24 @@ impl TemporalReadView for FjallReadView {
 
     fn expand(&self, request: AdjacencyRead) -> StoreFuture<'_, Vec<EdgeVersion>> {
         Box::pin(async move {
+            let ids = self
+                .history
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    LogicalMutation::PutEdge(edge) => Some(edge.id()),
+                    LogicalMutation::DeleteEdge(tombstone) => Some(tombstone.id()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
             let mut visible = BTreeMap::<EdgeId, EdgeVersion>::new();
-            for mutation in &self.history {
-                if let LogicalMutation::PutEdge(edge) = mutation
-                    && request.matches(edge)
-                    && visible.get(&edge.id()).is_none_or(|current| {
-                        (edge.transaction_time(), edge.version())
-                            > (current.transaction_time(), current.version())
-                    })
+            for id in ids {
+                if let Some(edge) = self.visible_edge(&EdgeRead::new(
+                    id,
+                    request.valid_at(),
+                    request.transaction_at(),
+                )) && request.matches(&edge)
                 {
-                    visible.insert(edge.id(), edge.clone());
+                    visible.insert(id, edge);
                 }
             }
             Ok(visible
@@ -270,15 +325,13 @@ impl TemporalReadView for FjallReadView {
             let matching: Vec<_> = self
                 .changes
                 .iter()
-                .filter(|change| request.includes(change.raft_index()))
+                .filter(|change| request.includes(change.cursor()))
                 .cloned()
                 .collect();
             let limit = request.limit() as usize;
             let has_more = matching.len() > limit;
             let rows: Vec<_> = matching.into_iter().take(limit).collect();
-            let next = has_more
-                .then(|| rows.last().map(ChangeRecord::raft_index))
-                .flatten();
+            let next = has_more.then(|| rows.last().expect("page is nonempty").cursor());
             Ok(ChangePage::new(rows, next))
         })
     }

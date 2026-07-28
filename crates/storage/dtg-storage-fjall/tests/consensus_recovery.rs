@@ -7,9 +7,10 @@ use std::{
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, CommandId, ConsensusCommandEnvelope,
     ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, Digest32, ProviderKind,
-    RaftHardState, RaftMembership, ReplicaBinding, ReplicaId,
+    RaftHardState, RaftMembership, ReplicaBinding, ReplicaId, StorageError,
 };
 use dtg_storage_fjall::FjallConsensusStore;
+use fjall::{Database, KeyspaceCreateOptions, PersistMode};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
@@ -22,8 +23,20 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 fn fixture_replica() -> ReplicaBinding {
-    let capabilities = CapabilityManifest::from_names(["point"]).unwrap();
-    let class = BackendClass::new(ProviderKind::Fjall, 1, 1, ["point"]).unwrap();
+    let capabilities = CapabilityManifest::from_names([
+        "adjacency",
+        "immutable-read-view",
+        "logical-snapshot",
+        "point",
+    ])
+    .unwrap();
+    let class = BackendClass::new(
+        ProviderKind::Fjall,
+        1,
+        1,
+        capabilities.names().map(str::to_owned),
+    )
+    .unwrap();
     ReplicaBinding::builder()
         .cluster_id(1)
         .graph_id(2)
@@ -51,6 +64,17 @@ fn entry(index: u64) -> ConsensusEntry {
         index,
         CommandId::new(u128::from(index)).unwrap(),
         ConsensusCommandEnvelope::new(1, vec![index as u8]).unwrap(),
+    )
+    .unwrap()
+}
+
+fn divergent_entry(index: u64) -> ConsensusEntry {
+    ConsensusEntry::new(
+        1,
+        9,
+        index,
+        CommandId::new(u128::from(index) + 1000).unwrap(),
+        ConsensusCommandEnvelope::new(1, vec![99, index as u8]).unwrap(),
     )
     .unwrap()
 }
@@ -88,4 +112,114 @@ fn consensus_entries_survive_reopen() {
         block_on(reopened.snapshot_metadata()).unwrap(),
         Some(snapshot)
     );
+}
+
+#[test]
+fn divergent_append_atomically_replaces_and_truncates_the_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = fixture_replica();
+    let store = FjallConsensusStore::open(dir.path(), binding).unwrap();
+    block_on(store.append(vec![entry(4), entry(5), entry(6)])).unwrap();
+
+    block_on(store.append(vec![entry(4), entry(5)])).unwrap();
+    assert_eq!(
+        block_on(store.entries(4, 7, 4096)).unwrap(),
+        vec![entry(4), entry(5), entry(6)]
+    );
+
+    let replacement = divergent_entry(5);
+    block_on(store.append(vec![replacement.clone()])).unwrap();
+    assert_eq!(
+        block_on(store.entries(4, 7, 4096)).unwrap(),
+        vec![entry(4), replacement]
+    );
+
+    let before_gap = block_on(store.entries(4, 8, 4096)).unwrap();
+    assert!(matches!(
+        block_on(store.append(vec![entry(7)])),
+        Err(StorageError::InvalidConsensus(_))
+    ));
+    assert_eq!(block_on(store.entries(4, 8, 4096)).unwrap(), before_gap);
+}
+
+#[test]
+fn consensus_ranges_truncation_and_reopen_preserve_one_contiguous_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = fixture_replica();
+    let store = FjallConsensusStore::open(dir.path(), binding.clone()).unwrap();
+    block_on(store.append(vec![entry(4), entry(5), entry(6)])).unwrap();
+    assert!(matches!(
+        block_on(store.entries(7, 6, 1024)),
+        Err(StorageError::InvalidConsensus(_))
+    ));
+    assert!(matches!(
+        block_on(store.entries(4, 7, 0)),
+        Err(StorageError::InvalidConsensus(_))
+    ));
+    assert!(block_on(store.entries(5, 5, 1024)).unwrap().is_empty());
+    assert!(matches!(
+        block_on(store.truncate_suffix(0)),
+        Err(StorageError::InvalidConsensus(_))
+    ));
+    block_on(store.truncate_suffix(6)).unwrap();
+    drop(store);
+
+    let reopened = FjallConsensusStore::open(dir.path(), binding).unwrap();
+    assert_eq!(
+        block_on(reopened.entries(4, 7, 4096)).unwrap(),
+        vec![entry(4), entry(5)]
+    );
+    block_on(reopened.append(vec![entry(6)])).unwrap();
+    assert_eq!(block_on(reopened.entries(4, 7, 4096)).unwrap().len(), 3);
+}
+
+#[test]
+fn consensus_records_fail_closed_on_unknown_codec_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = fixture_replica();
+    let store = FjallConsensusStore::open(dir.path(), binding.clone()).unwrap();
+    block_on(store.append(vec![entry(4)])).unwrap();
+    block_on(store.set_hard_state(RaftHardState {
+        current_term: 4,
+        voted_for: Some(ReplicaId::new(5).unwrap()),
+        committed_index: 4,
+    }))
+    .unwrap();
+    block_on(store.set_membership(RaftMembership {
+        voters: vec![ReplicaId::new(5).unwrap()],
+        learners: vec![],
+        configuration_index: 4,
+    }))
+    .unwrap();
+    block_on(store.set_snapshot_metadata(ConsensusSnapshotMetadata {
+        snapshot_id: 5,
+        last_included_term: 3,
+        last_included_index: 3,
+        content_digest: Digest32::new([6; 32]),
+    }))
+    .unwrap();
+    drop(store);
+
+    let db = Database::builder(dir.path()).open().unwrap();
+    for (partition, key) in [
+        ("raft_log", 4_u64.to_be_bytes().to_vec()),
+        ("raft_state", b"hard_state".to_vec()),
+        ("raft_state", b"membership".to_vec()),
+        ("raft_snapshot", b"snapshot".to_vec()),
+    ] {
+        let keyspace = db
+            .keyspace(partition, KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut bytes = keyspace.get(&key).unwrap().unwrap().to_vec();
+        bytes[0] = 2;
+        keyspace.insert(key, bytes).unwrap();
+    }
+    db.persist(PersistMode::SyncAll).unwrap();
+    drop(db);
+
+    let reopened = FjallConsensusStore::open(dir.path(), binding).unwrap();
+    assert!(block_on(reopened.entries(4, 5, 4096)).is_err());
+    assert!(block_on(reopened.hard_state()).is_err());
+    assert!(block_on(reopened.membership()).is_err());
+    assert!(block_on(reopened.snapshot_metadata()).is_err());
 }

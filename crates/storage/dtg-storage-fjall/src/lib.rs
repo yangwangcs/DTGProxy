@@ -8,14 +8,18 @@ mod namespace;
 mod read_view;
 mod snapshot;
 
+#[cfg(feature = "tck")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "tck")]
 use dtg_storage::{
-    ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommittedShardBatch,
-    LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
-    ProviderKind, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence,
-    ReplicaBinding, ReplicaStateStore, SnapshotRecord, SnapshotRequest, StorageError,
-    StorageTckFactory, StorageTckStore, StoreFuture, TemporalReadView,
+    ApplyReceipt, BackendClass, BindingRole, CommittedShardBatch, LogicalSnapshotReader,
+    LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter, ProviderKind, ReadFence,
+    SnapshotRequest, StorageError, StorageTckFactory, StorageTckStore, TemporalReadView,
+};
+use dtg_storage::{
+    CapabilityManifest, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest,
+    ReplicaBinding, ReplicaStateStore, SnapshotRecord, StoreFuture,
 };
 
 pub use artifact::FjallArtifactStore;
@@ -76,11 +80,13 @@ impl PushdownExecutor for FjallReplicaStore {
     }
 }
 
+#[cfg(feature = "tck")]
 pub struct FjallStorageTckFactory {
     root: PathBuf,
     capabilities: CapabilityManifest,
 }
 
+#[cfg(feature = "tck")]
 impl FjallStorageTckFactory {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
@@ -96,6 +102,7 @@ impl FjallStorageTckFactory {
     }
 }
 
+#[cfg(feature = "tck")]
 impl StorageTckFactory for FjallStorageTckFactory {
     fn capabilities(&self) -> CapabilityManifest {
         self.capabilities.clone()
@@ -141,10 +148,12 @@ impl StorageTckFactory for FjallStorageTckFactory {
     }
 }
 
+#[cfg(feature = "tck")]
 struct FjallStorageTckStore {
     store: FjallReplicaStore,
 }
 
+#[cfg(feature = "tck")]
 impl ReplicaStateStore for FjallStorageTckStore {
     fn binding(&self) -> &ReplicaBinding {
         ReplicaStateStore::binding(&self.store)
@@ -163,6 +172,7 @@ impl ReplicaStateStore for FjallStorageTckStore {
     }
 }
 
+#[cfg(feature = "tck")]
 impl LogicalSnapshotSource for FjallStorageTckStore {
     fn begin_snapshot(
         &self,
@@ -173,6 +183,7 @@ impl LogicalSnapshotSource for FjallStorageTckStore {
     }
 }
 
+#[cfg(feature = "tck")]
 impl LogicalSnapshotSink for FjallStorageTckStore {
     fn begin_restore(
         &self,
@@ -183,6 +194,7 @@ impl LogicalSnapshotSink for FjallStorageTckStore {
     }
 }
 
+#[cfg(feature = "tck")]
 impl PushdownExecutor for FjallStorageTckStore {
     fn binding(&self) -> &ReplicaBinding {
         PushdownExecutor::binding(&self.store)
@@ -197,6 +209,7 @@ impl PushdownExecutor for FjallStorageTckStore {
     }
 }
 
+#[cfg(feature = "tck")]
 impl StorageTckStore for FjallStorageTckStore {
     fn arm_apply_failure_after(&self, staged_mutations: usize) -> Result<(), StorageError> {
         self.store.arm_apply_failure_after(staged_mutations)

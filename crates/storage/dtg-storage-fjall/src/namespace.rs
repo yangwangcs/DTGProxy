@@ -1,16 +1,19 @@
 use std::{
     collections::BTreeMap,
+    fs,
     ops::Deref,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
-use dtg_storage::{ReplicaBinding, StorageError};
+use dtg_storage::{BackendClass, CapabilityManifest, ProviderKind, ReplicaBinding, StorageError};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use crate::codec::{decode_binding, encode_binding};
 
 const OWNER_KEY: &[u8] = b"binding";
+pub(crate) const FJALL_CONTRACT_VERSION: u32 = 1;
+pub(crate) const FJALL_LAYOUT_VERSION: u32 = 1;
 
 static OPEN_NAMESPACES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<NamespaceInner>>>> = OnceLock::new();
 
@@ -32,6 +35,8 @@ pub(crate) struct NamespaceInner {
     pub(crate) raft_log: Keyspace,
     pub(crate) raft_state: Keyspace,
     pub(crate) raft_snapshot: Keyspace,
+    pub(crate) consensus_guard: Mutex<()>,
+    pub(crate) artifact_guard: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -47,7 +52,8 @@ impl Deref for NamespaceDb {
 
 impl NamespaceDb {
     pub(crate) fn open(path: &Path, binding: &ReplicaBinding) -> Result<Self, StorageError> {
-        let path = absolute_path(path)?;
+        validate_fjall_binding(binding)?;
+        let path = canonical_namespace_path(path)?;
         let registry = OPEN_NAMESPACES.get_or_init(|| Mutex::new(BTreeMap::new()));
         let mut registry = registry
             .lock()
@@ -121,20 +127,76 @@ impl NamespaceDb {
             raft_log,
             raft_state,
             raft_snapshot,
+            consensus_guard: Mutex::new(()),
+            artifact_guard: Mutex::new(()),
         });
         registry.insert(path, Arc::downgrade(&shared));
         Ok(Self(shared))
     }
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, StorageError> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
+pub(crate) fn fjall_capabilities() -> Result<CapabilityManifest, StorageError> {
+    CapabilityManifest::from_names([
+        "adjacency",
+        "immutable-read-view",
+        "logical-snapshot",
+        "point",
+    ])
+}
+
+fn validate_fjall_binding(binding: &ReplicaBinding) -> Result<(), StorageError> {
+    let capabilities = fjall_capabilities()?;
+    let class = BackendClass::new(
+        ProviderKind::Fjall,
+        FJALL_CONTRACT_VERSION,
+        FJALL_LAYOUT_VERSION,
+        capabilities.names().map(str::to_owned),
+    )?;
+    if binding.provider_kind() != &ProviderKind::Fjall
+        || binding.contract_version() != FJALL_CONTRACT_VERSION
+        || binding.layout_version() != FJALL_LAYOUT_VERSION
+        || binding.capability_digest() != capabilities.digest()
+        || binding.backend_class_digest() != class.digest()
+    {
+        return Err(StorageError::InvalidBinding(
+            "binding does not match the supported Fjall backend class and capability floor".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_namespace_path(path: &Path) -> Result<PathBuf, StorageError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map(|current| current.join(path))
-            .map_err(|error| StorageError::Internal(format!("cannot resolve Fjall path: {error}")))
+            .map_err(|error| StorageError::Internal(format!("cannot resolve Fjall path: {error}")))?
+            .join(path)
+    };
+    let canonical = if absolute.exists() {
+        fs::canonicalize(&absolute).map_err(|error| {
+            StorageError::Internal(format!("cannot canonicalize Fjall path: {error}"))
+        })?
+    } else {
+        let final_component = absolute.file_name().ok_or_else(|| {
+            StorageError::InvalidBinding("Fjall namespace path has no final component".into())
+        })?;
+        let parent = absolute.parent().ok_or_else(|| {
+            StorageError::InvalidBinding("Fjall namespace path has no parent".into())
+        })?;
+        let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+            StorageError::InvalidBinding(format!(
+                "Fjall namespace parent must already exist and resolve safely: {error}"
+            ))
+        })?;
+        canonical_parent.join(final_component)
+    };
+    if canonical.parent() == Some(canonical.as_path()) {
+        return Err(StorageError::InvalidBinding(
+            "Fjall namespace path cannot resolve to a filesystem root".into(),
+        ));
     }
+    Ok(canonical)
 }
 
 pub(crate) fn fjall_error(error: fjall::Error) -> StorageError {

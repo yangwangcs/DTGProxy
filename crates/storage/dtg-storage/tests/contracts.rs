@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
@@ -6,18 +6,19 @@ use std::task::{Context, Poll, Waker};
 
 use dtg_storage::{
     AdjacencyRead, ApplyReceipt, ArtifactStore, BackendClass, BindingRole, CapabilityManifest,
-    ChangePage, ChangesRead, CommandId, CommittedShardBatch, ConsensusCommandEnvelope,
-    ConsensusEntry, ConsensusStore, Digest32, DurabilityPolicy, EdgeHistoryRead, EdgeId, EdgeRead,
-    EdgeScan, EdgeTombstone, EdgeVersion, LogicalMutation, LogicalSnapshotReader,
-    LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter, ProviderKind,
-    PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence,
+    ChangeCursor, ChangePage, ChangeRecord, ChangesRead, CommandId, CommittedShardBatch,
+    ConsensusCommandEnvelope, ConsensusEntry, ConsensusStore, Digest32, DurabilityPolicy,
+    EdgeHistoryRead, EdgeId, EdgeRead, EdgeScan, EdgeTombstone, EdgeVersion, LogicalMutation,
+    LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
+    ProviderKind, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence,
     ReplicaBinding, ReplicaMetadata, ReplicaStateStore, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
     SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
     SUPPORTED_SNAPSHOT_FORMAT_VERSION, ScanPage, SnapshotChunk, SnapshotHeader, SnapshotManifest,
-    SnapshotRecord, SnapshotRequest, SnapshotRestoreReceipt, StorageError, StorageTckFactory,
-    StorageTckStore, StoreFuture, TemporalReadView, TransactionId, TransactionRecord,
-    TransactionState, TransactionTime, ValidInterval, Value, Version, VertexHistoryRead, VertexId,
-    VertexRead, VertexScan, VertexTombstone, VertexVersion, run_storage_tck,
+    SnapshotRecord, SnapshotReplayRecord, SnapshotRequest, SnapshotRestoreReceipt, StorageError,
+    StorageTckFactory, StorageTckStore, StoreFuture, TemporalReadView, TransactionId,
+    TransactionRecord, TransactionState, TransactionTime, ValidInterval, Value, Version,
+    VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexTombstone, VertexVersion,
+    run_storage_tck,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -320,6 +321,55 @@ fn tombstones_expose_complete_temporal_identity() {
 }
 
 #[test]
+fn change_pages_resume_after_the_complete_ordering_key() {
+    let cursor = ChangeCursor::new(7, 3);
+    let mutation = LogicalMutation::PutVertex(sample_vertex(10, 1));
+    let record = ChangeRecord::new(cursor, mutation);
+    let page = ChangePage::new(vec![record.clone()], Some(cursor));
+
+    assert_eq!(record.cursor(), cursor);
+    assert_eq!(record.raft_index(), 7);
+    assert_eq!(record.mutation_ordinal(), 3);
+    assert_eq!(page.next_after(), Some(cursor));
+
+    let next = ChangesRead::new(page.next_after(), 7, 1).unwrap();
+    assert!(!next.includes(cursor));
+    assert!(next.includes(ChangeCursor::new(7, 4)));
+}
+
+#[test]
+fn snapshot_records_cover_tombstones_replay_and_ordered_changes() {
+    let vertex_tombstone = VertexTombstone::new(
+        VertexId::new(10).unwrap(),
+        Version::new(2),
+        TransactionTime::new(2).unwrap(),
+    );
+    let edge_tombstone = EdgeTombstone::new(
+        EdgeId::new(11).unwrap(),
+        Version::new(3),
+        TransactionTime::new(3).unwrap(),
+    );
+    let replay =
+        SnapshotReplayRecord::new(7, 4, CommandId::new(12).unwrap(), Digest32::new([5; 32]))
+            .unwrap();
+    let change = ChangeRecord::new(
+        ChangeCursor::new(7, 0),
+        LogicalMutation::DeleteVertex(vertex_tombstone.clone()),
+    );
+    let snapshot_id = SnapshotRequest::new(47, 8).unwrap().snapshot_id();
+    let records = vec![
+        SnapshotRecord::VertexTombstone(vertex_tombstone),
+        SnapshotRecord::EdgeTombstone(edge_tombstone),
+        SnapshotRecord::Replay(replay),
+        SnapshotRecord::Change(change),
+    ];
+    let chunk = SnapshotChunk::new(snapshot_id, 0, records.clone()).unwrap();
+
+    assert_eq!(chunk.records(), records);
+    chunk.validate().unwrap();
+}
+
+#[test]
 fn scan_pages_preserve_typed_128_bit_cursors_for_next_requests() {
     let vertex_cursor = VertexId::new(u128::from(u64::MAX) + 101).unwrap();
     let vertex_page = ScanPage::<VertexVersion, VertexId>::new(Vec::new(), Some(vertex_cursor));
@@ -457,7 +507,7 @@ fn execution_stage_failure_is_atomic() {
         ))
         .unwrap();
     assert_eq!(scan.rows(), &[first, second]);
-    let changes = block_on(view.changes(ChangesRead::new(0, 2, 16).unwrap())).unwrap();
+    let changes = block_on(view.changes(ChangesRead::new(None, 2, 16).unwrap())).unwrap();
     assert_eq!(changes.rows().len(), 2);
     assert!(changes.rows().iter().all(|change| change.raft_index() == 1));
 
@@ -476,8 +526,10 @@ fn execution_stage_failure_is_atomic() {
             Some(vertex.clone())
         );
     }
-    let committed_changes =
-        block_on(committed.changes(ChangesRead::new(1, 2, 16).unwrap())).unwrap();
+    let committed_changes = block_on(
+        committed.changes(ChangesRead::new(Some(ChangeCursor::new(1, u64::MAX)), 2, 16).unwrap()),
+    )
+    .unwrap();
     assert_eq!(committed_changes.rows().len(), 2);
     assert!(
         committed_changes
@@ -494,8 +546,11 @@ fn execution_stage_failure_is_atomic() {
         2,
     )))
     .unwrap();
-    let after_replay_changes =
-        block_on(after_replay.changes(ChangesRead::new(1, 2, 16).unwrap())).unwrap();
+    let after_replay_changes = block_on(
+        after_replay
+            .changes(ChangesRead::new(Some(ChangeCursor::new(1, u64::MAX)), 2, 16).unwrap()),
+    )
+    .unwrap();
     assert_eq!(after_replay_changes, committed_changes);
 }
 
@@ -563,32 +618,49 @@ fn snapshot_round_trip_preserves_all_typed_records() {
     let edge = sample_edge(13, first.id(), second.id());
     let transaction = sample_transaction(14);
     let metadata = ReplicaMetadata::new("lease-owner", Value::String("replica-17".into())).unwrap();
-    let expected = vec![
+    let mutations = vec![
+        LogicalMutation::PutVertex(first.clone()),
+        LogicalMutation::PutVertex(second.clone()),
+        LogicalMutation::PutEdge(edge.clone()),
+        LogicalMutation::PutTransaction(transaction.clone()),
+        LogicalMutation::PutReplicaMetadata(metadata.clone()),
+    ];
+    let batch = CommittedShardBatch::new(
+        source_binding.clone(),
+        1,
+        1,
+        CommandId::new(14).unwrap(),
+        mutations.clone(),
+    )
+    .unwrap();
+    let mut expected = vec![
         SnapshotRecord::Vertex(first.clone()),
         SnapshotRecord::Vertex(second.clone()),
         SnapshotRecord::Edge(edge.clone()),
         SnapshotRecord::Transaction(transaction.clone()),
         SnapshotRecord::ReplicaMetadata(metadata.clone()),
     ];
-    block_on(
-        source.apply(
-            CommittedShardBatch::new(
-                source_binding.clone(),
-                1,
-                1,
-                CommandId::new(14).unwrap(),
-                vec![
-                    LogicalMutation::PutVertex(first),
-                    LogicalMutation::PutVertex(second),
-                    LogicalMutation::PutEdge(edge),
-                    LogicalMutation::PutTransaction(transaction),
-                    LogicalMutation::PutReplicaMetadata(metadata),
-                ],
-            )
-            .unwrap(),
-        ),
-    )
-    .unwrap();
+    expected.push(SnapshotRecord::Replay(
+        SnapshotReplayRecord::new(
+            batch.raft_index(),
+            batch.raft_term(),
+            batch.command_id(),
+            batch.mutation_digest(),
+        )
+        .unwrap(),
+    ));
+    expected.extend(
+        mutations
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, mutation)| {
+                SnapshotRecord::Change(ChangeRecord::new(
+                    ChangeCursor::new(1, ordinal as u64),
+                    mutation,
+                ))
+            }),
+    );
+    block_on(source.apply(batch)).unwrap();
 
     let (header, chunks, manifest, records) = export_snapshot(&*source, &source_binding, 1, 47, 2);
     assert_eq!(records, expected);
@@ -666,8 +738,9 @@ struct TestState {
     edges: Vec<EdgeVersion>,
     transactions: Vec<TransactionRecord>,
     metadata: Vec<ReplicaMetadata>,
+    history: Vec<LogicalMutation>,
     replay: BTreeMap<u64, ReplayRecord>,
-    changes: Vec<(u64, LogicalMutation)>,
+    changes: Vec<(ChangeCursor, LogicalMutation)>,
 }
 
 #[derive(Clone)]
@@ -811,13 +884,16 @@ impl ReplicaStateStore for TestStore {
                     });
                 }
                 if self.duplicate_changes_on_replay {
-                    state.changes.extend(
-                        batch
-                            .mutations()
-                            .iter()
-                            .cloned()
-                            .map(|mutation| (batch.raft_index(), mutation)),
-                    );
+                    state
+                        .changes
+                        .extend(batch.mutations().iter().cloned().enumerate().map(
+                            |(ordinal, mutation)| {
+                                (
+                                    ChangeCursor::new(batch.raft_index(), ordinal as u64),
+                                    mutation,
+                                )
+                            },
+                        ));
                 }
                 return Ok(ApplyReceipt::new(&batch, true));
             }
@@ -837,15 +913,11 @@ impl ReplicaStateStore for TestStore {
                             .or_default()
                             .push(vertex.clone());
                     }
-                    LogicalMutation::DeleteVertex(tombstone) => {
-                        next.vertices.remove(&tombstone.id());
-                    }
+                    LogicalMutation::DeleteVertex(_) => {}
                     LogicalMutation::PutEdge(edge) => {
                         next.edges.push(edge.clone());
                     }
-                    LogicalMutation::DeleteEdge(tombstone) => {
-                        next.edges.retain(|edge| edge.id() != tombstone.id());
-                    }
+                    LogicalMutation::DeleteEdge(_) => {}
                     LogicalMutation::PutTransaction(transaction) => {
                         next.transactions.push(transaction.clone());
                     }
@@ -855,7 +927,11 @@ impl ReplicaStateStore for TestStore {
                         next.metadata.push(metadata.clone());
                     }
                 }
-                next.changes.push((batch.raft_index(), mutation.clone()));
+                next.history.push(mutation.clone());
+                next.changes.push((
+                    ChangeCursor::new(batch.raft_index(), position as u64),
+                    mutation.clone(),
+                ));
                 let mut armed_failure = self.apply_failure_after.lock().unwrap();
                 if *armed_failure == Some(position + 1) {
                     if !self.persistent_apply_failure {
@@ -908,16 +984,70 @@ struct TestReadView {
     state: TestState,
 }
 
-fn visible_vertex(versions: &[VertexVersion], request: &VertexRead) -> Option<VertexVersion> {
-    versions
-        .iter()
-        .filter(|version| {
-            version.valid_time().start() <= request.valid_at()
-                && request.valid_at() < version.valid_time().end()
-                && version.transaction_time() <= request.transaction_at()
-        })
-        .max_by_key(|version| (version.transaction_time(), version.version()))
-        .cloned()
+fn visible_vertex(history: &[LogicalMutation], request: &VertexRead) -> Option<VertexVersion> {
+    let mut candidate: Option<(TransactionTime, Version, Option<VertexVersion>)> = None;
+    for mutation in history {
+        let event = match mutation {
+            LogicalMutation::PutVertex(vertex)
+                if vertex.id() == request.id()
+                    && vertex.transaction_time() <= request.transaction_at()
+                    && vertex.valid_time().start() <= request.valid_at()
+                    && request.valid_at() < vertex.valid_time().end() =>
+            {
+                Some((
+                    vertex.transaction_time(),
+                    vertex.version(),
+                    Some(vertex.clone()),
+                ))
+            }
+            LogicalMutation::DeleteVertex(tombstone)
+                if tombstone.id() == request.id()
+                    && tombstone.transaction_time() <= request.transaction_at() =>
+            {
+                Some((tombstone.transaction_time(), tombstone.version(), None))
+            }
+            _ => None,
+        };
+        if let Some(event) = event
+            && candidate
+                .as_ref()
+                .is_none_or(|current| (event.0, event.1) > (current.0, current.1))
+        {
+            candidate = Some(event);
+        }
+    }
+    candidate.and_then(|(_, _, vertex)| vertex)
+}
+
+fn visible_edge(history: &[LogicalMutation], request: &EdgeRead) -> Option<EdgeVersion> {
+    let mut candidate: Option<(TransactionTime, Version, Option<EdgeVersion>)> = None;
+    for mutation in history {
+        let event = match mutation {
+            LogicalMutation::PutEdge(edge)
+                if edge.id() == request.id()
+                    && edge.transaction_time() <= request.transaction_at()
+                    && edge.valid_time().start() <= request.valid_at()
+                    && request.valid_at() < edge.valid_time().end() =>
+            {
+                Some((edge.transaction_time(), edge.version(), Some(edge.clone())))
+            }
+            LogicalMutation::DeleteEdge(tombstone)
+                if tombstone.id() == request.id()
+                    && tombstone.transaction_time() <= request.transaction_at() =>
+            {
+                Some((tombstone.transaction_time(), tombstone.version(), None))
+            }
+            _ => None,
+        };
+        if let Some(event) = event
+            && candidate
+                .as_ref()
+                .is_none_or(|current| (event.0, event.1) > (current.0, current.1))
+        {
+            candidate = Some(event);
+        }
+    }
+    candidate.and_then(|(_, _, edge)| edge)
 }
 
 impl TemporalReadView for TestReadView {
@@ -926,41 +1056,28 @@ impl TemporalReadView for TestReadView {
     }
 
     fn get_vertex(&self, request: VertexRead) -> StoreFuture<'_, Option<VertexVersion>> {
-        Box::pin(async move {
-            Ok(self
-                .state
-                .vertices
-                .get(&request.id())
-                .and_then(|versions| visible_vertex(versions, &request)))
-        })
+        Box::pin(async move { Ok(visible_vertex(&self.state.history, &request)) })
     }
 
     fn get_edge(&self, request: EdgeRead) -> StoreFuture<'_, Option<EdgeVersion>> {
-        Box::pin(async move {
-            Ok(self
-                .state
-                .edges
-                .iter()
-                .filter(|edge| {
-                    edge.id() == request.id()
-                        && edge.valid_time().start() <= request.valid_at()
-                        && request.valid_at() < edge.valid_time().end()
-                        && edge.transaction_time() <= request.transaction_at()
-                })
-                .max_by_key(|edge| (edge.transaction_time(), edge.version()))
-                .cloned())
-        })
+        Box::pin(async move { Ok(visible_edge(&self.state.history, &request)) })
     }
 
     fn vertex_history(&self, request: VertexHistoryRead) -> StoreFuture<'_, Vec<VertexVersion>> {
         Box::pin(async move {
             let mut versions = self
                 .state
-                .vertices
-                .get(&request.id())
-                .cloned()
-                .unwrap_or_default();
-            versions.retain(|version| request.includes(version));
+                .history
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    LogicalMutation::PutVertex(vertex)
+                        if vertex.id() == request.id() && request.includes(vertex) =>
+                    {
+                        Some(vertex.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             versions.sort_by_key(|version| (version.transaction_time(), version.version()));
             versions.truncate(request.limit() as usize);
             Ok(versions)
@@ -971,10 +1088,16 @@ impl TemporalReadView for TestReadView {
         Box::pin(async move {
             let mut versions = self
                 .state
-                .edges
+                .history
                 .iter()
-                .filter(|edge| edge.id() == request.id() && request.includes(edge))
-                .cloned()
+                .filter_map(|mutation| match mutation {
+                    LogicalMutation::PutEdge(edge)
+                        if edge.id() == request.id() && request.includes(edge) =>
+                    {
+                        Some(edge.clone())
+                    }
+                    _ => None,
+                })
                 .collect::<Vec<_>>();
             versions.sort_by_key(|edge| (edge.transaction_time(), edge.version()));
             versions.truncate(request.limit() as usize);
@@ -984,16 +1107,28 @@ impl TemporalReadView for TestReadView {
 
     fn expand(&self, request: AdjacencyRead) -> StoreFuture<'_, Vec<EdgeVersion>> {
         Box::pin(async move {
-            let mut edges = self
+            let ids = self
                 .state
-                .edges
+                .history
                 .iter()
-                .filter(|edge| request.matches(edge))
-                .cloned()
-                .collect::<Vec<_>>();
-            edges.sort_by_key(EdgeVersion::id);
-            edges.truncate(request.limit() as usize);
-            Ok(edges)
+                .filter_map(|mutation| match mutation {
+                    LogicalMutation::PutEdge(edge) => Some(edge.id()),
+                    LogicalMutation::DeleteEdge(tombstone) => Some(tombstone.id()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let mut rows = Vec::new();
+            for id in ids {
+                if let Some(edge) = visible_edge(
+                    &self.state.history,
+                    &EdgeRead::new(id, request.valid_at(), request.transaction_at()),
+                ) && request.matches(&edge)
+                {
+                    rows.push(edge);
+                }
+            }
+            rows.truncate(request.limit() as usize);
+            Ok(rows)
         })
     }
 
@@ -1003,11 +1138,19 @@ impl TemporalReadView for TestReadView {
                 .state
                 .changes
                 .iter()
-                .filter(|(index, _)| request.includes(*index))
+                .filter(|(cursor, _)| request.includes(*cursor))
                 .take(request.limit() as usize)
-                .map(|(index, mutation)| dtg_storage::ChangeRecord::new(*index, mutation.clone()))
-                .collect();
-            Ok(ChangePage::new(changes, None))
+                .map(|(cursor, mutation)| ChangeRecord::new(*cursor, mutation.clone()))
+                .collect::<Vec<_>>();
+            let has_more = self
+                .state
+                .changes
+                .iter()
+                .filter(|(cursor, _)| request.includes(*cursor))
+                .count()
+                > changes.len();
+            let next_after = has_more.then(|| changes.last().unwrap().cursor());
+            Ok(ChangePage::new(changes, next_after))
         })
     }
 
@@ -1016,19 +1159,23 @@ impl TemporalReadView for TestReadView {
         request: VertexScan,
     ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>> {
         Box::pin(async move {
-            let mut rows = self
+            let ids = self
                 .state
-                .vertices
+                .history
                 .iter()
-                .filter(|(id, _)| request.after().is_none_or(|after| **id > after))
-                .filter_map(|(_, versions)| {
+                .filter_map(|mutation| match mutation {
+                    LogicalMutation::PutVertex(vertex) => Some(vertex.id()),
+                    LogicalMutation::DeleteVertex(tombstone) => Some(tombstone.id()),
+                    _ => None,
+                })
+                .filter(|id| request.after().is_none_or(|after| *id > after))
+                .collect::<BTreeSet<_>>();
+            let mut rows = ids
+                .into_iter()
+                .filter_map(|id| {
                     visible_vertex(
-                        versions,
-                        &VertexRead::new(
-                            versions.first().unwrap().id(),
-                            request.valid_at(),
-                            request.transaction_at(),
-                        ),
+                        &self.state.history,
+                        &VertexRead::new(id, request.valid_at(), request.transaction_at()),
                     )
                 })
                 .take(request.limit() as usize + 1)
@@ -1042,25 +1189,25 @@ impl TemporalReadView for TestReadView {
 
     fn scan_edges(&self, request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion, EdgeId>> {
         Box::pin(async move {
-            let mut latest_by_id = BTreeMap::new();
-            for edge in self
+            let ids = self
                 .state
-                .edges
+                .history
                 .iter()
-                .filter(|edge| request.includes(edge))
-            {
-                let replace = latest_by_id
-                    .get(&edge.id())
-                    .is_none_or(|current: &EdgeVersion| {
-                        (edge.transaction_time(), edge.version())
-                            > (current.transaction_time(), current.version())
-                    });
-                if replace {
-                    latest_by_id.insert(edge.id(), edge.clone());
-                }
-            }
-            let mut rows = latest_by_id
-                .into_values()
+                .filter_map(|mutation| match mutation {
+                    LogicalMutation::PutEdge(edge) => Some(edge.id()),
+                    LogicalMutation::DeleteEdge(tombstone) => Some(tombstone.id()),
+                    _ => None,
+                })
+                .filter(|id| request.after().is_none_or(|after| *id > after))
+                .collect::<BTreeSet<_>>();
+            let mut rows = ids
+                .into_iter()
+                .filter_map(|id| {
+                    visible_edge(
+                        &self.state.history,
+                        &EdgeRead::new(id, request.valid_at(), request.transaction_at()),
+                    )
+                })
                 .take(request.limit() as usize + 1)
                 .collect::<Vec<_>>();
             let next_after = (rows.len() > request.limit() as usize)
@@ -1097,24 +1244,24 @@ impl PushdownExecutor for TestStore {
                 .intersection(request.required_capabilities());
             let state = self.state.lock().unwrap().clone();
             let rows = match request.operation() {
-                PushdownOperation::Vertex(read) => state
-                    .vertices
-                    .get(&read.id())
-                    .and_then(|versions| visible_vertex(versions, read))
+                PushdownOperation::Vertex(read) => visible_vertex(&state.history, read)
                     .map(SnapshotRecord::Vertex)
                     .into_iter()
                     .collect(),
                 PushdownOperation::VertexScan(scan) => state
-                    .vertices
-                    .values()
-                    .filter_map(|versions| {
+                    .history
+                    .iter()
+                    .filter_map(|mutation| match mutation {
+                        LogicalMutation::PutVertex(vertex) => Some(vertex.id()),
+                        LogicalMutation::DeleteVertex(tombstone) => Some(tombstone.id()),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .filter_map(|id| {
                         visible_vertex(
-                            versions,
-                            &VertexRead::new(
-                                versions.first().unwrap().id(),
-                                scan.valid_at(),
-                                scan.transaction_at(),
-                            ),
+                            &state.history,
+                            &VertexRead::new(id, scan.valid_at(), scan.transaction_at()),
                         )
                     })
                     .take(scan.limit() as usize)
@@ -1165,11 +1312,25 @@ impl LogicalSnapshotSource for TestStore {
                 state.applied_index,
                 1,
             )?;
-            let mut records = Vec::new();
-            for versions in state.vertices.values() {
-                records.extend(versions.iter().cloned().map(SnapshotRecord::Vertex));
-            }
-            records.extend(state.edges.into_iter().map(SnapshotRecord::Edge));
+            let mut records = state
+                .history
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    LogicalMutation::PutVertex(vertex) => {
+                        Some(SnapshotRecord::Vertex(vertex.clone()))
+                    }
+                    LogicalMutation::DeleteVertex(tombstone) => {
+                        Some(SnapshotRecord::VertexTombstone(tombstone.clone()))
+                    }
+                    LogicalMutation::PutEdge(edge) => Some(SnapshotRecord::Edge(edge.clone())),
+                    LogicalMutation::DeleteEdge(tombstone) => {
+                        Some(SnapshotRecord::EdgeTombstone(tombstone.clone()))
+                    }
+                    LogicalMutation::PutTransaction(_) | LogicalMutation::PutReplicaMetadata(_) => {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
             records.extend(
                 state
                     .transactions
@@ -1182,6 +1343,20 @@ impl LogicalSnapshotSource for TestStore {
                     .into_iter()
                     .map(SnapshotRecord::ReplicaMetadata),
             );
+            records.extend(state.replay.into_iter().map(|(raft_index, replay)| {
+                SnapshotRecord::Replay(
+                    SnapshotReplayRecord::new(
+                        raft_index,
+                        replay.term,
+                        replay.command_id,
+                        replay.digest,
+                    )
+                    .expect("stored replay identity was validated on apply"),
+                )
+            }));
+            records.extend(state.changes.into_iter().map(|(cursor, mutation)| {
+                SnapshotRecord::Change(ChangeRecord::new(cursor, mutation))
+            }));
             let chunks = records
                 .chunks(request.max_records_per_chunk() as usize)
                 .enumerate()
@@ -1301,16 +1476,39 @@ impl LogicalSnapshotWriter for TestSnapshotWriter {
             {
                 match record {
                     SnapshotRecord::Vertex(vertex) => {
+                        next.history
+                            .push(LogicalMutation::PutVertex(vertex.clone()));
                         next.vertices.entry(vertex.id()).or_default().push(vertex);
                     }
+                    SnapshotRecord::VertexTombstone(tombstone) => {
+                        next.history.push(LogicalMutation::DeleteVertex(tombstone));
+                    }
                     SnapshotRecord::Edge(edge) => {
+                        next.history.push(LogicalMutation::PutEdge(edge.clone()));
                         next.edges.push(edge);
+                    }
+                    SnapshotRecord::EdgeTombstone(tombstone) => {
+                        next.history.push(LogicalMutation::DeleteEdge(tombstone));
                     }
                     SnapshotRecord::Transaction(transaction) => {
                         next.transactions.push(transaction);
                     }
                     SnapshotRecord::ReplicaMetadata(metadata) => {
                         next.metadata.push(metadata);
+                    }
+                    SnapshotRecord::Replay(replay) => {
+                        next.replay.insert(
+                            replay.raft_index(),
+                            ReplayRecord {
+                                term: replay.raft_term(),
+                                command_id: replay.command_id(),
+                                digest: replay.mutation_digest(),
+                            },
+                        );
+                    }
+                    SnapshotRecord::Change(change) => {
+                        next.changes
+                            .push((change.cursor(), change.mutation().clone()));
                     }
                 }
             }

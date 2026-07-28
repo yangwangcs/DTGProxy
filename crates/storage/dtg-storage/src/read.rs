@@ -211,6 +211,14 @@ impl AdjacencyRead {
             && edge.transaction_time() <= self.transaction_at
     }
 
+    pub const fn valid_at(&self) -> i64 {
+        self.valid_at
+    }
+
+    pub const fn transaction_at(&self) -> TransactionTime {
+        self.transaction_at
+    }
+
     pub const fn limit(&self) -> u32 {
         self.limit
     }
@@ -218,27 +226,38 @@ impl AdjacencyRead {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangesRead {
-    after_index: u64,
+    after: Option<ChangeCursor>,
     through_index: u64,
     limit: u32,
 }
 
 impl ChangesRead {
-    pub fn new(after_index: u64, through_index: u64, limit: u32) -> Result<Self, StorageError> {
-        if after_index > through_index || limit == 0 {
+    pub fn new(
+        after: Option<ChangeCursor>,
+        through_index: u64,
+        limit: u32,
+    ) -> Result<Self, StorageError> {
+        if after.is_some_and(|cursor| cursor.raft_index() > through_index) || limit == 0 {
             return Err(StorageError::InvalidMutation(
                 "change bounds must be ordered and nonempty".into(),
             ));
         }
         Ok(Self {
-            after_index,
+            after,
             through_index,
             limit,
         })
     }
 
-    pub const fn includes(&self, index: u64) -> bool {
-        self.after_index < index && index <= self.through_index
+    pub const fn includes(&self, cursor: ChangeCursor) -> bool {
+        (match self.after {
+            Some(after) => {
+                after.raft_index < cursor.raft_index
+                    || (after.raft_index == cursor.raft_index
+                        && after.mutation_ordinal < cursor.mutation_ordinal)
+            }
+            None => true,
+        }) && cursor.raft_index <= self.through_index
     }
 
     pub const fn limit(&self) -> u32 {
@@ -246,22 +265,50 @@ impl ChangesRead {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub struct ChangeCursor {
+    raft_index: u64,
+    mutation_ordinal: u64,
+}
+
+impl ChangeCursor {
+    pub const fn new(raft_index: u64, mutation_ordinal: u64) -> Self {
+        Self {
+            raft_index,
+            mutation_ordinal,
+        }
+    }
+
+    pub const fn raft_index(self) -> u64 {
+        self.raft_index
+    }
+
+    pub const fn mutation_ordinal(self) -> u64 {
+        self.mutation_ordinal
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangeRecord {
-    raft_index: u64,
+    cursor: ChangeCursor,
     mutation: LogicalMutation,
 }
 
 impl ChangeRecord {
-    pub const fn new(raft_index: u64, mutation: LogicalMutation) -> Self {
-        Self {
-            raft_index,
-            mutation,
-        }
+    pub const fn new(cursor: ChangeCursor, mutation: LogicalMutation) -> Self {
+        Self { cursor, mutation }
+    }
+
+    pub const fn cursor(&self) -> ChangeCursor {
+        self.cursor
     }
 
     pub const fn raft_index(&self) -> u64 {
-        self.raft_index
+        self.cursor.raft_index()
+    }
+
+    pub const fn mutation_ordinal(&self) -> u64 {
+        self.cursor.mutation_ordinal()
     }
 
     pub const fn mutation(&self) -> &LogicalMutation {
@@ -272,23 +319,20 @@ impl ChangeRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangePage {
     rows: Vec<ChangeRecord>,
-    next_after_index: Option<u64>,
+    next_after: Option<ChangeCursor>,
 }
 
 impl ChangePage {
-    pub const fn new(rows: Vec<ChangeRecord>, next_after_index: Option<u64>) -> Self {
-        Self {
-            rows,
-            next_after_index,
-        }
+    pub const fn new(rows: Vec<ChangeRecord>, next_after: Option<ChangeCursor>) -> Self {
+        Self { rows, next_after }
     }
 
     pub fn rows(&self) -> &[ChangeRecord] {
         &self.rows
     }
 
-    pub const fn next_after_index(&self) -> Option<u64> {
-        self.next_after_index
+    pub const fn next_after(&self) -> Option<ChangeCursor> {
+        self.next_after
     }
 }
 

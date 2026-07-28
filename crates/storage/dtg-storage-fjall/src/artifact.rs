@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, sync::MutexGuard};
 
 use dtg_storage::{
     ArtifactChunk, ArtifactKey, ArtifactKind, ArtifactManifest, ArtifactStore, ReplicaBinding,
@@ -46,6 +46,13 @@ impl FjallArtifactStore {
             })
         }
     }
+
+    fn lock(&self) -> Result<MutexGuard<'_, ()>, StorageError> {
+        self.namespace
+            .artifact_guard
+            .lock()
+            .map_err(|_| StorageError::Internal("Fjall artifact lock is poisoned".into()))
+    }
 }
 
 impl ArtifactStore for FjallArtifactStore {
@@ -55,13 +62,36 @@ impl ArtifactStore for FjallArtifactStore {
 
     fn put_chunk(&self, binding: ReplicaBinding, chunk: ArtifactChunk) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
             self.verify_binding(&binding)?;
+            let key = chunk_key(chunk.key(), chunk.ordinal());
+            if self
+                .namespace
+                .artifact
+                .get(manifest_key(chunk.key()))
+                .map_err(fjall_error)?
+                .is_some()
+            {
+                let existing = self
+                    .namespace
+                    .artifact
+                    .get(&key)
+                    .map_err(fjall_error)?
+                    .ok_or_else(|| {
+                        StorageError::InvalidArtifact(
+                            "committed artifact is missing an immutable chunk".into(),
+                        )
+                    })?;
+                if decode_artifact_chunk(&existing)? == chunk {
+                    return Ok(());
+                }
+                return Err(StorageError::InvalidArtifact(
+                    "committed artifact chunks are immutable".into(),
+                ));
+            }
             self.namespace
                 .artifact
-                .insert(
-                    chunk_key(chunk.key(), chunk.ordinal()),
-                    encode_artifact_chunk(&chunk)?,
-                )
+                .insert(key, encode_artifact_chunk(&chunk)?)
                 .map_err(fjall_error)?;
             self.namespace
                 .db
@@ -77,13 +107,27 @@ impl ArtifactStore for FjallArtifactStore {
         ordinal: u64,
     ) -> StoreFuture<'_, Option<ArtifactChunk>> {
         Box::pin(async move {
+            let _guard = self.lock()?;
             self.verify_binding(&binding)?;
-            self.namespace
+            if let Some((_, chunks)) = load_published_artifact(&self.namespace, key)? {
+                return Ok(chunks.into_iter().find(|chunk| chunk.ordinal() == ordinal));
+            }
+            let chunk = self
+                .namespace
                 .artifact
                 .get(chunk_key(key, ordinal))
                 .map_err(fjall_error)?
                 .map(|bytes| decode_artifact_chunk(&bytes))
-                .transpose()
+                .transpose()?;
+            if chunk
+                .as_ref()
+                .is_some_and(|chunk| chunk.key() != key || chunk.ordinal() != ordinal)
+            {
+                return Err(StorageError::InvalidArtifact(
+                    "stored artifact chunk identity mismatch".into(),
+                ));
+            }
+            Ok(chunk)
         })
     }
 
@@ -93,7 +137,25 @@ impl ArtifactStore for FjallArtifactStore {
         manifest: ArtifactManifest,
     ) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
             self.verify_binding(&binding)?;
+            if let Some(stored) = self
+                .namespace
+                .artifact
+                .get(manifest_key(manifest.key()))
+                .map_err(fjall_error)?
+            {
+                let stored = decode_artifact_manifest(&stored)?;
+                if stored.key != manifest.key()
+                    || stored.chunk_count != manifest.chunk_count()
+                    || stored.total_bytes != manifest.total_bytes()
+                    || stored.content_digest != manifest.content_digest()
+                {
+                    return Err(StorageError::InvalidArtifact(
+                        "committed artifact manifest is immutable".into(),
+                    ));
+                }
+            }
             let chunks = load_chunks(&self.namespace, manifest.key())?;
             let expected = ArtifactManifest::new(manifest.key(), &chunks)?;
             if expected != manifest {
@@ -101,17 +163,24 @@ impl ArtifactStore for FjallArtifactStore {
                     "artifact manifest does not match stored chunks".into(),
                 ));
             }
-            self.namespace
-                .artifact
-                .insert(
-                    manifest_key(manifest.key()),
-                    encode_artifact_manifest(&manifest)?,
-                )
-                .map_err(fjall_error)?;
-            self.namespace
+            let mut batch = self
+                .namespace
                 .db
-                .persist(PersistMode::SyncAll)
-                .map_err(fjall_error)
+                .batch()
+                .durability(Some(PersistMode::SyncAll));
+            for chunk in &chunks {
+                batch.insert(
+                    &self.namespace.artifact,
+                    chunk_key(chunk.key(), chunk.ordinal()),
+                    encode_artifact_chunk(chunk)?,
+                );
+            }
+            batch.insert(
+                &self.namespace.artifact,
+                manifest_key(manifest.key()),
+                encode_artifact_manifest(&manifest)?,
+            );
+            batch.commit().map_err(fjall_error)
         })
     }
 
@@ -121,36 +190,15 @@ impl ArtifactStore for FjallArtifactStore {
         key: ArtifactKey,
     ) -> StoreFuture<'_, Option<ArtifactManifest>> {
         Box::pin(async move {
+            let _guard = self.lock()?;
             self.verify_binding(&binding)?;
-            let Some(bytes) = self
-                .namespace
-                .artifact
-                .get(manifest_key(key))
-                .map_err(fjall_error)?
-            else {
-                return Ok(None);
-            };
-            let stored = decode_artifact_manifest(&bytes)?;
-            if stored.key != key {
-                return Err(StorageError::InvalidArtifact(
-                    "stored artifact manifest identity mismatch".into(),
-                ));
-            }
-            let manifest = ArtifactManifest::new(key, &load_chunks(&self.namespace, key)?)?;
-            if manifest.chunk_count() != stored.chunk_count
-                || manifest.total_bytes() != stored.total_bytes
-                || manifest.content_digest() != stored.content_digest
-            {
-                return Err(StorageError::InvalidArtifact(
-                    "stored artifact manifest is corrupt".into(),
-                ));
-            }
-            Ok(Some(manifest))
+            Ok(load_published_artifact(&self.namespace, key)?.map(|(manifest, _)| manifest))
         })
     }
 
     fn delete(&self, binding: ReplicaBinding, key: ArtifactKey) -> StoreFuture<'_, ()> {
         Box::pin(async move {
+            let _guard = self.lock()?;
             self.verify_binding(&binding)?;
             let prefix = chunk_prefix(key);
             let keys = self
@@ -185,6 +233,36 @@ fn load_chunks(
             decode_artifact_chunk(&value)
         })
         .collect()
+}
+
+fn load_published_artifact(
+    namespace: &NamespaceDb,
+    key: ArtifactKey,
+) -> Result<Option<(ArtifactManifest, Vec<ArtifactChunk>)>, StorageError> {
+    let Some(bytes) = namespace
+        .artifact
+        .get(manifest_key(key))
+        .map_err(fjall_error)?
+    else {
+        return Ok(None);
+    };
+    let stored = decode_artifact_manifest(&bytes)?;
+    if stored.key != key {
+        return Err(StorageError::InvalidArtifact(
+            "stored artifact manifest identity mismatch".into(),
+        ));
+    }
+    let chunks = load_chunks(namespace, key)?;
+    let manifest = ArtifactManifest::new(key, &chunks)?;
+    if manifest.chunk_count() != stored.chunk_count
+        || manifest.total_bytes() != stored.total_bytes
+        || manifest.content_digest() != stored.content_digest
+    {
+        return Err(StorageError::InvalidArtifact(
+            "stored artifact manifest is corrupt".into(),
+        ));
+    }
+    Ok(Some((manifest, chunks)))
 }
 
 fn artifact_identity(prefix: u8, key: ArtifactKey) -> Vec<u8> {

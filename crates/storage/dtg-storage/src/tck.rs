@@ -3,12 +3,13 @@ use std::collections::BTreeMap;
 use dtg_kernel::{Digest32, TransactionId, TransactionTime, ValidInterval, Value, Version};
 
 use crate::{
-    CapabilityManifest, CommandId, CommittedShardBatch, EdgeId, EdgeRead, EdgeScan, EdgeVersion,
-    LogicalMutation, LogicalSnapshotSink, LogicalSnapshotSource, PushdownExecutor,
-    PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence, ReplicaBinding,
-    ReplicaMetadata, ReplicaStateStore, SUPPORTED_PUSHDOWN_CONTRACT_VERSION, SnapshotRecord,
+    AdjacencyDirection, AdjacencyRead, CapabilityManifest, ChangeCursor, CommandId,
+    CommittedShardBatch, EdgeId, EdgeRead, EdgeScan, EdgeTombstone, EdgeVersion, LogicalMutation,
+    LogicalSnapshotSink, LogicalSnapshotSource, PushdownExecutor, PushdownOperation,
+    PushdownOutcome, PushdownRequest, ReadFence, ReplicaBinding, ReplicaMetadata,
+    ReplicaStateStore, SUPPORTED_PUSHDOWN_CONTRACT_VERSION, SnapshotRecord, SnapshotReplayRecord,
     SnapshotRequest, SnapshotRestoreReceipt, StorageError, StoreFuture, TransactionRecord,
-    TransactionState, VertexId, VertexRead, VertexScan, VertexVersion,
+    TransactionState, VertexId, VertexRead, VertexScan, VertexTombstone, VertexVersion,
 };
 
 /// Certification-only adapter implemented by provider test harnesses.
@@ -129,6 +130,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
                 LogicalMutation::PutReplicaMetadata(metadata.clone()),
             ],
         )?;
+        expected_snapshot_records.extend(snapshot_state_records(&first_batch)?);
         let receipt = primary.apply(first_batch.clone()).await?;
         require(!receipt.replayed(), "first apply was marked as replay")?;
         require(
@@ -264,7 +266,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             "execution-stage failure changed logical scan visibility",
         )?;
         let after_failed_changes = after_failed_view
-            .changes(crate::ChangesRead::new(0, 2, 32)?)
+            .changes(crate::ChangesRead::new(None, 2, 32)?)
             .await?;
         require(
             after_failed_changes.rows().len() == first_batch.mutations().len()
@@ -301,7 +303,11 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             )?;
         }
         let retry_changes = committed_after_retry
-            .changes(crate::ChangesRead::new(1, 2, 16)?)
+            .changes(crate::ChangesRead::new(
+                Some(ChangeCursor::new(1, u64::MAX)),
+                2,
+                16,
+            )?)
             .await?;
         require(
             retry_changes.rows().len() == execution_failure.mutations().len()
@@ -314,6 +320,9 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
                     }),
             "retry after injected failure did not publish its complete change set",
         )?;
+        expected_snapshot_records.push(SnapshotRecord::Vertex(staged_vertex.clone()));
+        expected_snapshot_records.push(SnapshotRecord::Vertex(second_staged_vertex.clone()));
+        expected_snapshot_records.extend(snapshot_state_records(&execution_failure)?);
         let retry_replay = primary.apply(execution_failure).await?;
         require(
             retry_replay.replayed(),
@@ -327,15 +336,16 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             .begin_read_view(ReadFence::new(primary_binding.clone(), 2))
             .await?;
         let after_retry_replay_changes = after_retry_replay
-            .changes(crate::ChangesRead::new(1, 2, 16)?)
+            .changes(crate::ChangesRead::new(
+                Some(ChangeCursor::new(1, u64::MAX)),
+                2,
+                16,
+            )?)
             .await?;
         require(
             after_retry_replay_changes.rows() == retry_changes.rows(),
             "idempotent retry replay duplicated or reordered observable changes",
         )?;
-        expected_snapshot_records.push(SnapshotRecord::Vertex(staged_vertex.clone()));
-        expected_snapshot_records.push(SnapshotRecord::Vertex(second_staged_vertex.clone()));
-
         let drifted_fence =
             ReadFence::with_capability_digest(primary_binding.clone(), 2, Digest32::new([9; 32]));
         require_error(
@@ -552,14 +562,59 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             }
         }
         require(
-            large_edge_page.rows() == [latest_first_edge, second_edge]
+            large_edge_page.rows() == [latest_first_edge, second_edge.clone()]
                 && paged_edges == large_edge_page.rows(),
             "edge scan pagination skipped, duplicated, or returned multiple versions per edge ID",
         )?;
 
+        let large_change_page = current
+            .changes(crate::ChangesRead::new(None, 1, 32)?)
+            .await?;
+        let mut paged_changes = Vec::new();
+        let mut change_after = None;
+        loop {
+            let page = current
+                .changes(crate::ChangesRead::new(change_after, 1, 1)?)
+                .await?;
+            paged_changes.extend_from_slice(page.rows());
+            match page.next_after() {
+                Some(cursor) => change_after = Some(cursor),
+                None => break,
+            }
+        }
+        require(
+            paged_changes == large_change_page.rows(),
+            "change pagination lost or duplicated mutations sharing one Raft index",
+        )?;
+
+        let deleted_vertex = VertexTombstone::new(
+            second_staged_vertex.id(),
+            Version::new(2),
+            TransactionTime::new(3).map_err(kernel_error)?,
+        );
+        let deleted_edge = EdgeTombstone::new(
+            second_edge.id(),
+            Version::new(2),
+            TransactionTime::new(3).map_err(kernel_error)?,
+        );
+        let delete_batch = CommittedShardBatch::new(
+            primary_binding.clone(),
+            4,
+            3,
+            CommandId::new(7003)?,
+            vec![
+                LogicalMutation::DeleteVertex(deleted_vertex.clone()),
+                LogicalMutation::DeleteEdge(deleted_edge.clone()),
+            ],
+        )?;
+        primary.apply(delete_batch.clone()).await?;
+        expected_snapshot_records.push(SnapshotRecord::VertexTombstone(deleted_vertex));
+        expected_snapshot_records.push(SnapshotRecord::EdgeTombstone(deleted_edge));
+        expected_snapshot_records.extend(snapshot_state_records(&delete_batch)?);
+
         let mut reader = primary
             .begin_snapshot(
-                ReadFence::new(primary_binding.clone(), 2),
+                ReadFence::new(primary_binding.clone(), 3),
                 SnapshotRequest::new(9001, 1)?,
             )
             .await?;
@@ -590,6 +645,16 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
 
         let restored_binding = factory.binding("tck-restored", 2)?;
         let restored = factory.open(restored_binding.clone()).await?;
+        let dirty_vertex = sample_vertex(999, 1, "dirty-target")?;
+        restored
+            .apply(CommittedShardBatch::new(
+                restored_binding.clone(),
+                9,
+                1,
+                CommandId::new(9901)?,
+                vec![LogicalMutation::PutVertex(dirty_vertex.clone())],
+            )?)
+            .await?;
         let mut writer = restored
             .begin_restore(restored_binding.clone(), header)
             .await?;
@@ -606,12 +671,90 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             "restore receipt lost manifest identity",
         )?;
         let restored_export =
-            export_snapshot_records(&*restored, &restored_binding, 2, 9002, 2).await?;
+            export_snapshot_records(&*restored, &restored_binding, 3, 9002, 2).await?;
         require_complete_snapshot_categories(&restored_export)?;
         require(
+            restored_export
+                .iter()
+                .any(|record| matches!(record, SnapshotRecord::VertexTombstone(_)))
+                && restored_export
+                    .iter()
+                    .any(|record| matches!(record, SnapshotRecord::EdgeTombstone(_))),
+            "snapshot omitted vertex or edge deletion history",
+        )?;
+        require(
             canonical_snapshot_records(restored_export)
-                == canonical_snapshot_records(expected_snapshot_records),
+                == canonical_snapshot_records(expected_snapshot_records.clone()),
             "logical snapshot did not round-trip all typed record categories",
+        )?;
+        let restored_view = restored
+            .begin_read_view(ReadFence::new(restored_binding.clone(), 3))
+            .await?;
+        require(
+            restored_view
+                .get_vertex(VertexRead::new(
+                    dirty_vertex.id(),
+                    10,
+                    TransactionTime::new(10).map_err(kernel_error)?,
+                ))
+                .await?
+                .is_none(),
+            "snapshot restore merged dirty target state instead of replacing it",
+        )?;
+        require(
+            restored_view
+                .get_vertex(VertexRead::new(
+                    second_staged_vertex.id(),
+                    10,
+                    TransactionTime::new(10).map_err(kernel_error)?,
+                ))
+                .await?
+                .is_none()
+                && restored_view
+                    .get_edge(EdgeRead::new(
+                        second_edge.id(),
+                        10,
+                        TransactionTime::new(10).map_err(kernel_error)?,
+                    ))
+                    .await?
+                    .is_none(),
+            "snapshot restore resurrected deleted logical records",
+        )?;
+        let replay_delete = CommittedShardBatch::new(
+            restored_binding.clone(),
+            delete_batch.raft_term(),
+            delete_batch.raft_index(),
+            delete_batch.command_id(),
+            delete_batch.mutations().to_vec(),
+        )?;
+        require(
+            restored.apply(replay_delete).await?.replayed(),
+            "snapshot restore did not preserve replay identity",
+        )?;
+        let continued_vertex = sample_vertex(1000, 1, "continued")?;
+        restored
+            .apply(CommittedShardBatch::new(
+                restored_binding.clone(),
+                5,
+                4,
+                CommandId::new(7004)?,
+                vec![LogicalMutation::PutVertex(continued_vertex.clone())],
+            )?)
+            .await?;
+        let reopened = factory.open(restored_binding.clone()).await?;
+        let reopened_view = reopened
+            .begin_read_view(ReadFence::new(restored_binding, 4))
+            .await?;
+        require(
+            reopened_view
+                .get_vertex(VertexRead::new(
+                    continued_vertex.id(),
+                    10,
+                    TransactionTime::new(10).map_err(kernel_error)?,
+                ))
+                .await?
+                == Some(continued_vertex),
+            "restored state did not survive reopen and continued writes",
         )?;
 
         let isolated_binding = factory.binding("tck-isolated", 1)?;
@@ -664,6 +807,90 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
                 .await?
                 .is_none(),
             "isolated namespace write leaked into the primary namespace",
+        )?;
+
+        let adjacency_binding = factory.binding("tck-adjacency", 1)?;
+        let adjacency_store = factory.open(adjacency_binding.clone()).await?;
+        let old_source = VertexId::new(501)?;
+        let old_target = VertexId::new(502)?;
+        let new_source = VertexId::new(503)?;
+        let new_target = VertexId::new(504)?;
+        let old_edge = sample_edge_version(601, old_source, old_target, "moved", 1)?;
+        let moved_edge = sample_edge_version(601, new_source, new_target, "moved", 2)?;
+        adjacency_store
+            .apply(CommittedShardBatch::new(
+                adjacency_binding.clone(),
+                1,
+                1,
+                CommandId::new(9601)?,
+                vec![
+                    LogicalMutation::PutEdge(old_edge),
+                    LogicalMutation::PutEdge(moved_edge.clone()),
+                ],
+            )?)
+            .await?;
+        let moved_view = adjacency_store
+            .begin_read_view(ReadFence::new(adjacency_binding.clone(), 1))
+            .await?;
+        require(
+            moved_view
+                .expand(AdjacencyRead::new(
+                    old_source,
+                    AdjacencyDirection::Outgoing,
+                    10,
+                    TransactionTime::new(10).map_err(kernel_error)?,
+                    10,
+                )?)
+                .await?
+                .is_empty(),
+            "adjacency retained an edge under its superseded endpoint",
+        )?;
+        require(
+            moved_view
+                .expand(AdjacencyRead::new(
+                    new_source,
+                    AdjacencyDirection::Outgoing,
+                    10,
+                    TransactionTime::new(10).map_err(kernel_error)?,
+                    10,
+                )?)
+                .await?
+                == [moved_edge.clone()],
+            "adjacency did not resolve the latest moved edge version",
+        )?;
+        adjacency_store
+            .apply(CommittedShardBatch::new(
+                adjacency_binding.clone(),
+                1,
+                2,
+                CommandId::new(9602)?,
+                vec![
+                    LogicalMutation::PutEdge(sample_edge_version(
+                        601, new_source, new_target, "moved", 3,
+                    )?),
+                    LogicalMutation::DeleteEdge(EdgeTombstone::new(
+                        moved_edge.id(),
+                        Version::new(4),
+                        TransactionTime::new(4).map_err(kernel_error)?,
+                    )),
+                ],
+            )?)
+            .await?;
+        let deleted_view = adjacency_store
+            .begin_read_view(ReadFence::new(adjacency_binding, 2))
+            .await?;
+        require(
+            deleted_view
+                .expand(AdjacencyRead::new(
+                    new_source,
+                    AdjacencyDirection::Both,
+                    10,
+                    TransactionTime::new(10).map_err(kernel_error)?,
+                    10,
+                )?)
+                .await?
+                .is_empty(),
+            "adjacency returned an edge whose latest event is a tombstone",
         )?;
 
         let wrong_owner = primary_binding.to_builder().backend_generation(2).build()?;
@@ -734,6 +961,32 @@ fn sample_transaction(id: u128) -> Result<TransactionRecord, StorageError> {
     )
 }
 
+fn snapshot_state_records(
+    batch: &CommittedShardBatch,
+) -> Result<Vec<SnapshotRecord>, StorageError> {
+    let mut records = Vec::with_capacity(batch.mutations().len() + 1);
+    records.push(SnapshotRecord::Replay(SnapshotReplayRecord::new(
+        batch.raft_index(),
+        batch.raft_term(),
+        batch.command_id(),
+        batch.mutation_digest(),
+    )?));
+    records.extend(
+        batch
+            .mutations()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(ordinal, mutation)| {
+                SnapshotRecord::Change(crate::ChangeRecord::new(
+                    ChangeCursor::new(batch.raft_index(), ordinal as u64),
+                    mutation,
+                ))
+            }),
+    );
+    Ok(records)
+}
+
 async fn export_snapshot_records(
     store: &dyn StorageTckStore,
     binding: &ReplicaBinding,
@@ -764,16 +1017,22 @@ fn require_complete_snapshot_categories(records: &[SnapshotRecord]) -> Result<()
     let mut edges = false;
     let mut transactions = false;
     let mut metadata = false;
+    let mut replay = false;
+    let mut changes = false;
     for record in records {
         match record {
             SnapshotRecord::Vertex(_) => vertices = true,
+            SnapshotRecord::VertexTombstone(_) => {}
             SnapshotRecord::Edge(_) => edges = true,
+            SnapshotRecord::EdgeTombstone(_) => {}
             SnapshotRecord::Transaction(_) => transactions = true,
             SnapshotRecord::ReplicaMetadata(_) => metadata = true,
+            SnapshotRecord::Replay(_) => replay = true,
+            SnapshotRecord::Change(_) => changes = true,
         }
     }
     require(
-        vertices && edges && transactions && metadata,
+        vertices && edges && transactions && metadata && replay && changes,
         "snapshot omitted a required typed logical record category",
     )
 }
@@ -799,14 +1058,42 @@ fn snapshot_record_key(record: &SnapshotRecord) -> (u8, u128, u64, i64, String) 
             edge.transaction_time().get(),
             String::new(),
         ),
-        SnapshotRecord::Transaction(transaction) => (
+        SnapshotRecord::VertexTombstone(tombstone) => (
             3,
+            tombstone.id().get(),
+            tombstone.version().get(),
+            tombstone.transaction_time().get(),
+            String::new(),
+        ),
+        SnapshotRecord::EdgeTombstone(tombstone) => (
+            4,
+            tombstone.id().get(),
+            tombstone.version().get(),
+            tombstone.transaction_time().get(),
+            String::new(),
+        ),
+        SnapshotRecord::Transaction(transaction) => (
+            5,
             transaction.id().get(),
             0,
             transaction.transaction_time().get(),
             String::new(),
         ),
-        SnapshotRecord::ReplicaMetadata(metadata) => (4, 0, 0, 0, metadata.name().to_owned()),
+        SnapshotRecord::ReplicaMetadata(metadata) => (6, 0, 0, 0, metadata.name().to_owned()),
+        SnapshotRecord::Replay(replay) => (
+            7,
+            u128::from(replay.raft_index()),
+            replay.raft_term(),
+            0,
+            replay.command_id().get().to_string(),
+        ),
+        SnapshotRecord::Change(change) => (
+            8,
+            u128::from(change.raft_index()),
+            change.mutation_ordinal(),
+            0,
+            format!("{:?}", change.mutation()),
+        ),
     }
 }
 
