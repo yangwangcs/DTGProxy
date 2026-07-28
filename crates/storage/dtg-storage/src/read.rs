@@ -372,28 +372,43 @@ impl EdgeScan {
             && edge.transaction_time() <= self.transaction_at
     }
 
+    pub const fn valid_at(&self) -> i64 {
+        self.valid_at
+    }
+
+    pub const fn transaction_at(&self) -> TransactionTime {
+        self.transaction_at
+    }
+
+    pub const fn after(&self) -> Option<EdgeId> {
+        self.after
+    }
+
     pub const fn limit(&self) -> u32 {
         self.limit
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScanPage<T> {
+pub struct ScanPage<T, C> {
     rows: Vec<T>,
-    next_offset: Option<u64>,
+    next_after: Option<C>,
 }
 
-impl<T> ScanPage<T> {
-    pub const fn new(rows: Vec<T>, next_offset: Option<u64>) -> Self {
-        Self { rows, next_offset }
+impl<T, C> ScanPage<T, C> {
+    pub const fn new(rows: Vec<T>, next_after: Option<C>) -> Self {
+        Self { rows, next_after }
     }
 
     pub fn rows(&self) -> &[T] {
         &self.rows
     }
 
-    pub const fn next_offset(&self) -> Option<u64> {
-        self.next_offset
+    pub const fn next_after(&self) -> Option<C>
+    where
+        C: Copy,
+    {
+        self.next_after
     }
 }
 
@@ -412,6 +427,9 @@ pub trait TemporalReadView: Send + Sync {
     fn edge_history(&self, request: EdgeHistoryRead) -> StoreFuture<'_, Vec<EdgeVersion>>;
     fn expand(&self, request: AdjacencyRead) -> StoreFuture<'_, Vec<EdgeVersion>>;
     fn changes(&self, request: ChangesRead) -> StoreFuture<'_, ChangePage>;
-    fn scan_vertices(&self, request: VertexScan) -> StoreFuture<'_, ScanPage<VertexVersion>>;
-    fn scan_edges(&self, request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion>>;
+    fn scan_vertices(
+        &self,
+        request: VertexScan,
+    ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>>;
+    fn scan_edges(&self, request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion, EdgeId>>;
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
@@ -6,15 +6,18 @@ use std::task::{Context, Poll, Waker};
 
 use dtg_storage::{
     AdjacencyRead, ApplyReceipt, ArtifactStore, BackendClass, BindingRole, CapabilityManifest,
-    ChangePage, ChangesRead, CommandId, CommittedShardBatch, ConsensusStore, Digest32,
-    DurabilityPolicy, EdgeHistoryRead, EdgeRead, EdgeVersion, LogicalMutation,
-    LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
-    ProviderKind, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence,
-    ReplicaBinding, ReplicaStateStore, ScanPage, SnapshotChunk, SnapshotHeader, SnapshotManifest,
+    ChangePage, ChangesRead, CommandId, CommittedShardBatch, ConsensusCommandEnvelope,
+    ConsensusEntry, ConsensusStore, Digest32, DurabilityPolicy, EdgeHistoryRead, EdgeId, EdgeRead,
+    EdgeScan, EdgeTombstone, EdgeVersion, LogicalMutation, LogicalSnapshotReader,
+    LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter, ProviderKind,
+    PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence,
+    ReplicaBinding, ReplicaMetadata, ReplicaStateStore, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
+    SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
+    SUPPORTED_SNAPSHOT_FORMAT_VERSION, ScanPage, SnapshotChunk, SnapshotHeader, SnapshotManifest,
     SnapshotRecord, SnapshotRequest, SnapshotRestoreReceipt, StorageError, StorageTckFactory,
-    StorageTckStore, StoreFuture, TemporalReadView, TransactionRecord, TransactionTime,
-    ValidInterval, Value, Version, VertexHistoryRead, VertexId, VertexRead, VertexScan,
-    VertexVersion, run_storage_tck,
+    StorageTckStore, StoreFuture, TemporalReadView, TransactionId, TransactionRecord,
+    TransactionState, TransactionTime, ValidInterval, Value, Version, VertexHistoryRead, VertexId,
+    VertexRead, VertexScan, VertexTombstone, VertexVersion, run_storage_tck,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -240,6 +243,230 @@ fn pushdown_contract_owns_binding_and_reports_partial_guarantees() {
 }
 
 #[test]
+fn unknown_snapshot_and_pushdown_versions_fail_closed() {
+    let store_binding = binding("unknown-formats", 1);
+    let snapshot_id = SnapshotRequest::new(46, 2).unwrap().snapshot_id();
+    assert!(matches!(
+        SnapshotHeader::new(snapshot_id, store_binding.clone(), 0, 2),
+        Err(StorageError::CorruptSnapshot(_))
+    ));
+    assert!(matches!(
+        PushdownRequest::new(
+            2,
+            ReadFence::new(store_binding, 0),
+            CapabilityManifest::from_names(["point"]).unwrap(),
+            PushdownOperation::Vertex(VertexRead::new(
+                VertexId::new(1).unwrap(),
+                10,
+                TransactionTime::new(10).unwrap(),
+            )),
+        ),
+        Err(StorageError::InvalidCapability(_))
+    ));
+}
+
+#[test]
+fn supported_wire_versions_are_explicit_and_consensus_is_enveloped() {
+    assert_eq!(SUPPORTED_SNAPSHOT_FORMAT_VERSION, 1);
+    assert_eq!(SUPPORTED_PUSHDOWN_CONTRACT_VERSION, 1);
+    assert_eq!(SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, 1);
+    assert_eq!(SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, 1);
+
+    assert!(matches!(
+        ConsensusCommandEnvelope::new(2, vec![1, 2, 3]),
+        Err(StorageError::InvalidConsensus(_))
+    ));
+    let command =
+        ConsensusCommandEnvelope::new(SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, vec![1, 2, 3])
+            .unwrap();
+    assert_eq!(
+        command.format_version(),
+        SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION
+    );
+    assert_eq!(command.payload(), &[1, 2, 3]);
+    assert!(matches!(
+        ConsensusEntry::new(2, 3, 4, CommandId::new(5).unwrap(), command.clone(),),
+        Err(StorageError::InvalidConsensus(_))
+    ));
+    let entry = ConsensusEntry::new(
+        SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION,
+        3,
+        4,
+        CommandId::new(5).unwrap(),
+        command.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        entry.wal_format_version(),
+        SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION
+    );
+    assert_eq!(entry.command(), &command);
+    assert_eq!(entry.command_digest(), command.digest());
+}
+
+#[test]
+fn tombstones_expose_complete_temporal_identity() {
+    let version = Version::new(7);
+    let transaction_time = TransactionTime::new(9).unwrap();
+    let vertex = VertexTombstone::new(VertexId::new(10).unwrap(), version, transaction_time);
+    assert_eq!(vertex.id(), VertexId::new(10).unwrap());
+    assert_eq!(vertex.version(), version);
+    assert_eq!(vertex.transaction_time(), transaction_time);
+
+    let edge = EdgeTombstone::new(EdgeId::new(11).unwrap(), version, transaction_time);
+    assert_eq!(edge.id(), EdgeId::new(11).unwrap());
+    assert_eq!(edge.version(), version);
+    assert_eq!(edge.transaction_time(), transaction_time);
+}
+
+#[test]
+fn scan_pages_preserve_typed_128_bit_cursors_for_next_requests() {
+    let vertex_cursor = VertexId::new(u128::from(u64::MAX) + 101).unwrap();
+    let vertex_page = ScanPage::<VertexVersion, VertexId>::new(Vec::new(), Some(vertex_cursor));
+    let next_vertex_request = VertexScan::new(
+        10,
+        TransactionTime::new(10).unwrap(),
+        vertex_page.next_after(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(next_vertex_request.after(), Some(vertex_cursor));
+
+    let edge_cursor = EdgeId::new(u128::from(u64::MAX) + 202).unwrap();
+    let edge_page = ScanPage::<EdgeVersion, EdgeId>::new(Vec::new(), Some(edge_cursor));
+    let next_edge_request = EdgeScan::new(
+        10,
+        TransactionTime::new(10).unwrap(),
+        edge_page.next_after(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(next_edge_request.after(), Some(edge_cursor));
+}
+
+#[test]
+fn execution_stage_failure_is_atomic() {
+    let factory = TestFactory::new();
+    let store_binding = binding("execution-failure", 1);
+    let store = block_on(factory.open(store_binding.clone())).unwrap();
+    let first = sample_vertex(1, 1);
+    let second = sample_vertex(2, 1);
+    block_on(
+        store.apply(
+            CommittedShardBatch::new(
+                store_binding.clone(),
+                1,
+                1,
+                CommandId::new(1).unwrap(),
+                vec![
+                    LogicalMutation::PutVertex(first.clone()),
+                    LogicalMutation::PutVertex(second),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let staged = sample_vertex(3, 1);
+    let invalid_edge = sample_edge(9, staged.id(), VertexId::new(4).unwrap());
+    let invalid_batch = CommittedShardBatch::new(
+        store_binding.clone(),
+        1,
+        2,
+        CommandId::new(2).unwrap(),
+        vec![
+            LogicalMutation::PutVertex(staged.clone()),
+            LogicalMutation::PutEdge(invalid_edge.clone()),
+        ],
+    )
+    .unwrap();
+    invalid_batch.validate().unwrap();
+    assert!(block_on(store.apply(invalid_batch)).is_err());
+    assert_eq!(block_on(store.applied_index()).unwrap(), 1);
+
+    let view = block_on(store.begin_read_view(ReadFence::new(store_binding, 1))).unwrap();
+    assert_eq!(
+        block_on(view.get_vertex(VertexRead::new(
+            first.id(),
+            10,
+            TransactionTime::new(10).unwrap(),
+        )))
+        .unwrap(),
+        Some(first)
+    );
+    assert!(
+        block_on(view.get_vertex(VertexRead::new(
+            staged.id(),
+            10,
+            TransactionTime::new(10).unwrap(),
+        )))
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        block_on(view.get_edge(EdgeRead::new(
+            invalid_edge.id(),
+            10,
+            TransactionTime::new(10).unwrap(),
+        )))
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn snapshot_round_trip_preserves_all_typed_records() {
+    let factory = TestFactory::new();
+    let source_binding = binding("snapshot-all-types", 1);
+    let source = block_on(factory.open(source_binding.clone())).unwrap();
+    let first = sample_vertex(11, 1);
+    let second = sample_vertex(12, 1);
+    let edge = sample_edge(13, first.id(), second.id());
+    let transaction = sample_transaction(14);
+    let metadata = ReplicaMetadata::new("lease-owner", Value::String("replica-17".into())).unwrap();
+    let expected = vec![
+        SnapshotRecord::Vertex(first.clone()),
+        SnapshotRecord::Vertex(second.clone()),
+        SnapshotRecord::Edge(edge.clone()),
+        SnapshotRecord::Transaction(transaction.clone()),
+        SnapshotRecord::ReplicaMetadata(metadata.clone()),
+    ];
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(14).unwrap(),
+                vec![
+                    LogicalMutation::PutVertex(first),
+                    LogicalMutation::PutVertex(second),
+                    LogicalMutation::PutEdge(edge),
+                    LogicalMutation::PutTransaction(transaction),
+                    LogicalMutation::PutReplicaMetadata(metadata),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let (header, chunks, manifest, records) = export_snapshot(&*source, &source_binding, 1, 47, 2);
+    assert_eq!(records, expected);
+
+    let target_binding = binding("snapshot-all-types-restored", 2);
+    let target = block_on(factory.open(target_binding.clone())).unwrap();
+    let mut writer = block_on(target.begin_restore(target_binding.clone(), header)).unwrap();
+    for chunk in chunks {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    block_on(writer.commit(manifest)).unwrap();
+    let (_, _, _, restored_records) = export_snapshot(&*target, &target_binding, 1, 48, 3);
+    assert_eq!(restored_records, expected);
+}
+
+#[test]
 fn all_async_contracts_are_object_safe() {
     fn state_store(_: &dyn ReplicaStateStore) {}
     fn read_view(_: &dyn TemporalReadView) {}
@@ -267,6 +494,18 @@ fn deterministic_store_passes_the_public_tck() {
     block_on(run_storage_tck(&TestFactory::new())).unwrap();
 }
 
+#[test]
+fn public_tck_certifies_execution_failure_and_complete_snapshot() {
+    let factory = TestFactory::new();
+    block_on(run_storage_tck(&factory)).unwrap();
+    let audit = factory.audit.lock().unwrap().clone();
+    assert!(audit.execution_stage_failures > 0);
+    assert_eq!(
+        audit.restored_record_kinds,
+        BTreeSet::from(["edge", "metadata", "transaction", "vertex"])
+    );
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReplayRecord {
     term: u64,
@@ -280,6 +519,7 @@ struct TestState {
     vertices: BTreeMap<VertexId, Vec<VertexVersion>>,
     edges: Vec<EdgeVersion>,
     transactions: Vec<TransactionRecord>,
+    metadata: Vec<ReplicaMetadata>,
     replay: BTreeMap<u64, ReplayRecord>,
     changes: Vec<(u64, LogicalMutation)>,
 }
@@ -289,6 +529,13 @@ struct TestStore {
     binding: ReplicaBinding,
     capabilities: CapabilityManifest,
     state: Arc<Mutex<TestState>>,
+    audit: Arc<Mutex<TestAudit>>,
+}
+
+#[derive(Clone, Default)]
+struct TestAudit {
+    execution_stage_failures: usize,
+    restored_record_kinds: BTreeSet<&'static str>,
 }
 
 #[derive(Default)]
@@ -300,6 +547,7 @@ struct FactoryState {
 struct TestFactory {
     state: Mutex<FactoryState>,
     capabilities: CapabilityManifest,
+    audit: Arc<Mutex<TestAudit>>,
 }
 
 impl TestFactory {
@@ -307,6 +555,7 @@ impl TestFactory {
         Self {
             state: Mutex::new(FactoryState::default()),
             capabilities: capabilities(),
+            audit: Arc::new(Mutex::new(TestAudit::default())),
         }
     }
 }
@@ -347,6 +596,7 @@ impl StorageTckFactory for TestFactory {
                 binding: requested,
                 capabilities: self.capabilities.clone(),
                 state,
+                audit: Arc::clone(&self.audit),
             }) as Box<dyn StorageTckStore>)
         })
     }
@@ -409,14 +659,28 @@ impl ReplicaStateStore for TestStore {
                     LogicalMutation::DeleteVertex(tombstone) => {
                         next.vertices.remove(&tombstone.id());
                     }
-                    LogicalMutation::PutEdge(edge) => next.edges.push(edge.clone()),
+                    LogicalMutation::PutEdge(edge) => {
+                        if !next.vertices.contains_key(&edge.source())
+                            || !next.vertices.contains_key(&edge.target())
+                        {
+                            self.audit.lock().unwrap().execution_stage_failures += 1;
+                            return Err(StorageError::ConstraintViolation(
+                                "edge endpoints must exist during atomic application".into(),
+                            ));
+                        }
+                        next.edges.push(edge.clone());
+                    }
                     LogicalMutation::DeleteEdge(tombstone) => {
                         next.edges.retain(|edge| edge.id() != tombstone.id());
                     }
                     LogicalMutation::PutTransaction(transaction) => {
                         next.transactions.push(transaction.clone());
                     }
-                    LogicalMutation::PutReplicaMetadata(_) => {}
+                    LogicalMutation::PutReplicaMetadata(metadata) => {
+                        next.metadata
+                            .retain(|existing| existing.name() != metadata.name());
+                        next.metadata.push(metadata.clone());
+                    }
                 }
                 next.changes.push((batch.raft_index(), mutation.clone()));
             }
@@ -565,13 +829,17 @@ impl TemporalReadView for TestReadView {
         })
     }
 
-    fn scan_vertices(&self, request: VertexScan) -> StoreFuture<'_, ScanPage<VertexVersion>> {
+    fn scan_vertices(
+        &self,
+        request: VertexScan,
+    ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>> {
         Box::pin(async move {
-            let rows = self
+            let mut rows = self
                 .state
                 .vertices
-                .values()
-                .filter_map(|versions| {
+                .iter()
+                .filter(|(id, _)| request.after().is_none_or(|after| **id > after))
+                .filter_map(|(_, versions)| {
                     visible_vertex(
                         versions,
                         &VertexRead::new(
@@ -581,23 +849,30 @@ impl TemporalReadView for TestReadView {
                         ),
                     )
                 })
-                .take(request.limit() as usize)
-                .collect();
-            Ok(ScanPage::new(rows, None))
+                .take(request.limit() as usize + 1)
+                .collect::<Vec<_>>();
+            let next_after = (rows.len() > request.limit() as usize)
+                .then(|| rows[request.limit() as usize - 1].id());
+            rows.truncate(request.limit() as usize);
+            Ok(ScanPage::new(rows, next_after))
         })
     }
 
-    fn scan_edges(&self, request: dtg_storage::EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion>> {
+    fn scan_edges(&self, request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion, EdgeId>> {
         Box::pin(async move {
-            let rows = self
+            let mut rows = self
                 .state
                 .edges
                 .iter()
                 .filter(|edge| request.includes(edge))
-                .take(request.limit() as usize)
                 .cloned()
-                .collect();
-            Ok(ScanPage::new(rows, None))
+                .collect::<Vec<_>>();
+            rows.sort_by_key(EdgeVersion::id);
+            rows.truncate(request.limit() as usize + 1);
+            let next_after = (rows.len() > request.limit() as usize)
+                .then(|| rows[request.limit() as usize - 1].id());
+            rows.truncate(request.limit() as usize);
+            Ok(ScanPage::new(rows, next_after))
         })
     }
 }
@@ -707,6 +982,12 @@ impl LogicalSnapshotSource for TestStore {
                     .into_iter()
                     .map(SnapshotRecord::Transaction),
             );
+            records.extend(
+                state
+                    .metadata
+                    .into_iter()
+                    .map(SnapshotRecord::ReplicaMetadata),
+            );
             let chunks = records
                 .chunks(request.max_records_per_chunk() as usize)
                 .enumerate()
@@ -773,6 +1054,7 @@ impl LogicalSnapshotSink for TestStore {
                 header,
                 chunks: Vec::new(),
                 state: Arc::clone(&self.state),
+                audit: Arc::clone(&self.audit),
             }) as Box<dyn LogicalSnapshotWriter>)
         })
     }
@@ -783,6 +1065,7 @@ struct TestSnapshotWriter {
     header: SnapshotHeader,
     chunks: Vec<SnapshotChunk>,
     state: Arc<Mutex<TestState>>,
+    audit: Arc<Mutex<TestAudit>>,
 }
 
 impl LogicalSnapshotWriter for TestSnapshotWriter {
@@ -826,13 +1109,37 @@ impl LogicalSnapshotWriter for TestSnapshotWriter {
             {
                 match record {
                     SnapshotRecord::Vertex(vertex) => {
+                        self.audit
+                            .lock()
+                            .unwrap()
+                            .restored_record_kinds
+                            .insert("vertex");
                         next.vertices.entry(vertex.id()).or_default().push(vertex);
                     }
-                    SnapshotRecord::Edge(edge) => next.edges.push(edge),
+                    SnapshotRecord::Edge(edge) => {
+                        self.audit
+                            .lock()
+                            .unwrap()
+                            .restored_record_kinds
+                            .insert("edge");
+                        next.edges.push(edge);
+                    }
                     SnapshotRecord::Transaction(transaction) => {
+                        self.audit
+                            .lock()
+                            .unwrap()
+                            .restored_record_kinds
+                            .insert("transaction");
                         next.transactions.push(transaction);
                     }
-                    SnapshotRecord::ReplicaMetadata(_) => {}
+                    SnapshotRecord::ReplicaMetadata(metadata) => {
+                        self.audit
+                            .lock()
+                            .unwrap()
+                            .restored_record_kinds
+                            .insert("metadata");
+                        next.metadata.push(metadata);
+                    }
                 }
             }
             *self.state.lock().unwrap() = next;
@@ -855,4 +1162,58 @@ fn sample_vertex(id: u128, version: u64) -> VertexVersion {
         BTreeMap::from([("name".to_owned(), Value::String(format!("v{id}")))]),
     )
     .unwrap()
+}
+
+fn sample_edge(id: u128, source: VertexId, target: VertexId) -> EdgeVersion {
+    EdgeVersion::new(
+        EdgeId::new(id).unwrap(),
+        source,
+        target,
+        "knows",
+        Version::new(1),
+        ValidInterval::new(0, 100).unwrap(),
+        TransactionTime::new(1).unwrap(),
+        BTreeMap::from([("weight".to_owned(), Value::Integer(7))]),
+    )
+    .unwrap()
+}
+
+fn sample_transaction(id: u128) -> TransactionRecord {
+    TransactionRecord::new(
+        TransactionId::new(id).unwrap(),
+        TransactionState::Committed,
+        TransactionTime::new(1).unwrap(),
+        Digest32::new([7; 32]),
+    )
+    .unwrap()
+}
+
+fn export_snapshot(
+    store: &dyn StorageTckStore,
+    binding: &ReplicaBinding,
+    applied_index: u64,
+    snapshot_id: u128,
+    max_records_per_chunk: u32,
+) -> (
+    SnapshotHeader,
+    Vec<SnapshotChunk>,
+    SnapshotManifest,
+    Vec<SnapshotRecord>,
+) {
+    let mut reader = block_on(store.begin_snapshot(
+        ReadFence::new(binding.clone(), applied_index),
+        SnapshotRequest::new(snapshot_id, max_records_per_chunk).unwrap(),
+    ))
+    .unwrap();
+    let header = reader.header().clone();
+    let mut chunks = Vec::new();
+    while let Some(chunk) = block_on(reader.next_chunk()).unwrap() {
+        chunks.push(chunk);
+    }
+    let manifest = block_on(reader.finish()).unwrap();
+    let records = chunks
+        .iter()
+        .flat_map(|chunk| chunk.records().iter().cloned())
+        .collect();
+    (header, chunks, manifest, records)
 }

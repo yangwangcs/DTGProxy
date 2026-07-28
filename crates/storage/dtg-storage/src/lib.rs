@@ -17,9 +17,12 @@ pub use binding::{
 };
 pub use capability::{
     CapabilityManifest, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest,
+    SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
 };
 pub use consensus::{
-    ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, RaftHardState, RaftMembership,
+    ConsensusCommandEnvelope, ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore,
+    RaftHardState, RaftMembership, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
+    SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION,
 };
 pub use dtg_kernel::{
     BackendGeneration, ClusterId, Digest32, GraphId, PlacementEpoch, ReplicaId, ShardId,
@@ -38,8 +41,8 @@ pub use read::{
 };
 pub use snapshot::{
     LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
-    SnapshotChunk, SnapshotHeader, SnapshotId, SnapshotManifest, SnapshotRecord, SnapshotRequest,
-    SnapshotRestoreReceipt,
+    SUPPORTED_SNAPSHOT_FORMAT_VERSION, SnapshotChunk, SnapshotHeader, SnapshotId, SnapshotManifest,
+    SnapshotRecord, SnapshotRequest, SnapshotRestoreReceipt,
 };
 pub use tck::{StorageTckFactory, StorageTckStore, run_storage_tck};
 

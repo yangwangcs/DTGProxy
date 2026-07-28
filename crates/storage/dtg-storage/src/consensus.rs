@@ -2,35 +2,85 @@ use dtg_kernel::{Digest32, ReplicaId};
 
 use crate::{CommandId, ReplicaBinding, StorageError, StoreFuture};
 
+pub const SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION: u32 = 1;
+pub const SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsensusCommandEnvelope {
+    format_version: u32,
+    payload: Vec<u8>,
+    digest: Digest32,
+}
+
+impl ConsensusCommandEnvelope {
+    pub fn new(format_version: u32, payload: Vec<u8>) -> Result<Self, StorageError> {
+        if format_version != SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION || payload.is_empty() {
+            return Err(StorageError::InvalidConsensus(
+                "unsupported or empty consensus command envelope".into(),
+            ));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"dtg-consensus-command-envelope-v1");
+        hasher.update(&format_version.to_be_bytes());
+        hasher.update(&(payload.len() as u64).to_be_bytes());
+        hasher.update(&payload);
+        let digest = Digest32::new(*hasher.finalize().as_bytes());
+        Ok(Self {
+            format_version,
+            payload,
+            digest,
+        })
+    }
+
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub const fn digest(&self) -> Digest32 {
+        self.digest
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusEntry {
+    wal_format_version: u32,
     term: u64,
     index: u64,
     command_id: CommandId,
     command_digest: Digest32,
-    command: Vec<u8>,
+    command: ConsensusCommandEnvelope,
 }
 
 impl ConsensusEntry {
     pub fn new(
+        wal_format_version: u32,
         term: u64,
         index: u64,
         command_id: CommandId,
-        command_digest: Digest32,
-        command: Vec<u8>,
+        command: ConsensusCommandEnvelope,
     ) -> Result<Self, StorageError> {
-        if term == 0 || index == 0 || command_digest.get() == [0; 32] || command.is_empty() {
+        if wal_format_version != SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION || term == 0 || index == 0 {
             return Err(StorageError::InvalidConsensus(
-                "consensus entry identity and command must be complete".into(),
+                "unsupported consensus WAL format or incomplete entry identity".into(),
             ));
         }
+        let command_digest = command.digest();
         Ok(Self {
+            wal_format_version,
             term,
             index,
             command_id,
             command_digest,
             command,
         })
+    }
+
+    pub const fn wal_format_version(&self) -> u32 {
+        self.wal_format_version
     }
 
     pub const fn term(&self) -> u64 {
@@ -49,7 +99,7 @@ impl ConsensusEntry {
         self.command_digest
     }
 
-    pub fn command(&self) -> &[u8] {
+    pub const fn command(&self) -> &ConsensusCommandEnvelope {
         &self.command
     }
 }

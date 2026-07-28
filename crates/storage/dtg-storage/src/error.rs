@@ -7,6 +7,7 @@ pub enum StorageError {
     InvalidBinding(String),
     InvalidCapability(String),
     InvalidMutation(String),
+    ConstraintViolation(String),
     InvalidBatch(String),
     StaleBinding {
         expected: Box<ReplicaBinding>,
@@ -45,6 +46,7 @@ impl StorageError {
             Self::InvalidBinding(_) => "DTG-STORAGE-BINDING",
             Self::InvalidCapability(_) => "DTG-STORAGE-CAPABILITY",
             Self::InvalidMutation(_) => "DTG-STORAGE-MUTATION",
+            Self::ConstraintViolation(_) => "DTG-STORAGE-CONSTRAINT",
             Self::InvalidBatch(_) => "DTG-STORAGE-BATCH",
             Self::StaleBinding { .. } => "DTG-STORAGE-STALE-BINDING",
             Self::NamespaceOwnerMismatch { .. } => "DTG-STORAGE-NAMESPACE-OWNER",
@@ -71,6 +73,7 @@ impl fmt::Display for StorageError {
             Self::InvalidBinding(message)
             | Self::InvalidCapability(message)
             | Self::InvalidMutation(message)
+            | Self::ConstraintViolation(message)
             | Self::InvalidBatch(message)
             | Self::CorruptSnapshot(message)
             | Self::InvalidConsensus(message)

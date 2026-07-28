@@ -179,6 +179,14 @@ impl VertexTombstone {
     pub const fn id(&self) -> VertexId {
         self.id
     }
+
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    pub const fn transaction_time(&self) -> TransactionTime {
+        self.transaction_time
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +207,14 @@ impl EdgeTombstone {
 
     pub const fn id(&self) -> EdgeId {
         self.id
+    }
+
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    pub const fn transaction_time(&self) -> TransactionTime {
+        self.transaction_time
     }
 }
 
@@ -284,6 +300,8 @@ impl ReplicaMetadata {
 pub enum LogicalMutation {
     PutVertex(VertexVersion),
     DeleteVertex(VertexTombstone),
+    /// Requires both endpoints to exist in the pre-batch state or an earlier mutation in the
+    /// same atomic batch. Providers reject a missing endpoint with a constraint violation.
     PutEdge(EdgeVersion),
     DeleteEdge(EdgeTombstone),
     PutTransaction(TransactionRecord),

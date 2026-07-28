@@ -6,6 +6,8 @@ use crate::{
     mutation::{encode_edge, encode_metadata, encode_transaction, encode_vertex},
 };
 
+pub const SUPPORTED_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct SnapshotId(u128);
 
@@ -70,9 +72,9 @@ impl SnapshotHeader {
         applied_index: u64,
         format_version: u32,
     ) -> Result<Self, StorageError> {
-        if format_version == 0 {
+        if format_version != SUPPORTED_SNAPSHOT_FORMAT_VERSION {
             return Err(StorageError::CorruptSnapshot(
-                "snapshot format version must be nonzero".into(),
+                "unsupported snapshot format version".into(),
             ));
         }
         Ok(Self {

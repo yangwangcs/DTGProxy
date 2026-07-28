@@ -4,6 +4,8 @@ use dtg_kernel::Digest32;
 
 use crate::{ReadFence, SnapshotRecord, StorageError, StoreFuture, VertexRead, VertexScan};
 
+pub const SUPPORTED_PUSHDOWN_CONTRACT_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityManifest {
     names: BTreeSet<String>,
@@ -114,9 +116,9 @@ impl PushdownRequest {
     }
 
     pub fn validate(&self) -> Result<(), StorageError> {
-        if self.contract_version == 0 {
+        if self.contract_version != SUPPORTED_PUSHDOWN_CONTRACT_VERSION {
             return Err(StorageError::InvalidCapability(
-                "pushdown contract version must be nonzero".into(),
+                "unsupported pushdown contract version".into(),
             ));
         }
         Ok(())
