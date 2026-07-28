@@ -276,9 +276,9 @@ CALL (range) {
   ORDER BY record.logical_key_hex
   LIMIT range.max_items + 1
   RETURN range.ordinal AS ordinal, record.logical_key_hex AS logical_key_hex,
-         record.value_base64 AS value_base64, range.max_bytes AS max_bytes
+         record.value_base64 AS value_base64
 }
-RETURN ordinal, logical_key_hex, value_base64, max_bytes
+RETURN ordinal, logical_key_hex, value_base64
 ORDER BY ordinal, logical_key_hex
 "#;
 const CANDIDATE_SCAN_CYPHER: &str = "MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= $start_hex AND ($end_hex IS NULL OR record.logical_key_hex < $end_hex) AND (record.valid_min_micros IS NULL OR record.valid_min_micros <= $valid_time_micros) AND (record.valid_max_micros IS NULL OR $valid_time_micros < record.valid_max_micros) AND all(constraint IN $constraints WHERE constraint.operator <> 'equal' OR record.property_equal_tokens IS NULL OR constraint.token IN record.property_equal_tokens) RETURN record.logical_key_hex, record.value_base64 ORDER BY record.logical_key_hex LIMIT $limit";
@@ -1530,7 +1530,6 @@ impl Neo4jReadSnapshot<'_> {
                     "end_hex": scan.span().end().map(hex),
                     "required_prefix_hex": scan.span().required_prefix().map(hex),
                     "max_items": primitive_query_limit(scan.bounds())?,
-                    "max_bytes": scan.bounds().max_bytes(),
                 }))
             })
             .collect::<Result<Vec<_>, AdapterError>>()?;

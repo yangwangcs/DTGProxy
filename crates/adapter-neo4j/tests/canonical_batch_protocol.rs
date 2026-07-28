@@ -11,7 +11,7 @@ fn canonical_batch_scan_is_one_ordinal_preserving_unwind_query() {
     assert!(query.contains("range.end_hex"));
     assert!(query.contains("range.required_prefix_hex"));
     assert!(query.contains("range.max_items"));
-    assert!(query.contains("range.max_bytes"));
+    assert!(!query.contains("range.max_bytes"));
     assert!(query.contains("ORDER BY ordinal, logical_key_hex"));
     assert!(!query.contains("$keyspace"));
 }

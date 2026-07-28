@@ -178,6 +178,67 @@ fn canonical_batch_request() -> CanonicalBatchScanRequest {
     .unwrap()
 }
 
+fn take_varint(payload: &[u8], offset: &mut usize) -> Result<u64, String> {
+    let mut value = 0_u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *payload
+            .get(*offset)
+            .ok_or_else(|| "truncated protobuf varint".to_owned())?;
+        *offset = offset
+            .checked_add(1)
+            .ok_or_else(|| "protobuf offset overflow".to_owned())?;
+        let bits = u64::from(byte & 0x7f);
+        if shift == 63 && bits > 1 {
+            return Err("protobuf varint overflow".to_owned());
+        }
+        value |= bits << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("protobuf varint overflow".to_owned())
+}
+
+fn top_level_fields(payload: &[u8]) -> Result<Vec<u32>, String> {
+    let mut fields = Vec::new();
+    let mut offset = 0_usize;
+    while offset < payload.len() {
+        let key = take_varint(payload, &mut offset)?;
+        let field = u32::try_from(key >> 3).map_err(|_| "protobuf field overflow".to_owned())?;
+        if field == 0 {
+            return Err("protobuf field zero is invalid".to_owned());
+        }
+        fields.push(field);
+        match key & 0x07 {
+            0 => {
+                let _ = take_varint(payload, &mut offset)?;
+            }
+            1 => {
+                offset = offset
+                    .checked_add(8)
+                    .ok_or_else(|| "protobuf offset overflow".to_owned())?;
+            }
+            2 => {
+                let length = usize::try_from(take_varint(payload, &mut offset)?)
+                    .map_err(|_| "protobuf length overflow".to_owned())?;
+                offset = offset
+                    .checked_add(length)
+                    .ok_or_else(|| "protobuf offset overflow".to_owned())?;
+            }
+            5 => {
+                offset = offset
+                    .checked_add(4)
+                    .ok_or_else(|| "protobuf offset overflow".to_owned())?;
+            }
+            wire_type => return Err(format!("unsupported protobuf wire type {wire_type}")),
+        }
+        if offset > payload.len() {
+            return Err("truncated protobuf field".to_owned());
+        }
+    }
+    Ok(fields)
+}
+
 #[test]
 fn canonical_batch_feature_and_envelope_fields_are_append_only() {
     assert_eq!(
@@ -193,7 +254,11 @@ fn canonical_batch_feature_and_envelope_fields_are_append_only() {
         },
     )
     .unwrap();
-    assert!(request[28..request.len() - 4].contains(&0xaa));
+    assert!(
+        top_level_fields(&request[28..request.len() - 4])
+            .unwrap()
+            .contains(&21)
+    );
 
     let response = encode_frame(
         2,
@@ -204,7 +269,11 @@ fn canonical_batch_feature_and_envelope_fields_are_append_only() {
         },
     )
     .unwrap();
-    assert!(response[28..response.len() - 4].contains(&0xba));
+    assert!(
+        top_level_fields(&response[28..response.len() - 4])
+            .unwrap()
+            .contains(&23)
+    );
 }
 
 fn candidate_request() -> CandidateScanRequest {
