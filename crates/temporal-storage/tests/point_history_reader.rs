@@ -179,12 +179,33 @@ impl ReadSnapshot for ScriptedSnapshot {
                     })
                     .cloned()
                     .collect();
-                let limit = self
-                    .page_items
-                    .min(scan.bounds().max_items())
-                    .min(matching.len());
-                let entries = matching[..limit].to_vec();
-                let next_start = matching.get(limit).map(|entry| entry.key().clone());
+                let item_limit = self.page_items.min(scan.bounds().max_items());
+                let mut entries = Vec::new();
+                let mut retained = 0_u64;
+                let mut next_start = None;
+                for entry in matching {
+                    if entries.len() == item_limit {
+                        next_start = Some(entry.key().clone());
+                        break;
+                    }
+                    let entry_bytes = u64::try_from(entry.key().as_bytes().len())
+                        .unwrap()
+                        .checked_add(u64::try_from(entry.value().len()).unwrap())
+                        .unwrap();
+                    let required = retained.checked_add(entry_bytes).unwrap();
+                    if required > scan.bounds().max_bytes() {
+                        if entries.is_empty() {
+                            return Err(AdapterError::ScanByteLimit {
+                                limit: scan.bounds().max_bytes(),
+                                required,
+                            });
+                        }
+                        next_start = Some(entry.key().clone());
+                        break;
+                    }
+                    retained = required;
+                    entries.push(entry);
+                }
                 pages.push(
                     CanonicalScanPage::new(scan, page_index, entries, next_start)
                         .map_err(|error| AdapterError::Backend(error.to_string()))?,
@@ -514,7 +535,7 @@ fn nine_distinct_one_page_requests_use_one_batch_call() {
 
     let outcomes = block_on(
         PointHistoryReader::new(
-            HistoryReadBudget::new(16, storage_api::MAX_QUERY_PAGE_BYTES, 4096).unwrap(),
+            HistoryReadBudget::new(16, storage_api::MAX_QUERY_PAGE_BYTES, 1024 * 1024).unwrap(),
         )
         .read_batch(&snapshot, &requests, PropertyDemand::All),
     )
@@ -525,6 +546,64 @@ fn nine_distinct_one_page_requests_use_one_batch_call() {
     for (ordinal, outcome) in outcomes.into_iter().enumerate() {
         assert_eq!(outcome.value, Some(payload(&format!("value-{ordinal}"))));
     }
+}
+
+#[test]
+fn oversized_record_after_continuation_is_a_history_record_limit() {
+    let element = vertex(151);
+    let mut entries = vec![anchor(
+        element,
+        100,
+        vec![(interval(0, 10), payload(&"a".repeat(900)))],
+    )];
+    entries.extend(
+        (0..15).map(|ordinal| put(element, 101 + ordinal, interval(20, 30), payload("small"))),
+    );
+    let snapshot = ScriptedSnapshot::new(entries).with_page_items(15);
+
+    assert_eq!(
+        block_on(
+            PointHistoryReader::new(HistoryReadBudget::new(16, 4096, 512).unwrap()).read(
+                &snapshot,
+                element,
+                tx(115),
+                valid(5),
+                PropertyDemand::All,
+            )
+        ),
+        Err(TemporalStoreError::HistoryRecordByteLimit)
+    );
+}
+
+#[test]
+fn cumulative_bytes_after_continuation_are_a_history_total_limit() {
+    let element = vertex(152);
+    let mut entries = vec![anchor(
+        element,
+        100,
+        vec![(interval(0, 10), payload(&"anchor".repeat(80)))],
+    )];
+    entries.extend(
+        (0..15).map(|ordinal| put(element, 101 + ordinal, interval(20, 30), payload("small"))),
+    );
+    let total = entries
+        .iter()
+        .map(|entry| u64::try_from(entry.value().len()).unwrap())
+        .sum::<u64>();
+    let max_record = entries
+        .iter()
+        .map(|entry| u64::try_from(entry.value().len()).unwrap())
+        .max()
+        .unwrap();
+    let snapshot = ScriptedSnapshot::new(entries).with_page_items(15);
+
+    assert_eq!(
+        block_on(
+            PointHistoryReader::new(HistoryReadBudget::new(16, total - 1, max_record).unwrap(),)
+                .read(&snapshot, element, tx(115), valid(5), PropertyDemand::All)
+        ),
+        Err(TemporalStoreError::HistoryTotalByteLimit)
+    );
 }
 
 #[test]

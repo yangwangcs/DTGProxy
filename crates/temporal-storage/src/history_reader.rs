@@ -148,7 +148,13 @@ impl PointHistoryReader {
             let (range_ordinals, scans, max_total_bytes) = self.build_batch(&ranges)?;
             let request = CanonicalBatchScanRequest::new(scans, max_total_bytes)
                 .map_err(query_primitive_error)?;
-            let page = read.scan_canonical_batch(&request).await?;
+            let page = match read.scan_canonical_batch(&request).await {
+                Ok(page) => page,
+                Err(AdapterError::ScanByteLimit { .. }) => {
+                    return Err(TemporalStoreError::HistoryRecordByteLimit);
+                }
+                Err(error) => return Err(TemporalStoreError::Adapter(error)),
+            };
             if page.applied_log_index() != expected_applied_log_index {
                 return Err(TemporalStoreError::HistoryAppliedIndexMismatch {
                     expected: expected_applied_log_index,
@@ -193,31 +199,11 @@ impl PointHistoryReader {
                     .len(),
             )
             .map_err(|_| TemporalStoreError::HistoryTotalByteLimit)?;
-            let key_overhead = key_bytes
-                .checked_mul(
-                    u64::try_from(remaining_records)
-                        .map_err(|_| TemporalStoreError::HistoryTotalByteLimit)?,
-                )
-                .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
-            let remaining_value_bytes = self
-                .budget
-                .max_total_bytes
-                .checked_sub(range.stats.history_bytes)
-                .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
-            let maximum_record_bytes = self
+            let requested_bytes = self
                 .budget
                 .max_record_bytes
                 .checked_add(key_bytes)
                 .ok_or(TemporalStoreError::HistoryTotalByteLimit)?
-                .checked_mul(
-                    u64::try_from(remaining_records)
-                        .map_err(|_| TemporalStoreError::HistoryTotalByteLimit)?,
-                )
-                .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
-            let requested_bytes = remaining_value_bytes
-                .checked_add(key_overhead)
-                .ok_or(TemporalStoreError::HistoryTotalByteLimit)?
-                .min(maximum_record_bytes)
                 .min(MAX_QUERY_PAGE_BYTES);
             let next_aggregate = aggregate_bytes
                 .checked_add(requested_bytes)
