@@ -63,7 +63,7 @@ fn fifteen_corrections_materialize_each_payload_once() {
     assert_eq!(outcome.stats.payload_bytes_copied, expected_payload_bytes);
     assert!(
         outcome.stats.payloads_decoded
-            <= projection.segments().len() + outcome.stats.history_records - 1
+            < projection.segments().len() + outcome.stats.history_records
     );
 }
 
