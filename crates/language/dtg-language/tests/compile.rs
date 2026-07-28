@@ -430,6 +430,30 @@ fn valid_and_system_time_changes_cannot_be_combined() {
 }
 
 #[test]
+fn statement_wide_changes_axes_cannot_be_hidden_by_match_overrides() {
+    let error = compile(
+        "CHANGES FOR VALID_TIME BETWEEN 1 AND 2 \
+         CHANGES FOR SYSTEM_TIME BETWEEN 3 AND 4 \
+         MATCH (a) FOR VALID_TIME AS OF 1 \
+         MATCH (b) FOR SYSTEM_TIME AS OF 3 RETURN a",
+        &EmptySchemaCatalog,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "DTG-LANG-UNSUPPORTED-CHANGES");
+}
+
+#[test]
+fn repeated_bindings_inside_one_pattern_fail_closed() {
+    for source in [
+        "MATCH (a)-[r]->(b)-[s]->(a) RETURN a",
+        "MATCH (a)-[r]->(b)-[r]->(c) RETURN r",
+    ] {
+        let error = compile(source, &EmptySchemaCatalog).unwrap_err();
+        assert_eq!(error.code(), "DTG-LANG-UNSUPPORTED-CORRELATION", "{source}");
+    }
+}
+
+#[test]
 fn historical_system_time_is_rejected_for_write_selection_matches() {
     for source in [
         "MATCH (n) FOR SYSTEM_TIME AS OF 1 SET n.name = 'Wang' VALID FROM 2",

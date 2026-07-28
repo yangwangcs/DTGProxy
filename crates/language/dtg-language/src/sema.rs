@@ -80,6 +80,7 @@ fn validate_statement(statement: &Statement) -> Result<(), LanguageError> {
         }
         Statement::Query(query) => {
             validate_scopes(&query.scopes)?;
+            validate_statement_changes_axes(&query.scopes, &query.matches)?;
             let mut bindings = Bindings::new();
             validate_matches(&query.matches, &query.scopes, &mut bindings)?;
             if let Some((left, right)) = &query.where_clause {
@@ -187,6 +188,8 @@ fn validate_correlation(
     bindings: &Bindings,
     read_scope: &EffectiveReadScope,
 ) -> Result<(), LanguageError> {
+    validate_current_pattern_uniqueness(pattern)?;
+
     let mut prebound = BTreeSet::new();
     for variable in pattern
         .nodes
@@ -226,6 +229,33 @@ fn validate_correlation(
             "DTG-LANG-INCOMPATIBLE-SCOPE",
             format!("incompatible temporal scope for reused binding '{variable}'"),
         ));
+    }
+    Ok(())
+}
+
+fn validate_current_pattern_uniqueness(pattern: &Pattern) -> Result<(), LanguageError> {
+    let mut current = BTreeMap::new();
+    for (variable, kind) in pattern
+        .nodes
+        .iter()
+        .map(|node| (node.variable.as_str(), BindingKind::Node))
+        .chain(
+            pattern
+                .relationships
+                .iter()
+                .map(|relationship| (relationship.variable.as_str(), BindingKind::Relationship)),
+        )
+    {
+        if let Some(seen) = current.get(variable) {
+            if *seen == kind {
+                return Err(LanguageError::semantic(
+                    "DTG-LANG-UNSUPPORTED-CORRELATION",
+                    "logical IR cannot faithfully express repeated bindings within one pattern",
+                ));
+            }
+        } else {
+            current.insert(variable, kind);
+        }
     }
     Ok(())
 }
@@ -405,6 +435,25 @@ fn validate_scopes(scopes: &[Scope]) -> Result<(), LanguageError> {
                 "temporal interval must have start < end",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_statement_changes_axes(
+    defaults: &[Scope],
+    matches: &[Match],
+) -> Result<(), LanguageError> {
+    let changes_axes = defaults
+        .iter()
+        .chain(matches.iter().flat_map(|matching| matching.scopes.iter()))
+        .filter(|scope| matches!(scope.mode, Mode::Changes(_, _)))
+        .map(|scope| scope.axis as u8)
+        .collect::<BTreeSet<_>>();
+    if changes_axes.len() > 1 {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-UNSUPPORTED-CHANGES",
+            "at most one temporal axis per statement may use CHANGES",
+        ));
     }
     Ok(())
 }
