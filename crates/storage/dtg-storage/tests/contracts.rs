@@ -489,6 +489,14 @@ fn execution_stage_failure_is_atomic() {
     let replay = block_on(store.apply(failing_batch)).unwrap();
     assert!(replay.replayed());
     assert_eq!(block_on(store.applied_index()).unwrap(), 2);
+    let after_replay = block_on(store.begin_read_view(ReadFence::new(
+        ReplicaStateStore::binding(&*store).clone(),
+        2,
+    )))
+    .unwrap();
+    let after_replay_changes =
+        block_on(after_replay.changes(ChangesRead::new(1, 2, 16).unwrap())).unwrap();
+    assert_eq!(after_replay_changes, committed_changes);
 }
 
 #[test]
@@ -635,6 +643,15 @@ fn public_tck_rejects_an_injected_failure_that_is_not_one_shot() {
     ));
 }
 
+#[test]
+fn public_tck_rejects_replay_that_duplicates_change_records() {
+    let factory = TestFactory::with_duplicate_changes_on_replay();
+    assert!(matches!(
+        block_on(run_storage_tck(&factory)),
+        Err(StorageError::TckViolation(_))
+    ));
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReplayRecord {
     term: u64,
@@ -660,6 +677,7 @@ struct TestStore {
     state: Arc<Mutex<TestState>>,
     apply_failure_after: Arc<Mutex<Option<usize>>>,
     persistent_apply_failure: bool,
+    duplicate_changes_on_replay: bool,
 }
 
 #[derive(Default)]
@@ -672,6 +690,7 @@ struct TestFactory {
     state: Mutex<FactoryState>,
     capabilities: CapabilityManifest,
     persistent_apply_failure: bool,
+    duplicate_changes_on_replay: bool,
 }
 
 impl TestFactory {
@@ -680,12 +699,20 @@ impl TestFactory {
             state: Mutex::new(FactoryState::default()),
             capabilities: capabilities(),
             persistent_apply_failure: false,
+            duplicate_changes_on_replay: false,
         }
     }
 
     fn with_persistent_apply_failure() -> Self {
         Self {
             persistent_apply_failure: true,
+            ..Self::new()
+        }
+    }
+
+    fn with_duplicate_changes_on_replay() -> Self {
+        Self {
+            duplicate_changes_on_replay: true,
             ..Self::new()
         }
     }
@@ -729,6 +756,7 @@ impl StorageTckFactory for TestFactory {
                 state,
                 apply_failure_after: Arc::new(Mutex::new(None)),
                 persistent_apply_failure: self.persistent_apply_failure,
+                duplicate_changes_on_replay: self.duplicate_changes_on_replay,
             }) as Box<dyn StorageTckStore>)
         })
     }
@@ -781,6 +809,15 @@ impl ReplicaStateStore for TestStore {
                     return Err(StorageError::ReplayMismatch {
                         raft_index: batch.raft_index(),
                     });
+                }
+                if self.duplicate_changes_on_replay {
+                    state.changes.extend(
+                        batch
+                            .mutations()
+                            .iter()
+                            .cloned()
+                            .map(|mutation| (batch.raft_index(), mutation)),
+                    );
                 }
                 return Ok(ApplyReceipt::new(&batch, true));
             }

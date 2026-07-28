@@ -323,6 +323,16 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             primary.applied_index().await? == 2,
             "idempotent retry replay advanced the applied index",
         )?;
+        let after_retry_replay = primary
+            .begin_read_view(ReadFence::new(primary_binding.clone(), 2))
+            .await?;
+        let after_retry_replay_changes = after_retry_replay
+            .changes(crate::ChangesRead::new(1, 2, 16)?)
+            .await?;
+        require(
+            after_retry_replay_changes.rows() == retry_changes.rows(),
+            "idempotent retry replay duplicated or reordered observable changes",
+        )?;
         expected_snapshot_records.push(SnapshotRecord::Vertex(staged_vertex.clone()));
         expected_snapshot_records.push(SnapshotRecord::Vertex(second_staged_vertex.clone()));
 
