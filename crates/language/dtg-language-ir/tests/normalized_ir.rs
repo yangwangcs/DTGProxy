@@ -230,13 +230,17 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
                 id: LogicalNodeId::new(6),
                 kind: LogicalNodeKind::Subquery(Subquery {
                     input: None,
-                    plan: Box::new(plan(LogicalNodeKind::NodeScan(NodeScan {
-                        variable: "nested_v".into(),
-                        labels: Vec::new(),
-                        read_scope: ReadScope {
-                            transaction_time: nested_scope.clone(),
-                            valid_time: None,
-                        },
+                    plan: Box::new(plan(LogicalNodeKind::Subquery(Subquery {
+                        input: None,
+                        plan: Box::new(plan(LogicalNodeKind::NodeScan(NodeScan {
+                            variable: "nested_v".into(),
+                            labels: Vec::new(),
+                            read_scope: ReadScope {
+                                transaction_time: nested_scope.clone(),
+                                valid_time: None,
+                            },
+                        }))),
+                        correlated_variables: Vec::new(),
                     }))),
                     correlated_variables: Vec::new(),
                 }),
