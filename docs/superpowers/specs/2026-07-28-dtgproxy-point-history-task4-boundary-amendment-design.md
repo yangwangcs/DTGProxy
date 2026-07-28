@@ -124,6 +124,37 @@ limit, total byte limit, applied-index mismatch, nonadvancing continuation, unex
 key/record timestamp mismatch, missing anchor, and excessive replay depth. No error falls back to
 the old reconstruction path.
 
+### Whole-slice budget correction
+
+The whole-slice review found that deriving one range's page allowance from every remaining record
+can reserve the full 16 MiB batch for a single range. It also found that shrinking the next page to
+the range's remaining history-value budget lets an adapter byte-limit error preempt the reader's
+public `HistoryRecordByteLimit` or `HistoryTotalByteLimit` classification.
+
+Each unresolved range therefore receives at most one encoded-record inspection allowance per
+round: `max_record_bytes` plus the exact bounded history-key overhead. This allowance is independent
+of the number of records left in the chain and of the remaining aggregate history-value budget.
+The batch builder admits as many such ranges as fit under `MAX_QUERY_PAGE_BYTES`, up to 256. A
+range that returns a continuation participates again in the next lockstep round. This prevents a
+legal 1 MiB per-record budget from turning nine small one-page histories into nine remote calls,
+while accepting that records close to the physical 16 MiB protocol limit necessarily reduce batch
+cardinality.
+
+The reader remains the owner of history-value quota semantics:
+
+- a first entry that cannot fit within `max_record_bytes` plus its history key is reported as
+  `HistoryRecordByteLimit`;
+- records that individually fit are delivered to `charge_record`, which reports
+  `HistoryTotalByteLimit` when their cumulative encoded value bytes exceed `max_total_bytes`;
+- adapter page and aggregate bounds continue to count key plus value bytes and cannot replace the
+  reader's value-only accounting.
+
+The point-history test snapshot must enforce real item and byte page bounds. Regression tests cover
+high per-record budgets across nine distinct one-page ranges, an oversized record reached after a
+continuation, and cumulative total-byte exhaustion reached after a continuation. The Sidecar field
+stability test parses top-level protobuf keys rather than searching for marker bytes. Neo4j must not
+return an unused `range.max_bytes` result column unless that column participates in enforcement.
+
 ## Data flow
 
 ```text
