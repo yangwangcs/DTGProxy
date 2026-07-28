@@ -54,6 +54,13 @@ fn fifteen_corrections_materialize_each_payload_once() {
     assert_eq!(projection.visible_at(valid(99)), Some(&payload(0)));
     assert_eq!(outcome.stats.history_records, 16);
     assert_eq!(outcome.stats.payloads_decoded, 16);
+    let expected_payload_bytes = u64::try_from(
+        (0..=15)
+            .map(|value| payload(value).encode().unwrap().len())
+            .sum::<usize>(),
+    )
+    .unwrap();
+    assert_eq!(outcome.stats.payload_bytes_copied, expected_payload_bytes);
     assert!(
         outcome.stats.payloads_decoded
             <= projection.segments().len() + outcome.stats.history_records - 1

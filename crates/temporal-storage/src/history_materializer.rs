@@ -127,6 +127,21 @@ impl IntervalHistoryMaterializer {
                             .payloads_decoded
                             .checked_add(anchor.projection().segments().len())
                             .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
+                        for segment in anchor.projection().segments() {
+                            stats.payload_bytes_copied = stats
+                                .payload_bytes_copied
+                                .checked_add(
+                                    u64::try_from(
+                                        segment
+                                            .payload()
+                                            .encode()
+                                            .map_err(RecordCodecError::Canonical)?
+                                            .len(),
+                                    )
+                                    .map_err(|_| TemporalStoreError::HistoryTotalByteLimit)?,
+                                )
+                                .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
+                        }
                         let mut editor = ProjectionEditor::from_projection(anchor.projection());
                         for (commit_ts, changed_valid, replacement) in deltas.into_iter().rev() {
                             editor.apply(commit_ts, changed_valid, replacement)?;
