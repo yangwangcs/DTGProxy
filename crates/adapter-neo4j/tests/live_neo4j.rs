@@ -129,7 +129,7 @@ fn live_neo4j_history_anchor_and_fifteen_deltas_page_through_one_snapshot() {
     ))
     .unwrap();
 
-    assert_history_page_continuation(opened.adapter().as_ref());
+    assert_history_page_continuation(opened.adapter());
 }
 
 #[test]
