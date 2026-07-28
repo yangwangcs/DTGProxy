@@ -14,21 +14,22 @@ use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
 use crate::diff::{TemporalChange, diff_projections};
 use crate::history::{MAX_CHAIN_ENTRIES, entry_for_commit, reconstruct};
+use crate::history_materializer::ProjectionEditor;
 use crate::key::temporal_event_commit_prefix;
 use crate::key::temporal_event_valid_prefix;
-use crate::rewrite::rewrite_projection;
 use crate::transaction::TemporalOperation;
 use crate::{
     CanonicalTemporalEvent, EdgeIdentity, EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId,
-    GraphKey, HistoryAnchor, HistoryEntry, HistoryReadBudget, KeyCodecError, LabelId, PartitionId,
-    PointHistoryOutcome, PointHistoryReader, PointHistoryRequest, ProjectionRecord, PropertyDemand,
-    RecordCodecError, TemporalEventMetadata, TemporalEventOperation, TemporalTransaction,
-    VertexIdentity, cross_in_adjacency_key, cross_in_adjacency_prefix, cross_out_adjacency_key,
-    cross_out_adjacency_prefix, current_edge_graph_prefix, current_edge_key,
-    current_vertex_graph_prefix, current_vertex_key, decode_graph_key, edge_identity_graph_prefix,
-    edge_identity_key, edge_identity_prefix, history_anchor_key, history_prefix, in_adjacency_key,
-    in_adjacency_prefix, out_adjacency_key, out_adjacency_prefix, temporal_event_key,
-    temporal_event_valid_key, vertex_identity_graph_prefix, vertex_identity_key,
+    GraphKey, HistoryAnchor, HistoryEntry, HistoryReadBudget, IntervalHistoryMaterializer,
+    KeyCodecError, LabelId, PartitionId, PointHistoryOutcome, PointHistoryReader,
+    PointHistoryRequest, ProjectionRecord, PropertyDemand, RecordCodecError, TemporalEventMetadata,
+    TemporalEventOperation, TemporalTransaction, VertexIdentity, cross_in_adjacency_key,
+    cross_in_adjacency_prefix, cross_out_adjacency_key, cross_out_adjacency_prefix,
+    current_edge_graph_prefix, current_edge_key, current_vertex_graph_prefix, current_vertex_key,
+    decode_graph_key, edge_identity_graph_prefix, edge_identity_key, edge_identity_prefix,
+    history_anchor_key, history_prefix, in_adjacency_key, in_adjacency_prefix, out_adjacency_key,
+    out_adjacency_prefix, temporal_event_key, temporal_event_valid_key,
+    vertex_identity_graph_prefix, vertex_identity_key,
 };
 
 pub type TemporalStoreFuture<'a, T> =
@@ -621,12 +622,14 @@ where
                         .load_history_chain_at(mutation.element, context.commit_ts)
                         .await?;
                     let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-                    let projection = rewrite_projection(
-                        current.as_ref().unwrap_or(&empty),
+                    let mut editor =
+                        ProjectionEditor::from_projection(current.as_ref().unwrap_or(&empty));
+                    editor.apply(
                         context.commit_ts,
                         mutation.valid,
                         mutation.replacement.clone(),
                     )?;
+                    let projection = editor.finish()?;
                     let event = canonical_event(
                         mutation.element,
                         mutation.valid,
@@ -729,12 +732,14 @@ where
                         .load_history_chain_at(mutation.element, context.commit_ts)
                         .await?;
                     let empty = ProjectionRecord::new(context.read_ts, Vec::new())?;
-                    let projection = rewrite_projection(
-                        current.as_ref().unwrap_or(&empty),
+                    let mut editor =
+                        ProjectionEditor::from_projection(current.as_ref().unwrap_or(&empty));
+                    editor.apply(
                         context.commit_ts,
                         mutation.valid,
                         mutation.replacement.clone(),
                     )?;
+                    let projection = editor.finish()?;
                     let event = canonical_event(
                         mutation.element,
                         mutation.valid,
@@ -1903,8 +1908,8 @@ where
         transaction_time: TransactionTime,
     ) -> TemporalStoreFuture<'a, Vec<VertexTemporalSegment>> {
         Box::pin(async move {
-            let entries = self
-                .adapter
+            let read = self.begin_read_snapshot().await?;
+            let entries = read
                 .scan(&KeySpan::prefix(
                     Keyspace::Identity,
                     vertex_identity_graph_prefix(graph),
@@ -1919,7 +1924,9 @@ where
                 if identity.element() != element {
                     return Err(TemporalStoreError::IdentityMismatch);
                 }
-                if let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                if let Some(projection) = self
+                    .materialize_projection_at(read.as_ref(), element, transaction_time)
+                    .await?
                 {
                     append_vertex_segments(&mut segments, identity, &projection, window);
                 }
@@ -1938,8 +1945,14 @@ where
         max_bytes: u64,
     ) -> TemporalStoreFuture<'a, (Vec<VertexTemporalSegment>, u64, usize)> {
         Box::pin(async move {
+            let read = self.begin_read_snapshot().await?;
             let (entries, mut scanned_bytes) = self
-                .scan_identity_entries(vertex_identity_graph_prefix(graph), max_segments, max_bytes)
+                .scan_identity_entries_in_snapshot(
+                    read.as_ref(),
+                    vertex_identity_graph_prefix(graph),
+                    max_segments,
+                    max_bytes,
+                )
                 .await?;
             let entry_count = entries.len();
             let mut segments = Vec::new();
@@ -1951,7 +1964,9 @@ where
                 if identity.element() != element {
                     return Err(TemporalStoreError::IdentityMismatch);
                 }
-                let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                let Some(projection) = self
+                    .materialize_projection_at(read.as_ref(), element, transaction_time)
+                    .await?
                 else {
                     continue;
                 };
@@ -1992,11 +2007,15 @@ where
     ) -> TemporalStoreFuture<'a, Vec<VertexTemporalSegment>> {
         Box::pin(async move {
             require_vertex(element)?;
-            let Some(projection) = self.load_projection_at(element, transaction_time).await? else {
+            let read = self.begin_read_snapshot().await?;
+            let Some(projection) = self
+                .materialize_projection_at(read.as_ref(), element, transaction_time)
+                .await?
+            else {
                 return Ok(Vec::new());
             };
             let identity = self
-                .load_vertex_identity(element)
+                .load_vertex_identity_in_snapshot(read.as_ref(), element)
                 .await?
                 .ok_or(TemporalStoreError::IdentityMismatch)?;
             let mut segments = Vec::new();
@@ -2043,8 +2062,8 @@ where
         transaction_time: TransactionTime,
     ) -> TemporalStoreFuture<'a, Vec<EdgeTemporalSegment>> {
         Box::pin(async move {
-            let entries = self
-                .adapter
+            let read = self.begin_read_snapshot().await?;
+            let entries = read
                 .scan(&KeySpan::prefix(
                     Keyspace::Identity,
                     edge_identity_graph_prefix(graph),
@@ -2059,7 +2078,9 @@ where
                 if identity.element() != element {
                     return Err(TemporalStoreError::IdentityMismatch);
                 }
-                if let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                if let Some(projection) = self
+                    .materialize_projection_at(read.as_ref(), element, transaction_time)
+                    .await?
                 {
                     append_edge_segments(&mut segments, identity, &projection, window);
                 }
@@ -2078,8 +2099,14 @@ where
         max_bytes: u64,
     ) -> TemporalStoreFuture<'a, (Vec<EdgeTemporalSegment>, u64, usize)> {
         Box::pin(async move {
+            let read = self.begin_read_snapshot().await?;
             let (entries, mut scanned_bytes) = self
-                .scan_identity_entries(edge_identity_graph_prefix(graph), max_segments, max_bytes)
+                .scan_identity_entries_in_snapshot(
+                    read.as_ref(),
+                    edge_identity_graph_prefix(graph),
+                    max_segments,
+                    max_bytes,
+                )
                 .await?;
             let entry_count = entries.len();
             let mut segments = Vec::new();
@@ -2091,7 +2118,9 @@ where
                 if identity.element() != element {
                     return Err(TemporalStoreError::IdentityMismatch);
                 }
-                let Some(projection) = self.load_projection_at(element, transaction_time).await?
+                let Some(projection) = self
+                    .materialize_projection_at(read.as_ref(), element, transaction_time)
+                    .await?
                 else {
                     continue;
                 };
@@ -3227,9 +3256,31 @@ where
         if from_transaction > to_transaction {
             return Err(TemporalStoreError::InvalidDiffOrder);
         }
-        let before = self.load_projection_at(element, from_transaction).await?;
-        let after = self.load_projection_at(element, to_transaction).await?;
+        let read = self.begin_read_snapshot().await?;
+        let before = self
+            .materialize_projection_at(read.as_ref(), element, from_transaction)
+            .await?;
+        let after = self
+            .materialize_projection_at(read.as_ref(), element, to_transaction)
+            .await?;
         Ok(diff_projections(before.as_ref(), after.as_ref()))
+    }
+
+    async fn materialize_projection_at(
+        &self,
+        read: &dyn ReadSnapshot,
+        element: ElementRef,
+        transaction_time: TransactionTime,
+    ) -> Result<Option<ProjectionRecord>, TemporalStoreError> {
+        Ok(
+            IntervalHistoryMaterializer::new(default_history_read_budget(
+                element,
+                transaction_time,
+            )?)
+            .projection_at(read, element, transaction_time)
+            .await?
+            .projection,
+        )
     }
 }
 

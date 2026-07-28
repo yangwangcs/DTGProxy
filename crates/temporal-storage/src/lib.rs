@@ -3,6 +3,7 @@
 mod canonical;
 mod diff;
 mod history;
+mod history_materializer;
 mod history_reader;
 mod key;
 mod mapping_tck;
@@ -19,6 +20,7 @@ pub use canonical::{
     encode_canonical_graph_entry,
 };
 pub use diff::{TemporalChange, TemporalChangeKind};
+pub use history_materializer::{IntervalHistoryMaterializer, IntervalHistoryOutcome};
 pub use history_reader::{
     HistoryReadBudget, HistoryReadStats, PointHistoryOutcome, PointHistoryReader,
     PointHistoryRequest, PropertyDemand,
