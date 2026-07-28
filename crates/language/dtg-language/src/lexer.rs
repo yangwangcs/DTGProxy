@@ -67,11 +67,18 @@ pub(crate) fn lex(source: &str) -> Result<Vec<Token>, LanguageError> {
                         terminated = true;
                         break;
                     }
-                    if bytes[cursor] == b'\\' && cursor + 1 < bytes.len() {
+                    if bytes[cursor] == b'\\' {
                         cursor += 1;
+                        if cursor == bytes.len() {
+                            break;
+                        }
                     }
-                    value.push(bytes[cursor] as char);
-                    cursor += 1;
+                    let character = source[cursor..]
+                        .chars()
+                        .next()
+                        .expect("cursor is within the source");
+                    value.push(character);
+                    cursor += character.len_utf8();
                 }
                 if !terminated {
                     return Err(LanguageError::lex(

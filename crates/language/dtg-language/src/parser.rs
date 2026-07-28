@@ -47,8 +47,10 @@ impl Parser<'_> {
             }
         } else if self.take_word("SUBMIT") {
             self.submit()?
-        } else if self.at_word("CREATE") || self.at_word("MATCH") && self.has_write_keyword() {
-            self.write()?
+        } else if self.at_word("CREATE") {
+            self.create_write(Vec::new())?
+        } else if self.at_word("MATCH") {
+            self.match_leading_statement()?
         } else {
             Statement::Query(self.query()?)
         };
@@ -71,6 +73,20 @@ impl Parser<'_> {
         while self.at_word("FOR") || self.at_word("CHANGES") {
             scopes.push(self.scope()?);
         }
+        let matches = self.match_clauses()?;
+        self.query_tail(scopes, matches)
+    }
+    fn match_leading_statement(&mut self) -> Result<Statement, LanguageError> {
+        let matches = self.match_clauses()?;
+        if self.at_word("SET") || self.at_word("DELETE") {
+            self.write_after_matches(matches)
+        } else if self.at_word("CREATE") {
+            self.create_write(matches)
+        } else {
+            self.query_tail(Vec::new(), matches).map(Statement::Query)
+        }
+    }
+    fn match_clauses(&mut self) -> Result<Vec<Match>, LanguageError> {
         let mut matches = Vec::new();
         while self.take_word("MATCH") {
             let pattern = self.pattern()?;
@@ -86,6 +102,13 @@ impl Parser<'_> {
         if matches.is_empty() {
             return Err(self.error("MATCH is required for a query"));
         }
+        Ok(matches)
+    }
+    fn query_tail(
+        &mut self,
+        scopes: Vec<Scope>,
+        matches: Vec<Match>,
+    ) -> Result<crate::ast::Query, LanguageError> {
         let where_clause = if self.take_word("WHERE") {
             let left = self.expr()?;
             self.expect_symbol('=')?;
@@ -109,39 +132,45 @@ impl Parser<'_> {
             returns,
         })
     }
-    fn write(&mut self) -> Result<Statement, LanguageError> {
-        if self.take_word("CREATE") {
-            let pattern = self.node_pattern()?;
-            let valid_from = self.valid_from()?;
+    fn create_write(&mut self, matches: Vec<Match>) -> Result<Statement, LanguageError> {
+        self.expect_word("CREATE")?;
+        let pattern = self.pattern()?;
+        let valid_from = self.valid_from()?;
+        if matches.is_empty() && pattern.relationships.is_empty() && pattern.nodes.len() == 1 {
             return Ok(Statement::Write(Write::Create {
-                node: pattern,
+                node: pattern.nodes.into_iter().next().expect("one node"),
                 valid_from,
             }));
         }
-        self.expect_word("MATCH")?;
-        let pattern = self.pattern()?;
-        let variable = pattern
-            .nodes
-            .first()
-            .ok_or_else(|| self.error("write MATCH requires a node"))?
-            .variable
-            .clone();
+        Ok(Statement::Write(Write::CreateRelationship {
+            matches,
+            pattern,
+            valid_from,
+        }))
+    }
+    fn write_after_matches(&mut self, matches: Vec<Match>) -> Result<Statement, LanguageError> {
         if self.take_word("SET") {
             let mut properties = BTreeMap::new();
+            let variable = self.identifier()?;
+            self.expect_symbol('.')?;
+            let property = self.identifier()?;
+            self.expect_symbol('=')?;
+            properties.insert(property, self.expr()?);
             loop {
+                if !self.take_symbol(',') {
+                    break;
+                }
                 let target = self.identifier()?;
                 self.expect_symbol('.')?;
                 let property = self.identifier()?;
                 self.expect_symbol('=')?;
                 if target != variable {
-                    return Err(self.error("SET target must be the MATCH variable"));
+                    return Err(self.error("SET assignments must share one target"));
                 }
                 properties.insert(property, self.expr()?);
-                if !self.take_symbol(',') {
-                    break;
-                }
             }
             return Ok(Statement::Write(Write::Set {
+                matches,
                 variable,
                 properties,
                 valid_from: self.valid_from()?,
@@ -149,11 +178,9 @@ impl Parser<'_> {
         }
         self.expect_word("DELETE")?;
         let delete_variable = self.identifier()?;
-        if delete_variable != variable {
-            return Err(self.error("DELETE target must be the MATCH variable"));
-        }
         Ok(Statement::Write(Write::Delete {
-            variable,
+            matches,
+            variable: delete_variable,
             valid_from: self.valid_from()?,
         }))
     }
@@ -279,9 +306,15 @@ impl Parser<'_> {
         while self.take_symbol(':') {
             types.push(self.identifier()?);
         }
+        let properties = if self.take_symbol('{') {
+            self.property_map()?
+        } else {
+            BTreeMap::new()
+        };
         Ok(RelationshipPattern {
             variable,
             types,
+            properties,
             direction: RelationshipDirection::Outgoing,
         })
     }
@@ -370,11 +403,6 @@ impl Parser<'_> {
             }
         }
         Ok(name)
-    }
-    fn has_write_keyword(&self) -> bool {
-        self.tokens[self.cursor..]
-            .iter()
-            .any(|token| token.is_word("SET") || token.is_word("DELETE"))
     }
     fn current(&self) -> &Token {
         &self.tokens[self.cursor]

@@ -1,10 +1,12 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dtg_language_ir::{GraphId, LogicalType, Parameter};
 
 use crate::{
     LanguageError, SchemaCatalog,
-    ast::{Axis, Expr, Mode, Program, Scope, Statement},
+    ast::{
+        Axis, Expr, Match, Mode, Pattern, Program, RelationshipDirection, Scope, Statement, Write,
+    },
 };
 
 pub(crate) struct TypedProgram {
@@ -12,6 +14,20 @@ pub(crate) struct TypedProgram {
     pub(crate) parameters: Vec<Parameter>,
     pub(crate) statement: Statement,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindingKind {
+    Node,
+    Relationship,
+}
+
+#[derive(Clone, Debug)]
+struct Binding {
+    kind: BindingKind,
+    constraints: BTreeSet<String>,
+}
+
+type Bindings = BTreeMap<String, Binding>;
 
 pub(crate) fn analyze(
     program: Program,
@@ -57,27 +73,219 @@ fn validate_statement(statement: &Statement) -> Result<(), LanguageError> {
         }
         Statement::Query(query) => {
             validate_scopes(&query.scopes)?;
-            for matching in &query.matches {
-                validate_scopes(&matching.scopes)?;
+            let mut bindings = Bindings::new();
+            validate_matches(&query.matches, &mut bindings)?;
+            if let Some((left, right)) = &query.where_clause {
+                validate_expr(left, &bindings)?;
+                validate_expr(right, &bindings)?;
+            }
+            for expression in &query.returns {
+                validate_expr(expression, &bindings)?;
             }
             Ok(())
         }
-        Statement::Write(write) => {
-            let time = match write {
-                crate::ast::Write::Create { valid_from, .. } => valid_from,
-                crate::ast::Write::Set { valid_from, .. }
-                | crate::ast::Write::Delete { valid_from, .. } => valid_from,
-            };
-            if matches!(time, Expr::Integer(_)) || matches!(time, Expr::Parameter(_)) {
-                return Ok(());
-            }
-            Err(LanguageError::semantic(
-                "DTG-LANG-TYPE",
-                "VALID FROM must be an integer timestamp or parameter",
-            ))
-        }
+        Statement::Write(write) => validate_write(write),
         Statement::Boundary(_) => Ok(()),
     }
+}
+
+fn validate_write(write: &Write) -> Result<(), LanguageError> {
+    let valid_from = match write {
+        Write::Create { node, valid_from } => {
+            let bindings = Bindings::new();
+            for expression in node.properties.values() {
+                validate_expr(expression, &bindings)?;
+            }
+            valid_from
+        }
+        Write::CreateRelationship {
+            matches,
+            pattern,
+            valid_from,
+        } => {
+            let mut bindings = Bindings::new();
+            validate_matches(matches, &mut bindings)?;
+            validate_relationship_create(pattern, &bindings)?;
+            valid_from
+        }
+        Write::Set {
+            matches,
+            variable,
+            properties,
+            valid_from,
+        } => {
+            let mut bindings = Bindings::new();
+            validate_matches(matches, &mut bindings)?;
+            require_binding(variable, &bindings)?;
+            for expression in properties.values() {
+                validate_expr(expression, &bindings)?;
+            }
+            valid_from
+        }
+        Write::Delete {
+            matches,
+            variable,
+            valid_from,
+        } => {
+            let mut bindings = Bindings::new();
+            validate_matches(matches, &mut bindings)?;
+            require_binding(variable, &bindings)?;
+            valid_from
+        }
+    };
+    if matches!(valid_from, Expr::Integer(_) | Expr::Parameter(_)) {
+        Ok(())
+    } else {
+        Err(LanguageError::semantic(
+            "DTG-LANG-TYPE",
+            "VALID FROM must be an integer timestamp or parameter",
+        ))
+    }
+}
+
+fn validate_matches(matches: &[Match], bindings: &mut Bindings) -> Result<(), LanguageError> {
+    for matching in matches {
+        validate_scopes(&matching.scopes)?;
+        validate_pattern(&matching.pattern, bindings)?;
+    }
+    Ok(())
+}
+
+fn validate_pattern(pattern: &Pattern, bindings: &mut Bindings) -> Result<(), LanguageError> {
+    let first = pattern.nodes.first().ok_or_else(|| {
+        LanguageError::semantic("DTG-LANG-PATTERN", "MATCH pattern requires a node")
+    })?;
+    bind(bindings, &first.variable, BindingKind::Node, &first.labels)?;
+    validate_properties(&first.properties, bindings)?;
+
+    for (index, relationship) in pattern.relationships.iter().enumerate() {
+        bind(
+            bindings,
+            &relationship.variable,
+            BindingKind::Relationship,
+            &relationship.types,
+        )?;
+        validate_properties(&relationship.properties, bindings)?;
+        let destination = &pattern.nodes[index + 1];
+        bind(
+            bindings,
+            &destination.variable,
+            BindingKind::Node,
+            &destination.labels,
+        )?;
+        validate_properties(&destination.properties, bindings)?;
+    }
+    Ok(())
+}
+
+fn bind(
+    bindings: &mut Bindings,
+    variable: &str,
+    kind: BindingKind,
+    constraints: &[String],
+) -> Result<(), LanguageError> {
+    if let Some(existing) = bindings.get(variable) {
+        let adds_constraints = constraints
+            .iter()
+            .any(|constraint| !existing.constraints.contains(constraint));
+        if existing.kind != kind || adds_constraints {
+            return Err(LanguageError::semantic(
+                "DTG-LANG-CONFLICTING-BINDING",
+                format!("conflicting binding for variable '{variable}'"),
+            ));
+        }
+        return Ok(());
+    }
+    bindings.insert(
+        variable.to_owned(),
+        Binding {
+            kind,
+            constraints: constraints.iter().cloned().collect(),
+        },
+    );
+    Ok(())
+}
+
+fn validate_relationship_create(
+    pattern: &Pattern,
+    bindings: &Bindings,
+) -> Result<(), LanguageError> {
+    if pattern.nodes.len() != 2 || pattern.relationships.len() != 1 {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-CREATE-RELATIONSHIP",
+            "relationship CREATE requires exactly one relationship between two bound nodes",
+        ));
+    }
+    let relationship = &pattern.relationships[0];
+    if relationship.types.len() != 1 {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-RELATIONSHIP-TYPE",
+            "relationship CREATE requires exactly one explicit type",
+        ));
+    }
+    if relationship.direction == RelationshipDirection::Either {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-RELATIONSHIP-DIRECTION",
+            "relationship CREATE requires an explicit direction",
+        ));
+    }
+    if bindings.contains_key(&relationship.variable) {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-CONFLICTING-BINDING",
+            format!(
+                "relationship CREATE variable '{}' is already bound",
+                relationship.variable
+            ),
+        ));
+    }
+    for endpoint in &pattern.nodes {
+        if !endpoint.labels.is_empty() || !endpoint.properties.is_empty() {
+            return Err(LanguageError::semantic(
+                "DTG-LANG-CREATE-ENDPOINT",
+                "relationship CREATE endpoints must be bound variable references",
+            ));
+        }
+        match bindings.get(&endpoint.variable) {
+            Some(binding) if binding.kind == BindingKind::Node => {}
+            _ => return unbound(&endpoint.variable),
+        }
+    }
+    validate_properties(&relationship.properties, bindings)
+}
+
+fn validate_properties(
+    properties: &BTreeMap<String, Expr>,
+    bindings: &Bindings,
+) -> Result<(), LanguageError> {
+    for expression in properties.values() {
+        validate_expr(expression, bindings)?;
+    }
+    Ok(())
+}
+
+fn validate_expr(expr: &Expr, bindings: &Bindings) -> Result<(), LanguageError> {
+    match expr {
+        Expr::Parameter(_) | Expr::Integer(_) | Expr::String(_) | Expr::Boolean(_) | Expr::Null => {
+            Ok(())
+        }
+        Expr::Column(variable) => require_binding(variable, bindings),
+        Expr::Property { input, .. } => require_binding(input, bindings),
+    }
+}
+
+fn require_binding(variable: &str, bindings: &Bindings) -> Result<(), LanguageError> {
+    if bindings.contains_key(variable) {
+        Ok(())
+    } else {
+        unbound(variable)
+    }
+}
+
+fn unbound(variable: &str) -> Result<(), LanguageError> {
+    Err(LanguageError::semantic(
+        "DTG-LANG-UNBOUND-VARIABLE",
+        format!("unbound variable: {variable}"),
+    ))
 }
 
 fn validate_scopes(scopes: &[Scope]) -> Result<(), LanguageError> {
@@ -111,19 +319,8 @@ fn validate_scopes(scopes: &[Scope]) -> Result<(), LanguageError> {
 fn collect_statement_parameters(statement: &Statement, output: &mut BTreeSet<String>) {
     match statement {
         Statement::Query(query) => {
-            for scope in &query.scopes {
-                collect_scope(scope, output);
-            }
-            for matching in &query.matches {
-                for scope in &matching.scopes {
-                    collect_scope(scope, output);
-                }
-                for node in &matching.pattern.nodes {
-                    for value in node.properties.values() {
-                        collect_expr(value, output);
-                    }
-                }
-            }
+            collect_scopes(&query.scopes, output);
+            collect_matches(&query.matches, output);
             for value in &query.returns {
                 collect_expr(value, output);
             }
@@ -133,29 +330,72 @@ fn collect_statement_parameters(statement: &Statement, output: &mut BTreeSet<Str
             }
         }
         Statement::Write(write) => match write {
-            crate::ast::Write::Create { node, valid_from } => {
-                for value in node.properties.values() {
-                    collect_expr(value, output);
-                }
+            Write::Create { node, valid_from } => {
+                collect_properties(&node.properties, output);
                 collect_expr(valid_from, output);
             }
-            crate::ast::Write::Set {
+            Write::CreateRelationship {
+                matches,
+                pattern,
+                valid_from,
+            } => {
+                collect_matches(matches, output);
+                collect_pattern(pattern, output);
+                collect_expr(valid_from, output);
+            }
+            Write::Set {
+                matches,
                 properties,
                 valid_from,
                 ..
             } => {
-                for value in properties.values() {
-                    collect_expr(value, output);
-                }
+                collect_matches(matches, output);
+                collect_properties(properties, output);
                 collect_expr(valid_from, output);
             }
-            crate::ast::Write::Delete { valid_from, .. } => collect_expr(valid_from, output),
+            Write::Delete {
+                matches,
+                valid_from,
+                ..
+            } => {
+                collect_matches(matches, output);
+                collect_expr(valid_from, output);
+            }
         },
         Statement::Boundary(_)
         | Statement::SubmitAnalytics { .. }
         | Statement::Procedure { .. } => {}
     }
 }
+
+fn collect_matches(matches: &[Match], output: &mut BTreeSet<String>) {
+    for matching in matches {
+        collect_scopes(&matching.scopes, output);
+        collect_pattern(&matching.pattern, output);
+    }
+}
+
+fn collect_pattern(pattern: &Pattern, output: &mut BTreeSet<String>) {
+    for node in &pattern.nodes {
+        collect_properties(&node.properties, output);
+    }
+    for relationship in &pattern.relationships {
+        collect_properties(&relationship.properties, output);
+    }
+}
+
+fn collect_properties(properties: &BTreeMap<String, Expr>, output: &mut BTreeSet<String>) {
+    for expression in properties.values() {
+        collect_expr(expression, output);
+    }
+}
+
+fn collect_scopes(scopes: &[Scope], output: &mut BTreeSet<String>) {
+    for scope in scopes {
+        collect_scope(scope, output);
+    }
+}
+
 fn collect_scope(scope: &Scope, output: &mut BTreeSet<String>) {
     match &scope.mode {
         Mode::AsOf(value) => collect_expr(value, output),
@@ -165,6 +405,7 @@ fn collect_scope(scope: &Scope, output: &mut BTreeSet<String>) {
         }
     }
 }
+
 fn collect_expr(expr: &Expr, output: &mut BTreeSet<String>) {
     if let Expr::Parameter(name) = expr {
         output.insert(name.clone());

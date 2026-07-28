@@ -53,6 +53,7 @@ pub enum LogicalStatement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalWrite {
+    pub input: Option<LogicalPlan>,
     pub mutations: Vec<LogicalMutation>,
 }
 

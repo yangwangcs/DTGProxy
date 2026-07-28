@@ -407,9 +407,25 @@ fn every_mutation_valid_from_parameter_is_validated() {
 
     for mutation in mutations {
         assert_unknown_parameter(LogicalStatement::Write(LogicalWrite {
+            input: None,
             mutations: vec![mutation],
         }));
     }
+}
+
+#[test]
+fn write_inputs_are_recursively_validated_before_mutations() {
+    assert_unknown_parameter(LogicalStatement::Write(LogicalWrite {
+        input: Some(plan(LogicalNodeKind::NodeScan(NodeScan {
+            variable: "v".into(),
+            labels: vec!["Person".into()],
+            read_scope: unknown_read_scope(),
+        }))),
+        mutations: vec![LogicalMutation::Delete {
+            variable: "v".into(),
+            valid_from: ValidTimeExpr::Literal(1),
+        }],
+    }));
 }
 
 #[test]
@@ -546,6 +562,7 @@ fn validation_recursively_rejects_unknown_expression_parameters_everywhere() {
         },
     ))));
     assert_unknown_parameter(LogicalStatement::Write(LogicalWrite {
+        input: None,
         mutations: vec![LogicalMutation::SetProperties {
             variable: "v".into(),
             properties: BTreeMap::from([("property".into(), expression_with_unknown_parameter())]),

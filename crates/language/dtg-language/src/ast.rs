@@ -46,9 +46,10 @@ pub(crate) struct NodePattern {
 pub(crate) struct RelationshipPattern {
     pub(crate) variable: String,
     pub(crate) types: Vec<String>,
+    pub(crate) properties: BTreeMap<String, Expr>,
     pub(crate) direction: RelationshipDirection,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RelationshipDirection {
     Outgoing,
     Incoming,
@@ -60,12 +61,19 @@ pub(crate) enum Write {
         node: NodePattern,
         valid_from: Expr,
     },
+    CreateRelationship {
+        matches: Vec<Match>,
+        pattern: Pattern,
+        valid_from: Expr,
+    },
     Set {
+        matches: Vec<Match>,
         variable: String,
         properties: BTreeMap<String, Expr>,
         valid_from: Expr,
     },
     Delete {
+        matches: Vec<Match>,
         variable: String,
         valid_from: Expr,
     },

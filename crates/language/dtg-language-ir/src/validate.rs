@@ -237,6 +237,9 @@ fn validate_projections(
 }
 
 fn validate_write(write: &crate::LogicalWrite, parameters: &BTreeSet<&str>) -> Result<(), IrError> {
+    if let Some(input) = &write.input {
+        validate_plan(input, parameters)?;
+    }
     for mutation in &write.mutations {
         let properties = match mutation {
             LogicalMutation::CreateVertex {
