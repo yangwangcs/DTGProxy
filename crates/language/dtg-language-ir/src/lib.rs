@@ -6,13 +6,17 @@ mod plan;
 mod schema;
 mod validate;
 
-pub use analytics::{AnalyticsSubmission, BuiltInAlgorithmId, BuiltInAlgorithmIdError};
+pub use analytics::{
+    AnalyticsExecutionMode, AnalyticsRequestIdentity, AnalyticsRequestIdentityError,
+    AnalyticsSubmission, BuiltInAlgorithmId, BuiltInAlgorithmIdError,
+};
 pub use expr::{BinaryOperator, LogicalExpr, UnaryOperator};
 pub use plan::{
-    Aggregate, AggregateFunction, Expand, Join, JoinKind, Limit, LogicalMutation, LogicalNode,
-    LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement, LogicalWrite,
-    NodeScan, Projection, RelationshipScan, Sort, SortDirection, SortKey, Subquery, TemporalScope,
-    TimeExpr, Unwind,
+    Aggregate, AggregateFunction, AggregateKind, Expand, ExpandDirection, GraphScope, Join,
+    JoinKind, Limit, LogicalMutation, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
+    LogicalProgram, LogicalStatement, LogicalWrite, NodeScan, Projection, ReadScope,
+    RelationshipLookup, RelationshipScan, Sort, SortDirection, SortKey, Subquery, TemporalScope,
+    TimeExpr, Unwind, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate, VertexLookup,
 };
 pub use schema::{Field, LogicalType, Parameter, RowSchema};
 pub use validate::{IrError, IrVersion, validate_program};

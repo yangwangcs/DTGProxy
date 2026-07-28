@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
-use dtg_kernel::{TransactionTime, ValidInterval};
+use dtg_kernel::{GraphId, TransactionTime, ValidInterval};
 
 use crate::{AnalyticsSubmission, LogicalExpr, Parameter, RowSchema};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicalProgram {
     pub version: crate::IrVersion,
+    pub graph_scope: GraphScope,
     pub parameters: Vec<Parameter>,
     pub statement: LogicalStatement,
     pub result_schema: RowSchema,
@@ -16,11 +17,28 @@ impl LogicalProgram {
     pub const fn new(statement: LogicalStatement) -> Self {
         Self {
             version: crate::IrVersion::CURRENT,
+            graph_scope: GraphScope::SessionDefault,
             parameters: Vec::new(),
             statement,
             result_schema: RowSchema::empty(),
         }
     }
+
+    pub const fn for_graph(graph: GraphId, statement: LogicalStatement) -> Self {
+        Self {
+            version: crate::IrVersion::CURRENT,
+            graph_scope: GraphScope::Explicit(graph),
+            parameters: Vec::new(),
+            statement,
+            result_schema: RowSchema::empty(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
+pub enum GraphScope {
+    SessionDefault,
+    Explicit(GraphId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +121,8 @@ pub struct LogicalNode {
 pub enum LogicalNodeKind {
     NodeScan(NodeScan),
     RelationshipScan(RelationshipScan),
+    VertexLookup(VertexLookup),
+    RelationshipLookup(RelationshipLookup),
     Expand(Expand),
     Filter {
         input: LogicalNodeId,
@@ -124,14 +144,30 @@ pub enum LogicalNodeKind {
 pub struct NodeScan {
     pub variable: String,
     pub labels: Vec<String>,
-    pub temporal_scope: TemporalScope,
+    pub read_scope: ReadScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationshipScan {
     pub variable: String,
     pub relationship_types: Vec<String>,
-    pub temporal_scope: TemporalScope,
+    pub read_scope: ReadScope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VertexLookup {
+    pub variable: String,
+    pub id: LogicalExpr,
+    pub labels: Vec<String>,
+    pub read_scope: ReadScope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipLookup {
+    pub variable: String,
+    pub id: LogicalExpr,
+    pub relationship_types: Vec<String>,
+    pub read_scope: ReadScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,6 +178,7 @@ pub struct Expand {
     pub destination: String,
     pub direction: ExpandDirection,
     pub relationship_types: Vec<String>,
+    pub read_scope: ReadScope,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -242,6 +279,39 @@ pub enum TemporalScope {
     Current,
     AsOf(TimeExpr),
     Changes { from: TimeExpr, to: TimeExpr },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadScope {
+    pub transaction_time: TemporalScope,
+    pub valid_time: Option<ValidTimePredicate>,
+}
+
+impl ReadScope {
+    pub const fn current() -> Self {
+        Self {
+            transaction_time: TemporalScope::Current,
+            valid_time: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidTimePredicate {
+    At(ValidTimeExpr),
+    Overlaps(ValidIntervalExpr),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidTimeExpr {
+    Literal(i64),
+    Parameter(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidIntervalExpr {
+    Literal(ValidInterval),
+    Parameter(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
