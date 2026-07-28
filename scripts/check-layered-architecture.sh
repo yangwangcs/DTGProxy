@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+default_root="$(cd "$(dirname "$0")/.." && pwd)"
+repo_root="${LAYERED_ARCHITECTURE_ROOT:-$default_root}"
 cd "$repo_root"
 
 metadata="$(mktemp)"
-trap 'rm -f "$metadata"' EXIT
+trap 'rm -f "$metadata"' EXIT HUP INT TERM
 cargo metadata --no-deps --format-version 1 >"$metadata"
 
 python3 - "$metadata" <<'PY'
@@ -14,9 +15,16 @@ import sys
 from pathlib import Path
 
 
-def fail(owner, dependency, reason):
-    print(f"forbidden layered architecture dependency: {owner} -> {dependency} ({reason})", file=sys.stderr)
+def abort(message):
+    print(message, file=sys.stderr)
     raise SystemExit(1)
+
+
+def fail(owner, dependency, reason):
+    abort(
+        f"forbidden layered architecture dependency: {owner} -> {dependency} "
+        f"({reason})"
+    )
 
 
 try:
@@ -24,8 +32,7 @@ try:
     packages = metadata["packages"]
     workspace_members = set(metadata["workspace_members"])
 except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-    print(f"failed to read Cargo metadata: {error}", file=sys.stderr)
-    raise SystemExit(1)
+    abort(f"failed to read Cargo metadata: {error}")
 
 new_packages = {
     "dtg-kernel",
@@ -50,12 +57,47 @@ new_packages = {
     "dtg-meta",
     "dtg-controller",
 }
-processes = {"dtg-gateway", "dtg-data", "dtg-meta", "dtg-controller"}
-concrete_storage_providers = {
-    "dtg-storage-fjall",
-    "dtg-storage-postgres",
-    "dtg-storage-neo4j",
-    "dtg-storage-remote",
+allowed_new_dependencies = {
+    "dtg-kernel": set(),
+    "dtg-language-ir": {"dtg-kernel"},
+    "dtg-language": {"dtg-kernel", "dtg-language-ir"},
+    "dtg-storage": {"dtg-kernel"},
+    "dtg-storage-fjall": {"dtg-kernel", "dtg-storage"},
+    "dtg-storage-postgres": {"dtg-kernel", "dtg-storage"},
+    "dtg-storage-neo4j": {"dtg-kernel", "dtg-storage"},
+    "dtg-storage-remote-protocol": {"dtg-kernel"},
+    "dtg-storage-remote": {
+        "dtg-kernel",
+        "dtg-storage",
+        "dtg-storage-remote-protocol",
+    },
+    "dtg-plan": {"dtg-kernel", "dtg-language-ir", "dtg-storage"},
+    "dtg-query": {"dtg-kernel", "dtg-language-ir", "dtg-storage"},
+    "dtg-transaction": {"dtg-kernel", "dtg-language-ir", "dtg-storage"},
+    "dtg-shard": {"dtg-kernel", "dtg-language-ir", "dtg-storage"},
+    "dtg-analytics": {"dtg-kernel", "dtg-language-ir", "dtg-storage"},
+    "dtg-control": {"dtg-kernel", "dtg-language-ir", "dtg-storage"},
+    "dtg-cluster-protocol": {"dtg-kernel"},
+    "dtg-execution": {
+        "dtg-kernel",
+        "dtg-plan",
+        "dtg-query",
+        "dtg-transaction",
+        "dtg-shard",
+        "dtg-analytics",
+        "dtg-control",
+        "dtg-cluster-protocol",
+    },
+    "dtg-gateway": {"dtg-execution"},
+    "dtg-data": {
+        "dtg-execution",
+        "dtg-storage-fjall",
+        "dtg-storage-postgres",
+        "dtg-storage-neo4j",
+        "dtg-storage-remote",
+    },
+    "dtg-meta": {"dtg-execution"},
+    "dtg-controller": {"dtg-execution"},
 }
 legacy_runtime_packages = {
     "storage-api",
@@ -75,39 +117,48 @@ legacy_runtime_packages = {
     "controller",
     "dtgproxy",
 }
+
+if set(allowed_new_dependencies) != new_packages:
+    abort("layered architecture allowlist does not cover exactly the new packages")
+
+workspace_packages = {
+    package["id"]: package
+    for package in packages
+    if package.get("id") in workspace_members
+}
 workspace_package_names = {
-    package["name"] for package in packages if package.get("id") in workspace_members
+    package["name"] for package in workspace_packages.values()
+}
+packages_by_manifest = {
+    Path(package["manifest_path"]).resolve(): package
+    for package in workspace_packages.values()
 }
 
 
-def is_language(name):
-    return name.startswith("dtg-language")
+def dependency_name(dependency):
+    path = dependency.get("path")
+    if path is not None:
+        package = packages_by_manifest.get((Path(path).resolve() / "Cargo.toml").resolve())
+        if package is not None:
+            return package["name"]
+    name = dependency.get("name")
+    if not isinstance(name, str):
+        abort("Cargo metadata contains a dependency without a package name")
+    return name
 
 
-def is_storage(name):
-    return name.startswith("dtg-storage")
-
-
-def is_execution(name):
-    return name.startswith("dtg-") and name not in processes and not is_language(name) and not is_storage(name) and name != "dtg-kernel"
-
-
-for package in packages:
-    owner = package.get("name")
+for package in workspace_packages.values():
+    owner = package["name"]
     if owner not in new_packages:
         continue
     dependencies = package.get("dependencies")
     if not isinstance(dependencies, list):
-        print(f"missing dependency metadata for {owner}", file=sys.stderr)
-        raise SystemExit(1)
+        abort(f"Cargo dependency list is missing for {owner}")
 
     for dependency in dependencies:
         if dependency.get("kind") == "dev":
             continue
-        target = dependency.get("name")
-        if not isinstance(target, str):
-            print(f"missing dependency name for {owner}", file=sys.stderr)
-            raise SystemExit(1)
+        target = dependency_name(dependency)
 
         if (
             target.startswith("adapter-")
@@ -115,12 +166,8 @@ for package in packages:
             or (target in workspace_package_names and target not in new_packages)
         ):
             fail(owner, target, "new packages must not depend on legacy runtime packages")
-        if owner == "dtg-kernel" and target.startswith("dtg-"):
-            fail(owner, target, "kernel may not depend on a dtg package")
-        if is_language(owner) and (is_execution(target) or is_storage(target) or target in processes):
-            fail(owner, target, "language may depend only on kernel among architectural layers")
-        if is_storage(owner) and (is_language(target) or is_execution(target) or target in processes):
-            fail(owner, target, "storage may not depend on language, execution, or processes")
-        if is_execution(owner) and (target in processes or target in concrete_storage_providers):
-            fail(owner, target, "execution may not depend on processes or concrete storage providers")
+        if target in new_packages and target not in allowed_new_dependencies[owner]:
+            fail(owner, target, "dependency is not in the explicit layer allowlist")
+        if owner == "dtg-kernel" and target not in allowed_new_dependencies[owner]:
+            fail(owner, target, "kernel permits no dependencies")
 PY
