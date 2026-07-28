@@ -10,6 +10,7 @@ pub use analytics::{
     AnalyticsExecutionMode, AnalyticsRequestIdentity, AnalyticsRequestIdentityError,
     AnalyticsSubmission, BuiltInAlgorithmId, BuiltInAlgorithmIdError,
 };
+pub use dtg_kernel::{GraphId, TransactionTime, ValidInterval, Value};
 pub use expr::{BinaryOperator, LogicalExpr, UnaryOperator};
 pub use plan::{
     Aggregate, AggregateFunction, AggregateKind, Expand, ExpandDirection, GraphScope, Join,

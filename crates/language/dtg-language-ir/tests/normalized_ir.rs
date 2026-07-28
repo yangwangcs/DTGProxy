@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
-use dtg_kernel::{GraphId, TransactionTime, ValidInterval, Value};
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, AnalyticsExecutionMode, AnalyticsRequestIdentity,
     AnalyticsSubmission, BinaryOperator, BuiltInAlgorithmId, Expand, ExpandDirection, Field,
-    GraphScope, IrError, IrVersion, Join, JoinKind, Limit, LogicalExpr, LogicalNode, LogicalNodeId,
-    LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement, LogicalType, LogicalWrite,
-    NodeScan, Parameter, Projection, ReadScope, RelationshipLookup, RelationshipScan, RowSchema,
-    Sort, SortDirection, SortKey, Subquery, TemporalScope, TimeExpr, UnaryOperator, Unwind,
-    ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate, VertexLookup, validate_program,
+    GraphId, GraphScope, IrError, IrVersion, Join, JoinKind, Limit, LogicalExpr, LogicalNode,
+    LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement, LogicalType,
+    LogicalWrite, NodeScan, Parameter, Projection, ReadScope, RelationshipLookup, RelationshipScan,
+    RowSchema, Sort, SortDirection, SortKey, Subquery, TemporalScope, TimeExpr, TransactionTime,
+    UnaryOperator, Unwind, ValidInterval, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate,
+    Value, VertexLookup, validate_program,
 };
 
 fn parameter(name: &str) -> Parameter {
