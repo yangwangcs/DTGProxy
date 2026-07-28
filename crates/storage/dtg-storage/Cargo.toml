@@ -5,5 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+blake3 = "=1.8.5"
+dtg-kernel = { path = "../../kernel/dtg-kernel" }
+
 [lints]
 workspace = true
