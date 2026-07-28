@@ -1056,12 +1056,13 @@ impl RestartableShard {
         let proxy = tokio::spawn(async move {
             loop {
                 let (mut inbound, _) = proxy_listener.accept().await?;
+                let mut connections = proxy_connections.lock().await;
                 let connection = tokio::spawn(async move {
                     let mut outbound = tokio::net::TcpStream::connect(backend_address).await?;
                     tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
                     Ok(())
                 });
-                proxy_connections.lock().await.push(connection);
+                connections.push(connection);
             }
         });
         self.host = Some(host);

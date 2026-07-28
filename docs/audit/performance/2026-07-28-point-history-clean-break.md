@@ -71,19 +71,85 @@ percentile estimate.
 
 ## Allocation and retained-memory method
 
-This fixture does not install an allocator sampler, RSS sampler, or retained-heap sampler, so it
-does not claim allocation or retained-memory measurements. `rocksdb_bytes` is the recursive byte
-size of the temporary RocksDB directory at the end of each benchmark process; it is retained
-on-disk storage only and must not be interpreted as process memory. The three observed directory
-sizes are recorded in the raw-runs table.
+The original baseline did not install an allocator, RSS, or retained-heap sampler, so it has no
+allocation/copy or retained-memory values. `rocksdb_bytes` is the recursive byte size of the
+temporary RocksDB directory at the end of each benchmark process; it is retained on-disk storage
+only and must not be interpreted as process memory.
+
+The corrected Task-8 latency benchmark preserves the original `measure` function exactly: one
+outer `Instant`, repeated calls to `operation()`, and one elapsed-time division after the loop.
+Per-operation `Instant` reads, sample retention, and percentile sorting occur only in a separate
+pass after the original point-read latency cells have completed. The same corrected benchmark
+source can therefore be applied to the old and new revisions without changing the legacy
+`*_ns_per_op` method, while the separate pass emits matching `*_p50_ns` and `*_p95_ns` fields.
+
+Physical heap evidence is isolated in the separate `roundtrip_alloc` benchmark target. It uses the
+dev-only external `dhat` allocator tracker through safe workspace code; no `unsafe` block or unsafe
+allocator implementation exists in workspace source. The target exercises only the production
+`TemporalStore::vertex_as_of` API that exists in both the recorded old revision and the new
+revision. For each PointHistory cell it reports:
+
+- `*_allocator_total_bytes_per_op`: allocator-observed bytes allocated during the profiled query
+  window, divided by the configured positive iteration count;
+- `*_allocator_peak_live_bytes`: the high-water mark of heap bytes allocated after the profiling
+  window opened and still live at the same instant;
+- `*_allocator_current_live_bytes`: those tracked bytes still live when the window closes; and
+- `*_allocator_allocations_per_op`: allocator events divided by the iteration count.
+
+These are physical heap-allocation observations, not logical history-byte counters and not RSS.
+The tracker is process-wide, so RocksDB background-thread allocations that occur inside the narrow
+query window are included; three isolated process runs and medians are required for old/new gate
+evidence. Allocations already live before the profiling window are intentionally excluded, which
+makes `allocator_peak_live_bytes` an incremental query-window heap peak rather than total process
+resident memory.
+
+The removed `history_bytes + payload_bytes_copied` field was neither peak retained memory nor an
+upper bound on it. The new-reader-only `payload_bytes_copied` statistic also has no semantically
+equivalent old-path counter, so it is not emitted as comparable benchmark evidence. It may still be
+used as an internal non-gating PointHistory diagnostic, but it cannot support an old/new gate
+without a separately reviewed counter on the historical production path.
 
 ## Post-change raw runs
 
+Not run in this task. The required three 10,000-iteration latency samples and matching allocator
+samples were explicitly deferred. No smoke output is presented as a performance result.
+
+### Required replay procedure
+
+1. Apply the corrected latency benchmark patch to the recorded pre-change implementation. Run the
+   command below three times at 10,000 iterations and save complete raw output. The frozen
+   historical `ns_per_op` rows remain continuity evidence, but matching old/new p50/p95 gates must
+   use the new separate percentile pass on both revisions.
+2. Run the same latency command three times against the post-change implementation and save every
+   complete raw output:
+
+   ```bash
+   DTGPROXY_BENCH_ITERS=10000 cargo bench --locked -p temporal-storage --features rocksdb-tests --bench roundtrip
+   ```
+
+3. Apply the identical `roundtrip_alloc` source and dev-dependency patch to the recorded pre-change
+   implementation. Run the following command in three fresh processes on both revisions, with the
+   same positive allocation iteration count, and preserve raw output:
+
+   ```bash
+   DTGPROXY_BENCH_ALLOC_ITERS=1 cargo bench --locked -p temporal-storage --features rocksdb-tests --bench roundtrip_alloc
+   ```
+
+4. For each stable PointHistory cell, report the median of the three old and three new p50, p95,
+   allocator-total-byte, and allocator-peak-live-byte observations. Preserve the historical and
+   current `ns_per_op` rows as continuity evidence, but do not present them as percentiles.
+5. Use `allocator_total_bytes_per_op` for the physical allocation gate and
+   `allocator_peak_live_bytes` for the incremental query-window peak-live gate. Do not compare
+   either field with `rocksdb_bytes`, RSS, the removed logical sum, or the unmatched new-reader
+   payload-copy diagnostic.
+
 ## Comparison
 
-No post-change observations have been collected. Comparison is deferred until Task 8 reruns these
-unchanged four stable benchmark cells under the same command and reports both raw observations and
-the same median calculation.
+No post-change 10,000-iteration observations have been collected. The latency gates require
+matching old and new p50/p95 medians. The physical allocation and incremental peak-live gates now
+have an old/new-compatible procedure, but neither revision has been sampled with it. The exact
+payload-copy gate remains unresolved because the historical production path exposes no equivalent
+counter. Therefore no Task-8 acceptance gate is claimed.
 
 ## Remaining bottlenecks
 

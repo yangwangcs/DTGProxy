@@ -64,29 +64,12 @@ use tonic::transport::Server;
 
 const CLUSTER_ID: [u8; 16] = [0x76; 16];
 
-struct FailOnceProcessStop {
-    point: AnalyticsFaultPoint,
-    fired: AtomicBool,
-}
-
 struct ObservedProcessStop {
     point: AnalyticsFaultPoint,
     fired: Arc<AtomicBool>,
 }
 
 impl AnalyticsFaultInjector for ObservedProcessStop {
-    fn check(
-        &self,
-        point: AnalyticsFaultPoint,
-    ) -> Result<(), procedure_runtime::ClusterAnalyticsError> {
-        if point == self.point && !self.fired.swap(true, Ordering::AcqRel) {
-            return Err(process_stop_fault(point));
-        }
-        Ok(())
-    }
-}
-
-impl AnalyticsFaultInjector for FailOnceProcessStop {
     fn check(
         &self,
         point: AnalyticsFaultPoint,
@@ -131,6 +114,62 @@ impl Backend {
             Self::Neo4j => StartupBackend::Neo4j,
         }
     }
+}
+
+fn certification_filters() -> (Option<String>, Option<String>) {
+    let backend = std::env::var("DTGPROXY_CERT_BACKEND").ok();
+    let mode = std::env::var("DTGPROXY_CERT_MODE").ok();
+    if let Some(filter) = backend.as_deref() {
+        assert!(
+            Backend::ALL.iter().any(|backend| backend.name() == filter),
+            "unknown DTGPROXY_CERT_BACKEND={filter}"
+        );
+    }
+    if let Some(filter) = mode.as_deref() {
+        assert!(
+            [
+                DeploymentMode::PrimaryReplica,
+                DeploymentMode::SharedNothing
+            ]
+            .iter()
+            .any(|mode| mode_name(*mode) == filter),
+            "unknown DTGPROXY_CERT_MODE={filter}"
+        );
+    }
+    (backend, mode)
+}
+
+fn validated_filter(name: &str, allowed: &[&str]) -> Option<String> {
+    let filter = std::env::var(name).ok();
+    if let Some(filter) = filter.as_deref() {
+        assert!(allowed.contains(&filter), "unknown {name}={filter}");
+    }
+    filter
+}
+
+fn validate_takeover_filter_combination(
+    algorithm: Option<&str>,
+    fault_point: Option<&str>,
+) -> Result<(), String> {
+    if let (Some(algorithm), Some(fault_point)) = (algorithm, fault_point)
+        && algorithm != "dtg.graph.degree"
+        && fault_point != "begin"
+    {
+        return Err(format!(
+            "DTGPROXY_CERT_ALGORITHM={algorithm} does not support \
+             DTGPROXY_CERT_FAULT_POINT={fault_point}; only begin is valid"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn takeover_filters_reject_faults_unsupported_by_the_selected_algorithm() {
+    let error = validate_takeover_filter_combination(Some("dtg.graph.wcc"), Some("publish"))
+        .expect_err("WCC cannot silently turn a publish fault request into a begin fault");
+
+    assert!(error.contains("dtg.graph.wcc"), "{error}");
+    assert!(error.contains("publish"), "{error}");
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -243,10 +282,18 @@ async fn all_backends_are_equivalent_in_both_deployment_modes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend_and_mode() {
+    let (backend_filter, mode_filter) = certification_filters();
+    let algorithm_filter = validated_filter("DTGPROXY_CERT_ALGORITHM", &RESUMABLE_ALGORITHMS);
+    let degree_fault_names = DEGREE_FAULT_POINTS
+        .iter()
+        .map(|(_, name)| *name)
+        .chain(["begin", "gateway-restart"])
+        .collect::<Vec<_>>();
+    let fault_filter = validated_filter("DTGPROXY_CERT_FAULT_POINT", &degree_fault_names);
+    validate_takeover_filter_combination(algorithm_filter.as_deref(), fault_filter.as_deref())
+        .unwrap_or_else(|error| panic!("{error}"));
     let live = LiveConfiguration::from_process();
-    let backend_filter = std::env::var("DTGPROXY_CERT_BACKEND").ok();
-    let mode_filter = std::env::var("DTGPROXY_CERT_MODE").ok();
-    let algorithm_filter = std::env::var("DTGPROXY_CERT_ALGORITHM").ok();
+    let mut executed_cases = 0usize;
     for backend in Backend::ALL {
         if backend_filter
             .as_deref()
@@ -269,6 +316,9 @@ async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend
                 if algorithm_filter
                     .as_deref()
                     .is_some_and(|filter| filter != algorithm)
+                    || fault_filter
+                        .as_deref()
+                        .is_some_and(|filter| filter != "begin")
                 {
                     continue;
                 }
@@ -280,6 +330,7 @@ async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend
                     SidecarRecovery::None,
                 )
                 .await;
+                executed_cases += 1;
                 assert_surface_semantics(&recovered);
                 assert_eq!(
                     recovered.async_result_artifacts.get(algorithm),
@@ -291,7 +342,6 @@ async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend
                 .as_deref()
                 .is_none_or(|filter| filter == "dtg.graph.degree")
             {
-                let fault_filter = std::env::var("DTGPROXY_CERT_FAULT_POINT").ok();
                 for (fault_point, fault_name) in DEGREE_FAULT_POINTS {
                     if fault_filter
                         .as_deref()
@@ -307,6 +357,7 @@ async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend
                         SidecarRecovery::None,
                     )
                     .await;
+                    executed_cases += 1;
                     assert_surface_semantics(&recovered);
                     assert_eq!(
                         recovered.async_result_artifacts.get("dtg.graph.degree"),
@@ -318,8 +369,7 @@ async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend
             if algorithm_filter
                 .as_deref()
                 .is_none_or(|filter| filter == "dtg.graph.degree")
-                && std::env::var("DTGPROXY_CERT_FAULT_POINT")
-                    .ok()
+                && fault_filter
                     .as_deref()
                     .is_none_or(|filter| filter == "gateway-restart")
             {
@@ -335,6 +385,7 @@ async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend
                     SidecarRecovery::None,
                 )
                 .await;
+                executed_cases += 1;
                 assert_surface_semantics(&recovered);
                 assert_eq!(
                     recovered.async_result_artifacts.get("dtg.graph.degree"),
@@ -344,13 +395,16 @@ async fn resumable_algorithms_are_byte_identical_after_takeover_on_every_backend
             }
         }
     }
+    assert_ne!(
+        executed_cases, 0,
+        "certification filters must select at least one takeover scenario"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backend_sidecar_restart_recovers_degree_on_every_backend_and_mode() {
+    let (backend_filter, mode_filter) = certification_filters();
     let live = LiveConfiguration::from_process();
-    let backend_filter = std::env::var("DTGPROXY_CERT_BACKEND").ok();
-    let mode_filter = std::env::var("DTGPROXY_CERT_MODE").ok();
     for backend in Backend::ALL {
         if backend_filter
             .as_deref()
@@ -383,9 +437,8 @@ async fn backend_sidecar_restart_recovers_degree_on_every_backend_and_mode() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backend_sidecar_restart_allows_cross_gateway_degree_takeover() {
+    let (backend_filter, mode_filter) = certification_filters();
     let live = LiveConfiguration::from_process();
-    let backend_filter = std::env::var("DTGPROXY_CERT_BACKEND").ok();
-    let mode_filter = std::env::var("DTGPROXY_CERT_MODE").ok();
     for backend in Backend::ALL {
         if backend_filter
             .as_deref()
@@ -418,10 +471,12 @@ async fn backend_sidecar_restart_allows_cross_gateway_degree_takeover() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tombstone_gc_recovers_at_every_boundary_on_every_backend_and_mode() {
+    let (backend_filter, mode_filter) = certification_filters();
+    let fault_filter = validated_filter(
+        "DTGPROXY_CERT_GC_FAULT_POINT",
+        &["after-fence", "before-delete", "before-acknowledgement"],
+    );
     let live = LiveConfiguration::from_process();
-    let backend_filter = std::env::var("DTGPROXY_CERT_BACKEND").ok();
-    let mode_filter = std::env::var("DTGPROXY_CERT_MODE").ok();
-    let fault_filter = std::env::var("DTGPROXY_CERT_GC_FAULT_POINT").ok();
     for backend in Backend::ALL {
         if backend_filter
             .as_deref()
@@ -461,9 +516,8 @@ async fn tombstone_gc_recovers_at_every_boundary_on_every_backend_and_mode() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordered_full_stack_restart_recovers_on_every_backend_and_mode() {
+    let (backend_filter, mode_filter) = certification_filters();
     let live = LiveConfiguration::from_process();
-    let backend_filter = std::env::var("DTGPROXY_CERT_BACKEND").ok();
-    let mode_filter = std::env::var("DTGPROXY_CERT_MODE").ok();
     for backend in Backend::ALL {
         if backend_filter
             .as_deref()
@@ -632,6 +686,14 @@ async fn run_live_full_stack_restart_certification(
     for shard in &mut shards {
         shard.stop().await;
     }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (interrupted_state, interrupted_error) =
+        analytics_status(&mut first_bolt, &interrupted_job).await;
+    assert_eq!(
+        interrupted_state, "RUNNING",
+        "{backend:?} {mode:?} full-stack job completed before the data outage was observed: \
+         {interrupted_error:?}"
+    );
     meta.stop().await;
     drop(first_bolt);
     drop(first_client);
@@ -1715,10 +1777,15 @@ async fn run_surface(
         Arc::new(RemoteShardClient::new_loopback_plaintext(CLUSTER_ID, topology).unwrap());
     let gateway_id =
         backend.gateway_id() + u64::from(matches!(mode, DeploymentMode::SharedNothing));
+    let takeover_fault_fired = takeover.map(|_| Arc::new(AtomicBool::new(false)));
     let gateway = if let Some((_, fault_point, _)) = takeover {
-        let injector: Arc<dyn AnalyticsFaultInjector> = Arc::new(FailOnceProcessStop {
+        let injector: Arc<dyn AnalyticsFaultInjector> = Arc::new(ObservedProcessStop {
             point: fault_point,
-            fired: AtomicBool::new(false),
+            fired: Arc::clone(
+                takeover_fault_fired
+                    .as_ref()
+                    .expect("takeover fault observer"),
+            ),
         });
         RemoteGatewayService::new_at_revision_with_gateway_id_and_delay_and_fault_injector(
             gateway_id,
@@ -1877,6 +1944,13 @@ async fn run_surface(
         drop(bolt);
         tokio::time::sleep(Duration::from_millis(250)).await;
         wait_async_algorithm(&mut takeover_bolt, &job_id, algorithm).await;
+        assert!(
+            takeover_fault_fired
+                .as_ref()
+                .expect("takeover fault observer")
+                .load(Ordering::Acquire),
+            "requested takeover fault must fire before recovery completes"
+        );
         async_result_artifacts.insert(
             algorithm.to_owned(),
             read_result_artifact(
@@ -1899,9 +1973,9 @@ async fn run_surface(
             .expect("Sidecar shutdown");
         tokio::time::sleep(Duration::from_secs(3)).await;
         let (state, error) = analytics_status(&mut bolt, &job_id).await;
-        assert_ne!(
-            state, "FAILED",
-            "{backend:?} {mode:?} Sidecar outage became terminal: {error:?}"
+        assert_eq!(
+            state, "RUNNING",
+            "{backend:?} {mode:?} Sidecar outage did not interrupt an active job: {error:?}"
         );
         let (backend_root, instance_id, sidecar_address) = sidecar_specs
             .get(&10)
@@ -2620,12 +2694,13 @@ where
                 extra: BTreeMap::new(),
             })
             .await;
-        if matches!(run.as_slice(), [ServerMessage::Failure { message, .. }] if message.contains("DTG-ANALYTICS-JOB-FINAL"))
+        if matches!(run.as_slice(), [ServerMessage::Failure { message, .. }] if message.contains("DTG-ANALYTICS-JOB-FINAL") || message.contains("DTG-ANALYTICS-META-UNAVAILABLE"))
         {
             assert!(matches!(
                 bolt.handle(ClientMessage::Reset).await.as_slice(),
                 [ServerMessage::Success(_)]
             ));
+            tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         }
         assert!(

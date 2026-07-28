@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -6,8 +7,13 @@ use adapter_memory::MemoryAdapter;
 use storage_api::{
     AdapterError, CandidateScanRequest, CanonicalScanRequest, ChangeScanRequest,
     CommittedMutationBatch, KeySpan, Keyspace, LogicalKey, Mutation, PushdownGuarantee,
-    QueryPageBounds, StorageAdapter,
+    QueryPageBounds, ReadSnapshot, StorageAdapter,
 };
+use temporal_storage::{
+    ElementId, ElementRef, GraphId, HistoryAnchor, HistoryDelta, HistoryEntry, PartitionId,
+    ProjectionRecord, ValidSegment, history_anchor_key, history_prefix,
+};
+use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
 fn key(value: &str) -> LogicalKey {
     LogicalKey::new(value.as_bytes().to_vec())
@@ -310,6 +316,12 @@ fn canonical_scan_pages_follow_one_pinned_snapshot_without_gaps() {
 }
 
 #[test]
+fn history_anchor_and_fifteen_deltas_page_through_one_pinned_snapshot() {
+    let adapter = MemoryAdapter::new();
+    assert_history_page_continuation(&adapter);
+}
+
+#[test]
 fn query_primitive_capabilities_advertise_bounded_scan_primitives() {
     let capabilities = MemoryAdapter::new().query_primitive_capabilities();
 
@@ -602,6 +614,175 @@ fn read_snapshot_pins_multi_get_and_paginated_scans_to_its_committed_prefix() {
             .len(),
         3
     );
+}
+
+fn assert_history_page_continuation(adapter: &dyn StorageAdapter) {
+    let element = ElementRef::vertex(GraphId::new(7), PartitionId::new(3), ElementId::new(9));
+    let valid =
+        Interval::new(ValidTime::from_micros(0), Some(ValidTime::from_micros(100))).unwrap();
+    let payload = CanonicalElement::new(1, BTreeMap::new());
+    let anchor = HistoryEntry::Anchor(
+        HistoryAnchor::new(
+            TransactionTime::new(100, 0),
+            valid,
+            ProjectionRecord::new(
+                TransactionTime::new(100, 0),
+                vec![ValidSegment::new(valid, payload.clone())],
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    let anchor_key = history_anchor_key(element, TransactionTime::new(100, 0), 0);
+    let mut records = vec![(anchor_key, anchor.encode().unwrap())];
+    for offset in 1..=15_u32 {
+        let commit = 100 + i64::from(offset);
+        let delta = HistoryEntry::Delta(HistoryDelta::put(
+            TransactionTime::new(commit, 0),
+            valid,
+            payload.clone(),
+        ));
+        records.push((
+            history_anchor_key(element, TransactionTime::new(commit, 0), 0),
+            delta.encode().unwrap(),
+        ));
+    }
+    let mut expected_keys = records
+        .iter()
+        .map(|(key, _)| key.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    expected_keys.sort();
+    let retained_sizes = records
+        .iter()
+        .map(|(key, value)| key.as_bytes().len() + value.len())
+        .collect::<Vec<_>>();
+    let byte_budget = u64::try_from(*retained_sizes.iter().max().unwrap()).unwrap();
+    assert!(
+        retained_sizes.iter().min().unwrap().saturating_mul(2)
+            > usize::try_from(byte_budget).unwrap(),
+        "byte budget fixture must admit one record but never two"
+    );
+    let mutations = records
+        .iter()
+        .enumerate()
+        .map(|(sequence, (key, value))| {
+            Mutation::put(u32::try_from(sequence).unwrap(), key.clone(), value.clone())
+        })
+        .collect();
+    block_on(adapter.apply_committed(batch(1, 401, mutations))).unwrap();
+
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+    assert_eq!(snapshot.applied_log_index(), 1);
+    let later = HistoryEntry::Delta(HistoryDelta::put(
+        TransactionTime::new(99, 0),
+        valid,
+        payload,
+    ));
+    let later_key = history_anchor_key(element, TransactionTime::new(99, 0), 0);
+    assert!(
+        expected_keys
+            .last()
+            .is_some_and(|key| key.as_slice() < later_key.as_bytes()),
+        "intervening record must sort into a later page"
+    );
+    block_on(adapter.apply_committed(batch(
+        2,
+        402,
+        vec![Mutation::put(0, later_key.clone(), later.encode().unwrap())],
+    )))
+    .unwrap();
+
+    let prefix = history_prefix(element);
+    let (item_records, item_page_lengths) = collect_history_pages(
+        snapshot.as_ref(),
+        &prefix,
+        QueryPageBounds::new(3, 16 * 1024).unwrap(),
+        1,
+    );
+    let (byte_records, byte_page_lengths) = collect_history_pages(
+        snapshot.as_ref(),
+        &prefix,
+        QueryPageBounds::new(3, byte_budget).unwrap(),
+        1,
+    );
+
+    assert_eq!(item_page_lengths, vec![3, 3, 3, 3, 3, 1]);
+    assert_eq!(byte_page_lengths, vec![1; 16]);
+    assert_eq!(record_keys(&item_records), expected_keys);
+    assert_eq!(record_keys(&byte_records), expected_keys);
+    assert!(!record_keys(&item_records).contains(&later_key.as_bytes().to_vec()));
+    assert_history_record_counts(&item_records, 1, 15);
+
+    let fresh = block_on(adapter.begin_read_snapshot()).unwrap();
+    assert_eq!(fresh.applied_log_index(), 2);
+    let (fresh_records, _) = collect_history_pages(
+        fresh.as_ref(),
+        &prefix,
+        QueryPageBounds::new(32, 16 * 1024).unwrap(),
+        2,
+    );
+    assert!(record_keys(&fresh_records).contains(&later_key.as_bytes().to_vec()));
+    assert_history_record_counts(&fresh_records, 1, 16);
+}
+
+fn collect_history_pages(
+    snapshot: &dyn ReadSnapshot,
+    prefix: &[u8],
+    bounds: QueryPageBounds,
+    expected_log_index: u64,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<usize>) {
+    let mut span = KeySpan::prefix(Keyspace::History, prefix.to_vec());
+    let mut records = Vec::new();
+    let mut page_lengths = Vec::new();
+    loop {
+        let page =
+            block_on(snapshot.scan_canonical(&CanonicalScanRequest::new(span, bounds).unwrap()))
+                .unwrap();
+        assert_eq!(page.applied_log_index(), expected_log_index);
+        let retained_bytes = page.entries().iter().fold(0_u64, |total, entry| {
+            total
+                .saturating_add(u64::try_from(entry.key().as_bytes().len()).unwrap())
+                .saturating_add(u64::try_from(entry.value().len()).unwrap())
+        });
+        assert!(retained_bytes <= bounds.max_bytes());
+        page_lengths.push(page.entries().len());
+        records.extend(
+            page.entries()
+                .iter()
+                .map(|entry| (entry.key().as_bytes().to_vec(), entry.value().to_vec())),
+        );
+        assert!(records.len() <= 17, "history pagination did not terminate");
+        let Some(next_start) = page.next_start() else {
+            break;
+        };
+        span = KeySpan::prefix_from(
+            Keyspace::History,
+            prefix.to_vec(),
+            next_start.as_bytes().to_vec(),
+        )
+        .unwrap();
+    }
+    (records, page_lengths)
+}
+
+fn record_keys(records: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
+    records.iter().map(|(key, _)| key.clone()).collect()
+}
+
+fn assert_history_record_counts(
+    records: &[(Vec<u8>, Vec<u8>)],
+    expected_anchors: usize,
+    expected_deltas: usize,
+) {
+    let (anchors, deltas) =
+        records.iter().fold(
+            (0, 0),
+            |(anchors, deltas), (_, value)| match HistoryEntry::decode(value).unwrap() {
+                HistoryEntry::Anchor(_) => (anchors + 1, deltas),
+                HistoryEntry::Delta(_) => (anchors, deltas + 1),
+            },
+        );
+    assert_eq!((anchors, deltas), (expected_anchors, expected_deltas));
 }
 
 struct NoopWake;

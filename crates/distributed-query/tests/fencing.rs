@@ -1,4 +1,9 @@
-use distributed_query::{BatchEnvelope, BatchMerger, DistributedQueryError, SnapshotToken};
+use std::collections::BTreeMap;
+
+use distributed_query::{
+    BatchEnvelope, BatchMerger, DistributedQueryError, FragmentRequest, SnapshotToken,
+};
+use physical_plan::FragmentId;
 use temporal_types::TransactionTime;
 
 fn snapshot(epoch: u64) -> SnapshotToken {
@@ -62,5 +67,43 @@ fn refuses_to_finish_with_an_incomplete_shard_stream() {
     assert_eq!(
         merger.finish(),
         Err(DistributedQueryError::IncompleteShards(vec![1, 2]))
+    );
+}
+
+#[test]
+fn fragment_request_requires_a_complete_nonzero_read_index_map_for_expected_shards() {
+    let request = FragmentRequest::new(FragmentId::new(1), snapshot(11), 1, 1024, 1)
+        .expect("request")
+        .with_expected_shards(vec![1, 2])
+        .expect("expected shards");
+
+    assert_eq!(
+        request
+            .clone()
+            .with_required_applied_indexes(BTreeMap::from([(1, 7)])),
+        Err(DistributedQueryError::InvalidRequest)
+    );
+    assert_eq!(
+        request.with_required_applied_indexes(BTreeMap::from([(1, 7), (2, 0)])),
+        Err(DistributedQueryError::InvalidRequest)
+    );
+}
+
+#[test]
+fn fragment_request_requires_complete_nonzero_capability_generations() {
+    let request = FragmentRequest::new(FragmentId::new(1), snapshot(11), 1, 1024, 1)
+        .expect("request")
+        .with_expected_shards(vec![1, 2])
+        .expect("expected shards");
+
+    assert_eq!(
+        request
+            .clone()
+            .with_expected_capability_generations(BTreeMap::from([(1, 7)])),
+        Err(DistributedQueryError::InvalidRequest)
+    );
+    assert_eq!(
+        request.with_expected_capability_generations(BTreeMap::from([(1, 7), (2, 0)])),
+        Err(DistributedQueryError::InvalidRequest)
     );
 }

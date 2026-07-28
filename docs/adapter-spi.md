@@ -25,6 +25,8 @@ same canonical bytes exactly.
 - configuration/schema validation before serving;
 - `prepare`, `apply`, `commit`, and `abort` over one `CommittedMutationBatch`;
 - canonical multi-get and bytewise ordered scan;
+- optional `ReadSnapshot`: one immutable canonical KV read view with its pinned
+  `applied_log_index`, multi-get, and paginated ordered scans;
 - canonical export and restore;
 - durable `applied_log_index` and capability declarations.
 
@@ -34,6 +36,85 @@ layout. A failed apply or commit is explicitly aborted; acknowledgement follows 
 commit.
 
 Optional extensions cover checkpoint/logical export, predicate pushdown, adjacency pushdown, and change feeds.
+
+## Query Read Views
+
+`ReadSnapshot` is a query fence, not a temporal or columnar execution interface. A caller opens
+one view before issuing related point or paginated range reads; every operation through that view
+must observe the same committed adapter prefix and reports that fixed `applied_log_index`. It has
+no T-Cypher text, temporal scope, query-plan, or column-batch parameter. DTGProxy binds temporal
+semantics and residual filtering above this canonical KV boundary.
+
+`FencedScan` is a separate, weaker primitive for one bounded ordered scan. Its entries and
+`applied_log_index` describe exactly the same backend operation, but the result does not imply that
+a later point or range read can reuse that view. A backend may implement `scan_fenced` while
+rejecting `begin_read_snapshot`. This is the production contract used by a `CHANGES` source that
+performs exactly one canonical event-index scan. Pagination, mixed point/range reads, and other
+multi-read fragments still require a real `ReadSnapshot` or a backend begin/read/end session.
+
+The in-process Memory adapter copies its canonical view for deterministic tests. The in-process
+RocksDB Mapping returns a native RocksDB snapshot and forwards it through `MappingBackedAdapter`.
+PostgreSQL opens a dedicated read-only `REPEATABLE READ` transaction and retains it for the view
+lifetime, with the same Mapping forwarding path.
+An adapter that cannot hold one real backend read view returns `UnsupportedOperation`; reporting
+an applied index and then performing ordinary reads is explicitly not an equivalent substitute.
+Neo4j now keeps one explicit Query API transaction for the read-view lifetime, and the remote
+Sidecar exposes bounded begin/read/end sessions backed by the adapter's real `ReadSnapshot`.
+Both paths have local contract coverage. Neo4j query-read-view certification against a disposable
+live server remains required before this capability is described as real-backend certified.
+
+A hot-swappable slot exposes `read_snapshot_binding` instead of manufacturing a `'static`
+snapshot. The binding atomically captures an `Arc<dyn StorageAdapter>` owner and its non-zero query
+capability generation under the slot state lock. Callers retain that owner while opening and using
+the borrowed `ReadSnapshot`; the snapshot must be dropped before the binding. Primitive requests
+carry the expected generation for each shard, and a binding captured after cutover must fail closed
+with a capability-generation mismatch so the coordinator can replan. Stable adapters return no
+binding and keep the direct snapshot path. This contract requires no backend type, storage layout,
+T-Cypher node, physical plan, or `ColumnBatch` at the SPI boundary.
+
+The Shard client uses a Raft ReadIndex followed by one leader/epoch-validated scan in the same
+Replica actor. DataNode returns the adapter index captured for that scan, and the client preserves
+it as `FencedScan.applied_log_index`. The Shard adapter deliberately rejects
+`begin_read_snapshot`; a one-shot operation is not exposed as a reusable snapshot.
+
+## Backend-neutral query primitives
+
+The language, binder, Temporal IR, and planner target graph and temporal semantics rather than a
+storage layout. An Adapter may represent data as KV pairs, rows, columns, native graph records, or
+a remote Sidecar implementation. Its optional query surface is limited to typed, bounded storage
+primitives:
+
+- candidate scan;
+- property gather;
+- adjacency expand;
+- canonical change scan.
+
+Each primitive returns a canonical page, never T-Cypher, a logical/physical plan, or `ColumnBatch`.
+`QueryPrimitiveCapabilities` is the planner authority and declares each primitive as
+`Unsupported`, `Candidate`, or `Exact`. `Candidate` means a no-false-negative superset, so DTGProxy
+must retain residual evaluation. DTGProxy 1.1 also retains the complete residual for `Exact` until
+the equivalence proof and page-level certification are complete. Broad legacy descriptor booleans
+must not be used to infer exactness or choose language semantics.
+
+For a `CandidateScan`, the physical plan may carry backend-neutral property hints such as
+`property(slot, id) >= literal`. These are only a bounded candidate hint, never a language or
+storage-layout contract. The request also carries the query `valid_time`; a backend may use a hint
+only when it can prove that no visible version is omitted, otherwise it must ignore the hint and
+return the complete candidate superset. The request contains no T-Cypher, `ColumnBatch`, column
+layout, index name, or backend type. The executor maps the hint into the SPI and always evaluates
+the original Filter residual.
+
+`CanonicalScanRequest` and `CanonicalScanPage` form the backend-neutral streaming foundation for
+ordinary ordered keyspace scans. Each page is bounded by item and byte limits, carries the pinned
+`applied_log_index`, and returns a validated inclusive `next_start`. This exposes neither a columnar
+layout nor a backend cursor: RocksDB may use an iterator, PostgreSQL a bounded ordered query, and
+Neo4j a transactional continuation while the executor observes the same canonical contract.
+Canonical scan pagination is exact keyspace traversal and must not be advertised as `CandidateScan`
+predicate pushdown.
+
+The query runtime converts canonical pages into its internal batch representation after the
+Adapter boundary. This keeps vectorization an execution choice inside DTGProxy and permits every
+backend family to use its natural physical model.
 
 ## Backend matrix
 
@@ -109,9 +190,24 @@ Rust has no stable native plugin ABI, so DTGProxy does not `dlopen` arbitrary Ru
 
 `adapter-sidecar` implements a canonical Protobuf payload inside a fixed `DTAS` binary frame. The frame has an explicit wire version, request/response kind, 128-bit request identifier, bounded 16 MiB payload length, and CRC32. Unknown versions, flags, message variants, enum values, non-canonical encodings, length mismatches, and checksum failures fail closed.
 
-The deliberately small remote surface is `Describe`, `Apply`, `MultiGet`, `Scan`, `AppliedLogIndex`, and `Health`. The client checks the actual descriptor and readiness at connect time, caches the durable applied index, and rejects write acknowledgements behind the required index, index regression, wrong multi-get cardinality, out-of-range/unordered scans, unexpected response types, and remote structured errors.
+The deliberately small remote surface is `Describe`, `Apply`, `MultiGet`, `Scan`,
+`AppliedLogIndex`, `Health`, and bounded read-view begin/multi-get/scan/end operations. The client
+checks the actual descriptor and readiness at connect time, caches the durable applied index, and
+rejects write acknowledgements behind the required index, index regression, wrong multi-get
+cardinality, out-of-range/unordered scans, unexpected response types, and remote structured errors.
 
-The TCP implementation provides a fixed-size persistent connection pool, positive connect/read/write timeouts, `TCP_NODELAY`, request/response ID matching, and one reconnect retry with the original request ID. The bounded server uses a fixed worker count and finite pending-connection queue; it does not create a thread per connection and has explicit shutdown that interrupts active connections. A full queue sheds new connections and lets the client timeout/retry.
+The TCP implementation provides a fixed-size persistent connection pool, positive
+connect/read/write timeouts, `TCP_NODELAY`, and request/response ID matching. It retries only
+operations whose replay is semantically safe; session creation, advancement, publication, and
+termination fail explicitly after an ambiguous transport result. The bounded server uses a fixed
+worker count and finite pending-connection queue; it does not create a thread per connection and
+has explicit shutdown that interrupts active connections. A full queue sheds new connections and
+lets retry-safe calls timeout/retry.
+
+Each read-view session also has a finite command queue. When its backend read is slower than the
+caller, excess commands fail with `SessionBusy` instead of accumulating without bound. A slow
+session startup must still own its original reservation when the backend snapshot becomes ready;
+an aborted or expired reservation cannot be resurrected and cannot exceed global session capacity.
 
 The Sidecar frame request ID is transport correlation, not the storage idempotency key. A response can be lost after an apply, so a retry may execute twice. Correctness therefore depends on the mandatory Adapter rule that the same committed `(shard_id, log_index, txn_id, mutation fingerprint)` is idempotent and a different replay at the same log index fails.
 

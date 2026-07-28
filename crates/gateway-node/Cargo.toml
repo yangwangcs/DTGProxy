@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+paper-benchmark-control = []
 three-backend-certification = []
+test-support = []
 
 [dependencies]
 blake3 = "=1.8.5"
@@ -24,6 +26,7 @@ cypher-ast = { path = "../cypher-ast" }
 cypher-syntax = { path = "../cypher-syntax" }
 distributed-query = { path = "../distributed-query" }
 dtgproxy = { path = "../dtgproxy" }
+getrandom = "=0.4.3"
 query-executor = { path = "../query-executor" }
 procedure-runtime = { path = "../procedure-runtime" }
 serde = { version = "=1.0.228", features = ["derive"] }
@@ -34,7 +37,7 @@ temporal-ir = { path = "../temporal-ir" }
 temporal-storage = { path = "../temporal-storage" }
 temporal-types = { path = "../temporal-types" }
 timestamp-oracle = { path = "../timestamp-oracle" }
-tokio = { version = "=1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio = { version = "=1.53.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util"] }
 tokio-stream = { version = "=0.1.18", features = ["net"] }
 tonic = { version = "=0.14.6", features = ["transport", "tls-ring"] }
 txn-protocol = { path = "../txn-protocol" }
@@ -52,6 +55,14 @@ tempfile = "3"
 [[test]]
 name = "three_backend_deployment"
 required-features = ["three-backend-certification"]
+
+[[test]]
+name = "read_fanout"
+required-features = ["test-support"]
+
+[[test]]
+name = "benchmark_ablation_control"
+required-features = ["paper-benchmark-control"]
 
 [lints]
 workspace = true

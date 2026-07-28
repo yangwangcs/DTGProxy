@@ -2,11 +2,15 @@ use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(all(feature = "paper-benchmark-control", unix))]
+use std::{os::unix::fs::FileTypeExt, os::unix::fs::PermissionsExt, time::Duration};
 
 use bolt_server::{BoltConnectionConfig, serve_connection};
 use cluster_protocol::MAX_COMMAND_BYTES;
 use cluster_protocol::proto::gateway_service_server::GatewayServiceServer;
 use cypher_engine::CypherBoltService;
+#[cfg(all(feature = "paper-benchmark-control", unix))]
+use gateway_node::{BenchmarkAblationRuntime, serve_benchmark_ablation_control};
 use gateway_node::{
     GatewayCatalogRouter, GatewayNodeRuntimeConfig, GatewayTransportSecurity, RemoteGatewayService,
 };
@@ -53,6 +57,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.maximum_inflight(),
         config.max_raft_ticks(),
     )?;
+    #[cfg(all(feature = "paper-benchmark-control", unix))]
+    let (gateway, benchmark_runtime, benchmark_control_path) = {
+        let path = std::env::var_os("DTGPROXY_PAPER_ABLATION_CONTROL").map(PathBuf::from);
+        let runtime = path
+            .as_ref()
+            .map(|_| Arc::new(BenchmarkAblationRuntime::new()));
+        let gateway = if let Some(runtime) = runtime.as_ref() {
+            gateway.with_benchmark_ablation_runtime(Arc::clone(runtime))
+        } else {
+            gateway
+        };
+        (gateway, runtime, path)
+    };
     let listener = tokio::net::TcpListener::bind(config.listen_address()).await?;
     let bolt_listener = match config.bolt_listen_address() {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
@@ -81,6 +98,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let _ = shutdown_sender.send(true);
         }
     });
+    #[cfg(all(feature = "paper-benchmark-control", unix))]
+    let benchmark_control = match (benchmark_runtime, benchmark_control_path) {
+        (Some(runtime), Some(path)) => {
+            if !path.is_absolute() {
+                return Err("DTGPROXY_PAPER_ABLATION_CONTROL must be an absolute path".into());
+            }
+            let receiver = shutdown_receiver.clone();
+            let task_path = path.clone();
+            let mut task = tokio::spawn(async move {
+                serve_benchmark_ablation_control(&task_path, runtime, receiver).await
+            });
+            await_benchmark_control_ready(&path, &mut task).await?;
+            Some(task)
+        }
+        _ => None,
+    };
     let bolt_address = bolt_listener
         .as_ref()
         .map(|listener| listener.local_addr())
@@ -128,8 +161,41 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .map_err(|_| "Gateway Bolt server exceeded shutdown grace")??
             .map_err(|error| format!("Gateway Bolt server failed: {error}"))?;
     }
+    #[cfg(all(feature = "paper-benchmark-control", unix))]
+    if let Some(benchmark_control) = benchmark_control {
+        tokio::time::timeout(config.shutdown_grace(), benchmark_control)
+            .await
+            .map_err(|_| "Gateway benchmark control exceeded shutdown grace")???;
+    }
     server_result?;
     Ok(())
+}
+
+#[cfg(all(feature = "paper-benchmark-control", unix))]
+async fn await_benchmark_control_ready(
+    path: &std::path::Path,
+    task: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if task.is_finished() {
+            return Err(format!(
+                "Gateway benchmark control failed before ready: {:?}",
+                task.await?
+            )
+            .into());
+        }
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if !metadata.file_type().is_socket() || metadata.permissions().mode() & 0o777 != 0o600 {
+                return Err("Gateway benchmark control path is not a mode-0600 Unix socket".into());
+            }
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Gateway benchmark control did not become ready within 5 seconds".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 async fn run_bolt_listener(

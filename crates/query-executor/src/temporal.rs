@@ -1,16 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
+use std::pin::Pin;
 
-use physical_plan::{PhysicalApply, PhysicalOperator, PhysicalPlan, Placement, PlanFragment};
-use storage_api::StorageAdapter;
-use temporal_ir::{
-    ApplyKind, ResolvedProcedure, RowSchema, ScalarExpr, TransactionTimeSpec, ValidTimeSpec,
+use physical_plan::{
+    AccessGuarantee, AggregatePhase, PhysicalAccess, PhysicalApply, PhysicalComparisonOperator,
+    PhysicalOperator, PhysicalPlan, PhysicalPropertyConstraint, Placement, PlanFragment,
+    PrimitiveKind, ResidualPolicy,
 };
-use temporal_storage::{ElementKind, GraphId, TemporalStore, TemporalStoreError};
-use temporal_types::{Interval, TransactionTime, ValidTime};
+use storage_api::{
+    LogicalKey, MAX_QUERY_PAGE_BYTES, MAX_QUERY_PAGE_ITEMS, PropertyConstraint, PushdownGuarantee,
+    QueryPageBounds, ReadSnapshot, StorageAdapter,
+};
+use temporal_ir::{
+    ApplyKind, ChangeAxis, ResolvedProcedure, RowSchema, ScalarExpr, TransactionTimeSpec,
+    ValidTimeSpec,
+};
+use temporal_storage::{
+    CanonicalTemporalEvent, ElementKind, GraphId, TemporalEventMetadata, TemporalScanBudget,
+    TemporalStore, TemporalStoreError,
+};
+use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
-use crate::{EdgeRecord, VertexRecord};
+use crate::{ChangeMetadata, ColumnBatch, EdgeRecord, VertexRecord};
 
 use super::executor::{
     aggregate_expression, compare_values, estimate_composed_procedure_row, invoke_procedure_row,
@@ -28,6 +41,42 @@ use super::{
 
 use super::expression::evaluate;
 
+pub type RecordMorselFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<ExecutionMorsel>, TemporalExecutionError>> + Send + 'a>,
+>;
+
+pub trait RecordMorselSource: Send {
+    fn next<'a>(&'a mut self) -> RecordMorselFuture<'a>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionMorsel {
+    batch: RecordBatch,
+    has_more: bool,
+}
+
+impl ExecutionMorsel {
+    #[must_use]
+    pub const fn new(batch: RecordBatch, has_more: bool) -> Self {
+        Self { batch, has_more }
+    }
+
+    #[must_use]
+    pub const fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    #[must_use]
+    pub fn into_batch(self) -> RecordBatch {
+        self.batch
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolvedValidTime {
     Point(ValidTime),
@@ -39,6 +88,98 @@ pub struct ResolvedTemporalScope {
     graph: GraphId,
     valid_time: ResolvedValidTime,
     transaction_time: TransactionTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangeWindow {
+    Valid(Interval<ValidTime>),
+    System(Interval<TransactionTime>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChangeScanScope {
+    graph: GraphId,
+    axis: ChangeAxis,
+    window: ChangeWindow,
+    snapshot: TransactionTime,
+}
+
+impl ChangeScanScope {
+    pub fn valid(
+        graph: GraphId,
+        start: ValidTime,
+        end: ValidTime,
+        snapshot: TransactionTime,
+    ) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            graph,
+            axis: ChangeAxis::ValidTime,
+            window: ChangeWindow::Valid(
+                Interval::new(start, Some(end))
+                    .map_err(|_| RuntimeError::InvalidTemporalInterval)?,
+            ),
+            snapshot,
+        })
+    }
+
+    pub fn system(
+        graph: GraphId,
+        start: TransactionTime,
+        end: TransactionTime,
+        snapshot: TransactionTime,
+    ) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            graph,
+            axis: ChangeAxis::SystemTime,
+            window: ChangeWindow::System(
+                Interval::new(start, Some(end))
+                    .map_err(|_| RuntimeError::InvalidTemporalInterval)?,
+            ),
+            snapshot,
+        })
+    }
+
+    #[must_use]
+    pub const fn graph(&self) -> GraphId {
+        self.graph
+    }
+    #[must_use]
+    pub const fn axis(&self) -> ChangeAxis {
+        self.axis
+    }
+    #[must_use]
+    pub const fn window(&self) -> ChangeWindow {
+        self.window
+    }
+    #[must_use]
+    pub const fn snapshot(&self) -> TransactionTime {
+        self.snapshot
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangeEventBatch {
+    pub columns: ColumnBatch,
+    pub events: Vec<CanonicalTemporalEvent>,
+    pub applied_log_index: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangeFragmentResult {
+    batches: Vec<RecordBatch>,
+    applied_log_index: u64,
+}
+
+impl ChangeFragmentResult {
+    #[must_use]
+    pub const fn applied_log_index(&self) -> u64 {
+        self.applied_log_index
+    }
+
+    #[must_use]
+    pub fn into_batches(self) -> Vec<RecordBatch> {
+        self.batches
+    }
 }
 
 impl ResolvedTemporalScope {
@@ -107,6 +248,40 @@ pub fn resolve_temporal_scope(
     })
 }
 
+pub fn resolve_change_scope(
+    graph: GraphId,
+    axis: ChangeAxis,
+    start: &ScalarExpr,
+    end: &ScalarExpr,
+    system_snapshot: &TransactionTimeSpec,
+    current_transaction_time: TransactionTime,
+    context: &ExecutionContext,
+) -> Result<ChangeScanScope, RuntimeError> {
+    context.check_fences()?;
+    let snapshot = match system_snapshot {
+        TransactionTimeSpec::Current => current_transaction_time,
+        TransactionTimeSpec::AsOf(expression) => {
+            TransactionTime::new(resolve_timestamp(expression, context)?, u32::MAX)
+        }
+    };
+    let start = resolve_timestamp(start, context)?;
+    let end = resolve_timestamp(end, context)?;
+    match axis {
+        ChangeAxis::ValidTime => ChangeScanScope::valid(
+            graph,
+            ValidTime::from_micros(start),
+            ValidTime::from_micros(end),
+            snapshot,
+        ),
+        ChangeAxis::SystemTime => ChangeScanScope::system(
+            graph,
+            TransactionTime::new(start, 0),
+            TransactionTime::new(end, 0),
+            snapshot,
+        ),
+    }
+}
+
 fn resolve_timestamp(
     expression: &ScalarExpr,
     context: &ExecutionContext,
@@ -114,6 +289,61 @@ fn resolve_timestamp(
     match evaluate(expression, &RowSchema::empty(), &[], context)? {
         RuntimeValue::TimestampMicros(value) | RuntimeValue::Integer(value) => Ok(value),
         value => Err(RuntimeError::InvalidTemporalValue(value.kind())),
+    }
+}
+
+fn change_scan_pushdown(
+    fragment: &PlanFragment,
+    change_index: usize,
+) -> Result<Option<PushdownGuarantee>, RuntimeError> {
+    match fragment.access().get(change_index) {
+        Some(PhysicalAccess::Generic) => Ok(None),
+        Some(PhysicalAccess::Primitive {
+            primitive: PrimitiveKind::ChangeScan,
+            guarantee: AccessGuarantee::Candidate,
+            residual: ResidualPolicy::Evaluate,
+            ..
+        }) => Ok(Some(PushdownGuarantee::Candidate)),
+        Some(PhysicalAccess::Primitive {
+            primitive: PrimitiveKind::ChangeScan,
+            guarantee: AccessGuarantee::Exact,
+            residual: ResidualPolicy::Evaluate,
+            ..
+        }) => Ok(Some(PushdownGuarantee::Exact)),
+        Some(PhysicalAccess::Primitive { .. }) | None => Err(RuntimeError::InvalidPhysicalPlan),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CandidateScanPushdown<'a> {
+    required: PushdownGuarantee,
+    constraints: &'a [PhysicalPropertyConstraint],
+}
+
+fn candidate_scan_pushdown(
+    access: &PhysicalAccess,
+) -> Result<Option<CandidateScanPushdown<'_>>, RuntimeError> {
+    match access {
+        PhysicalAccess::Generic => Ok(None),
+        PhysicalAccess::Primitive {
+            primitive: PrimitiveKind::CandidateScan,
+            guarantee: AccessGuarantee::Candidate,
+            residual: ResidualPolicy::Evaluate,
+            constraints,
+        } => Ok(Some(CandidateScanPushdown {
+            required: PushdownGuarantee::Candidate,
+            constraints,
+        })),
+        PhysicalAccess::Primitive {
+            primitive: PrimitiveKind::CandidateScan,
+            guarantee: AccessGuarantee::Exact,
+            residual: ResidualPolicy::Evaluate,
+            constraints,
+        } => Ok(Some(CandidateScanPushdown {
+            required: PushdownGuarantee::Exact,
+            constraints,
+        })),
+        PhysicalAccess::Primitive { .. } => Err(RuntimeError::InvalidPhysicalPlan),
     }
 }
 
@@ -128,6 +358,14 @@ pub struct TemporalRead {
     graph: GraphId,
     valid_time: ValidTime,
     transaction: TransactionRead,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateScanExecution<'a> {
+    snapshot: Option<&'a dyn ReadSnapshot>,
+    required: Option<PushdownGuarantee>,
+    constraints: &'a [PhysicalPropertyConstraint],
+    budget: TemporalScanBudget,
 }
 
 impl TemporalRead {
@@ -159,6 +397,209 @@ pub struct TemporalBatchExecutor<A> {
     scalar: BatchExecutor,
 }
 
+struct DeferredRecordMorselSource<'a, A> {
+    executor: &'a TemporalBatchExecutor<A>,
+    fragment: PlanFragment,
+    context: ExecutionContext,
+    read: TemporalRead,
+    expected_capability_generation: Option<u64>,
+    batches: Option<std::iter::Peekable<std::vec::IntoIter<RecordBatch>>>,
+    record_eager_page_collection: bool,
+}
+
+struct CandidateRecordMorselSource<'a, A> {
+    executor: &'a TemporalBatchExecutor<A>,
+    context: ExecutionContext,
+    read: TemporalRead,
+    expected_capability_generation: Option<u64>,
+    labels: Vec<u32>,
+    scan_output: RowSchema,
+    operators: Vec<PhysicalOperator>,
+    output: RowSchema,
+    required: PushdownGuarantee,
+    constraints: Vec<PropertyConstraint>,
+    memory_limit: u64,
+    page_rows: usize,
+    remaining_rows: usize,
+    remaining_bytes: u64,
+    remaining_skip: usize,
+    remaining_limit: Option<usize>,
+    continuation: Option<LogicalKey>,
+    snapshot: Option<Box<dyn ReadSnapshot + 'a>>,
+    finished: bool,
+}
+
+impl<A> RecordMorselSource for DeferredRecordMorselSource<'_, A>
+where
+    A: StorageAdapter + Sync,
+{
+    fn next<'a>(&'a mut self) -> RecordMorselFuture<'a> {
+        Box::pin(async move {
+            if self.batches.is_none() {
+                let batches = self
+                    .executor
+                    .execute_fragment_with_expected_capability_generation(
+                        &self.fragment,
+                        &self.context,
+                        self.read,
+                        self.expected_capability_generation,
+                    )
+                    .await?;
+                if self.record_eager_page_collection {
+                    self.context.record_eager_page_collection();
+                    self.record_eager_page_collection = false;
+                }
+                self.batches = Some(batches.into_iter().peekable());
+            }
+            let batches = self.batches.as_mut().expect("initialized above");
+            Ok(batches.next().map(|batch| ExecutionMorsel {
+                batch,
+                has_more: batches.peek().is_some(),
+            }))
+        })
+    }
+}
+
+impl<'source, A> CandidateRecordMorselSource<'source, A>
+where
+    A: StorageAdapter + Sync,
+{
+    async fn initialize_snapshot(&mut self) -> Result<(), TemporalExecutionError> {
+        if self.snapshot.is_some() {
+            return Ok(());
+        }
+        if self.expected_capability_generation.is_some_and(|expected| {
+            expected != self.executor.store.adapter().query_capability_generation()
+        }) {
+            return Err(RuntimeError::CapabilityGenerationMismatch.into());
+        }
+        let mut snapshot = self.executor.store.begin_read_snapshot().await?;
+        if let Some(metrics) = self.context.query_metrics() {
+            snapshot = temporal_storage::observe_read_snapshot(snapshot, metrics);
+        }
+        if self.expected_capability_generation.is_some_and(|expected| {
+            expected != self.executor.store.adapter().query_capability_generation()
+        }) {
+            return Err(RuntimeError::CapabilityGenerationMismatch.into());
+        }
+        self.snapshot = Some(snapshot);
+        Ok(())
+    }
+}
+
+impl<A> RecordMorselSource for CandidateRecordMorselSource<'_, A>
+where
+    A: StorageAdapter + Sync,
+{
+    fn next<'a>(&'a mut self) -> RecordMorselFuture<'a> {
+        Box::pin(async move {
+            if self.finished || self.remaining_limit == Some(0) {
+                self.finished = true;
+                return Ok(None);
+            }
+            self.context.check_fences()?;
+            self.initialize_snapshot().await?;
+            loop {
+                if self.remaining_rows == 0 {
+                    return Err(TemporalStoreError::ScanEntryLimit.into());
+                }
+                if self.remaining_bytes == 0 {
+                    return Err(TemporalStoreError::ScanByteLimit.into());
+                }
+                let snapshot = self.snapshot.as_deref().expect("snapshot initialized");
+                let bounds = QueryPageBounds::new(
+                    self.page_rows.min(MAX_QUERY_PAGE_ITEMS),
+                    MAX_QUERY_PAGE_BYTES,
+                )
+                .expect("fixed executor page bounds are valid");
+                let page = self
+                    .executor
+                    .store
+                    .scan_vertex_views_current_candidate_page_after_in_snapshot(
+                        snapshot,
+                        self.read.graph,
+                        self.read.valid_time,
+                        self.continuation.as_ref(),
+                        bounds,
+                        TemporalScanBudget::new(self.remaining_rows, self.remaining_bytes),
+                        self.required,
+                        &self.constraints,
+                    )
+                    .await?;
+                self.remaining_rows = self
+                    .remaining_rows
+                    .checked_sub(page.scanned_rows())
+                    .ok_or(TemporalStoreError::ScanEntryLimit)?;
+                self.remaining_bytes = self
+                    .remaining_bytes
+                    .checked_sub(page.scanned_bytes())
+                    .ok_or(TemporalStoreError::ScanByteLimit)?;
+                self.continuation = page.next_start().cloned();
+
+                let rows = page
+                    .into_views()
+                    .into_iter()
+                    .map(|view| RuntimeValue::Node(VertexRecord::from(view)))
+                    .filter(|value| {
+                        let RuntimeValue::Node(vertex) = value else {
+                            return false;
+                        };
+                        self.labels.is_empty()
+                            || vertex
+                                .label()
+                                .is_some_and(|label| self.labels.contains(&label.value()))
+                    })
+                    .map(|value| vec![value])
+                    .collect::<Vec<_>>();
+                let input = RecordBatch::try_new(self.scan_output.clone(), rows)?;
+                let batches = self
+                    .executor
+                    .scalar
+                    .execute_operators(
+                        &self.operators,
+                        &self.output,
+                        self.memory_limit,
+                        &self.context,
+                        vec![input],
+                        None,
+                        ChildOutputDemand::AllRows,
+                        &super::ApplyBudgetLedger::default(),
+                    )
+                    .await?;
+                let schema = batches
+                    .first()
+                    .map_or_else(|| self.output.clone(), |batch| batch.schema().clone());
+                let mut rows = batches
+                    .into_iter()
+                    .flat_map(|batch| batch.rows().to_vec())
+                    .collect::<Vec<_>>();
+                if self.remaining_skip != 0 {
+                    let skipped = self.remaining_skip.min(rows.len());
+                    rows.drain(..skipped);
+                    self.remaining_skip -= skipped;
+                }
+                if let Some(remaining_limit) = self.remaining_limit.as_mut() {
+                    if rows.len() > *remaining_limit {
+                        rows.truncate(*remaining_limit);
+                    }
+                    *remaining_limit -= rows.len();
+                }
+                let batch = RecordBatch::try_new(schema, rows)?;
+                let has_more = self.continuation.is_some() && self.remaining_limit != Some(0);
+                if !has_more {
+                    self.finished = true;
+                }
+                if !batch.rows().is_empty() {
+                    return Ok(Some(ExecutionMorsel::new(batch, has_more)));
+                }
+                if !has_more {
+                    return Ok(None);
+                }
+            }
+        })
+    }
+}
+
 impl<A> TemporalBatchExecutor<A>
 where
     A: StorageAdapter,
@@ -174,6 +615,486 @@ where
     #[must_use]
     pub const fn store(&self) -> &TemporalStore<A> {
         &self.store
+    }
+
+    pub fn open_fragment_morsels(
+        &self,
+        fragment: &PlanFragment,
+        context: &ExecutionContext,
+        read: TemporalRead,
+        expected_capability_generation: Option<u64>,
+        max_rows: usize,
+    ) -> Box<dyn RecordMorselSource + Send + '_>
+    where
+        A: Sync,
+    {
+        if let Some(source) = self.open_candidate_record_morsels(
+            fragment,
+            context,
+            read,
+            expected_capability_generation,
+            max_rows,
+        ) {
+            return source;
+        }
+        Box::new(DeferredRecordMorselSource {
+            executor: self,
+            fragment: fragment.clone(),
+            context: context.clone(),
+            read,
+            expected_capability_generation,
+            batches: None,
+            record_eager_page_collection: false,
+        })
+    }
+
+    fn open_candidate_record_morsels(
+        &self,
+        fragment: &PlanFragment,
+        context: &ExecutionContext,
+        read: TemporalRead,
+        expected_capability_generation: Option<u64>,
+        max_rows: usize,
+    ) -> Option<Box<dyn RecordMorselSource + Send + '_>>
+    where
+        A: Sync,
+    {
+        if max_rows == 0
+            || !matches!(read.transaction, TransactionRead::Current)
+            || !context.graph_overlay().is_empty()
+            || self.store.read_snapshot_binding().ok().flatten().is_some()
+        {
+            return None;
+        }
+        let (labels, scan_output) = match fragment.operators().first()? {
+            PhysicalOperator::NodeScan { labels, output, .. } => (labels.clone(), output.clone()),
+            _ => return None,
+        };
+        let pushdown = candidate_scan_pushdown(fragment.access().first()?).ok()??;
+        let constraints = pushdown
+            .constraints
+            .iter()
+            .map(Self::to_storage_property_constraint)
+            .collect::<Vec<_>>();
+        let mut operators = Vec::new();
+        let mut remaining_skip = 0;
+        let mut remaining_limit = None;
+        let mut seen_row_bound = false;
+        for operator in &fragment.operators()[1..] {
+            match operator {
+                PhysicalOperator::Filter(_) | PhysicalOperator::Project { .. }
+                    if !seen_row_bound =>
+                {
+                    operators.push(operator.clone())
+                }
+                PhysicalOperator::Skip { count } if !seen_row_bound => {
+                    remaining_skip = row_count(count, context).ok()?;
+                    seen_row_bound = true;
+                }
+                PhysicalOperator::Limit { count } => {
+                    let limit = row_count(count, context).ok()?;
+                    remaining_limit =
+                        Some(remaining_limit.map_or(limit, |current: usize| current.min(limit)));
+                    seen_row_bound = true;
+                }
+                PhysicalOperator::Finish => operators.push(operator.clone()),
+                _ => return None,
+            }
+        }
+        if !context.benchmark_ablations().native_pushdown {
+            return None;
+        }
+        if !context.benchmark_ablations().bounded_lazy_pages {
+            return Some(Box::new(DeferredRecordMorselSource {
+                executor: self,
+                fragment: fragment.clone(),
+                context: context.clone(),
+                read,
+                expected_capability_generation,
+                batches: None,
+                record_eager_page_collection: true,
+            }));
+        }
+        Some(Box::new(CandidateRecordMorselSource {
+            executor: self,
+            context: context.clone(),
+            read,
+            expected_capability_generation,
+            labels,
+            scan_output,
+            operators,
+            output: fragment.output().clone(),
+            required: pushdown.required,
+            constraints,
+            memory_limit: fragment.budget().memory_bytes(),
+            page_rows: max_rows.min(MAX_BATCH_ROWS),
+            remaining_rows: usize::try_from(fragment.execution_budget().raw_scan().entry_limit())
+                .unwrap_or(usize::MAX),
+            remaining_bytes: fragment.execution_budget().raw_scan().byte_limit(),
+            remaining_skip,
+            remaining_limit,
+            continuation: None,
+            snapshot: None,
+            finished: false,
+        }))
+    }
+
+    pub async fn scan_change_nodes(
+        &self,
+        scope: &ChangeScanScope,
+        labels: &[u32],
+        output: &RowSchema,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<ChangeEventBatch, TemporalExecutionError> {
+        let (events, _, applied_log_index) = self
+            .scan_change_events_fenced(scope, max_rows, max_bytes)
+            .await?;
+        change_node_batch(events, labels, output, applied_log_index)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_change_nodes_in_snapshot(
+        &self,
+        read: &dyn ReadSnapshot,
+        scope: &ChangeScanScope,
+        labels: &[u32],
+        output: &RowSchema,
+        max_rows: usize,
+        max_bytes: u64,
+        required: Option<PushdownGuarantee>,
+    ) -> Result<ChangeEventBatch, TemporalExecutionError> {
+        let (events, _) = self
+            .scan_change_events_in_snapshot(read, scope, max_rows, max_bytes, required)
+            .await?;
+        change_node_batch(events, labels, output, read.applied_log_index())
+    }
+
+    pub async fn scan_change_relationships(
+        &self,
+        scope: &ChangeScanScope,
+        types: &[u32],
+        output: &RowSchema,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<ChangeEventBatch, TemporalExecutionError> {
+        let (events, _, applied_log_index) = self
+            .scan_change_events_fenced(scope, max_rows, max_bytes)
+            .await?;
+        change_relationship_batch(events, types, output, applied_log_index)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_change_relationships_in_snapshot(
+        &self,
+        read: &dyn ReadSnapshot,
+        scope: &ChangeScanScope,
+        types: &[u32],
+        output: &RowSchema,
+        max_rows: usize,
+        max_bytes: u64,
+        required: Option<PushdownGuarantee>,
+    ) -> Result<ChangeEventBatch, TemporalExecutionError> {
+        let (events, _) = self
+            .scan_change_events_in_snapshot(read, scope, max_rows, max_bytes, required)
+            .await?;
+        change_relationship_batch(events, types, output, read.applied_log_index())
+    }
+
+    pub async fn execute_change_source_fragment(
+        &self,
+        fragment: &PlanFragment,
+        scope: &ChangeScanScope,
+        max_rows: usize,
+    ) -> Result<ChangeEventBatch, TemporalExecutionError> {
+        let operators = fragment.operators();
+        let Some((change_index, plan_axis)) =
+            operators
+                .iter()
+                .enumerate()
+                .find_map(|(index, operator)| match operator {
+                    PhysicalOperator::ChangeScan { axis, .. } => Some((index, *axis)),
+                    _ => None,
+                })
+        else {
+            return Err(RuntimeError::UnsupportedOperator("missing ChangeScan").into());
+        };
+        if change_index != 1 {
+            return Err(RuntimeError::UnsupportedOperator("non-source ChangeScan fragment").into());
+        }
+        if plan_axis != scope.axis() {
+            return Err(RuntimeError::UnsupportedOperator("ChangeScan axis mismatch").into());
+        }
+        if change_scan_pushdown(fragment, change_index)?.is_some() {
+            let binding = self.store.read_snapshot_binding()?;
+            let read = match binding.as_ref() {
+                Some(binding) => binding
+                    .owner()
+                    .begin_read_snapshot()
+                    .await
+                    .map_err(TemporalStoreError::from)?,
+                None => self.store.begin_read_snapshot().await?,
+            };
+            return self
+                .execute_change_source_fragment_in_snapshot(
+                    read.as_ref(),
+                    fragment,
+                    scope,
+                    max_rows,
+                )
+                .await;
+        }
+        match &operators[0] {
+            PhysicalOperator::NodeScan { labels, output, .. } => {
+                self.scan_change_nodes(
+                    scope,
+                    labels,
+                    output,
+                    max_rows,
+                    fragment.execution_budget().raw_scan().byte_limit(),
+                )
+                .await
+            }
+            PhysicalOperator::RelationshipScan { types, output, .. } => {
+                self.scan_change_relationships(
+                    scope,
+                    types,
+                    output,
+                    max_rows,
+                    fragment.execution_budget().raw_scan().byte_limit(),
+                )
+                .await
+            }
+            _ => Err(RuntimeError::UnsupportedOperator("ChangeScan source").into()),
+        }
+    }
+
+    pub async fn execute_change_source_fragment_in_snapshot(
+        &self,
+        read: &dyn ReadSnapshot,
+        fragment: &PlanFragment,
+        scope: &ChangeScanScope,
+        max_rows: usize,
+    ) -> Result<ChangeEventBatch, TemporalExecutionError> {
+        let operators = fragment.operators();
+        let Some((change_index, plan_axis)) =
+            operators
+                .iter()
+                .enumerate()
+                .find_map(|(index, operator)| match operator {
+                    PhysicalOperator::ChangeScan { axis, .. } => Some((index, *axis)),
+                    _ => None,
+                })
+        else {
+            return Err(RuntimeError::UnsupportedOperator("missing ChangeScan").into());
+        };
+        if change_index != 1 {
+            return Err(RuntimeError::UnsupportedOperator("non-source ChangeScan fragment").into());
+        }
+        if plan_axis != scope.axis() {
+            return Err(RuntimeError::UnsupportedOperator("ChangeScan axis mismatch").into());
+        }
+        let required = change_scan_pushdown(fragment, change_index)?;
+        match &operators[0] {
+            PhysicalOperator::NodeScan { labels, output, .. } => {
+                self.scan_change_nodes_in_snapshot(
+                    read,
+                    scope,
+                    labels,
+                    output,
+                    max_rows,
+                    fragment.execution_budget().raw_scan().byte_limit(),
+                    required,
+                )
+                .await
+            }
+            PhysicalOperator::RelationshipScan { types, output, .. } => {
+                self.scan_change_relationships_in_snapshot(
+                    read,
+                    scope,
+                    types,
+                    output,
+                    max_rows,
+                    fragment.execution_budget().raw_scan().byte_limit(),
+                    required,
+                )
+                .await
+            }
+            _ => Err(RuntimeError::UnsupportedOperator("ChangeScan source").into()),
+        }
+    }
+
+    pub async fn execute_change_fragment(
+        &self,
+        fragment: &PlanFragment,
+        scope: &ChangeScanScope,
+        context: &ExecutionContext,
+        max_rows: usize,
+    ) -> Result<ChangeFragmentResult, TemporalExecutionError> {
+        let change_index = fragment
+            .operators()
+            .iter()
+            .position(|operator| matches!(operator, PhysicalOperator::ChangeScan { .. }))
+            .ok_or(RuntimeError::UnsupportedOperator("missing ChangeScan"))?;
+        let source = self
+            .execute_change_source_fragment(fragment, scope, max_rows)
+            .await?;
+        let input = source.columns.to_record_batch()?;
+        let applied_log_index = source.applied_log_index;
+        let batches = self
+            .scalar
+            .execute_operators(
+                &fragment.operators()[change_index + 1..],
+                fragment.output(),
+                fragment.budget().memory_bytes(),
+                context,
+                vec![input],
+                None,
+                ChildOutputDemand::AllRows,
+                &super::ApplyBudgetLedger::default(),
+            )
+            .await
+            .map_err(TemporalExecutionError::from)?;
+        Ok(ChangeFragmentResult {
+            batches,
+            applied_log_index,
+        })
+    }
+
+    pub async fn execute_change_fragment_in_snapshot(
+        &self,
+        read: &dyn ReadSnapshot,
+        fragment: &PlanFragment,
+        scope: &ChangeScanScope,
+        context: &ExecutionContext,
+        max_rows: usize,
+    ) -> Result<ChangeFragmentResult, TemporalExecutionError> {
+        let change_index = fragment
+            .operators()
+            .iter()
+            .position(|operator| matches!(operator, PhysicalOperator::ChangeScan { .. }))
+            .ok_or(RuntimeError::UnsupportedOperator("missing ChangeScan"))?;
+        let source = self
+            .execute_change_source_fragment_in_snapshot(read, fragment, scope, max_rows)
+            .await?;
+        let input = source.columns.to_record_batch()?;
+        let applied_log_index = source.applied_log_index;
+        let batches = self
+            .scalar
+            .execute_operators(
+                &fragment.operators()[change_index + 1..],
+                fragment.output(),
+                fragment.budget().memory_bytes(),
+                context,
+                vec![input],
+                None,
+                ChildOutputDemand::AllRows,
+                &super::ApplyBudgetLedger::default(),
+            )
+            .await
+            .map_err(TemporalExecutionError::from)?;
+        Ok(ChangeFragmentResult {
+            batches,
+            applied_log_index,
+        })
+    }
+
+    async fn scan_change_events_in_snapshot(
+        &self,
+        read: &dyn ReadSnapshot,
+        scope: &ChangeScanScope,
+        max_rows: usize,
+        max_bytes: u64,
+        required: Option<PushdownGuarantee>,
+    ) -> Result<(Vec<CanonicalTemporalEvent>, u64), TemporalStoreError> {
+        match scope.window() {
+            ChangeWindow::Valid(window) => {
+                if let Some(required) = required {
+                    self.store
+                        .scan_events_by_valid_from_primitive_in_snapshot(
+                            read,
+                            scope.graph(),
+                            window.start(),
+                            window.end().expect("change windows are finite"),
+                            scope.snapshot(),
+                            TemporalScanBudget::new(max_rows, max_bytes),
+                            required,
+                        )
+                        .await
+                } else {
+                    self.store
+                        .scan_events_by_valid_from_in_snapshot(
+                            read,
+                            scope.graph(),
+                            window.start(),
+                            window.end().expect("change windows are finite"),
+                            scope.snapshot(),
+                            TemporalScanBudget::new(max_rows, max_bytes),
+                        )
+                        .await
+                }
+            }
+            ChangeWindow::System(window) => {
+                if let Some(required) = required {
+                    self.store
+                        .scan_events_by_commit_primitive_in_snapshot(
+                            read,
+                            scope.graph(),
+                            window.start(),
+                            window.end().expect("change windows are finite"),
+                            scope.snapshot(),
+                            TemporalScanBudget::new(max_rows, max_bytes),
+                            required,
+                        )
+                        .await
+                } else {
+                    self.store
+                        .scan_events_by_commit_in_snapshot(
+                            read,
+                            scope.graph(),
+                            window.start(),
+                            window.end().expect("change windows are finite"),
+                            scope.snapshot(),
+                            TemporalScanBudget::new(max_rows, max_bytes),
+                        )
+                        .await
+                }
+            }
+        }
+    }
+
+    async fn scan_change_events_fenced(
+        &self,
+        scope: &ChangeScanScope,
+        max_rows: usize,
+        max_bytes: u64,
+    ) -> Result<(Vec<CanonicalTemporalEvent>, u64, u64), TemporalStoreError> {
+        match scope.window() {
+            ChangeWindow::Valid(window) => {
+                self.store
+                    .scan_events_by_valid_from_fenced(
+                        scope.graph(),
+                        window.start(),
+                        window.end().expect("change windows are finite"),
+                        scope.snapshot(),
+                        max_rows,
+                        max_bytes,
+                    )
+                    .await
+            }
+            ChangeWindow::System(window) => {
+                self.store
+                    .scan_events_by_commit_fenced(
+                        scope.graph(),
+                        window.start(),
+                        window.end().expect("change windows are finite"),
+                        scope.snapshot(),
+                        max_rows,
+                        max_bytes,
+                    )
+                    .await
+            }
+        }
     }
 
     pub async fn scan_vertex_rows_interval_as_of(
@@ -570,12 +1491,13 @@ where
                     sort_temporal_rows(&mut rows, &schema, keys)?;
                 }
                 PhysicalOperator::Aggregate {
+                    phase,
                     grouping,
                     aggregates,
                     output,
                 } => {
                     rows = aggregate_interval_rows(
-                        rows, &schema, grouping, aggregates, output, context,
+                        rows, &schema, *phase, grouping, aggregates, output, context,
                     )?;
                     schema = output.clone();
                 }
@@ -600,15 +1522,122 @@ where
         context: &ExecutionContext,
         read: TemporalRead,
     ) -> Result<Vec<RecordBatch>, TemporalExecutionError> {
+        self.execute_fragment_with_expected_capability_generation(fragment, context, read, None)
+            .await
+    }
+
+    pub async fn execute_fragment_with_expected_capability_generation(
+        &self,
+        fragment: &PlanFragment,
+        context: &ExecutionContext,
+        read: TemporalRead,
+        expected_capability_generation: Option<u64>,
+    ) -> Result<Vec<RecordBatch>, TemporalExecutionError> {
+        if let Some(metrics) = context.query_metrics() {
+            let observed = TemporalBatchExecutor::new(self.store.observed(metrics));
+            return observed
+                .execute_fragment_observed(fragment, context, read, expected_capability_generation)
+                .await;
+        }
+        self.execute_fragment_observed(fragment, context, read, expected_capability_generation)
+            .await
+    }
+
+    async fn execute_fragment_observed(
+        &self,
+        fragment: &PlanFragment,
+        context: &ExecutionContext,
+        read: TemporalRead,
+        expected_capability_generation: Option<u64>,
+    ) -> Result<Vec<RecordBatch>, TemporalExecutionError> {
         if fragment.operators().is_empty() {
             return Err(RuntimeError::UnsupportedOperator("empty fragment").into());
         }
+        let needs_candidate_snapshot = context.benchmark_ablations().native_pushdown
+            && matches!(read.transaction, TransactionRead::Current)
+            && fragment
+                .operators()
+                .iter()
+                .zip(fragment.access())
+                .any(|(operator, access)| {
+                    matches!(operator, PhysicalOperator::NodeScan { .. })
+                        && matches!(
+                            access,
+                            PhysicalAccess::Primitive {
+                                primitive: PrimitiveKind::CandidateScan,
+                                ..
+                            }
+                        )
+                });
+        let candidate_binding = if needs_candidate_snapshot {
+            self.store.read_snapshot_binding()?
+        } else {
+            None
+        };
+        let candidate_snapshot = if needs_candidate_snapshot {
+            Some(match candidate_binding.as_ref() {
+                Some(binding) => {
+                    if expected_capability_generation
+                        .is_some_and(|expected| expected != binding.capability_generation())
+                    {
+                        return Err(RuntimeError::CapabilityGenerationMismatch.into());
+                    }
+                    binding
+                        .owner()
+                        .begin_read_snapshot()
+                        .await
+                        .map_err(TemporalStoreError::from)?
+                }
+                None => {
+                    if expected_capability_generation.is_some_and(|expected| {
+                        expected != self.store.adapter().query_capability_generation()
+                    }) {
+                        return Err(RuntimeError::CapabilityGenerationMismatch.into());
+                    }
+                    self.store.begin_read_snapshot().await?
+                }
+            })
+        } else {
+            None
+        };
         let mut batches = Vec::new();
-        for operator in fragment.operators() {
+        for (operator_index, operator) in fragment.operators().iter().enumerate() {
             context.check_fences()?;
             match operator {
                 PhysicalOperator::NodeScan { labels, output, .. } => {
-                    batches = self.node_scan(labels, output, read, context).await?;
+                    let planned_pushdown =
+                        candidate_scan_pushdown(&fragment.access()[operator_index])?;
+                    let current_read = matches!(read.transaction, TransactionRead::Current);
+                    if current_read
+                        && planned_pushdown.is_some()
+                        && !context.benchmark_ablations().native_pushdown
+                    {
+                        context.record_canonical_residual_scan();
+                    }
+                    let pushdown = planned_pushdown
+                        .filter(|_| current_read && context.benchmark_ablations().native_pushdown);
+                    batches = self
+                        .node_scan(
+                            labels,
+                            output,
+                            read,
+                            context,
+                            CandidateScanExecution {
+                                snapshot: candidate_snapshot.as_deref(),
+                                required: pushdown.as_ref().map(|value| value.required),
+                                constraints: pushdown
+                                    .as_ref()
+                                    .map_or(&[], |value| value.constraints),
+                                budget: TemporalScanBudget::new(
+                                    usize::try_from(
+                                        fragment.execution_budget().raw_scan().entry_limit(),
+                                    )
+                                    .unwrap_or(usize::MAX),
+                                    fragment.execution_budget().raw_scan().byte_limit(),
+                                ),
+                            },
+                        )
+                        .await?;
                 }
                 PhysicalOperator::RelationshipScan { types, output, .. } => {
                     batches = self.relationship_scan(types, output, read, context).await?;
@@ -681,12 +1710,36 @@ where
         output: &temporal_ir::RowSchema,
         read: TemporalRead,
         context: &ExecutionContext,
+        candidate: CandidateScanExecution<'_>,
     ) -> Result<Vec<RecordBatch>, TemporalExecutionError> {
+        let constraints = candidate
+            .constraints
+            .iter()
+            .map(Self::to_storage_property_constraint)
+            .collect::<Vec<_>>();
         let vertices = match read.transaction {
             TransactionRead::Current => {
-                self.store
-                    .scan_vertex_views_current(read.graph, read.valid_time)
-                    .await?
+                if let (Some(snapshot), Some(required)) = (candidate.snapshot, candidate.required) {
+                    self.store
+                        .scan_vertex_views_current_candidate_in_snapshot(
+                            snapshot,
+                            read.graph,
+                            read.valid_time,
+                            candidate.budget,
+                            required,
+                            &constraints,
+                        )
+                        .await?
+                } else {
+                    self.store
+                        .scan_vertex_views_current_batched(
+                            read.graph,
+                            read.valid_time,
+                            MAX_BATCH_ROWS,
+                            4 * 1024 * 1024,
+                        )
+                        .await?
+                }
             }
             TransactionRead::AsOf(transaction_time) => {
                 self.store
@@ -735,6 +1788,28 @@ where
             .collect()
     }
 
+    fn to_storage_property_constraint(
+        constraint: &PhysicalPropertyConstraint,
+    ) -> storage_api::PropertyConstraint {
+        let operator = match constraint.operator() {
+            PhysicalComparisonOperator::Equal => storage_api::ComparisonOperator::Equal,
+            PhysicalComparisonOperator::NotEqual => storage_api::ComparisonOperator::NotEqual,
+            PhysicalComparisonOperator::LessThan => storage_api::ComparisonOperator::LessThan,
+            PhysicalComparisonOperator::LessThanOrEqual => {
+                storage_api::ComparisonOperator::LessThanOrEqual
+            }
+            PhysicalComparisonOperator::GreaterThan => storage_api::ComparisonOperator::GreaterThan,
+            PhysicalComparisonOperator::GreaterThanOrEqual => {
+                storage_api::ComparisonOperator::GreaterThanOrEqual
+            }
+        };
+        storage_api::PropertyConstraint::new(
+            storage_api::PropertyId::new(constraint.property_id()),
+            operator,
+            constraint.value().clone(),
+        )
+    }
+
     async fn relationship_scan(
         &self,
         types: &[u32],
@@ -745,7 +1820,12 @@ where
         let edges = match read.transaction {
             TransactionRead::Current => {
                 self.store
-                    .scan_edges_current(read.graph, read.valid_time)
+                    .scan_edges_current_batched(
+                        read.graph,
+                        read.valid_time,
+                        MAX_BATCH_ROWS,
+                        4 * 1024 * 1024,
+                    )
                     .await?
             }
             TransactionRead::AsOf(transaction_time) => {
@@ -820,20 +1900,78 @@ where
                     }
                     .into());
                 };
-                for edge in self
+                let edges = self
                     .combined_expand_edges(source_node.element(), outgoing, read, context)
                     .await?
                     .into_iter()
                     .filter(|edge| types.is_empty() || types.contains(&edge.edge_type().value()))
-                {
-                    let destination_ref = if outgoing {
-                        edge.destination_ref()
-                    } else {
-                        edge.source_ref()
+                    .collect::<Vec<_>>();
+                let destination_refs = edges
+                    .iter()
+                    .map(|edge| {
+                        if outgoing {
+                            edge.destination_ref()
+                        } else {
+                            edge.source_ref()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let committed_destinations = match read.transaction {
+                    TransactionRead::Current => {
+                        let values = if context.benchmark_ablations().batched_property_gather {
+                            self.store
+                                .vertex_views_current_batched(
+                                    &destination_refs,
+                                    read.valid_time,
+                                    MAX_BATCH_ROWS,
+                                    4 * 1024 * 1024,
+                                )
+                                .await?
+                        } else {
+                            let values = self
+                                .store
+                                .vertex_views_current_one_at_a_time(
+                                    &destination_refs,
+                                    read.valid_time,
+                                    4 * 1024 * 1024,
+                                )
+                                .await?;
+                            context.record_singleton_property_gather_reads(destination_refs.len());
+                            values
+                        };
+                        Some(
+                            values
+                                .into_iter()
+                                .map(|value| {
+                                    value.map(|value| RuntimeValue::Node(VertexRecord::from(value)))
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    TransactionRead::AsOf(_) => None,
+                };
+                let mut overlay = context
+                    .graph_overlay()
+                    .visible_expand(read.valid_time, ElementKind::Vertex);
+                for (index, edge) in edges.into_iter().enumerate() {
+                    let destination_ref = destination_refs[index];
+                    let destination_value = match read.transaction {
+                        TransactionRead::Current => {
+                            if let Some(replacement) = overlay.remove(&destination_ref) {
+                                replacement
+                            } else {
+                                committed_destinations
+                                    .as_ref()
+                                    .and_then(|values| values.get(index))
+                                    .cloned()
+                                    .flatten()
+                            }
+                        }
+                        TransactionRead::AsOf(_) => {
+                            self.combined_vertex(destination_ref, read, context).await?
+                        }
                     };
-                    let Some(destination_value) =
-                        self.combined_vertex(destination_ref, read, context).await?
-                    else {
+                    let Some(destination_value) = destination_value else {
                         continue;
                     };
                     let mut values = schema
@@ -1078,12 +2216,14 @@ pub async fn execute_interval_coordinator_operators_with_invoker_and_ledger(
                 sort_temporal_rows(&mut rows, &schema, keys)?;
             }
             PhysicalOperator::Aggregate {
+                phase,
                 grouping,
                 aggregates,
                 output,
             } => {
-                rows =
-                    aggregate_interval_rows(rows, &schema, grouping, aggregates, output, context)?;
+                rows = aggregate_interval_rows(
+                    rows, &schema, *phase, grouping, aggregates, output, context,
+                )?;
                 schema = output.clone();
             }
             PhysicalOperator::Apply { apply, output } => {
@@ -1630,6 +2770,7 @@ fn sort_temporal_rows(
 fn aggregate_interval_rows(
     rows: Vec<TemporalRow>,
     input: &RowSchema,
+    phase: AggregatePhase,
     grouping: &[temporal_ir::SlotId],
     aggregates: &[(temporal_ir::SlotId, ScalarExpr)],
     output: &RowSchema,
@@ -1687,7 +2828,11 @@ fn aggregate_interval_rows(
                 for (slot, expression) in aggregates {
                     values.insert(
                         *slot,
-                        aggregate_expression(expression, input, &member_values, context)?,
+                        if phase == AggregatePhase::FinalCount {
+                            sum_partial_count(*slot, input, &member_values)?
+                        } else {
+                            aggregate_expression(expression, input, &member_values, context)?
+                        },
                     );
                 }
                 let values = output
@@ -1713,6 +2858,32 @@ fn aggregate_interval_rows(
         }
     }
     Ok(result)
+}
+
+fn sum_partial_count(
+    slot: temporal_ir::SlotId,
+    schema: &RowSchema,
+    rows: &[Vec<RuntimeValue>],
+) -> Result<RuntimeValue, RuntimeError> {
+    let index = schema
+        .columns()
+        .iter()
+        .position(|column| column.slot() == slot)
+        .ok_or(RuntimeError::MissingSlot(slot))?;
+    rows.iter()
+        .try_fold(0_i64, |total, row| {
+            let value = row.get(index).ok_or(RuntimeError::MissingSlot(slot))?;
+            let RuntimeValue::Integer(partial) = value else {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: temporal_ir::ValueType::Integer,
+                    actual: value.kind(),
+                });
+            };
+            total
+                .checked_add(*partial)
+                .ok_or(RuntimeError::ArithmeticOverflow)
+        })
+        .map(RuntimeValue::Integer)
 }
 
 fn temporal_cells<T>(
@@ -1770,6 +2941,87 @@ pub(super) fn batches_from_rows(
         batches.push(RecordBatch::try_new(schema.clone(), chunk)?);
     }
     Ok(batches)
+}
+
+fn change_node_batch(
+    events: Vec<CanonicalTemporalEvent>,
+    labels: &[u32],
+    output: &RowSchema,
+    applied_log_index: u64,
+) -> Result<ChangeEventBatch, TemporalExecutionError> {
+    let mut retained_events = Vec::new();
+    let mut rows = Vec::new();
+    for event in events {
+        let Some(TemporalEventMetadata::Vertex { label }) = event.metadata() else {
+            continue;
+        };
+        if !labels.is_empty() && !labels.contains(&label.value()) {
+            continue;
+        }
+        let payload = event
+            .payload()
+            .cloned()
+            .unwrap_or_else(|| CanonicalElement::new(0, BTreeMap::new()));
+        rows.push(vec![RuntimeValue::Node(
+            VertexRecord::new(event.element(), Some(*label), payload)
+                .with_change_metadata(change_metadata(&event)),
+        )]);
+        retained_events.push(event);
+    }
+    let records = RecordBatch::try_new(output.clone(), rows)?;
+    Ok(ChangeEventBatch {
+        columns: ColumnBatch::from_record_batch(&records)?,
+        events: retained_events,
+        applied_log_index,
+    })
+}
+
+fn change_relationship_batch(
+    events: Vec<CanonicalTemporalEvent>,
+    types: &[u32],
+    output: &RowSchema,
+    applied_log_index: u64,
+) -> Result<ChangeEventBatch, TemporalExecutionError> {
+    let mut retained_events = Vec::new();
+    let mut rows = Vec::new();
+    for event in events {
+        let Some(TemporalEventMetadata::Edge {
+            edge_type,
+            source,
+            destination,
+        }) = event.metadata()
+        else {
+            continue;
+        };
+        if !types.is_empty() && !types.contains(&edge_type.value()) {
+            continue;
+        }
+        let payload = event
+            .payload()
+            .cloned()
+            .unwrap_or_else(|| CanonicalElement::new(0, BTreeMap::new()));
+        rows.push(vec![RuntimeValue::Relationship(
+            EdgeRecord::from_endpoints(event.element(), *edge_type, *source, *destination, payload)
+                .with_change_metadata(change_metadata(&event)),
+        )]);
+        retained_events.push(event);
+    }
+    let records = RecordBatch::try_new(output.clone(), rows)?;
+    Ok(ChangeEventBatch {
+        columns: ColumnBatch::from_record_batch(&records)?,
+        events: retained_events,
+        applied_log_index,
+    })
+}
+
+fn change_metadata(event: &CanonicalTemporalEvent) -> ChangeMetadata {
+    ChangeMetadata::new(
+        event.valid().start(),
+        event.valid().end(),
+        event.commit_ts(),
+        event.ordinal(),
+        event.operation(),
+    )
 }
 
 #[derive(Debug)]

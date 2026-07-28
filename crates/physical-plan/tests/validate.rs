@@ -1,11 +1,13 @@
 use physical_plan::{
-    ExchangeKind, FragmentId, JoinKind, MAX_RECURSIVE_PLAN_NODES, MemoryBudget, PhysicalApply,
-    PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeader, Placement, ValidationError,
+    AccessGuarantee, AggregatePhase, COUNT_AGGREGATE_FUNCTION_ID, ExchangeKind,
+    FragmentExecutionBudget, FragmentId, JoinKind, MAX_RECURSIVE_PLAN_NODES, MemoryBudget,
+    PhysicalAccess, PhysicalApply, PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeader,
+    Placement, PrimitiveKind, RawScanBudget, ResidualPolicy, ValidationError,
 };
 use temporal_ir::{
-    ApplyKind, ChildPlanId, Column, ProcedureArgument, ProcedureEffect, ProcedureIdentity,
-    ProcedurePlacement, ProcedureYieldBinding, ResolvedProcedure, RowSchema, ScalarExpr, SlotId,
-    ValueType,
+    ApplyKind, ChangeAxis, ChildPlanId, Column, ProcedureArgument, ProcedureEffect,
+    ProcedureIdentity, ProcedurePlacement, ProcedureYieldBinding, ResolvedProcedure, RowSchema,
+    ScalarExpr, SlotId, TransactionTimeSpec, ValueType,
 };
 
 fn schema() -> RowSchema {
@@ -20,6 +22,435 @@ fn schema() -> RowSchema {
 
 fn header() -> PhysicalPlanHeader {
     PhysicalPlanHeader::new(7, 3, 11, [8; 32]).expect("header")
+}
+
+fn count_expression(arguments: Vec<ScalarExpr>) -> ScalarExpr {
+    ScalarExpr::Function {
+        function_id: COUNT_AGGREGATE_FUNCTION_ID,
+        arguments,
+    }
+}
+
+fn count_plan(
+    phase: AggregatePhase,
+    placement: Placement,
+    input: RowSchema,
+    aggregates: Vec<(SlotId, ScalarExpr)>,
+    output: RowSchema,
+) -> Result<physical_plan::PhysicalPlan, ValidationError> {
+    let mut builder = PhysicalPlanBuilder::new(header());
+    let root = builder.add_fragment(
+        placement,
+        vec![
+            PhysicalOperator::Argument { output: input },
+            PhysicalOperator::Aggregate {
+                phase,
+                grouping: Vec::new(),
+                aggregates,
+                output: output.clone(),
+            },
+        ],
+        output,
+        MemoryBudget::new(1024, 1024).expect("budget"),
+    )?;
+    builder.finish(root)
+}
+
+fn integer_count_schema(slot: u32) -> RowSchema {
+    RowSchema::new(vec![Column::new(
+        SlotId::new(slot),
+        "count",
+        ValueType::Integer,
+        false,
+    )])
+    .expect("count schema")
+}
+
+#[test]
+fn partial_count_rejects_missing_extra_or_non_integer_aggregate_output_slots() {
+    let aggregate = vec![(SlotId::new(1), count_expression(Vec::new()))];
+    let extra = RowSchema::new(vec![
+        Column::new(SlotId::new(1), "count", ValueType::Integer, false),
+        Column::new(SlotId::new(2), "extra", ValueType::Integer, false),
+    ])
+    .expect("extra output");
+    let wrong_type = RowSchema::new(vec![Column::new(
+        SlotId::new(1),
+        "count",
+        ValueType::String,
+        false,
+    )])
+    .expect("wrong type output");
+    let nullable_output = RowSchema::new(vec![Column::new(
+        SlotId::new(1),
+        "count",
+        ValueType::Integer,
+        true,
+    )])
+    .expect("nullable output");
+
+    for output in [RowSchema::empty(), extra, wrong_type, nullable_output] {
+        assert_eq!(
+            count_plan(
+                AggregatePhase::PartialCount,
+                Placement::AllShards,
+                schema(),
+                aggregate.clone(),
+                output,
+            ),
+            Err(ValidationError::InvalidAggregatePhase(FragmentId::new(0)))
+        );
+    }
+}
+
+#[test]
+fn partial_count_rejects_duplicate_aggregate_output_slots() {
+    let output = RowSchema::new(vec![
+        Column::new(SlotId::new(1), "count", ValueType::Integer, false),
+        Column::new(SlotId::new(2), "extra", ValueType::Integer, false),
+    ])
+    .expect("output");
+
+    assert_eq!(
+        count_plan(
+            AggregatePhase::PartialCount,
+            Placement::AllShards,
+            schema(),
+            vec![
+                (SlotId::new(1), count_expression(Vec::new())),
+                (SlotId::new(1), count_expression(Vec::new())),
+            ],
+            output,
+        ),
+        Err(ValidationError::InvalidAggregatePhase(FragmentId::new(0)))
+    );
+}
+
+#[test]
+fn final_count_rejects_non_integer_or_non_matching_input_and_output_slots() {
+    let aggregate = vec![(SlotId::new(1), count_expression(Vec::new()))];
+    let extra_input = RowSchema::new(vec![
+        Column::new(SlotId::new(1), "count", ValueType::Integer, false),
+        Column::new(SlotId::new(2), "extra", ValueType::Integer, false),
+    ])
+    .expect("extra input");
+    let wrong_type_input = RowSchema::new(vec![Column::new(
+        SlotId::new(1),
+        "count",
+        ValueType::String,
+        false,
+    )])
+    .expect("wrong type input");
+    let nullable_input = RowSchema::new(vec![Column::new(
+        SlotId::new(1),
+        "count",
+        ValueType::Integer,
+        true,
+    )])
+    .expect("nullable input");
+    let wrong_slot_output = integer_count_schema(2);
+
+    for (input, output) in [
+        (extra_input, integer_count_schema(1)),
+        (wrong_type_input, integer_count_schema(1)),
+        (nullable_input, integer_count_schema(1)),
+        (integer_count_schema(1), wrong_slot_output),
+    ] {
+        assert_eq!(
+            count_plan(
+                AggregatePhase::FinalCount,
+                Placement::Coordinator,
+                input,
+                aggregate.clone(),
+                output,
+            ),
+            Err(ValidationError::InvalidAggregatePhase(FragmentId::new(0)))
+        );
+    }
+}
+
+#[test]
+fn physical_header_tracks_a_non_zero_capability_generation() {
+    let default_header = header();
+    assert_eq!(default_header.capability_generation(), 1);
+
+    let selected = default_header
+        .with_capability_generation(9)
+        .expect("non-zero generation");
+    assert_eq!(selected.capability_generation(), 9);
+    assert_eq!(
+        header().with_capability_generation(0),
+        Err(ValidationError::InvalidCapabilityGeneration)
+    );
+}
+
+#[test]
+fn fragment_access_metadata_is_aligned_and_backend_neutral() {
+    let access = PhysicalAccess::Primitive {
+        primitive: PrimitiveKind::CandidateScan,
+        guarantee: AccessGuarantee::Candidate,
+        residual: ResidualPolicy::Evaluate,
+        constraints: Vec::new(),
+    };
+    let mut builder = PhysicalPlanBuilder::new(header());
+    let root = builder
+        .add_fragment_with_access(
+            Placement::AllShards,
+            vec![PhysicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: vec![42],
+                output: schema(),
+            }],
+            vec![access.clone()],
+            schema(),
+            MemoryBudget::new(1024, 1024).expect("budget"),
+        )
+        .expect("fragment");
+    let plan = builder.finish(root).expect("plan");
+
+    assert_eq!(plan.fragments()[0].access(), &[access]);
+}
+
+#[test]
+fn fragment_rejects_access_metadata_with_the_wrong_arity() {
+    let mut builder = PhysicalPlanBuilder::new(header());
+    assert_eq!(
+        builder.add_fragment_with_access(
+            Placement::AllShards,
+            vec![PhysicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: Vec::new(),
+                output: schema(),
+            }],
+            Vec::new(),
+            schema(),
+            MemoryBudget::new(1024, 1024).expect("budget"),
+        ),
+        Err(ValidationError::AccessMetadataMismatch(FragmentId::new(0)))
+    );
+}
+
+#[test]
+fn fragment_rejects_exact_primitive_without_a_residual() {
+    let mut builder = PhysicalPlanBuilder::new(header());
+    assert_eq!(
+        builder.add_fragment_with_access(
+            Placement::AllShards,
+            vec![PhysicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: Vec::new(),
+                output: schema(),
+            }],
+            vec![PhysicalAccess::Primitive {
+                primitive: PrimitiveKind::CandidateScan,
+                guarantee: AccessGuarantee::Exact,
+                residual: ResidualPolicy::Omit,
+                constraints: Vec::new(),
+            }],
+            schema(),
+            MemoryBudget::new(1024, 1024).expect("budget"),
+        ),
+        Err(ValidationError::InvalidPhysicalAccess)
+    );
+}
+
+#[test]
+fn fragment_rejects_a_primitive_attached_to_the_wrong_operator() {
+    let mut builder = PhysicalPlanBuilder::new(header());
+    assert_eq!(
+        builder.add_fragment_with_access(
+            Placement::AllShards,
+            vec![PhysicalOperator::Filter(ScalarExpr::Parameter(
+                "predicate".into(),
+            ))],
+            vec![PhysicalAccess::Primitive {
+                primitive: PrimitiveKind::CandidateScan,
+                guarantee: AccessGuarantee::Candidate,
+                residual: ResidualPolicy::Evaluate,
+                constraints: Vec::new(),
+            }],
+            schema(),
+            MemoryBudget::new(1024, 1024).expect("budget"),
+        ),
+        Err(ValidationError::InvalidPhysicalAccess)
+    );
+}
+
+fn change_scan() -> PhysicalOperator {
+    PhysicalOperator::ChangeScan {
+        axis: ChangeAxis::ValidTime,
+        start: ScalarExpr::Parameter("start".into()),
+        end: ScalarExpr::Parameter("end".into()),
+        system_snapshot: TransactionTimeSpec::Current,
+    }
+}
+
+fn change_plan(
+    operators: Vec<PhysicalOperator>,
+    output: RowSchema,
+) -> Result<physical_plan::PhysicalPlan, ValidationError> {
+    let mut builder = PhysicalPlanBuilder::new(header());
+    let root = builder.add_fragment(
+        Placement::AllShards,
+        operators,
+        output,
+        MemoryBudget::new(1024, 1024).expect("budget"),
+    )?;
+    builder.finish(root)
+}
+
+#[test]
+fn validates_change_scan_after_node_or_relationship_source() {
+    change_plan(
+        vec![
+            PhysicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: Vec::new(),
+                output: schema(),
+            },
+            change_scan(),
+        ],
+        schema(),
+    )
+    .expect("node ChangeScan source");
+
+    let relationship_schema = RowSchema::new(vec![Column::new(
+        SlotId::new(0),
+        "r",
+        ValueType::Relationship,
+        false,
+    )])
+    .expect("relationship schema");
+    change_plan(
+        vec![
+            PhysicalOperator::RelationshipScan {
+                binding: SlotId::new(0),
+                types: Vec::new(),
+                output: relationship_schema.clone(),
+            },
+            change_scan(),
+        ],
+        relationship_schema,
+    )
+    .expect("relationship ChangeScan source");
+}
+
+#[test]
+fn rejects_change_scan_at_fragment_start() {
+    assert_eq!(
+        change_plan(
+            vec![change_scan(), PhysicalOperator::Finish],
+            RowSchema::empty()
+        ),
+        Err(ValidationError::InvalidChangeScanStructure(
+            FragmentId::new(0)
+        ))
+    );
+}
+
+#[test]
+fn rejects_change_scan_after_operator_index_one() {
+    assert_eq!(
+        change_plan(
+            vec![
+                PhysicalOperator::NodeScan {
+                    binding: SlotId::new(0),
+                    labels: Vec::new(),
+                    output: schema(),
+                },
+                PhysicalOperator::Filter(ScalarExpr::Parameter("predicate".into())),
+                change_scan(),
+            ],
+            schema(),
+        ),
+        Err(ValidationError::InvalidChangeScanStructure(
+            FragmentId::new(0)
+        ))
+    );
+}
+
+#[test]
+fn rejects_change_scan_without_graph_scan_source() {
+    assert_eq!(
+        change_plan(
+            vec![
+                PhysicalOperator::Argument {
+                    output: RowSchema::empty(),
+                },
+                change_scan(),
+            ],
+            RowSchema::empty(),
+        ),
+        Err(ValidationError::InvalidChangeScanStructure(
+            FragmentId::new(0)
+        ))
+    );
+}
+
+#[test]
+fn rejects_duplicate_change_scan_in_fragment() {
+    assert_eq!(
+        change_plan(
+            vec![
+                PhysicalOperator::NodeScan {
+                    binding: SlotId::new(0),
+                    labels: Vec::new(),
+                    output: schema(),
+                },
+                change_scan(),
+                change_scan(),
+            ],
+            schema(),
+        ),
+        Err(ValidationError::InvalidChangeScanStructure(
+            FragmentId::new(0)
+        ))
+    );
+}
+
+#[test]
+fn rejects_change_scan_in_multiple_fragments() {
+    let mut builder = PhysicalPlanBuilder::new(header());
+    let mut sources = Vec::new();
+    for _ in 0..2 {
+        sources.push(
+            builder
+                .add_fragment(
+                    Placement::AllShards,
+                    vec![
+                        PhysicalOperator::NodeScan {
+                            binding: SlotId::new(0),
+                            labels: Vec::new(),
+                            output: schema(),
+                        },
+                        change_scan(),
+                    ],
+                    schema(),
+                    MemoryBudget::new(1024, 1024).expect("budget"),
+                )
+                .expect("source fragment"),
+        );
+    }
+    let root = builder
+        .add_fragment(
+            Placement::Coordinator,
+            vec![PhysicalOperator::Union { all: true }],
+            schema(),
+            MemoryBudget::new(1024, 1024).expect("budget"),
+        )
+        .expect("root fragment");
+    for source in sources {
+        builder
+            .add_exchange(source, root, ExchangeKind::Gather, schema(), 1)
+            .expect("exchange");
+    }
+
+    assert_eq!(
+        builder.finish(root),
+        Err(ValidationError::InvalidChangeScanStructure(
+            FragmentId::new(1)
+        ))
+    );
 }
 
 #[test]
@@ -109,6 +540,38 @@ fn rejects_zero_memory_or_exchange_credit() {
     assert_eq!(
         MemoryBudget::new(0, 1),
         Err(ValidationError::InvalidMemoryBudget)
+    );
+}
+
+#[test]
+fn fragment_execution_budget_keeps_scan_units_separate_from_resident_memory() {
+    let memory = MemoryBudget::new(64, 128).expect("memory budget");
+    let scan = RawScanBudget::new(7, 4_096).expect("scan budget");
+    let budget = FragmentExecutionBudget::new(memory, scan);
+
+    assert_eq!(budget.resident_memory_bytes(), 64);
+    assert_eq!(budget.spill_bytes(), 128);
+    assert_eq!(budget.raw_scan().entry_limit(), 7);
+    assert_eq!(budget.raw_scan().byte_limit(), 4_096);
+}
+
+#[test]
+fn legacy_memory_budget_uses_scan_defaults_independent_of_memory_size() {
+    let small =
+        FragmentExecutionBudget::from(MemoryBudget::new(1, 1).expect("small memory budget"));
+    let large = FragmentExecutionBudget::from(
+        MemoryBudget::new(64 * 1024 * 1024, 64 * 1024 * 1024).expect("large memory budget"),
+    );
+
+    assert_eq!(small.raw_scan(), large.raw_scan());
+    assert_ne!(small.resident_memory_bytes(), large.resident_memory_bytes());
+    assert_eq!(
+        RawScanBudget::new(0, 1),
+        Err(ValidationError::InvalidRawScanBudget)
+    );
+    assert_eq!(
+        RawScanBudget::new(1, 0),
+        Err(ValidationError::InvalidRawScanBudget)
     );
 }
 

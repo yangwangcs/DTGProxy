@@ -38,17 +38,30 @@ fn main() {
     measure("current_point_lookup", iterations, || {
         black_box(block_on(store.vertex_current(vertex, valid(50))).unwrap());
     });
-    for (name, snapshot) in [
+    let as_of_cells = [
         ("as_of_replay_depth_0", 99_200_i64),
         ("as_of_replay_depth_1", 99_300_i64),
         ("as_of_replay_depth_8", 100_000_i64),
         ("as_of_replay_depth_15", 100_700_i64),
-    ] {
+    ];
+    for &(name, snapshot) in &as_of_cells {
         measure(name, iterations, || {
             black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(snapshot))).unwrap());
         });
     }
     measure("as_of_snapshot_age_1000", iterations, || {
+        black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(800))).unwrap());
+    });
+
+    measure_percentiles("current_point_lookup", iterations, || {
+        black_box(block_on(store.vertex_current(vertex, valid(50))).unwrap());
+    });
+    for &(name, snapshot) in &as_of_cells {
+        measure_percentiles(name, iterations, || {
+            black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(snapshot))).unwrap());
+        });
+    }
+    measure_percentiles("as_of_snapshot_age_1000", iterations, || {
         black_box(block_on(store.vertex_as_of(vertex, valid(50), tx(800))).unwrap());
     });
 
@@ -277,6 +290,30 @@ fn measure(mut name: &str, iterations: u64, mut operation: impl FnMut()) {
 fn report(name: &str, iterations: u64, elapsed: std::time::Duration) {
     let nanos = elapsed.as_nanos() / u128::from(iterations.max(1));
     println!("{name}_ns_per_op={nanos}");
+}
+
+fn measure_percentiles(mut name: &str, iterations: u64, mut operation: impl FnMut()) {
+    if iterations == 0 {
+        name = "invalid_zero_iteration_benchmark";
+    }
+    let capacity = usize::try_from(iterations).unwrap_or(0);
+    let mut samples = Vec::with_capacity(capacity);
+    for _ in 0..iterations {
+        let sample_start = Instant::now();
+        operation();
+        samples.push(sample_start.elapsed().as_nanos());
+    }
+    samples.sort_unstable();
+    println!("{name}_p50_ns={}", percentile(&samples, 50));
+    println!("{name}_p95_ns={}", percentile(&samples, 95));
+}
+
+fn percentile(samples: &[u128], percentile: usize) -> u128 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let rank = samples.len().saturating_mul(percentile).div_ceil(100);
+    samples[rank.saturating_sub(1)]
 }
 
 fn directory_size(path: &Path) -> u64 {

@@ -7,6 +7,7 @@ mod host;
 mod identity;
 mod manifest;
 mod migration;
+mod query_codec;
 mod raft_network;
 mod raft_runtime;
 mod replica_actor;
@@ -26,6 +27,10 @@ pub use manifest::{
 pub use migration::{
     ChunkAppendOutcome, MigrationChunk, MigrationReceipt, MigrationReceiptStore,
     MigrationStorageError, ReceiptWriteOutcome, SnapshotInbox,
+};
+pub use query_codec::{
+    CandidateCodecError, decode_candidate_scan_batch, decode_candidate_scan_plan,
+    encode_candidate_scan_batches, encode_candidate_scan_plan, is_candidate_scan_plan,
 };
 pub use raft_network::{RaftDelivery, RaftNetworkError, SharedRaftTransport};
 pub use raft_runtime::{DataRaftRuntime, DataRaftRuntimeError};

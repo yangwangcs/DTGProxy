@@ -9,6 +9,7 @@ license.workspace = true
 storage-api = { path = "../storage-api" }
 
 [dev-dependencies]
+temporal-storage = { path = "../temporal-storage" }
 temporal-types = { path = "../temporal-types" }
 
 [lints]

@@ -19,6 +19,7 @@ analytics-api = { path = "../analytics-api" }
 shard-runtime = { path = "../shard-runtime", optional = true }
 storage-api = { path = "../storage-api" }
 temporal-ir = { path = "../temporal-ir" }
+temporal-semantics = { path = "../temporal-semantics" }
 temporal-storage = { path = "../temporal-storage" }
 temporal-types = { path = "../temporal-types" }
 tempfile = { version = "3", optional = true }

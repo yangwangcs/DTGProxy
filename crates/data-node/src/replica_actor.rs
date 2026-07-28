@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use adapter_registry::MigrationStatus;
 use raft::eraftpb::Message;
 use shard_runtime::DurableRaftReplica;
-use storage_api::{AdapterRequirement, KeySpan, KeyValue, LogicalKey, StorageAdapter};
+use storage_api::{
+    AdapterRequirement, CandidateScanPage, CandidateScanRequest, KeySpan, KeyValue, LogicalKey,
+    StorageAdapter,
+};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -171,6 +174,20 @@ pub(crate) enum ActorCommand {
     Scan {
         span: KeySpan,
         response: oneshot::Sender<Result<Vec<KeyValue>, HostError>>,
+    },
+    FencedScan {
+        placement_epoch: u64,
+        request_id: u128,
+        minimum_applied_index: u64,
+        span: KeySpan,
+        response: oneshot::Sender<Result<(u64, Vec<KeyValue>), HostError>>,
+    },
+    FencedCandidateScan {
+        placement_epoch: u64,
+        request_id: u128,
+        minimum_applied_index: u64,
+        request: CandidateScanRequest,
+        response: oneshot::Sender<Result<CandidateScanPage, HostError>>,
     },
     CreateSnapshot {
         destination: PathBuf,
@@ -448,6 +465,73 @@ async fn run_actor(
                     .scan(&span)
                     .await
                     .map_err(HostError::from_adapter);
+                let _ = response.send(result);
+            }
+            ActorCommand::FencedScan {
+                placement_epoch,
+                request_id,
+                minimum_applied_index,
+                span,
+                response,
+            } => {
+                let result = async {
+                    let authoritative_epoch = replica.metadata().placement_epoch;
+                    if placement_epoch != authoritative_epoch {
+                        return Err(HostError::StaleEpoch {
+                            expected: authoritative_epoch,
+                            actual: placement_epoch,
+                        });
+                    }
+                    if !replica.is_leader() {
+                        return Err(HostError::NotLeader {
+                            leader_id: replica.leader_id(),
+                        });
+                    }
+                    let scan = replica
+                        .adapter()
+                        .scan_fenced(&span)
+                        .await
+                        .map_err(HostError::from_adapter)?;
+                    let applied_index = scan.applied_log_index();
+                    if applied_index < minimum_applied_index {
+                        return Err(HostError::ReadBarrierUnavailable { request_id });
+                    }
+                    Ok((applied_index, scan.into_entries()))
+                }
+                .await;
+                let _ = response.send(result);
+            }
+            ActorCommand::FencedCandidateScan {
+                placement_epoch,
+                request_id,
+                minimum_applied_index,
+                request,
+                response,
+            } => {
+                let result = async {
+                    let authoritative_epoch = replica.metadata().placement_epoch;
+                    if placement_epoch != authoritative_epoch {
+                        return Err(HostError::StaleEpoch {
+                            expected: authoritative_epoch,
+                            actual: placement_epoch,
+                        });
+                    }
+                    if !replica.is_leader() {
+                        return Err(HostError::NotLeader {
+                            leader_id: replica.leader_id(),
+                        });
+                    }
+                    let page = replica
+                        .adapter()
+                        .scan_candidates(&request)
+                        .await
+                        .map_err(HostError::from_adapter)?;
+                    if page.applied_log_index() < minimum_applied_index {
+                        return Err(HostError::ReadBarrierUnavailable { request_id });
+                    }
+                    Ok(page)
+                }
+                .await;
                 let _ = response.send(result);
             }
             ActorCommand::CreateSnapshot {
@@ -830,6 +914,7 @@ async fn prepare_backend_target(
 }
 
 fn status(replica: &DurableRaftReplica, spec: &ReplicaSpec) -> ReplicaStatus {
+    let query_capabilities = replica.adapter().query_capability_snapshot();
     ReplicaStatus::new(
         spec.graph_id(),
         spec.shard_id(),
@@ -845,5 +930,6 @@ fn status(replica: &DurableRaftReplica, spec: &ReplicaSpec) -> ReplicaStatus {
         spec.backend_generation(),
         spec.snapshot_index(),
         true,
+        query_capabilities,
     )
 }

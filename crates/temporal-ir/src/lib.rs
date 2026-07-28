@@ -13,7 +13,7 @@ pub use error::ValidationError;
 pub use expression::ScalarExpr;
 pub use header::{LanguageProfile, PLAN_VERSION, PlanHeader};
 pub use logical::{
-    ApplyKind, ApplySlotMapping, ChildPlanId, LogicalApply, LogicalBatchSubtransaction,
+    ApplyKind, ApplySlotMapping, ChangeAxis, ChildPlanId, LogicalApply, LogicalBatchSubtransaction,
     LogicalNode, LogicalNodeId, LogicalOperator, LogicalPlan, LogicalPlanBuilder, MAX_APPLY_DEPTH,
     MAX_APPLY_INVOCATIONS, MAX_APPLY_OUTPUT_ROWS, MAX_BATCH_SUBTRANSACTION_ROWS, SortKey,
     TemporalJoinKind, TransactionTimeSpec, ValidTimeSpec,

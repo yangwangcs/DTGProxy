@@ -5,15 +5,19 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use temporal_ir::{
-    ApplyKind, ApplySlotMapping, ChildPlanId, Column, MAX_APPLY_DEPTH, MAX_APPLY_INVOCATIONS,
-    MAX_APPLY_OUTPUT_ROWS, MAX_BATCH_SUBTRANSACTION_ROWS, ProcedurePlacement, ResolvedProcedure,
-    RowSchema, ScalarExpr, SlotId, SortKey, TransactionTimeSpec, ValidTimeSpec,
+    ApplyKind, ApplySlotMapping, ChangeAxis, ChildPlanId, Column, MAX_APPLY_DEPTH,
+    MAX_APPLY_INVOCATIONS, MAX_APPLY_OUTPUT_ROWS, MAX_BATCH_SUBTRANSACTION_ROWS,
+    ProcedurePlacement, ResolvedProcedure, RowSchema, ScalarExpr, SlotId, SortKey,
+    TransactionTimeSpec, ValidTimeSpec, ValueType,
 };
+use temporal_types::GraphValue;
 
 pub const PHYSICAL_PLAN_VERSION: u16 = 1;
 pub const MAX_FRAGMENTS: usize = 65_536;
 pub const MAX_EXCHANGES: usize = 131_072;
 pub const MAX_RECURSIVE_PLAN_NODES: usize = 4_096;
+pub const DEFAULT_RAW_SCAN_ENTRY_LIMIT: u64 = 16_384;
+pub const DEFAULT_RAW_SCAN_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalPlanHeader {
@@ -21,6 +25,7 @@ pub struct PhysicalPlanHeader {
     graph_id: u64,
     schema_version: u64,
     topology_epoch: u64,
+    capability_generation: u64,
     query_fingerprint: [u8; 32],
     expected_shards: Vec<u32>,
 }
@@ -37,6 +42,7 @@ impl PhysicalPlanHeader {
             graph_id,
             schema_version,
             topology_epoch,
+            capability_generation: 1,
             query_fingerprint,
             expected_shards: vec![0],
         };
@@ -56,6 +62,17 @@ impl PhysicalPlanHeader {
         Ok(self)
     }
 
+    pub fn with_capability_generation(
+        mut self,
+        capability_generation: u64,
+    ) -> Result<Self, ValidationError> {
+        if capability_generation == 0 {
+            return Err(ValidationError::InvalidCapabilityGeneration);
+        }
+        self.capability_generation = capability_generation;
+        Ok(self)
+    }
+
     fn validate(&self) -> Result<(), ValidationError> {
         if self.version != PHYSICAL_PLAN_VERSION {
             return Err(ValidationError::UnsupportedVersion {
@@ -66,6 +83,7 @@ impl PhysicalPlanHeader {
         if self.graph_id == 0
             || self.schema_version == 0
             || self.topology_epoch == 0
+            || self.capability_generation == 0
             || self.query_fingerprint == [0; 32]
         {
             return Err(ValidationError::InvalidHeader);
@@ -94,6 +112,11 @@ impl PhysicalPlanHeader {
     #[must_use]
     pub const fn topology_epoch(&self) -> u64 {
         self.topology_epoch
+    }
+
+    #[must_use]
+    pub const fn capability_generation(&self) -> u64 {
+        self.capability_generation
     }
 
     #[must_use]
@@ -167,6 +190,79 @@ impl MemoryBudget {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawScanBudget {
+    entry_limit: u64,
+    byte_limit: u64,
+}
+
+impl RawScanBudget {
+    pub fn new(entry_limit: u64, byte_limit: u64) -> Result<Self, ValidationError> {
+        if entry_limit == 0 || byte_limit == 0 {
+            return Err(ValidationError::InvalidRawScanBudget);
+        }
+        Ok(Self {
+            entry_limit,
+            byte_limit,
+        })
+    }
+
+    #[must_use]
+    pub const fn entry_limit(self) -> u64 {
+        self.entry_limit
+    }
+
+    #[must_use]
+    pub const fn byte_limit(self) -> u64 {
+        self.byte_limit
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentExecutionBudget {
+    memory: MemoryBudget,
+    raw_scan: RawScanBudget,
+}
+
+impl FragmentExecutionBudget {
+    #[must_use]
+    pub const fn new(memory: MemoryBudget, raw_scan: RawScanBudget) -> Self {
+        Self { memory, raw_scan }
+    }
+
+    #[must_use]
+    pub const fn resident_memory_bytes(self) -> u64 {
+        self.memory.memory_bytes()
+    }
+
+    #[must_use]
+    pub const fn spill_bytes(self) -> u64 {
+        self.memory.spill_bytes()
+    }
+
+    #[must_use]
+    pub const fn memory(self) -> MemoryBudget {
+        self.memory
+    }
+
+    #[must_use]
+    pub const fn raw_scan(self) -> RawScanBudget {
+        self.raw_scan
+    }
+}
+
+impl From<MemoryBudget> for FragmentExecutionBudget {
+    fn from(memory: MemoryBudget) -> Self {
+        Self {
+            memory,
+            raw_scan: RawScanBudget {
+                entry_limit: DEFAULT_RAW_SCAN_ENTRY_LIMIT,
+                byte_limit: DEFAULT_RAW_SCAN_BYTE_LIMIT,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JoinKind {
     Inner,
@@ -180,6 +276,121 @@ pub enum WriteOperation {
     Set,
     Remove,
     Delete { detach: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimitiveKind {
+    CandidateScan,
+    AdjacencyExpand,
+    ChangeScan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessGuarantee {
+    Unsupported,
+    Candidate,
+    Exact,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidualPolicy {
+    Evaluate,
+    Omit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalComparisonOperator {
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalPropertyConstraint {
+    property_id: u32,
+    operator: PhysicalComparisonOperator,
+    value: GraphValue,
+}
+
+impl PhysicalPropertyConstraint {
+    #[must_use]
+    pub const fn new(
+        property_id: u32,
+        operator: PhysicalComparisonOperator,
+        value: GraphValue,
+    ) -> Self {
+        Self {
+            property_id,
+            operator,
+            value,
+        }
+    }
+
+    #[must_use]
+    pub const fn property_id(&self) -> u32 {
+        self.property_id
+    }
+
+    #[must_use]
+    pub const fn operator(&self) -> PhysicalComparisonOperator {
+        self.operator
+    }
+
+    #[must_use]
+    pub const fn value(&self) -> &GraphValue {
+        &self.value
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PhysicalAccess {
+    Generic,
+    Primitive {
+        primitive: PrimitiveKind,
+        guarantee: AccessGuarantee,
+        residual: ResidualPolicy,
+        constraints: Vec<PhysicalPropertyConstraint>,
+    },
+}
+
+impl PhysicalAccess {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::Generic => Ok(()),
+            Self::Primitive {
+                guarantee: AccessGuarantee::Unsupported,
+                ..
+            }
+            | Self::Primitive {
+                residual: ResidualPolicy::Omit,
+                ..
+            } => Err(ValidationError::InvalidPhysicalAccess),
+            Self::Primitive {
+                primitive,
+                guarantee,
+                constraints,
+                ..
+            } if constraints.is_empty()
+                || (*primitive == PrimitiveKind::CandidateScan
+                    && *guarantee == AccessGuarantee::Candidate) =>
+            {
+                Ok(())
+            }
+            Self::Primitive { .. } => Err(ValidationError::InvalidPhysicalAccess),
+        }
+    }
+}
+
+pub const COUNT_AGGREGATE_FUNCTION_ID: u32 = 0xd190_b1fd;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregatePhase {
+    Single,
+    PartialCount,
+    FinalCount,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +431,7 @@ pub enum PhysicalOperator {
         keys: Vec<SlotId>,
     },
     Aggregate {
+        phase: AggregatePhase,
         grouping: Vec<SlotId>,
         aggregates: Vec<(SlotId, ScalarExpr)>,
         output: RowSchema,
@@ -240,7 +452,12 @@ pub enum PhysicalOperator {
         valid_time: ValidTimeSpec,
         transaction_time: TransactionTimeSpec,
     },
-    Diff,
+    ChangeScan {
+        axis: ChangeAxis,
+        start: ScalarExpr,
+        end: ScalarExpr,
+        system_snapshot: TransactionTimeSpec,
+    },
     Write {
         operation: WriteOperation,
         output: RowSchema,
@@ -352,8 +569,9 @@ pub struct PlanFragment {
     id: FragmentId,
     placement: Placement,
     operators: Vec<PhysicalOperator>,
+    access: Vec<PhysicalAccess>,
     output: RowSchema,
-    budget: MemoryBudget,
+    execution_budget: FragmentExecutionBudget,
 }
 
 impl PlanFragment {
@@ -373,13 +591,23 @@ impl PlanFragment {
     }
 
     #[must_use]
+    pub fn access(&self) -> &[PhysicalAccess] {
+        &self.access
+    }
+
+    #[must_use]
     pub const fn output(&self) -> &RowSchema {
         &self.output
     }
 
     #[must_use]
     pub const fn budget(&self) -> MemoryBudget {
-        self.budget
+        self.execution_budget.memory()
+    }
+
+    #[must_use]
+    pub const fn execution_budget(&self) -> FragmentExecutionBudget {
+        self.execution_budget
     }
 }
 
@@ -457,11 +685,23 @@ impl PhysicalPlan {
         {
             return Err(ValidationError::InvalidRoot(self.root));
         }
+        let mut change_scan_fragment = None;
         for (index, fragment) in self.fragments.iter().enumerate() {
             if fragment.id.value() != u32::try_from(index).unwrap_or(u32::MAX)
                 || fragment.operators.is_empty()
             {
                 return Err(ValidationError::InvalidFragment(fragment.id));
+            }
+            if fragment.access.len() != fragment.operators.len() {
+                return Err(ValidationError::AccessMetadataMismatch(fragment.id));
+            }
+            for access in &fragment.access {
+                access.validate()?;
+            }
+            if validate_change_scan_structure(fragment)?
+                && change_scan_fragment.replace(fragment.id).is_some()
+            {
+                return Err(ValidationError::InvalidChangeScanStructure(fragment.id));
             }
             let incoming = self
                 .exchanges
@@ -501,8 +741,24 @@ impl PhysicalPlan {
                     | PhysicalOperator::Expand { output, .. }
                     | PhysicalOperator::Project { output, .. }
                     | PhysicalOperator::Unwind { output, .. }
-                    | PhysicalOperator::Aggregate { output, .. }
                     | PhysicalOperator::Write { output, .. } => {
+                        current_schema = output.clone();
+                    }
+                    PhysicalOperator::Aggregate {
+                        phase,
+                        grouping,
+                        aggregates,
+                        output,
+                    } => {
+                        validate_aggregate_phase(
+                            fragment.id,
+                            fragment.placement,
+                            *phase,
+                            grouping,
+                            aggregates,
+                            &current_schema,
+                            output,
+                        )?;
                         current_schema = output.clone();
                     }
                     PhysicalOperator::Procedure { procedure, output } => {
@@ -576,6 +832,27 @@ impl PhysicalPlan {
     }
 }
 
+fn validate_change_scan_structure(fragment: &PlanFragment) -> Result<bool, ValidationError> {
+    let mut change_scans = fragment
+        .operators
+        .iter()
+        .enumerate()
+        .filter(|(_, operator)| matches!(operator, PhysicalOperator::ChangeScan { .. }));
+    let Some((change_index, _)) = change_scans.next() else {
+        return Ok(false);
+    };
+    if change_index != 1
+        || change_scans.next().is_some()
+        || !matches!(
+            fragment.operators.first(),
+            Some(PhysicalOperator::NodeScan { .. } | PhysicalOperator::RelationshipScan { .. })
+        )
+    {
+        return Err(ValidationError::InvalidChangeScanStructure(fragment.id));
+    }
+    Ok(true)
+}
+
 fn validate_apply(
     parent_header: &PhysicalPlanHeader,
     parent_input: &RowSchema,
@@ -600,6 +877,7 @@ fn validate_apply(
     if child_header.graph_id() != parent_header.graph_id()
         || child_header.schema_version() != parent_header.schema_version()
         || child_header.topology_epoch() != parent_header.topology_epoch()
+        || child_header.capability_generation() != parent_header.capability_generation()
         || child_header.expected_shards() != parent_header.expected_shards()
         || child_header.query_fingerprint() == parent_header.query_fingerprint()
     {
@@ -905,6 +1183,58 @@ impl PhysicalPlanBuilder {
         output: RowSchema,
         budget: MemoryBudget,
     ) -> Result<FragmentId, ValidationError> {
+        let access = vec![PhysicalAccess::Generic; operators.len()];
+        self.add_fragment_with_access_and_execution_budget(
+            placement,
+            operators,
+            access,
+            output,
+            budget.into(),
+        )
+    }
+
+    pub fn add_fragment_with_access(
+        &mut self,
+        placement: Placement,
+        operators: Vec<PhysicalOperator>,
+        access: Vec<PhysicalAccess>,
+        output: RowSchema,
+        budget: MemoryBudget,
+    ) -> Result<FragmentId, ValidationError> {
+        self.add_fragment_with_access_and_execution_budget(
+            placement,
+            operators,
+            access,
+            output,
+            budget.into(),
+        )
+    }
+
+    pub fn add_fragment_with_execution_budget(
+        &mut self,
+        placement: Placement,
+        operators: Vec<PhysicalOperator>,
+        output: RowSchema,
+        execution_budget: FragmentExecutionBudget,
+    ) -> Result<FragmentId, ValidationError> {
+        let access = vec![PhysicalAccess::Generic; operators.len()];
+        self.add_fragment_with_access_and_execution_budget(
+            placement,
+            operators,
+            access,
+            output,
+            execution_budget,
+        )
+    }
+
+    fn add_fragment_with_access_and_execution_budget(
+        &mut self,
+        placement: Placement,
+        operators: Vec<PhysicalOperator>,
+        access: Vec<PhysicalAccess>,
+        output: RowSchema,
+        execution_budget: FragmentExecutionBudget,
+    ) -> Result<FragmentId, ValidationError> {
         if operators.is_empty() || self.fragments.len() >= MAX_FRAGMENTS {
             return Err(ValidationError::InvalidFragmentCount);
         }
@@ -912,12 +1242,62 @@ impl PhysicalPlanBuilder {
             u32::try_from(self.fragments.len())
                 .map_err(|_| ValidationError::InvalidFragmentCount)?,
         );
+        if access.len() != operators.len() {
+            return Err(ValidationError::AccessMetadataMismatch(id));
+        }
+        for (index, (operator, item)) in operators.iter().zip(&access).enumerate() {
+            item.validate()?;
+            let aligned = match item {
+                PhysicalAccess::Generic => true,
+                PhysicalAccess::Primitive {
+                    primitive: PrimitiveKind::CandidateScan,
+                    ..
+                } => matches!(operator, PhysicalOperator::NodeScan { .. }),
+                PhysicalAccess::Primitive {
+                    primitive: PrimitiveKind::AdjacencyExpand,
+                    ..
+                } => matches!(operator, PhysicalOperator::Expand { .. }),
+                PhysicalAccess::Primitive {
+                    primitive: PrimitiveKind::ChangeScan,
+                    ..
+                } => matches!(operator, PhysicalOperator::ChangeScan { .. }),
+            };
+            if !aligned {
+                return Err(ValidationError::InvalidPhysicalAccess);
+            }
+            if let PhysicalAccess::Primitive {
+                primitive: PrimitiveKind::CandidateScan,
+                constraints,
+                ..
+            } = item
+                && !constraints.is_empty()
+            {
+                let Some(PhysicalOperator::NodeScan { binding, .. }) = operators.get(index) else {
+                    return Err(ValidationError::InvalidPhysicalAccess);
+                };
+                let Some(PhysicalOperator::Filter(predicate)) = operators.get(index + 1) else {
+                    return Err(ValidationError::InvalidPhysicalAccess);
+                };
+                if access.get(index + 1) != Some(&PhysicalAccess::Generic) {
+                    return Err(ValidationError::InvalidPhysicalAccess);
+                }
+                let mut residual_constraints = Vec::new();
+                collect_physical_constraints(predicate, *binding, &mut residual_constraints);
+                if constraints
+                    .iter()
+                    .any(|constraint| !residual_constraints.contains(constraint))
+                {
+                    return Err(ValidationError::InvalidPhysicalAccess);
+                }
+            }
+        }
         self.fragments.push(PlanFragment {
             id,
             placement,
             operators,
+            access,
             output,
-            budget,
+            execution_budget,
         });
         Ok(id)
     }
@@ -961,6 +1341,104 @@ impl PhysicalPlanBuilder {
     }
 }
 
+fn collect_physical_constraints(
+    expression: &ScalarExpr,
+    binding: SlotId,
+    constraints: &mut Vec<PhysicalPropertyConstraint>,
+) {
+    if let ScalarExpr::And(left, right) = expression {
+        collect_physical_constraints(left, binding, constraints);
+        collect_physical_constraints(right, binding, constraints);
+        return;
+    }
+    let extracted = match expression {
+        ScalarExpr::Equal(left, right) => {
+            physical_constraint(left, right, binding, PhysicalComparisonOperator::Equal)
+        }
+        ScalarExpr::NotEqual(left, right) => {
+            physical_constraint(left, right, binding, PhysicalComparisonOperator::NotEqual)
+        }
+        ScalarExpr::Less(left, right) => {
+            physical_constraint(left, right, binding, PhysicalComparisonOperator::LessThan)
+        }
+        ScalarExpr::LessEqual(left, right) => physical_constraint(
+            left,
+            right,
+            binding,
+            PhysicalComparisonOperator::LessThanOrEqual,
+        ),
+        ScalarExpr::Greater(left, right) => physical_constraint(
+            left,
+            right,
+            binding,
+            PhysicalComparisonOperator::GreaterThan,
+        ),
+        ScalarExpr::GreaterEqual(left, right) => physical_constraint(
+            left,
+            right,
+            binding,
+            PhysicalComparisonOperator::GreaterThanOrEqual,
+        ),
+        _ => None,
+    };
+    if let Some(constraint) = extracted {
+        constraints.push(constraint);
+    }
+}
+
+fn physical_constraint(
+    left: &ScalarExpr,
+    right: &ScalarExpr,
+    binding: SlotId,
+    operator: PhysicalComparisonOperator,
+) -> Option<PhysicalPropertyConstraint> {
+    if let (Some(property_id), ScalarExpr::Literal(value)) =
+        (physical_bound_property(left, binding), right)
+    {
+        return Some(PhysicalPropertyConstraint::new(
+            property_id,
+            operator,
+            value.clone(),
+        ));
+    }
+    if let (ScalarExpr::Literal(value), Some(property_id)) =
+        (left, physical_bound_property(right, binding))
+    {
+        return Some(PhysicalPropertyConstraint::new(
+            property_id,
+            reverse_physical_comparison(operator),
+            value.clone(),
+        ));
+    }
+    None
+}
+
+fn physical_bound_property(expression: &ScalarExpr, binding: SlotId) -> Option<u32> {
+    match expression {
+        ScalarExpr::Property { value, property_id } if matches!(value.as_ref(), ScalarExpr::Slot(slot) if *slot == binding) => {
+            Some(*property_id)
+        }
+        _ => None,
+    }
+}
+
+const fn reverse_physical_comparison(
+    operator: PhysicalComparisonOperator,
+) -> PhysicalComparisonOperator {
+    match operator {
+        PhysicalComparisonOperator::Equal => PhysicalComparisonOperator::Equal,
+        PhysicalComparisonOperator::NotEqual => PhysicalComparisonOperator::NotEqual,
+        PhysicalComparisonOperator::LessThan => PhysicalComparisonOperator::GreaterThan,
+        PhysicalComparisonOperator::LessThanOrEqual => {
+            PhysicalComparisonOperator::GreaterThanOrEqual
+        }
+        PhysicalComparisonOperator::GreaterThan => PhysicalComparisonOperator::LessThan,
+        PhysicalComparisonOperator::GreaterThanOrEqual => {
+            PhysicalComparisonOperator::LessThanOrEqual
+        }
+    }
+}
+
 fn validate_exchange(
     fragments: &[PlanFragment],
     exchange: &Exchange,
@@ -989,20 +1467,103 @@ fn validate_exchange(
     Ok(())
 }
 
+fn validate_aggregate_phase(
+    fragment: FragmentId,
+    placement: Placement,
+    phase: AggregatePhase,
+    grouping: &[SlotId],
+    aggregates: &[(SlotId, ScalarExpr)],
+    input: &RowSchema,
+    output: &RowSchema,
+) -> Result<(), ValidationError> {
+    if phase == AggregatePhase::Single {
+        return Ok(());
+    }
+    if !grouping.is_empty()
+        || aggregates.is_empty()
+        || aggregates.iter().any(|(_, expression)| {
+            !matches!(
+                expression,
+                ScalarExpr::Function { function_id, .. }
+                    if *function_id == COUNT_AGGREGATE_FUNCTION_ID
+            )
+        })
+    {
+        return Err(ValidationError::InvalidAggregatePhase(fragment));
+    }
+    if !count_output_schema_matches(aggregates, output) {
+        return Err(ValidationError::InvalidAggregatePhase(fragment));
+    }
+    match phase {
+        AggregatePhase::Single => Ok(()),
+        AggregatePhase::PartialCount => {
+            if placement != Placement::AllShards
+                || !aggregates.iter().all(|(_, expression)| {
+                    let ScalarExpr::Function { arguments, .. } = expression else {
+                        return false;
+                    };
+                    match arguments.as_slice() {
+                        [] => true,
+                        [ScalarExpr::Slot(slot)] => input
+                            .columns()
+                            .iter()
+                            .find(|column| column.slot() == *slot)
+                            .is_some_and(|column| !column.nullable()),
+                        _ => false,
+                    }
+                })
+            {
+                return Err(ValidationError::InvalidAggregatePhase(fragment));
+            }
+            Ok(())
+        }
+        AggregatePhase::FinalCount => {
+            if placement != Placement::Coordinator
+                || !count_output_schema_matches(aggregates, input)
+            {
+                return Err(ValidationError::InvalidAggregatePhase(fragment));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn count_output_schema_matches(aggregates: &[(SlotId, ScalarExpr)], schema: &RowSchema) -> bool {
+    let aggregate_slots = aggregates
+        .iter()
+        .map(|(slot, _)| *slot)
+        .collect::<BTreeSet<_>>();
+    aggregate_slots.len() == aggregates.len()
+        && aggregate_slots.len() == schema.columns().len()
+        && aggregate_slots.iter().all(|slot| {
+            schema.columns().iter().any(|column| {
+                column.slot() == *slot
+                    && column.value_type() == &ValueType::Integer
+                    && !column.nullable()
+            })
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     UnsupportedVersion { expected: u16, actual: u16 },
     InvalidHeader,
+    InvalidCapabilityGeneration,
     InvalidExpectedShards,
     InvalidMemoryBudget,
+    InvalidRawScanBudget,
     InvalidFragmentCount,
     TooManyExchanges,
     InvalidRoot(FragmentId),
     InvalidFragment(FragmentId),
+    AccessMetadataMismatch(FragmentId),
+    InvalidPhysicalAccess,
     InvalidExchangeDirection { from: FragmentId, to: FragmentId },
     InvalidExchangeCredit,
     ExchangeSchemaMismatch(ExchangeId),
     HashJoinSchemaMismatch(FragmentId),
+    InvalidAggregatePhase(FragmentId),
+    InvalidChangeScanStructure(FragmentId),
     FragmentOutputMismatch(FragmentId),
     InvalidProcedure,
     ProcedurePlacementMismatch,

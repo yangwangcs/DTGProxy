@@ -26,13 +26,14 @@ use cluster_protocol::proto::{
     ListAnalyticsArtifactGenerationsRequest, ListAnalyticsArtifactGenerationsResponse,
     PinAnalyticsArtifactGenerationRequest, PinAnalyticsArtifactGenerationResponse,
     PrepareBackendTargetRequest, PrepareBackendTargetResponse, PutAnalyticsArtifactChunkRequest,
-    PutAnalyticsArtifactChunkResponse, ReadRequest, ReadResponse, ReplicaBootstrapProfile,
+    PutAnalyticsArtifactChunkResponse, QueryPushdownGuarantee as WirePushdownGuarantee,
+    ReadBarrierRequest, ReadBarrierResponse, ReadRequest, ReadResponse, ReplicaBootstrapProfile,
     ReplicaRole as WireReplicaRole, ReplicaStatusRequest, ReplicaStatusResponse, ScanBatch,
     ScanRequest, SnapshotChunk,
 };
 use cluster_protocol::{CommandPayload, CommonRequestContext, ProtocolError, ShardRequestContext};
 use prost::Message as ProstMessage;
-use storage_api::{KeySpan, KeyValue, Keyspace, LogicalKey};
+use storage_api::{KeySpan, KeyValue, Keyspace, LogicalKey, PushdownGuarantee};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
@@ -265,6 +266,7 @@ pub enum DataOperation {
     Execute,
     Read,
     Scan,
+    ReadBarrier,
     PutAnalyticsArtifact,
     PinAnalyticsArtifact,
     GetAnalyticsArtifact,
@@ -969,7 +971,7 @@ impl ShardService for DataNodeGrpcService {
         request: Request<ScanRequest>,
     ) -> Result<Response<Self::ScanStream>, Status> {
         let request = request.into_inner();
-        let (context, key, _) = self.validate(request.context, DataOperation::Scan)?;
+        let (context, key, request_id) = self.validate(request.context, DataOperation::Scan)?;
         if !request.read_proof.is_empty() {
             return Err(Status::invalid_argument(
                 "follower scan proofs are not enabled on the leader-only P0 path",
@@ -980,9 +982,35 @@ impl ShardService for DataNodeGrpcService {
         if !(MIN_SCAN_BATCH_BYTES..=MAX_SCAN_BATCH_BYTES).contains(&maximum_batch_bytes) {
             return Err(Status::invalid_argument("invalid scan batch byte bound"));
         }
-        let status = self.require_leader(key).await?;
-        if status.placement_epoch() != context.placement_epoch() {
-            return Err(stale_epoch_status(status.placement_epoch()));
+        let deadline = monotonic_deadline(context.common().deadline_unix_ms())?;
+        let read_index = self
+            .host
+            .leader_read_permit(key, context.placement_epoch(), request_id, deadline)
+            .await
+            .map_err(host_status)?;
+        if crate::is_candidate_scan_plan(&request.plan) {
+            let candidate = crate::decode_candidate_scan_plan(&request.plan)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if candidate.span().keyspace() == Keyspace::Meta {
+                return Err(Status::permission_denied(
+                    "typed candidate scans cannot access reserved metadata keys",
+                ));
+            }
+            let page = self
+                .host
+                .scan_candidates_fenced(
+                    key,
+                    context.placement_epoch(),
+                    request_id,
+                    read_index,
+                    candidate,
+                )
+                .await
+                .map_err(host_status)?;
+            let applied_index = page.applied_log_index();
+            let batches = crate::encode_candidate_scan_batches(page, maximum_batch_bytes)
+                .map_err(|error| Status::resource_exhausted(error.to_string()))?;
+            return Ok(Response::new(scan_payload_stream(applied_index, batches)));
         }
         let span = decode_key_scan_plan(&request.plan)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -991,44 +1019,19 @@ impl ShardService for DataNodeGrpcService {
                 "generic scans cannot access reserved metadata keys",
             ));
         }
-        let rows = self.host.scan(key, span).await.map_err(host_status)?;
+        let (applied_index, rows) = self
+            .host
+            .scan_fenced(key, context.placement_epoch(), request_id, read_index, span)
+            .await
+            .map_err(host_status)?;
         let batches = partition_scan_rows(rows, maximum_batch_bytes)
             .map_err(|error| Status::resource_exhausted(error.to_string()))?;
-        let applied_index = status.applied_index();
-        let (sender, receiver) = mpsc::channel(8);
-        tokio::spawn(async move {
-            let terminal_sequence = batches.len().saturating_sub(1);
-            for (sequence, batch) in batches.into_iter().enumerate() {
-                let encoded = match encode_key_scan_batch(&batch) {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        let _ = sender
-                            .send(Err(Status::resource_exhausted(error.to_string())))
-                            .await;
-                        return;
-                    }
-                };
-                let Ok(sequence) = u64::try_from(sequence) else {
-                    let _ = sender
-                        .send(Err(Status::internal("scan sequence overflow")))
-                        .await;
-                    return;
-                };
-                if sender
-                    .send(Ok(ScanBatch {
-                        sequence,
-                        applied_index,
-                        arrow_record_batch: encoded,
-                        terminal: usize::try_from(sequence).ok() == Some(terminal_sequence),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(receiver)))
+        let encoded = batches
+            .into_iter()
+            .map(|batch| encode_key_scan_batch(&batch))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| Status::resource_exhausted(error.to_string()))?;
+        Ok(Response::new(scan_payload_stream(applied_index, encoded)))
     }
 
     type ExportSnapshotStream = ReceiverStream<Result<SnapshotChunk, Status>>;
@@ -1291,6 +1294,21 @@ impl ShardService for DataNodeGrpcService {
             return Err(stale_epoch_status(status.placement_epoch()));
         }
         Ok(Response::new(status_response(status)))
+    }
+
+    async fn read_barrier(
+        &self,
+        request: Request<ReadBarrierRequest>,
+    ) -> Result<Response<ReadBarrierResponse>, Status> {
+        let (context, key, request_id) =
+            self.validate(request.into_inner().context, DataOperation::ReadBarrier)?;
+        let deadline = monotonic_deadline(context.common().deadline_unix_ms())?;
+        let read_index = self
+            .host
+            .leader_read_permit(key, context.placement_epoch(), request_id, deadline)
+            .await
+            .map_err(host_status)?;
+        Ok(Response::new(ReadBarrierResponse { read_index }))
     }
 }
 
@@ -2465,6 +2483,8 @@ fn status_response(status: ReplicaStatus) -> ReplicaStatusResponse {
             ReplicaRole::Voter => WireReplicaRole::Follower,
         }
     };
+    let query = status.query_capabilities();
+    let primitives = query.capabilities();
     ReplicaStatusResponse {
         node_id: status.node_id(),
         role: role.into(),
@@ -2475,6 +2495,19 @@ fn status_response(status: ReplicaStatus) -> ReplicaStatusResponse {
         schema_version: status.schema_version(),
         backend_generation: status.backend_generation(),
         ready: status.ready(),
+        query_capability_generation: query.generation(),
+        candidate_scan: wire_pushdown_guarantee(primitives.candidate_scan()).into(),
+        property_gather: wire_pushdown_guarantee(primitives.property_gather()).into(),
+        adjacency_expand: wire_pushdown_guarantee(primitives.adjacency_expand()).into(),
+        change_scan: wire_pushdown_guarantee(primitives.change_scan()).into(),
+    }
+}
+
+const fn wire_pushdown_guarantee(value: PushdownGuarantee) -> WirePushdownGuarantee {
+    match value {
+        PushdownGuarantee::Unsupported => WirePushdownGuarantee::Unsupported,
+        PushdownGuarantee::Candidate => WirePushdownGuarantee::Candidate,
+        PushdownGuarantee::Exact => WirePushdownGuarantee::Exact,
     }
 }
 
@@ -2698,6 +2731,7 @@ fn host_status(error: HostError) -> Status {
             Status::unavailable(error.to_string())
         }
         HostError::AdapterUnavailable(_) => Status::unavailable(error.to_string()),
+        HostError::UnsupportedQueryPrimitive(_) => Status::unimplemented(error.to_string()),
         HostError::ReplicaNotReady { .. } => Status::failed_precondition(error.to_string()),
         HostError::NotLeader { leader_id } => not_leader_status(leader_id),
         HostError::MembershipConflict => Status::failed_precondition(error.to_string()),
@@ -2709,6 +2743,37 @@ fn host_status(error: HostError) -> Status {
         HostError::ActorStopped => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),
     }
+}
+
+fn scan_payload_stream(
+    applied_index: u64,
+    batches: Vec<Vec<u8>>,
+) -> ReceiverStream<Result<ScanBatch, Status>> {
+    let (sender, receiver) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let terminal_sequence = batches.len().saturating_sub(1);
+        for (sequence, payload) in batches.into_iter().enumerate() {
+            let Ok(sequence) = u64::try_from(sequence) else {
+                let _ = sender
+                    .send(Err(Status::internal("scan sequence overflow")))
+                    .await;
+                return;
+            };
+            if sender
+                .send(Ok(ScanBatch {
+                    sequence,
+                    applied_index,
+                    arrow_record_batch: payload,
+                    terminal: usize::try_from(sequence).ok() == Some(terminal_sequence),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    ReceiverStream::new(receiver)
 }
 
 fn not_leader_status(leader_id: Option<u64>) -> Status {
@@ -2791,6 +2856,10 @@ mod tests {
             1,
             0,
             true,
+            storage_api::QueryCapabilitySnapshot::new(
+                1,
+                storage_api::QueryPrimitiveCapabilities::NONE,
+            ),
         )
     }
 

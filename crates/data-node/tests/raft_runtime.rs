@@ -553,25 +553,39 @@ async fn three_replica_read_index_requires_quorum_and_fails_on_term_change() {
     let mut retained_read_heartbeat = None;
     for offset in 0..1_021_u128 {
         let request_id = 10_000 + offset;
-        assert_eq!(
-            first
-                .leader_read_permit(
-                    key,
-                    3,
-                    request_id,
-                    tokio::time::Instant::now() + Duration::from_millis(2),
-                )
-                .await,
-            Err(HostError::ReadBarrierDeadline { request_id })
-        );
-        for message in first.take_outbound(key, 64).await.unwrap() {
-            if message.get_msg_type() == MessageType::MsgHeartbeat
-                && message.to == 2
-                && !message.context.is_empty()
-            {
-                retained_read_heartbeat = Some(message);
+        let pending = tokio::spawn({
+            let first = Arc::clone(&first);
+            async move {
+                first
+                    .leader_read_permit(
+                        key,
+                        3,
+                        request_id,
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                    )
+                    .await
             }
-        }
+        });
+        let submitted = loop {
+            let submitted = first
+                .take_outbound(key, 64)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|message| {
+                    message.get_msg_type() == MessageType::MsgHeartbeat
+                        && message.to == 2
+                        && !message.context.is_empty()
+                });
+            if let Some(submitted) = submitted {
+                break submitted;
+            }
+            tokio::task::yield_now().await;
+        };
+        pending.abort();
+        let _ = pending.await;
+        first.status(key).await.unwrap();
+        retained_read_heartbeat = Some(submitted);
     }
     let capacity_error = first
         .leader_read_permit(

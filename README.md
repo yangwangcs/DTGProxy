@@ -4,7 +4,7 @@ DTGProxy is a distributed bitemporal property-graph middleware written in Rust. 
 
 The 1.0 prototype implements the complete main path:
 
-- bitemporal Current/History storage, bounded Anchor+Delta reconstruction, `AS OF`, `DIFF`, and
+- bitemporal Current/History storage, bounded Anchor+Delta reconstruction, `AS OF`, `CHANGES`, and
   double adjacency;
 - independent Raft groups with durable WAL, checkpoint/suffix recovery, epoch fencing, ReadIndex,
   and follower safe-time reads;
@@ -27,8 +27,7 @@ Family is also present because RocksDB requires it, but DTGProxy does not place 
 there.
 
 The current architecture and implementation scope are defined by the
-[Temporal Cypher and analytics design](docs/superpowers/specs/2026-07-19-dtgproxy-temporal-cypher-analytics-design.md)
-and its [master implementation plan](docs/superpowers/plans/2026-07-19-dtgproxy-temporal-cypher-analytics-master.md).
+[Cedar T-Cypher clean-break design](docs/superpowers/specs/2026-07-23-dtgproxy-cedar-tcypher-clean-break-design.md).
 Protocol specifications for Raft commands, state-machine recovery, snapshots, transactions,
 control-plane state, Adapter SPI, and Sidecar transport are under [`docs/`](docs/).
 
@@ -73,8 +72,7 @@ atomically contains:
 - adapter replay metadata and the applied log index.
 
 The same backend-neutral API reads Current vertices/edges, transaction-time `AS OF` views,
-valid-time-filtered incoming/outgoing adjacency, and coalesced `Added`/`Removed`/`Changed` DIFF
-ranges. Durable records have explicit tags, magic, format versions, big-endian fixed-width
+valid-time-filtered incoming/outgoing adjacency, and immutable `CHANGES` events. Durable records have explicit tags, magic, format versions, big-endian fixed-width
 fields, length-delimited canonical payloads, and checksums. The randomized TCK drives the same
 fixed-seed corrections through the semantic model, Memory Adapter, and RocksDB after every
 commit.
@@ -156,28 +154,35 @@ numbers are service SLOs.
 ## Development
 
 The RocksDB binding compiles native C++ and bindgen code, so a C++17-capable Clang and
-libclang are required. On this macOS development host, the Command Line Tools compiler cannot
-resolve the standard C++ headers for the current SDK; Homebrew LLVM is the verified toolchain:
+libclang are required. On macOS, Cargo automatically uses `scripts/macos-cxx`, which resolves
+the active SDK and its libc++ headers through `xcrun`; no machine-local SDK path is committed.
+Homebrew LLVM remains an optional source of `libclang`. The repository's target-specific Cargo
+configuration intentionally keeps `scripts/macos-cxx` as the C++ driver, so setting a generic
+`CXX` does not override it:
 
 ```bash
 brew install llvm
-export CXX=/opt/homebrew/opt/llvm/bin/clang++
 export LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib
+```
+
+For short local development checks, an already installed RocksDB library can skip rebuilding the
+vendored C++ source. The library ABI/version used by a formal paper run must still be recorded in
+its environment fingerprint; do not silently mix this development shortcut with formal evidence:
+
+```bash
+export ROCKSDB_LIB_DIR=/opt/homebrew/opt/rocksdb/lib
+cargo check -p paper-benchmark --lib --bins
 ```
 
 Run the durable adapter tests explicitly with:
 
 ```bash
-CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib \
 cargo test -p adapter-rocksdb
 ```
 
 For the complete workspace:
 
 ```bash
-CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib \
 cargo test --workspace
 cargo run -p dtgproxy -- --version
 ```

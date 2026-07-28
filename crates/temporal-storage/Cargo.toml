@@ -16,6 +16,8 @@ tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 adapter-memory = { path = "../adapter-memory" }
+adapter-sidecar = { path = "../adapter-sidecar" }
+dhat = "=0.3.3"
 temporal-model = { path = "../temporal-model" }
 
 [lints]
@@ -23,6 +25,11 @@ workspace = true
 
 [[bench]]
 name = "roundtrip"
+harness = false
+required-features = ["rocksdb-tests"]
+
+[[bench]]
+name = "roundtrip_alloc"
 harness = false
 required-features = ["rocksdb-tests"]
 

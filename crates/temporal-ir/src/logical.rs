@@ -195,6 +195,12 @@ pub enum TransactionTimeSpec {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChangeAxis {
+    ValidTime,
+    SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemporalJoinKind {
     Inner,
     Left,
@@ -269,7 +275,12 @@ pub enum LogicalOperator {
         valid_time: ValidTimeSpec,
         transaction_time: TransactionTimeSpec,
     },
-    Diff,
+    ChangeScan {
+        axis: ChangeAxis,
+        start: ScalarExpr,
+        end: ScalarExpr,
+        system_snapshot: TransactionTimeSpec,
+    },
     Create,
     Merge,
     Set,
@@ -470,8 +481,7 @@ fn validate_input_count(node_id: LogicalNodeId, node: &LogicalNode) -> Result<()
     let expected = match node.operator {
         LogicalOperator::Argument
         | LogicalOperator::NodeScan { .. }
-        | LogicalOperator::RelationshipScan { .. }
-        | LogicalOperator::Diff => 0,
+        | LogicalOperator::RelationshipScan { .. } => 0,
         LogicalOperator::InnerJoin
         | LogicalOperator::LeftJoin
         | LogicalOperator::TemporalJoin { .. }
@@ -568,6 +578,18 @@ fn validate_slots(
                 }
             }
             if let TransactionTimeSpec::AsOf(expression) = transaction_time {
+                expression.visit_slots(&mut |slot| referenced.push(slot));
+            }
+        }
+        LogicalOperator::ChangeScan {
+            start,
+            end,
+            system_snapshot,
+            ..
+        } => {
+            start.visit_slots(&mut |slot| referenced.push(slot));
+            end.visit_slots(&mut |slot| referenced.push(slot));
+            if let TransactionTimeSpec::AsOf(expression) = system_snapshot {
                 expression.visit_slots(&mut |slot| referenced.push(slot));
             }
         }

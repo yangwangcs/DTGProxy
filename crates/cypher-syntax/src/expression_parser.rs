@@ -81,7 +81,15 @@ impl<'tokens> ExpressionParser<'tokens> {
                     )
                 })?;
                 let mut arguments = Vec::new();
-                if !self.consume(&TokenKind::RightParen) {
+                if self.consume(&TokenKind::Star) {
+                    self.expect(&TokenKind::RightParen)?;
+                    if !is_count_function(&name) {
+                        return Err(self.error_here(
+                            "DTG-CYPHER-INVALID-FUNCTION-ARGUMENT",
+                            "only count accepts * as an argument",
+                        ));
+                    }
+                } else if !self.consume(&TokenKind::RightParen) {
                     loop {
                         arguments.push(self.parse(0)?);
                         if self.consume(&TokenKind::Comma) {
@@ -377,6 +385,10 @@ fn qualified_name(expression: Expression) -> Option<Vec<Identifier>> {
         }
         _ => None,
     }
+}
+
+fn is_count_function(name: &[Identifier]) -> bool {
+    matches!(name, [identifier] if identifier.value().eq_ignore_ascii_case("count"))
 }
 
 fn expression_node_count(expression: &Expression) -> usize {

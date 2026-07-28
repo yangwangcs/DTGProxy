@@ -44,23 +44,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
-      - name: Install Protocol Buffers compiler
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes protobuf-compiler
+          sudo apt-get install --yes clang libclang-dev llvm-dev cmake protobuf-compiler
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
       - name: Run all six temporal graph migration directions
         run: >-
-          cargo test -p dtgproxy
+          cargo test --locked -p dtgproxy
           --features three-backend-certification
           --test three_backend_migration
           -- --test-threads=1
       - name: Run three-backend two-mode distributed surface equivalence
         run: >-
-          cargo test -p gateway-node
-          --features three-backend-certification
-          --test three_backend_deployment
+          scripts/run-exact-cargo-test.sh gateway-node
+          three-backend-certification three_backend_deployment
           all_backends_are_equivalent_in_both_deployment_modes
-          -- --exact --test-threads=1
 
   deployment-takeover-matrix:
     runs-on: ubuntu-24.04
@@ -108,42 +107,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
-      - name: Install Protocol Buffers compiler
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes protobuf-compiler
+          sudo apt-get install --yes clang libclang-dev llvm-dev cmake protobuf-compiler
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
       - name: Certify resumable analytics takeover and Artifact byte identity
         run: >-
-          cargo test -p gateway-node
-          --features three-backend-certification
-          --test three_backend_deployment
+          scripts/run-exact-cargo-test.sh gateway-node
+          three-backend-certification three_backend_deployment
           resumable_algorithms_are_byte_identical_after_takeover_on_every_backend_and_mode
-          -- --exact --test-threads=1
       - name: Certify backend Sidecar restart on the owning Gateway
         run: >-
-          cargo test -p gateway-node
-          --features three-backend-certification
-          --test three_backend_deployment
+          scripts/run-exact-cargo-test.sh gateway-node
+          three-backend-certification three_backend_deployment
           backend_sidecar_restart_recovers_degree_on_every_backend_and_mode
-          -- --exact --test-threads=1
       - name: Certify backend Sidecar restart with cross-Gateway takeover
         run: >-
-          cargo test -p gateway-node
-          --features three-backend-certification
-          --test three_backend_deployment
+          scripts/run-exact-cargo-test.sh gateway-node
+          three-backend-certification three_backend_deployment
           backend_sidecar_restart_allows_cross_gateway_degree_takeover
-          -- --exact --test-threads=1
       - name: Certify tombstone GC crash recovery and concurrent Gateway fencing
         run: >-
-          cargo test -p gateway-node
-          --features three-backend-certification
-          --test three_backend_deployment
+          scripts/run-exact-cargo-test.sh gateway-node
+          three-backend-certification three_backend_deployment
           tombstone_gc_recovers_at_every_boundary_on_every_backend_and_mode
-          -- --exact --test-threads=1
       - name: Certify ordered Gateway Meta Shard and backend restart recovery
         run: >-
-          cargo test -p gateway-node
-          --features three-backend-certification
-          --test three_backend_deployment
+          scripts/run-exact-cargo-test.sh gateway-node
+          three-backend-certification three_backend_deployment
           ordered_full_stack_restart_recovers_on_every_backend_and_mode
-          -- --exact --test-threads=1

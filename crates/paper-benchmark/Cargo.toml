@@ -1,0 +1,38 @@
+[package]
+name = "paper-benchmark"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+adapter-neo4j = { path = "../adapter-neo4j" }
+adapter-postgres = { path = "../adapter-postgres" }
+adapter-registry = { path = "../adapter-registry" }
+adapter-rocksdb = { path = "../adapter-rocksdb" }
+base64 = "=0.22.1"
+blake3 = "=1.8.5"
+bolt-protocol = { path = "../bolt-protocol" }
+postgres = "=0.19.14"
+query-executor = { path = "../query-executor", default-features = false }
+rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "multi-threaded-cf"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+storage-api = { path = "../storage-api" }
+temporal-storage = { path = "../temporal-storage" }
+ureq = { version = "=2.12.1", features = ["json"] }
+
+[dev-dependencies]
+adapter-memory = { path = "../adapter-memory" }
+cypher-engine = { path = "../cypher-engine" }
+distributed-query = { path = "../distributed-query" }
+physical-plan = { path = "../physical-plan" }
+temporal-ir = { path = "../temporal-ir" }
+temporal-storage = { path = "../temporal-storage" }
+temporal-types = { path = "../temporal-types" }
+tempfile = "3"
+tokio = { version = "=1.53.0", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

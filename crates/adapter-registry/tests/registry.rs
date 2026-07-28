@@ -199,6 +199,62 @@ fn hot_swap_dual_applies_then_cuts_over_without_an_index_gap() {
 }
 
 #[test]
+fn hot_swap_preserves_the_active_adapters_fenced_scan() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let active = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("fenced-source"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    block_on(active.adapter().apply_committed(batch(1, b"one"))).unwrap();
+    let hot = HotSwapAdapter::new(active);
+
+    let scan =
+        block_on(hot.scan_fenced(&KeySpan::prefix(Keyspace::Current, b"value".to_vec()))).unwrap();
+
+    assert_eq!(scan.applied_log_index(), 1);
+    assert_eq!(scan.entries().len(), 1);
+    assert_eq!(scan.entries()[0].value(), b"one");
+}
+
+#[test]
+fn hot_swap_snapshot_binding_pins_the_owner_and_generation_across_cutover() {
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(MemoryFactory)).unwrap();
+    let source = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("snapshot-source"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    let target = block_on(registry.open(
+        "memory",
+        &AdapterOpenRequest::new("snapshot-target"),
+        AdapterRequirement::Development,
+    ))
+    .unwrap();
+    block_on(source.adapter().apply_committed(batch(1, b"source"))).unwrap();
+    block_on(target.adapter().apply_committed(batch(1, b"target"))).unwrap();
+    let hot = HotSwapAdapter::new(source);
+    hot.start_migration(target, AdapterRequirement::Development)
+        .unwrap();
+
+    let binding = hot.read_snapshot_binding().unwrap().unwrap();
+    assert_eq!(binding.capability_generation(), 1);
+    let snapshot = block_on(binding.owner().begin_read_snapshot()).unwrap();
+
+    let retired = hot.cutover().unwrap();
+    drop(retired);
+    assert_eq!(hot.query_capability_generation(), 2);
+    let entries =
+        block_on(snapshot.scan(&KeySpan::prefix(Keyspace::Current, b"value".to_vec()))).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value(), b"source");
+}
+
+#[test]
 fn hot_swap_refuses_an_unsynchronized_target() {
     let mut registry = AdapterRegistry::new();
     registry.register(Arc::new(MemoryFactory)).unwrap();

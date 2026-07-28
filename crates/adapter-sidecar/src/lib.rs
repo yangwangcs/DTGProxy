@@ -1634,6 +1634,22 @@ impl<T: SidecarTransport> ReadSnapshot for SidecarReadSnapshot<'_, T> {
                         operation: "snapshot canonical scan",
                     })
                 }
+                Response::Error(error) if error.code == 9 => {
+                    match (error.scan_limit, error.scan_required) {
+                        (Some(limit), Some(required)) => {
+                            Err(AdapterError::ScanByteLimit { limit, required })
+                        }
+                        _ => Err(AdapterError::from(SidecarClientError::Remote(error))),
+                    }
+                }
+                Response::Error(error) if error.code == 10 => {
+                    match (error.scan_response_limit, error.scan_response_required) {
+                        (Some(limit), Some(required)) => {
+                            Err(AdapterError::ScanResponseByteLimit { limit, required })
+                        }
+                        _ => Err(AdapterError::from(SidecarClientError::Remote(error))),
+                    }
+                }
                 Response::Error(error) => {
                     Err(AdapterError::from(SidecarClientError::Remote(error)))
                 }
@@ -1788,6 +1804,22 @@ impl<T: SidecarTransport> ReadSnapshot for SidecarReadSnapshot<'_, T> {
                     Err(AdapterError::UnsupportedOperation {
                         operation: "snapshot canonical batch scan",
                     })
+                }
+                Response::Error(error) if error.code == 9 => {
+                    match (error.scan_limit, error.scan_required) {
+                        (Some(limit), Some(required)) => {
+                            Err(AdapterError::ScanByteLimit { limit, required })
+                        }
+                        _ => Err(AdapterError::from(SidecarClientError::Remote(error))),
+                    }
+                }
+                Response::Error(error) if error.code == 10 => {
+                    match (error.scan_response_limit, error.scan_response_required) {
+                        (Some(limit), Some(required)) => {
+                            Err(AdapterError::ScanResponseByteLimit { limit, required })
+                        }
+                        _ => Err(AdapterError::from(SidecarClientError::Remote(error))),
+                    }
                 }
                 Response::Error(error) => {
                     Err(AdapterError::from(SidecarClientError::Remote(error)))

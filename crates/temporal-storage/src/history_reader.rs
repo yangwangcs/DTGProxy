@@ -101,15 +101,65 @@ impl PointHistoryReader {
         valid_time: ValidTime,
         demand: PropertyDemand<'_>,
     ) -> Result<PointHistoryOutcome, TemporalStoreError> {
-        let request = PointHistoryRequest {
-            element,
-            transaction_time,
+        let mut range = RangeReplay::new(element, transaction_time);
+        range.points.push(PointReplay {
+            ordinal: 0,
             valid_time,
-        };
-        let mut outcomes = self.read_batch(read, &[request], demand).await?;
-        Ok(outcomes
-            .pop()
-            .expect("single point history request has one outcome"))
+            replacement: None,
+            payload_bytes_copied: 0,
+        });
+        let expected_applied_log_index = read.applied_log_index();
+        let mut outcome = None;
+
+        while !range.complete {
+            let request = self.build_single_scan(&range)?;
+            let page = match read.scan_canonical(&request).await {
+                Ok(page) => page,
+                Err(AdapterError::ScanByteLimit { .. }) => {
+                    return Err(TemporalStoreError::HistoryRecordByteLimit);
+                }
+                Err(error) => return Err(TemporalStoreError::Adapter(error)),
+            };
+            if page.applied_log_index() != expected_applied_log_index {
+                return Err(TemporalStoreError::HistoryAppliedIndexMismatch {
+                    expected: expected_applied_log_index,
+                    actual: page.applied_log_index(),
+                });
+            }
+            self.consume_page(&mut range, page, demand, std::slice::from_mut(&mut outcome))?;
+        }
+
+        outcome.ok_or(TemporalStoreError::MissingHistoryAnchor)
+    }
+
+    fn build_single_scan(
+        &self,
+        range: &RangeReplay,
+    ) -> Result<CanonicalScanRequest, TemporalStoreError> {
+        let remaining_records = self
+            .budget
+            .max_records
+            .checked_sub(range.stats.history_records)
+            .ok_or(TemporalStoreError::HistoryChainTooDeep)?;
+        if remaining_records == 0 {
+            return Err(TemporalStoreError::HistoryChainTooDeep);
+        }
+        let key_bytes = u64::try_from(range.start.len())
+            .map_err(|_| TemporalStoreError::HistoryTotalByteLimit)?;
+        let requested_bytes = self
+            .budget
+            .max_record_bytes
+            .checked_add(key_bytes)
+            .ok_or(TemporalStoreError::HistoryTotalByteLimit)?
+            .min(MAX_QUERY_PAGE_BYTES);
+        let span =
+            KeySpan::prefix_from(Keyspace::History, range.prefix.clone(), range.start.clone())
+                .map_err(|error| {
+                    TemporalStoreError::Adapter(AdapterError::Backend(error.to_string()))
+                })?;
+        let bounds = QueryPageBounds::new(remaining_records, requested_bytes)
+            .map_err(query_primitive_error)?;
+        CanonicalScanRequest::new(span, bounds).map_err(query_primitive_error)
     }
 
     pub async fn read_batch(

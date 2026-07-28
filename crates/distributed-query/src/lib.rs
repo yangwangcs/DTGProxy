@@ -3,19 +3,172 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+#[cfg(any(test, feature = "test-support"))]
+use std::ops::Deref;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::{Arc, Mutex, OnceLock};
 
 use temporal_types::TransactionTime;
 
 mod coordinator;
+mod exchange_codec;
 mod worker;
 
-pub use coordinator::DistributedCoordinator;
+pub use coordinator::{ChangePlanRequest, DistributedCapabilitySnapshot, DistributedCoordinator};
+pub use exchange_codec::{
+    DecodedExchangeBatch, ExchangeCodecLimits, ExchangeDecodeExpectation, ExchangeFrame,
+    MAX_EXCHANGE_PAYLOAD_BYTES, schema_fingerprint,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use test_support::{
+    ExchangeTestMetrics, ExchangeTestMetricsGuard, current_exchange_test_metrics,
+    install_exchange_test_metrics,
+};
 pub use worker::{
     FragmentWorker, LocalFragmentWorker, TemporalWorkerBatch, TemporalWorkerFuture, WorkerBatch,
-    WorkerFuture,
+    WorkerFuture, WorkerMorselFuture, WorkerMorselOpenFuture, WorkerMorselSource,
 };
 
 pub const DISTRIBUTED_QUERY_PROTOCOL_VERSION: u16 = 1;
+
+#[cfg(any(test, feature = "test-support"))]
+mod test_support {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    pub struct ExchangeTestMetrics {
+        encoded_frames: AtomicU64,
+        decoded_frames: AtomicU64,
+        retained_frame_bytes: AtomicU64,
+        peak_retained_frame_bytes: AtomicU64,
+        retained_decoded_bytes: AtomicU64,
+        peak_retained_decoded_bytes: AtomicU64,
+    }
+
+    impl ExchangeTestMetrics {
+        #[must_use]
+        pub fn encoded_frames(&self) -> u64 {
+            self.encoded_frames.load(Ordering::Relaxed)
+        }
+
+        #[must_use]
+        pub fn decoded_frames(&self) -> u64 {
+            self.decoded_frames.load(Ordering::Relaxed)
+        }
+
+        #[must_use]
+        pub fn retained_frame_bytes(&self) -> u64 {
+            self.retained_frame_bytes.load(Ordering::Relaxed)
+        }
+
+        #[must_use]
+        pub fn peak_retained_frame_bytes(&self) -> u64 {
+            self.peak_retained_frame_bytes.load(Ordering::Relaxed)
+        }
+
+        #[must_use]
+        pub fn retained_decoded_bytes(&self) -> u64 {
+            self.retained_decoded_bytes.load(Ordering::Relaxed)
+        }
+
+        #[must_use]
+        pub fn peak_retained_decoded_bytes(&self) -> u64 {
+            self.peak_retained_decoded_bytes.load(Ordering::Relaxed)
+        }
+
+        pub fn record_encoded_frame(&self) {
+            self.encoded_frames.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn record_decoded_frame(&self) {
+            self.decoded_frames.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn reserve_frame(&self, bytes: u64) {
+            let retained = self
+                .retained_frame_bytes
+                .fetch_add(bytes, Ordering::Relaxed)
+                .saturating_add(bytes);
+            self.peak_retained_frame_bytes
+                .fetch_max(retained, Ordering::Relaxed);
+        }
+
+        pub fn release_frame(&self, bytes: u64) {
+            self.retained_frame_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+        }
+
+        pub fn reserve_decoded(&self, bytes: u64) {
+            let retained = self
+                .retained_decoded_bytes
+                .fetch_add(bytes, Ordering::Relaxed)
+                .saturating_add(bytes);
+            self.peak_retained_decoded_bytes
+                .fetch_max(retained, Ordering::Relaxed);
+        }
+
+        pub fn release_decoded(&self, bytes: u64) {
+            self.retained_decoded_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ExchangeTestMetricsGuard {
+        metrics: Arc<ExchangeTestMetrics>,
+        prior: Option<Arc<ExchangeTestMetrics>>,
+    }
+
+    impl ExchangeTestMetricsGuard {
+        #[must_use]
+        pub fn metrics(&self) -> Arc<ExchangeTestMetrics> {
+            Arc::clone(&self.metrics)
+        }
+    }
+
+    impl Deref for ExchangeTestMetricsGuard {
+        type Target = ExchangeTestMetrics;
+
+        fn deref(&self) -> &Self::Target {
+            &self.metrics
+        }
+    }
+
+    impl Drop for ExchangeTestMetricsGuard {
+        fn drop(&mut self) {
+            let mut slot = metrics_slot()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = self.prior.take();
+        }
+    }
+
+    pub fn install_exchange_test_metrics() -> ExchangeTestMetricsGuard {
+        let metrics = Arc::new(ExchangeTestMetrics::default());
+        let prior = {
+            let mut slot = metrics_slot()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.replace(Arc::clone(&metrics))
+        };
+        ExchangeTestMetricsGuard { metrics, prior }
+    }
+
+    #[must_use]
+    pub fn current_exchange_test_metrics() -> Option<Arc<ExchangeTestMetrics>> {
+        metrics_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn metrics_slot() -> &'static Mutex<Option<Arc<ExchangeTestMetrics>>> {
+        static METRICS: OnceLock<Mutex<Option<Arc<ExchangeTestMetrics>>>> = OnceLock::new();
+        METRICS.get_or_init(|| Mutex::new(None))
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotToken {
@@ -101,6 +254,8 @@ pub struct FragmentRequest {
     memory_bytes: u64,
     batch_rows: u32,
     expected_shards: Vec<u32>,
+    required_applied_indexes: BTreeMap<u32, u64>,
+    expected_capability_generations: BTreeMap<u32, u64>,
 }
 
 impl FragmentRequest {
@@ -122,6 +277,8 @@ impl FragmentRequest {
             memory_bytes,
             batch_rows,
             expected_shards: Vec::new(),
+            required_applied_indexes: BTreeMap::new(),
+            expected_capability_generations: BTreeMap::new(),
         })
     }
 
@@ -130,10 +287,72 @@ impl FragmentRequest {
         expected_shards: Vec<u32>,
     ) -> Result<Self, DistributedQueryError> {
         let unique = expected_shards.iter().copied().collect::<BTreeSet<_>>();
-        if expected_shards.is_empty() || unique.len() != expected_shards.len() {
+        let required_shards = self
+            .required_applied_indexes
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let capability_shards = self
+            .expected_capability_generations
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if expected_shards.is_empty()
+            || unique.len() != expected_shards.len()
+            || (!required_shards.is_empty() && required_shards != unique)
+            || (!capability_shards.is_empty() && capability_shards != unique)
+        {
             return Err(DistributedQueryError::InvalidRequest);
         }
         self.expected_shards = expected_shards;
+        Ok(self)
+    }
+
+    pub fn with_required_applied_indexes(
+        mut self,
+        required_applied_indexes: BTreeMap<u32, u64>,
+    ) -> Result<Self, DistributedQueryError> {
+        let required_shards = required_applied_indexes
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let expected_shards = self
+            .expected_shards
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if required_applied_indexes.is_empty()
+            || required_applied_indexes.values().any(|index| *index == 0)
+            || (!expected_shards.is_empty() && required_shards != expected_shards)
+        {
+            return Err(DistributedQueryError::InvalidRequest);
+        }
+        self.required_applied_indexes = required_applied_indexes;
+        Ok(self)
+    }
+
+    pub fn with_expected_capability_generations(
+        mut self,
+        expected_capability_generations: BTreeMap<u32, u64>,
+    ) -> Result<Self, DistributedQueryError> {
+        let capability_shards = expected_capability_generations
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let expected_shards = self
+            .expected_shards
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if expected_capability_generations.is_empty()
+            || expected_capability_generations
+                .values()
+                .any(|generation| *generation == 0)
+            || (!expected_shards.is_empty() && capability_shards != expected_shards)
+        {
+            return Err(DistributedQueryError::InvalidRequest);
+        }
+        self.expected_capability_generations = expected_capability_generations;
         Ok(self)
     }
 
@@ -165,6 +384,26 @@ impl FragmentRequest {
     #[must_use]
     pub fn expected_shards(&self) -> &[u32] {
         &self.expected_shards
+    }
+
+    #[must_use]
+    pub fn required_applied_indexes(&self) -> &BTreeMap<u32, u64> {
+        &self.required_applied_indexes
+    }
+
+    #[must_use]
+    pub fn required_applied_index(&self, shard_id: u32) -> Option<u64> {
+        self.required_applied_indexes.get(&shard_id).copied()
+    }
+
+    #[must_use]
+    pub fn expected_capability_generations(&self) -> &BTreeMap<u32, u64> {
+        &self.expected_capability_generations
+    }
+
+    #[must_use]
+    pub fn expected_capability_generation(&self, shard_id: u32) -> Option<u64> {
+        self.expected_capability_generations.get(&shard_id).copied()
     }
 }
 
@@ -297,6 +536,7 @@ pub enum DistributedQueryError {
     InvalidRequest,
     InvalidMerger,
     SnapshotMismatch,
+    CapabilityGenerationMismatch,
     UnexpectedShard(u32),
     UnexpectedSequence {
         shard_id: u32,
@@ -329,6 +569,19 @@ pub enum DistributedQueryError {
     DuplicateWorker(u32),
     CreditExhausted,
     UnsupportedExchange,
+    UnsupportedChangeScan,
+    MissingRequiredAppliedIndex(u32),
+    StaleReadIndex {
+        shard_id: u32,
+        required: u64,
+        actual: u64,
+    },
+    ExchangeVersionMismatch(u16),
+    ExchangeChecksumMismatch,
+    ExchangeSchemaMismatch,
+    ExchangeMetadataMismatch,
+    MalformedExchange,
+    UnsupportedExchangeValue,
 }
 
 impl Display for DistributedQueryError {

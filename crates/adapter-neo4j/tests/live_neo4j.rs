@@ -8,12 +8,17 @@ use adapter_neo4j::Neo4jAdapterFactory;
 use adapter_registry::{AdapterOpenRequest, AdapterRegistry, SecretString};
 use base64::Engine;
 use storage_api::{
-    AdapterError, AdapterRequirement, CommittedMutationBatch, KeySpan, Keyspace, LogicalKey,
-    LogicalSnapshotExportRequest, Mutation,
+    AdapterError, AdapterRequirement, AdjacencyExpandRequest, CandidateScanRequest,
+    CanonicalScanRequest, ChangeScanRequest, CommittedMutationBatch, ComparisonOperator, KeySpan,
+    Keyspace, LogicalKey, LogicalSnapshotExportRequest, Mutation, PropertyConstraint,
+    PropertyGatherRequest, PropertyId, PushdownGuarantee, QueryPageBounds, ReadSnapshot,
+    StorageAdapter,
 };
 use temporal_storage::{
-    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
-    TemporalStore, VertexMutation,
+    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, HistoryAnchor,
+    HistoryDelta, HistoryEntry, LabelId, PartitionId, ProjectionRecord, TemporalStore,
+    ValidSegment, VertexMutation, current_vertex_graph_prefix, current_vertex_key,
+    history_anchor_key, history_prefix, out_adjacency_prefix, temporal_event_graph_prefix,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -95,6 +100,36 @@ fn live_neo4j_apply_query_export_restore_and_continue() {
     )
     .unwrap();
     assert_eq!(target.adapter().applied_log_index().unwrap(), 2);
+}
+
+#[test]
+fn live_neo4j_history_anchor_and_fifteen_deltas_page_through_one_snapshot() {
+    let endpoint = std::env::var("DTGPROXY_NEO4J_ENDPOINT")
+        .expect("DTGPROXY_NEO4J_ENDPOINT must point to a disposable Neo4j database");
+    let password = std::env::var("DTGPROXY_NEO4J_PASSWORD")
+        .expect("DTGPROXY_NEO4J_PASSWORD must authenticate to the disposable Neo4j database");
+    let username = std::env::var("DTGPROXY_NEO4J_USERNAME").unwrap_or_else(|_| "neo4j".into());
+    let database = std::env::var("DTGPROXY_NEO4J_DATABASE").unwrap_or_else(|_| "neo4j".into());
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(Neo4jAdapterFactory)).unwrap();
+    let opened = block_on(registry.open(
+        "neo4j",
+        &request(
+            format!("history-page-{suffix}"),
+            &endpoint,
+            &database,
+            &username,
+            &password,
+        ),
+        AdapterRequirement::HotPluggableReplica,
+    ))
+    .unwrap();
+
+    assert_history_page_continuation(opened.adapter().as_ref());
 }
 
 #[test]
@@ -185,6 +220,148 @@ fn live_neo4j_materializes_native_temporal_nodes_and_relationships() {
             serde_json::json!(1)
         ]]
     );
+}
+
+#[test]
+fn live_neo4j_executes_all_native_typed_query_primitives() {
+    let endpoint = std::env::var("DTGPROXY_NEO4J_ENDPOINT")
+        .expect("DTGPROXY_NEO4J_ENDPOINT must point to a disposable Neo4j database");
+    let password = std::env::var("DTGPROXY_NEO4J_PASSWORD")
+        .expect("DTGPROXY_NEO4J_PASSWORD must authenticate to the disposable Neo4j database");
+    let username = std::env::var("DTGPROXY_NEO4J_USERNAME").unwrap_or_else(|_| "neo4j".into());
+    let database = std::env::var("DTGPROXY_NEO4J_DATABASE").unwrap_or_else(|_| "neo4j".into());
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut registry = AdapterRegistry::new();
+    registry.register(Arc::new(Neo4jAdapterFactory)).unwrap();
+    let opened = block_on(registry.open(
+        "neo4j",
+        &request(
+            format!("typed-primitives-{suffix}"),
+            &endpoint,
+            &database,
+            &username,
+            &password,
+        ),
+        AdapterRequirement::HotPluggableReplica,
+    ))
+    .unwrap();
+    let adapter = opened.into_adapter();
+    let store = TemporalStore::new(Arc::clone(&adapter));
+    let graph = GraphId::new(29);
+    let source = ElementRef::vertex(graph, PartitionId::new(1), ElementId::new(10));
+    let destination = ElementRef::vertex(graph, PartitionId::new(1), ElementId::new(20));
+    let edge = ElementRef::edge(graph, PartitionId::new(1), ElementId::new(30));
+    let valid =
+        Interval::new(ValidTime::from_micros(10), Some(ValidTime::from_micros(30))).unwrap();
+    let source_payload = CanonicalElement::new(
+        1,
+        BTreeMap::from([(1, GraphValue::String("active".into()))]),
+    );
+    block_on(store.commit_vertex(
+        CommitContext::new(
+            1,
+            1,
+            1001,
+            TransactionTime::new(10, 0),
+            TransactionTime::new(20, 0),
+        ),
+        VertexMutation::put(source, LabelId::new(3), valid, source_payload).unwrap(),
+    ))
+    .unwrap();
+    block_on(
+        store.commit_edge(
+            CommitContext::new(
+                1,
+                2,
+                1002,
+                TransactionTime::new(20, 0),
+                TransactionTime::new(30, 0),
+            ),
+            EdgeMutation::put_between(
+                edge,
+                EdgeTypeId::new(4),
+                source,
+                destination,
+                valid,
+                CanonicalElement::new(1, BTreeMap::new()),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let bounds = QueryPageBounds::new(32, 16 * 1024).unwrap();
+
+    let candidates = block_on(
+        adapter.scan_candidates(
+            &CandidateScanRequest::new(
+                KeySpan::prefix(Keyspace::Current, current_vertex_graph_prefix(graph)),
+                ValidTime::from_micros(20),
+                vec![PropertyConstraint::new(
+                    PropertyId::new(1),
+                    ComparisonOperator::Equal,
+                    GraphValue::String("active".into()),
+                )],
+                bounds,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(candidates.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(candidates.applied_log_index(), 2);
+    assert_eq!(candidates.entries().len(), 1);
+
+    let properties = block_on(
+        adapter.gather_properties(
+            &PropertyGatherRequest::new(
+                vec![current_vertex_key(source)],
+                vec![PropertyId::new(1)],
+                bounds,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(properties.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(properties.applied_log_index(), 2);
+    assert_eq!(
+        properties.rows()[0].values(),
+        &[Some(GraphValue::String("active".into()))]
+    );
+
+    let adjacency = block_on(
+        adapter.expand_adjacency(
+            &AdjacencyExpandRequest::new(
+                vec![KeySpan::prefix(
+                    Keyspace::AdjOut,
+                    out_adjacency_prefix(graph, PartitionId::new(1), source.id()),
+                )],
+                bounds,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(adjacency.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(adjacency.applied_log_index(), 2);
+    assert_eq!(adjacency.entries().len(), 1);
+
+    let changes = block_on(
+        adapter.scan_changes(
+            &ChangeScanRequest::new(
+                KeySpan::prefix(Keyspace::TemporalIndex, temporal_event_graph_prefix(graph)),
+                bounds,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(changes.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(changes.applied_log_index(), 2);
+    assert!(!changes.entries().is_empty());
 }
 
 #[test]
@@ -367,6 +544,180 @@ fn native_present_edge_count(
     )[0][0]
         .as_u64()
         .unwrap()
+}
+
+fn assert_history_page_continuation(adapter: &dyn StorageAdapter) {
+    let element = ElementRef::vertex(GraphId::new(7), PartitionId::new(3), ElementId::new(9));
+    let valid =
+        Interval::new(ValidTime::from_micros(0), Some(ValidTime::from_micros(100))).unwrap();
+    let payload = CanonicalElement::new(1, BTreeMap::new());
+    let anchor = HistoryEntry::Anchor(
+        HistoryAnchor::new(
+            TransactionTime::new(100, 0),
+            valid,
+            ProjectionRecord::new(
+                TransactionTime::new(100, 0),
+                vec![ValidSegment::new(valid, payload.clone())],
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    let anchor_key = history_anchor_key(element, TransactionTime::new(100, 0), 0);
+    let mut records = vec![(anchor_key, anchor.encode().unwrap())];
+    for offset in 1..=15_u32 {
+        let commit = 100 + i64::from(offset);
+        let delta = HistoryEntry::Delta(HistoryDelta::put(
+            TransactionTime::new(commit, 0),
+            valid,
+            payload.clone(),
+        ));
+        let key = history_anchor_key(element, TransactionTime::new(commit, 0), 0);
+        records.push((key, delta.encode().unwrap()));
+    }
+    let mut expected_keys = records
+        .iter()
+        .map(|(key, _)| key.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    expected_keys.sort();
+    let retained_sizes = records
+        .iter()
+        .map(|(key, value)| key.as_bytes().len() + value.len())
+        .collect::<Vec<_>>();
+    let byte_budget = u64::try_from(*retained_sizes.iter().max().unwrap()).unwrap();
+    assert!(
+        retained_sizes.iter().min().unwrap().saturating_mul(2)
+            > usize::try_from(byte_budget).unwrap(),
+        "byte budget fixture must admit one record but never two"
+    );
+    let mutations = records
+        .iter()
+        .enumerate()
+        .map(|(sequence, (key, value))| {
+            Mutation::put(u32::try_from(sequence).unwrap(), key.clone(), value.clone())
+        })
+        .collect();
+    block_on(adapter.apply_committed(CommittedMutationBatch {
+        shard_id: 1,
+        log_index: 1,
+        txn_id: 401,
+        mutations,
+    }))
+    .unwrap();
+
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+    assert_eq!(snapshot.applied_log_index(), 1);
+    let later = HistoryEntry::Delta(HistoryDelta::put(
+        TransactionTime::new(99, 0),
+        valid,
+        payload,
+    ));
+    let later_key = history_anchor_key(element, TransactionTime::new(99, 0), 0);
+    assert!(
+        expected_keys
+            .last()
+            .is_some_and(|key| key.as_slice() < later_key.as_bytes()),
+        "intervening record must sort into a later page"
+    );
+    block_on(adapter.apply_committed(CommittedMutationBatch {
+        shard_id: 1,
+        log_index: 2,
+        txn_id: 402,
+        mutations: vec![Mutation::put(0, later_key.clone(), later.encode().unwrap())],
+    }))
+    .unwrap();
+
+    let prefix = history_prefix(element);
+    let (item_records, item_page_lengths) = collect_history_pages(
+        snapshot.as_ref(),
+        &prefix,
+        QueryPageBounds::new(3, 16 * 1024).unwrap(),
+        1,
+    );
+    let (byte_records, byte_page_lengths) = collect_history_pages(
+        snapshot.as_ref(),
+        &prefix,
+        QueryPageBounds::new(3, byte_budget).unwrap(),
+        1,
+    );
+
+    assert_eq!(item_page_lengths, vec![3, 3, 3, 3, 3, 1]);
+    assert_eq!(byte_page_lengths, vec![1; 16]);
+    assert_eq!(record_keys(&item_records), expected_keys);
+    assert_eq!(record_keys(&byte_records), expected_keys);
+    assert!(!record_keys(&item_records).contains(&later_key.as_bytes().to_vec()));
+    assert_history_record_counts(&item_records, 1, 15);
+
+    let fresh = block_on(adapter.begin_read_snapshot()).unwrap();
+    assert_eq!(fresh.applied_log_index(), 2);
+    let (fresh_records, _) = collect_history_pages(
+        fresh.as_ref(),
+        &prefix,
+        QueryPageBounds::new(32, 16 * 1024).unwrap(),
+        2,
+    );
+    assert!(record_keys(&fresh_records).contains(&later_key.as_bytes().to_vec()));
+    assert_history_record_counts(&fresh_records, 1, 16);
+}
+
+fn collect_history_pages(
+    snapshot: &dyn ReadSnapshot,
+    prefix: &[u8],
+    bounds: QueryPageBounds,
+    expected_log_index: u64,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<usize>) {
+    let mut span = KeySpan::prefix(Keyspace::History, prefix.to_vec());
+    let mut records = Vec::new();
+    let mut page_lengths = Vec::new();
+    loop {
+        let page =
+            block_on(snapshot.scan_canonical(&CanonicalScanRequest::new(span, bounds).unwrap()))
+                .unwrap();
+        assert_eq!(page.applied_log_index(), expected_log_index);
+        let retained_bytes = page.entries().iter().fold(0_u64, |total, entry| {
+            total
+                .saturating_add(u64::try_from(entry.key().as_bytes().len()).unwrap())
+                .saturating_add(u64::try_from(entry.value().len()).unwrap())
+        });
+        assert!(retained_bytes <= bounds.max_bytes());
+        page_lengths.push(page.entries().len());
+        records.extend(
+            page.entries()
+                .iter()
+                .map(|entry| (entry.key().as_bytes().to_vec(), entry.value().to_vec())),
+        );
+        assert!(records.len() <= 17, "history pagination did not terminate");
+        let Some(next_start) = page.next_start() else {
+            break;
+        };
+        span = KeySpan::prefix_from(
+            Keyspace::History,
+            prefix.to_vec(),
+            next_start.as_bytes().to_vec(),
+        )
+        .unwrap();
+    }
+    (records, page_lengths)
+}
+
+fn record_keys(records: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
+    records.iter().map(|(key, _)| key.clone()).collect()
+}
+
+fn assert_history_record_counts(
+    records: &[(Vec<u8>, Vec<u8>)],
+    expected_anchors: usize,
+    expected_deltas: usize,
+) {
+    let (anchors, deltas) =
+        records.iter().fold(
+            (0, 0),
+            |(anchors, deltas), (_, value)| match HistoryEntry::decode(value).unwrap() {
+                HistoryEntry::Anchor(_) => (anchors + 1, deltas),
+                HistoryEntry::Delta(_) => (anchors, deltas + 1),
+            },
+        );
+    assert_eq!((anchors, deltas), (expected_anchors, expected_deltas));
 }
 
 fn request(

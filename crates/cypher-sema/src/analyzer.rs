@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use analytics_api::AlgorithmType;
 use cypher_ast::{
     BinaryOperator, Clause, ClauseKind, CypherProfile, Expression, NodePattern, Pattern,
-    ProcedureYield, RelationshipPattern, Statement, TemporalAxis, UnaryOperator,
+    ProcedureYield, RelationshipPattern, Statement, TemporalAxis, TemporalMode, UnaryOperator,
 };
 use cypher_syntax::{ParsedQuery, TokenKind, lex, parse_expression, parse_pattern};
 use procedure_runtime::{
@@ -240,6 +240,7 @@ impl SemanticAnalyzer {
     ) -> Result<AnalyzedQuery, SemanticError> {
         match statement {
             Statement::Query(query) => {
+                validate_temporal_query(query)?;
                 let inference = InferenceContext {
                     analyzer: self,
                     profile,
@@ -772,7 +773,12 @@ fn bind_relationship(
     inference: &InferenceContext<'_>,
 ) -> Result<(), SemanticError> {
     if let Some(variable) = relationship.variable() {
-        scope.bind_compatible(variable.value(), CypherType::Relationship)?;
+        let relationship_type = if relationship.length().is_some() {
+            CypherType::List(Box::new(CypherType::Relationship))
+        } else {
+            CypherType::Relationship
+        };
+        scope.bind_compatible(variable.value(), relationship_type)?;
     }
     if let Some(properties) = relationship.properties() {
         let _ = infer(properties, scope, inference)?;
@@ -1098,6 +1104,11 @@ fn infer(
             match function.as_str() {
                 "count" | "size" => Ok(CypherType::Integer),
                 "tostring" => Ok(CypherType::String),
+                "valid_from" | "valid_to" | "system_time" => {
+                    temporal_metadata_type(&argument_types, CypherType::Temporal)
+                }
+                "commit_seq" => temporal_metadata_type(&argument_types, CypherType::Integer),
+                "operation" => temporal_metadata_type(&argument_types, CypherType::String),
                 "coalesce" => Ok(argument_types
                     .iter()
                     .fold(CypherType::Null, |current, next| {
@@ -1127,6 +1138,65 @@ fn infer(
                 Ok(CypherType::Integer)
             }
         }
+    }
+}
+
+fn validate_temporal_query(query: &cypher_ast::QueryStatement) -> Result<(), SemanticError> {
+    let change_scopes = query
+        .temporal()
+        .scopes()
+        .iter()
+        .filter(|scope| scope.mode() == TemporalMode::ChangesBetween)
+        .count();
+    if change_scopes > 1 {
+        return Err(SemanticError::new(
+            "DTG-TEMPORAL-MULTIPLE-CHANGE-AXES",
+            "a statement can select changes along only one temporal axis",
+        ));
+    }
+    if change_scopes == 0 {
+        return Ok(());
+    }
+
+    for clause in query.clauses() {
+        if !matches!(clause.kind(), ClauseKind::Match | ClauseKind::OptionalMatch) {
+            continue;
+        }
+        let pattern = parse_pattern(clause_body(clause)?)?;
+        for path in pattern.paths() {
+            let has_variable = path
+                .chains()
+                .iter()
+                .any(|chain| chain.relationship().length().is_some());
+            let has_fixed = path
+                .chains()
+                .iter()
+                .any(|chain| chain.relationship().length().is_none());
+            if has_variable && has_fixed {
+                return Err(SemanticError::new(
+                    "DTG-TEMPORAL-MIXED-PATH-CHANGES",
+                    "CHANGES does not support mixed fixed and variable-length paths",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn temporal_metadata_type(
+    argument_types: &[CypherType],
+    output: CypherType,
+) -> Result<CypherType, SemanticError> {
+    if matches!(
+        argument_types,
+        [CypherType::Node | CypherType::Relationship]
+    ) {
+        Ok(output)
+    } else {
+        Err(SemanticError::new(
+            "DTG-TEMPORAL-METADATA-ARGUMENT",
+            "temporal metadata functions require exactly one node or relationship argument",
+        ))
     }
 }
 

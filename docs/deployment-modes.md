@@ -9,7 +9,7 @@ DTGProxy exposes two user-facing deployment modes over one Shard/Raft/temporal k
 - One logical Shard owns the graph scope selected for this deployment.
 - The Raft leader is the Primary and acknowledges writes only after quorum commit and its local Adapter apply.
 - `CURRENT` and other linearizable reads require the current leader plus a quorum `ReadIndex` barrier.
-- Followers may serve `AS OF` and `DIFF` only when placement epoch, leader term, applied index, and closed timestamp all validate.
+- Followers may serve `AS OF` and `CHANGES` only when placement epoch, leader term, applied index, and closed timestamp all validate.
 - This mode is the compatibility path for a user migrating from one centralized graph/SQL instance. It can use RF=1 for development or RF=3+ for availability.
 
 ## SharedNothing

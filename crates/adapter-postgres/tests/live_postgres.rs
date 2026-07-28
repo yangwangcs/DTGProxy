@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -8,9 +9,19 @@ use adapter_registry::{AdapterFactory, AdapterOpenRequest, AdapterRegistry, Secr
 use adapter_rocksdb::{RocksAdapter, RocksAdapterFactory};
 use postgres::{Client, NoTls};
 use storage_api::{
-    AdapterError, AdapterRequirement, CommittedMutationBatch, KeySpan, Keyspace, LogicalKey,
-    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, Mutation, StorageAdapter,
+    AdapterError, AdapterRequirement, AdjacencyExpandRequest, CanonicalScanRequest,
+    ChangeScanRequest, CommittedMutationBatch, KeySpan, Keyspace, LogicalKey,
+    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, Mutation, PropertyConstraint,
+    PropertyGatherRequest, PropertyId, PushdownGuarantee, QueryPageBounds, ReadSnapshot,
+    StorageAdapter,
 };
+use temporal_storage::{
+    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, HistoryAnchor,
+    HistoryDelta, HistoryEntry, LabelId, PartitionId, ProjectionRecord, TemporalStore,
+    ValidSegment, VertexMutation, current_vertex_key, history_anchor_key, history_prefix,
+    out_adjacency_prefix, temporal_event_graph_prefix,
+};
+use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
 #[test]
 fn live_postgres_apply_export_restore_and_continue() {
@@ -97,6 +108,428 @@ fn live_postgres_apply_export_restore_and_continue() {
     assert_eq!(reopened.applied_log_index().unwrap(), 1);
     drop(reopened);
     cleanup(&url, &[&source_id, &target_id]);
+}
+
+#[test]
+fn live_read_snapshot_pins_paginated_reads_to_one_repeatable_read_transaction() {
+    let url = std::env::var("DTGPROXY_POSTGRES_URL")
+        .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let instance_id = format!("live-read-snapshot-{suffix}");
+    let adapter = PostgresAdapter::open(&url, &instance_id, 2).unwrap();
+    let first = key(b"event:1");
+    let second = key(b"event:2");
+    let later = key(b"event:3");
+    block_on(adapter.apply_committed(batch(1, b"event:1", b"one"))).unwrap();
+    block_on(adapter.apply_committed(batch(2, b"event:2", b"two"))).unwrap();
+
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+    assert_eq!(snapshot.applied_log_index(), 2);
+
+    block_on(adapter.apply_committed(batch(3, b"event:3", b"three"))).unwrap();
+    assert_eq!(
+        block_on(snapshot.multi_get(&[first.clone(), later.clone()])).unwrap(),
+        vec![Some(b"one".to_vec()), None]
+    );
+    let first_page = block_on(
+        snapshot.scan_canonical(
+            &CanonicalScanRequest::new(
+                KeySpan::prefix(Keyspace::TemporalIndex, b"event:".to_vec()),
+                QueryPageBounds::new(1, 64).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(first_page.applied_log_index(), 2);
+    assert_eq!(first_page.entries().len(), 1);
+    assert_eq!(first_page.entries()[0].key(), &first);
+    assert_eq!(
+        first_page.next_start().map(LogicalKey::as_bytes),
+        Some(second.as_bytes())
+    );
+
+    let second_page = block_on(
+        snapshot.scan_canonical(
+            &CanonicalScanRequest::new(
+                KeySpan::prefix_from(
+                    Keyspace::TemporalIndex,
+                    b"event:".to_vec(),
+                    first_page.next_start().unwrap().as_bytes().to_vec(),
+                )
+                .unwrap(),
+                QueryPageBounds::new(1, 64).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(second_page.applied_log_index(), 2);
+    assert_eq!(second_page.entries().len(), 1);
+    assert_eq!(second_page.entries()[0].key(), &second);
+    assert_eq!(second_page.next_start(), None);
+    assert_eq!(
+        block_on(
+            snapshot.scan(
+                &KeySpan::prefix(Keyspace::TemporalIndex, b"event:".to_vec())
+                    .with_limit(1)
+                    .unwrap(),
+            )
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.key().as_bytes().to_vec())
+        .collect::<Vec<_>>(),
+        vec![b"event:1".to_vec()]
+    );
+    assert_eq!(
+        block_on(
+            snapshot.scan(
+                &KeySpan::prefix_from(
+                    Keyspace::TemporalIndex,
+                    b"event:".to_vec(),
+                    second.as_bytes().to_vec(),
+                )
+                .unwrap(),
+            )
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.key().as_bytes().to_vec())
+        .collect::<Vec<_>>(),
+        vec![b"event:2".to_vec()]
+    );
+    assert_eq!(
+        block_on(adapter.scan(&KeySpan::prefix(
+            Keyspace::TemporalIndex,
+            b"event:".to_vec(),
+        )))
+        .unwrap()
+        .len(),
+        3
+    );
+
+    drop(snapshot);
+    drop(adapter);
+    cleanup(&url, &[&instance_id]);
+}
+
+#[test]
+fn live_postgres_history_anchor_and_fifteen_deltas_page_through_one_snapshot() {
+    let url = std::env::var("DTGPROXY_POSTGRES_URL")
+        .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let instance_id = format!("history-page-{suffix}");
+    let adapter = PostgresAdapter::open(&url, &instance_id, 2).unwrap();
+
+    assert_history_page_continuation(&adapter);
+
+    drop(adapter);
+    cleanup(&url, &[&instance_id]);
+}
+
+#[test]
+fn live_typed_primitives_keep_candidate_residuals_and_exact_native_pages() {
+    let url = std::env::var("DTGPROXY_POSTGRES_URL")
+        .expect("DTGPROXY_POSTGRES_URL must point to a disposable PostgreSQL database");
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let instance_id = format!("live-typed-primitives-{suffix}");
+    let store = TemporalStore::new(PostgresAdapter::open(&url, &instance_id, 2).unwrap());
+    assert!(!store.adapter().capabilities().predicate_pushdown);
+    assert!(store.adapter().capabilities().adjacency_pushdown);
+    assert!(store.adapter().capabilities().change_feed);
+    assert_eq!(
+        store.adapter().query_primitive_capabilities(),
+        adapter_postgres::POSTGRES_QUERY_PRIMITIVE_CAPABILITIES
+    );
+    let graph = GraphId::new(44);
+    let partition = PartitionId::new(7);
+    let source = ElementRef::vertex(graph, partition, ElementId::new(1));
+    let destination = ElementRef::vertex(graph, partition, ElementId::new(2));
+    let edge = ElementRef::edge(graph, partition, ElementId::new(3));
+    let second_edge = ElementRef::edge(graph, partition, ElementId::new(4));
+    let valid = Interval::new(ValidTime::from_micros(10), None).unwrap();
+    let source_payload = CanonicalElement::new(
+        1,
+        std::collections::BTreeMap::from([(9, GraphValue::String("source".to_owned()))]),
+    );
+    let destination_payload = CanonicalElement::new(
+        1,
+        std::collections::BTreeMap::from([(9, GraphValue::String("destination".to_owned()))]),
+    );
+    block_on(store.commit_vertex(
+        CommitContext::new(
+            1,
+            1,
+            901,
+            TransactionTime::new(10, 0),
+            TransactionTime::new(20, 0),
+        ),
+        VertexMutation::put(source, LabelId::new(1), valid, source_payload).unwrap(),
+    ))
+    .unwrap();
+    block_on(store.commit_vertex(
+        CommitContext::new(
+            1,
+            2,
+            902,
+            TransactionTime::new(20, 0),
+            TransactionTime::new(30, 0),
+        ),
+        VertexMutation::put(destination, LabelId::new(1), valid, destination_payload).unwrap(),
+    ))
+    .unwrap();
+    block_on(
+        store.commit_edge(
+            CommitContext::new(
+                1,
+                3,
+                903,
+                TransactionTime::new(30, 0),
+                TransactionTime::new(40, 0),
+            ),
+            EdgeMutation::put_between(
+                edge,
+                EdgeTypeId::new(2),
+                source,
+                destination,
+                valid,
+                CanonicalElement::new(1, std::collections::BTreeMap::new()),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    block_on(
+        store.commit_edge(
+            CommitContext::new(
+                1,
+                4,
+                904,
+                TransactionTime::new(40, 0),
+                TransactionTime::new(50, 0),
+            ),
+            EdgeMutation::put_between(
+                second_edge,
+                EdgeTypeId::new(3),
+                source,
+                destination,
+                valid,
+                CanonicalElement::new(1, std::collections::BTreeMap::new()),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let bounds = QueryPageBounds::new(1, 4096).unwrap();
+    let candidates = block_on(
+        store.adapter().scan_candidates(
+            &storage_api::CandidateScanRequest::new(
+                KeySpan::prefix(Keyspace::Current, vec![0x08]),
+                ValidTime::from_micros(10),
+                vec![PropertyConstraint::new(
+                    PropertyId::new(9),
+                    storage_api::ComparisonOperator::Equal,
+                    GraphValue::String("does-not-match".to_owned()),
+                )],
+                bounds,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(candidates.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(candidates.applied_log_index(), 4);
+    assert_eq!(candidates.entries().len(), 1);
+    let next = candidates
+        .next_start()
+        .expect("candidate page continuation");
+    let second_candidates = block_on(
+        store.adapter().scan_candidates(
+            &storage_api::CandidateScanRequest::new(
+                KeySpan::prefix_from(Keyspace::Current, vec![0x08], next.as_bytes().to_vec())
+                    .unwrap(),
+                ValidTime::from_micros(10),
+                Vec::new(),
+                bounds,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(second_candidates.entries().len(), 1);
+    assert!(second_candidates.next_start().is_none());
+
+    let properties = block_on(
+        store.adapter().gather_properties(
+            &PropertyGatherRequest::new(
+                vec![current_vertex_key(destination), current_vertex_key(source)],
+                vec![PropertyId::new(9)],
+                QueryPageBounds::new(4, 4096).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(properties.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(properties.applied_log_index(), 4);
+    assert_eq!(properties.rows()[0].key(), &current_vertex_key(destination));
+    assert_eq!(
+        properties.rows()[0].values(),
+        &[Some(GraphValue::String("destination".to_owned()))]
+    );
+    assert_eq!(properties.rows()[1].key(), &current_vertex_key(source));
+    assert_eq!(
+        properties.rows()[1].values(),
+        &[Some(GraphValue::String("source".to_owned()))]
+    );
+    let bounded_properties = block_on(
+        store.adapter().gather_properties(
+            &PropertyGatherRequest::new(
+                vec![current_vertex_key(destination), current_vertex_key(source)],
+                vec![PropertyId::new(9)],
+                QueryPageBounds::new(4, 63).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert!(
+        bounded_properties
+            .rows()
+            .iter()
+            .all(|row| row.values() == [None])
+    );
+
+    let mut history_graph_prefix = vec![0x20];
+    history_graph_prefix.extend_from_slice(&graph.value().to_be_bytes());
+    let history = block_on(
+        store.adapter().scan_candidates(
+            &storage_api::CandidateScanRequest::new(
+                KeySpan::prefix(Keyspace::History, history_graph_prefix.clone()),
+                ValidTime::from_micros(10),
+                Vec::new(),
+                QueryPageBounds::new(1, 4096).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(history.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(history.entries().len(), 1);
+    let mut history_keys = vec![history.entries()[0].key().as_bytes().to_vec()];
+    let mut history_next = history.next_start().cloned();
+    while let Some(next) = history_next {
+        let page = block_on(
+            store.adapter().scan_candidates(
+                &storage_api::CandidateScanRequest::new(
+                    KeySpan::prefix_from(
+                        Keyspace::History,
+                        history_graph_prefix.clone(),
+                        next.as_bytes().to_vec(),
+                    )
+                    .unwrap(),
+                    ValidTime::from_micros(10),
+                    Vec::new(),
+                    QueryPageBounds::new(1, 4096).unwrap(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(page.entries().len(), 1);
+        history_keys.push(page.entries()[0].key().as_bytes().to_vec());
+        assert!(
+            history_keys.len() <= 4,
+            "history pagination did not terminate"
+        );
+        history_next = page.next_start().cloned();
+    }
+    assert_eq!(history_keys.len(), 4);
+    assert!(history_keys.windows(2).all(|keys| keys[0] < keys[1]));
+
+    let adjacency = block_on(
+        store.adapter().expand_adjacency(
+            &AdjacencyExpandRequest::new(
+                vec![KeySpan::prefix(
+                    Keyspace::AdjOut,
+                    out_adjacency_prefix(graph, partition, source.id()),
+                )],
+                QueryPageBounds::new(1, 4096).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(adjacency.guarantee(), PushdownGuarantee::Exact);
+    assert_eq!(adjacency.applied_log_index(), 4);
+    assert_eq!(adjacency.entries().len(), 1);
+    let adjacency_next = adjacency.next().expect("adjacency page continuation");
+    assert_eq!(adjacency_next.input_ordinal(), 0);
+    let second_adjacency = block_on(
+        store.adapter().expand_adjacency(
+            &AdjacencyExpandRequest::new(
+                vec![
+                    KeySpan::prefix_from(
+                        Keyspace::AdjOut,
+                        out_adjacency_prefix(graph, partition, source.id()),
+                        adjacency_next.start().as_bytes().to_vec(),
+                    )
+                    .unwrap(),
+                ],
+                QueryPageBounds::new(1, 4096).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(second_adjacency.entries().len(), 1);
+    assert!(second_adjacency.next().is_none());
+
+    let changes = block_on(
+        store.adapter().scan_changes(
+            &ChangeScanRequest::new(
+                KeySpan::prefix(Keyspace::TemporalIndex, temporal_event_graph_prefix(graph)),
+                QueryPageBounds::new(2, 4096).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(changes.guarantee(), PushdownGuarantee::Exact);
+    assert_eq!(changes.applied_log_index(), 4);
+    assert_eq!(changes.entries().len(), 2);
+    let changes_next = changes.next_start().expect("change page continuation");
+    let second_changes = block_on(
+        store.adapter().scan_changes(
+            &ChangeScanRequest::new(
+                KeySpan::prefix_from(
+                    Keyspace::TemporalIndex,
+                    temporal_event_graph_prefix(graph),
+                    changes_next.as_bytes().to_vec(),
+                )
+                .unwrap(),
+                QueryPageBounds::new(2, 4096).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(second_changes.entries().len(), 2);
+    assert!(second_changes.next_start().is_none());
+
+    drop(store);
+    cleanup(&url, &[&instance_id]);
 }
 
 #[test]
@@ -282,6 +715,180 @@ fn live_schema_drift_rejects_reintroduced_canonical_shadow_table() {
         .batch_execute("DROP TABLE dtgproxy.canonical_kv")
         .unwrap();
     cleanup(&url, &[&instance_id]);
+}
+
+fn assert_history_page_continuation(adapter: &dyn StorageAdapter) {
+    let element = ElementRef::vertex(GraphId::new(7), PartitionId::new(3), ElementId::new(9));
+    let valid =
+        Interval::new(ValidTime::from_micros(0), Some(ValidTime::from_micros(100))).unwrap();
+    let payload = CanonicalElement::new(1, BTreeMap::new());
+    let anchor = HistoryEntry::Anchor(
+        HistoryAnchor::new(
+            TransactionTime::new(100, 0),
+            valid,
+            ProjectionRecord::new(
+                TransactionTime::new(100, 0),
+                vec![ValidSegment::new(valid, payload.clone())],
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    let anchor_key = history_anchor_key(element, TransactionTime::new(100, 0), 0);
+    let mut records = vec![(anchor_key, anchor.encode().unwrap())];
+    for offset in 1..=15_u32 {
+        let commit = 100 + i64::from(offset);
+        let delta = HistoryEntry::Delta(HistoryDelta::put(
+            TransactionTime::new(commit, 0),
+            valid,
+            payload.clone(),
+        ));
+        let key = history_anchor_key(element, TransactionTime::new(commit, 0), 0);
+        records.push((key, delta.encode().unwrap()));
+    }
+    let mut expected_keys = records
+        .iter()
+        .map(|(key, _)| key.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    expected_keys.sort();
+    let retained_sizes = records
+        .iter()
+        .map(|(key, value)| key.as_bytes().len() + value.len())
+        .collect::<Vec<_>>();
+    let byte_budget = u64::try_from(*retained_sizes.iter().max().unwrap()).unwrap();
+    assert!(
+        retained_sizes.iter().min().unwrap().saturating_mul(2)
+            > usize::try_from(byte_budget).unwrap(),
+        "byte budget fixture must admit one record but never two"
+    );
+    let mutations = records
+        .iter()
+        .enumerate()
+        .map(|(sequence, (key, value))| {
+            Mutation::put(u32::try_from(sequence).unwrap(), key.clone(), value.clone())
+        })
+        .collect();
+    block_on(adapter.apply_committed(CommittedMutationBatch {
+        shard_id: 1,
+        log_index: 1,
+        txn_id: 401,
+        mutations,
+    }))
+    .unwrap();
+
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+    assert_eq!(snapshot.applied_log_index(), 1);
+    let later = HistoryEntry::Delta(HistoryDelta::put(
+        TransactionTime::new(99, 0),
+        valid,
+        payload,
+    ));
+    let later_key = history_anchor_key(element, TransactionTime::new(99, 0), 0);
+    assert!(
+        expected_keys
+            .last()
+            .is_some_and(|key| key.as_slice() < later_key.as_bytes()),
+        "intervening record must sort into a later page"
+    );
+    block_on(adapter.apply_committed(CommittedMutationBatch {
+        shard_id: 1,
+        log_index: 2,
+        txn_id: 402,
+        mutations: vec![Mutation::put(0, later_key.clone(), later.encode().unwrap())],
+    }))
+    .unwrap();
+
+    let prefix = history_prefix(element);
+    let (item_records, item_page_lengths) = collect_history_pages(
+        snapshot.as_ref(),
+        &prefix,
+        QueryPageBounds::new(3, 16 * 1024).unwrap(),
+        1,
+    );
+    let (byte_records, byte_page_lengths) = collect_history_pages(
+        snapshot.as_ref(),
+        &prefix,
+        QueryPageBounds::new(3, byte_budget).unwrap(),
+        1,
+    );
+
+    assert_eq!(item_page_lengths, vec![3, 3, 3, 3, 3, 1]);
+    assert_eq!(byte_page_lengths, vec![1; 16]);
+    assert_eq!(record_keys(&item_records), expected_keys);
+    assert_eq!(record_keys(&byte_records), expected_keys);
+    assert!(!record_keys(&item_records).contains(&later_key.as_bytes().to_vec()));
+    assert_history_record_counts(&item_records, 1, 15);
+
+    let fresh = block_on(adapter.begin_read_snapshot()).unwrap();
+    assert_eq!(fresh.applied_log_index(), 2);
+    let (fresh_records, _) = collect_history_pages(
+        fresh.as_ref(),
+        &prefix,
+        QueryPageBounds::new(32, 16 * 1024).unwrap(),
+        2,
+    );
+    assert!(record_keys(&fresh_records).contains(&later_key.as_bytes().to_vec()));
+    assert_history_record_counts(&fresh_records, 1, 16);
+}
+
+fn collect_history_pages(
+    snapshot: &dyn ReadSnapshot,
+    prefix: &[u8],
+    bounds: QueryPageBounds,
+    expected_log_index: u64,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<usize>) {
+    let mut span = KeySpan::prefix(Keyspace::History, prefix.to_vec());
+    let mut records = Vec::new();
+    let mut page_lengths = Vec::new();
+    loop {
+        let page =
+            block_on(snapshot.scan_canonical(&CanonicalScanRequest::new(span, bounds).unwrap()))
+                .unwrap();
+        assert_eq!(page.applied_log_index(), expected_log_index);
+        let retained_bytes = page.entries().iter().fold(0_u64, |total, entry| {
+            total
+                .saturating_add(u64::try_from(entry.key().as_bytes().len()).unwrap())
+                .saturating_add(u64::try_from(entry.value().len()).unwrap())
+        });
+        assert!(retained_bytes <= bounds.max_bytes());
+        page_lengths.push(page.entries().len());
+        records.extend(
+            page.entries()
+                .iter()
+                .map(|entry| (entry.key().as_bytes().to_vec(), entry.value().to_vec())),
+        );
+        assert!(records.len() <= 17, "history pagination did not terminate");
+        let Some(next_start) = page.next_start() else {
+            break;
+        };
+        span = KeySpan::prefix_from(
+            Keyspace::History,
+            prefix.to_vec(),
+            next_start.as_bytes().to_vec(),
+        )
+        .unwrap();
+    }
+    (records, page_lengths)
+}
+
+fn record_keys(records: &[(Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
+    records.iter().map(|(key, _)| key.clone()).collect()
+}
+
+fn assert_history_record_counts(
+    records: &[(Vec<u8>, Vec<u8>)],
+    expected_anchors: usize,
+    expected_deltas: usize,
+) {
+    let (anchors, deltas) =
+        records.iter().fold(
+            (0, 0),
+            |(anchors, deltas), (_, value)| match HistoryEntry::decode(value).unwrap() {
+                HistoryEntry::Anchor(_) => (anchors + 1, deltas),
+                HistoryEntry::Delta(_) => (anchors, deltas + 1),
+            },
+        );
+    assert_eq!((anchors, deltas), (expected_anchors, expected_deltas));
 }
 
 fn batch(index: u64, value_key: &[u8], value: &[u8]) -> CommittedMutationBatch {

@@ -36,4 +36,4 @@ jobs:
           sudo apt-get install --yes clang libclang-dev llvm-dev cmake
           echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
       - name: Run PostgreSQL Mapping certification
-        run: cargo test -p adapter-postgres -- --test-threads=1
+        run: cargo test --locked -p adapter-postgres -- --test-threads=1

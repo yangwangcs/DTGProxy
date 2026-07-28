@@ -47,6 +47,7 @@ pub enum RuntimeError {
     ProcedureValueUnsupported(&'static str),
     ProcedureFailed(String),
     InvalidPhysicalPlan,
+    CapabilityGenerationMismatch,
     ApplyInvocationLimit {
         max: u64,
     },
@@ -56,6 +57,7 @@ pub enum RuntimeError {
     ChildInvocationFailed,
     MissingShards(Vec<u32>),
     ChildSnapshotMismatch,
+    ChildCapabilityGenerationMismatch,
     ChildSecurityMismatch,
     RecursivePlanViolation,
     ChildIncompleteShards(Vec<u32>),

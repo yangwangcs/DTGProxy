@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
-use temporal_storage::{EdgeTypeId, EdgeView, ElementId, ElementRef, LabelId, VertexView};
+use temporal_storage::{
+    EdgeTypeId, EdgeView, ElementId, ElementRef, LabelId, TemporalEventOperation, VertexView,
+};
 use temporal_types::CanonicalElement;
 
 mod batch;
 mod child_invocation;
+mod column_batch;
 mod context;
 mod error;
 mod executor;
@@ -18,15 +21,22 @@ pub use child_invocation::{
     ApplyBudgetLedger, ChildInvocationFuture, ChildInvocationLimits, ChildOutputDemand,
     ChildPlanInvoker, IntervalChildInvocationFuture,
 };
-pub use context::{CancellationToken, ExecutionContext};
+pub use column_batch::{ColumnBatch, ColumnValueRef, ColumnVector, ValidityBitmap};
+pub use context::{
+    AblationAxis, BenchmarkAblationConfig, BenchmarkAblationCounters,
+    BenchmarkAblationCountersSnapshot, CancellationToken, ExecutionContext, QueryExecutionMetrics,
+    QueryExecutionMetricsSnapshot,
+};
 pub use error::RuntimeError;
 pub use executor::{BatchExecutor, preflight_procedure_parameters};
 pub use overlay::{GraphOverlay, GraphOverlayEntry, GraphOverlayError};
 pub use temporal::{
-    ResolvedTemporalScope, ResolvedValidTime, TemporalBatchExecutor, TemporalExecutionError,
-    TemporalRead, TransactionRead, execute_interval_coordinator_operators,
-    execute_interval_coordinator_operators_with_invoker,
-    execute_interval_coordinator_operators_with_invoker_and_ledger, resolve_temporal_scope,
+    ChangeEventBatch, ChangeFragmentResult, ChangeScanScope, ChangeWindow, ExecutionMorsel,
+    RecordMorselFuture, RecordMorselSource, ResolvedTemporalScope, ResolvedValidTime,
+    TemporalBatchExecutor, TemporalExecutionError, TemporalRead, TransactionRead,
+    execute_interval_coordinator_operators, execute_interval_coordinator_operators_with_invoker,
+    execute_interval_coordinator_operators_with_invoker_and_ledger, resolve_change_scope,
+    resolve_temporal_scope,
 };
 pub use temporal_row::{
     TemporalProvenance, TemporalRecordBatch, TemporalRegion, TemporalRow, coalesce_temporal_rows,
@@ -34,12 +44,66 @@ pub use temporal_row::{
     temporal_hash_join_bounded, temporal_join, temporal_left_hash_join,
     temporal_left_hash_join_bounded,
 };
+pub use temporal_semantics::{
+    ChangeEvent, DerivedInterval, IntervalCell, TemporalOperation, coalesce_interval_cells,
+    derive_visible_intervals, intersect_interval_sets,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChangeMetadata {
+    valid_from: temporal_types::ValidTime,
+    valid_to: Option<temporal_types::ValidTime>,
+    commit: temporal_types::TransactionTime,
+    ordinal: u32,
+    operation: TemporalEventOperation,
+}
+
+impl ChangeMetadata {
+    #[must_use]
+    pub const fn new(
+        valid_from: temporal_types::ValidTime,
+        valid_to: Option<temporal_types::ValidTime>,
+        commit: temporal_types::TransactionTime,
+        ordinal: u32,
+        operation: TemporalEventOperation,
+    ) -> Self {
+        Self {
+            valid_from,
+            valid_to,
+            commit,
+            ordinal,
+            operation,
+        }
+    }
+
+    #[must_use]
+    pub const fn valid_from(&self) -> temporal_types::ValidTime {
+        self.valid_from
+    }
+    #[must_use]
+    pub const fn valid_to(&self) -> Option<temporal_types::ValidTime> {
+        self.valid_to
+    }
+    #[must_use]
+    pub const fn commit(&self) -> temporal_types::TransactionTime {
+        self.commit
+    }
+    #[must_use]
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+    #[must_use]
+    pub const fn operation(&self) -> TemporalEventOperation {
+        self.operation
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VertexRecord {
     element: ElementRef,
     label: Option<LabelId>,
     payload: CanonicalElement,
+    change_metadata: Option<ChangeMetadata>,
 }
 
 impl VertexRecord {
@@ -53,6 +117,7 @@ impl VertexRecord {
             element,
             label,
             payload,
+            change_metadata: None,
         }
     }
 
@@ -69,6 +134,17 @@ impl VertexRecord {
     #[must_use]
     pub const fn payload(&self) -> &CanonicalElement {
         &self.payload
+    }
+
+    #[must_use]
+    pub const fn with_change_metadata(mut self, metadata: ChangeMetadata) -> Self {
+        self.change_metadata = Some(metadata);
+        self
+    }
+
+    #[must_use]
+    pub const fn change_metadata(&self) -> Option<ChangeMetadata> {
+        self.change_metadata
     }
 }
 
@@ -89,6 +165,7 @@ pub struct EdgeRecord {
     source: ElementRef,
     destination: ElementRef,
     payload: CanonicalElement,
+    change_metadata: Option<ChangeMetadata>,
 }
 
 impl EdgeRecord {
@@ -123,6 +200,7 @@ impl EdgeRecord {
             source,
             destination,
             payload,
+            change_metadata: None,
         }
     }
 
@@ -159,6 +237,17 @@ impl EdgeRecord {
     #[must_use]
     pub const fn payload(&self) -> &CanonicalElement {
         &self.payload
+    }
+
+    #[must_use]
+    pub const fn with_change_metadata(mut self, metadata: ChangeMetadata) -> Self {
+        self.change_metadata = Some(metadata);
+        self
+    }
+
+    #[must_use]
+    pub const fn change_metadata(&self) -> Option<ChangeMetadata> {
+        self.change_metadata
     }
 }
 

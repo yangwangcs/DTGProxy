@@ -1,6 +1,7 @@
 use cypher_compiler::{CompileSession, CypherCompiler};
 use physical_plan::{
-    MemoryBudget, PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeader, Placement,
+    AggregatePhase, MemoryBudget, PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeader,
+    Placement,
 };
 use query_executor::{
     ExecutionContext, RuntimeValue, TemporalRecordBatch, TemporalRegion, TemporalRow,
@@ -591,6 +592,7 @@ async fn interval_aggregate_splits_count_over_valid_time_change_points() {
             vec![
                 identity_project(&input),
                 PhysicalOperator::Aggregate {
+                    phase: AggregatePhase::Single,
                     grouping: Vec::new(),
                     aggregates: vec![{
                         (

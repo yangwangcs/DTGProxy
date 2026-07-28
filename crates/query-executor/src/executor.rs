@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use physical_plan::{PhysicalApply, PhysicalOperator, PhysicalPlan, Placement, PlanFragment};
+use physical_plan::{
+    AggregatePhase, PhysicalApply, PhysicalOperator, PhysicalPlan, Placement, PlanFragment,
+};
 use procedure_runtime::{
     ProcedureAccess, ProcedureInvocation, ProcedureRegistry, ProcedureResult, ProcedureValue,
 };
@@ -191,6 +193,7 @@ impl BatchExecutor {
                 grouping,
                 aggregates,
             } => PhysicalOperator::Aggregate {
+                phase: AggregatePhase::Single,
                 grouping: grouping.clone(),
                 aggregates: aggregates.clone(),
                 output: output.clone(),
@@ -259,10 +262,18 @@ impl BatchExecutor {
                 PhysicalOperator::Limit { count } => limit(batches, row_count(count, context)?)?,
                 PhysicalOperator::Sort { keys } => sort(batches, keys)?,
                 PhysicalOperator::Aggregate {
+                    phase,
                     grouping,
                     aggregates,
                     output: aggregate_output,
-                } => aggregate(batches, grouping, aggregates, aggregate_output, context)?,
+                } => aggregate(
+                    batches,
+                    *phase,
+                    grouping,
+                    aggregates,
+                    aggregate_output,
+                    context,
+                )?,
                 PhysicalOperator::TemporalSlice { .. } | PhysicalOperator::Finish => batches,
                 PhysicalOperator::NodeScan { .. } => {
                     return Err(RuntimeError::UnsupportedOperator("NodeScan"));
@@ -277,8 +288,8 @@ impl BatchExecutor {
                     return Err(RuntimeError::UnsupportedOperator("HashJoin"));
                 }
                 PhysicalOperator::Union { all } => union(batches, *all, memory_limit)?,
-                PhysicalOperator::Diff => {
-                    return Err(RuntimeError::UnsupportedOperator("Diff"));
+                PhysicalOperator::ChangeScan { .. } => {
+                    return Err(RuntimeError::UnsupportedOperator("ChangeScan"));
                 }
                 PhysicalOperator::Write { .. } => {
                     return Err(RuntimeError::UnsupportedOperator("Write"));
@@ -912,6 +923,7 @@ fn sort_value_order(left: &RuntimeValue, right: &RuntimeValue, ascending: bool) 
 
 fn aggregate(
     batches: Vec<RecordBatch>,
+    phase: AggregatePhase,
     grouping: &[temporal_ir::SlotId],
     aggregates: &[(temporal_ir::SlotId, ScalarExpr)],
     output: &RowSchema,
@@ -924,6 +936,9 @@ fn aggregate(
         .into_iter()
         .flat_map(RecordBatch::into_rows)
         .collect::<Vec<_>>();
+    if phase == AggregatePhase::FinalCount {
+        return finalize_partial_counts(&schema, &rows, aggregates, output);
+    }
     let grouping_indices = grouping
         .iter()
         .map(|slot| {
@@ -977,6 +992,46 @@ fn aggregate(
         );
     }
     batches_from_rows(output, output_rows)
+}
+
+fn finalize_partial_counts(
+    schema: &RowSchema,
+    rows: &[Vec<RuntimeValue>],
+    aggregates: &[(temporal_ir::SlotId, ScalarExpr)],
+    output: &RowSchema,
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    let mut values = BTreeMap::new();
+    for (slot, _) in aggregates {
+        let index = schema
+            .columns()
+            .iter()
+            .position(|column| column.slot() == *slot)
+            .ok_or(RuntimeError::MissingSlot(*slot))?;
+        let count = rows.iter().try_fold(0_i64, |total, row| {
+            let value = row.get(index).ok_or(RuntimeError::MissingSlot(*slot))?;
+            let RuntimeValue::Integer(partial) = value else {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: temporal_ir::ValueType::Integer,
+                    actual: value.kind(),
+                });
+            };
+            total
+                .checked_add(*partial)
+                .ok_or(RuntimeError::ArithmeticOverflow)
+        })?;
+        values.insert(*slot, RuntimeValue::Integer(count));
+    }
+    let row = output
+        .columns()
+        .iter()
+        .map(|column| {
+            values
+                .get(&column.slot())
+                .cloned()
+                .ok_or(RuntimeError::MissingSlot(column.slot()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    batches_from_rows(output, vec![row])
 }
 
 pub(crate) fn aggregate_expression(

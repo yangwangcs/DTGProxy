@@ -89,6 +89,50 @@ impl RuntimeValue {
         };
         Ok(payload)
     }
+
+    #[must_use]
+    pub fn variable_width_bytes(&self) -> u64 {
+        match self {
+            Self::String(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+            Self::Bytes(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+            Self::List(values) => values.iter().fold(0_u64, |total, value| {
+                total.saturating_add(value.variable_width_bytes())
+            }),
+            Self::Map(values) => values.values().fold(0_u64, |total, value| {
+                total.saturating_add(value.variable_width_bytes())
+            }),
+            Self::Node(value) => graph_values_variable_width_bytes(value.payload().properties()),
+            Self::Relationship(value) => {
+                graph_values_variable_width_bytes(value.payload().properties())
+            }
+            Self::Null
+            | Self::Boolean(_)
+            | Self::Integer(_)
+            | Self::FloatBits(_)
+            | Self::TimestampMicros(_) => 0,
+        }
+    }
+}
+
+fn graph_values_variable_width_bytes(values: &BTreeMap<u32, GraphValue>) -> u64 {
+    values.values().fold(0_u64, |total, value| {
+        total.saturating_add(graph_value_variable_width_bytes(value))
+    })
+}
+
+fn graph_value_variable_width_bytes(value: &GraphValue) -> u64 {
+    match value {
+        GraphValue::String(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+        GraphValue::Bytes(value) => u64::try_from(value.len()).unwrap_or(u64::MAX),
+        GraphValue::List(values) => values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(graph_value_variable_width_bytes(value))
+        }),
+        GraphValue::Null
+        | GraphValue::Boolean(_)
+        | GraphValue::Integer(_)
+        | GraphValue::FloatBits(_)
+        | GraphValue::TimestampMicros(_) => 0,
+    }
 }
 
 fn collection_size<'a>(
@@ -176,6 +220,13 @@ impl RecordBatch {
     #[must_use]
     pub const fn estimated_bytes(&self) -> u64 {
         self.estimated_bytes
+    }
+
+    #[must_use]
+    pub fn variable_width_bytes(&self) -> u64 {
+        self.rows.iter().flatten().fold(0_u64, |total, value| {
+            total.saturating_add(value.variable_width_bytes())
+        })
     }
 
     pub fn rechunk(self, max_rows: usize) -> Result<Vec<Self>, RuntimeError> {

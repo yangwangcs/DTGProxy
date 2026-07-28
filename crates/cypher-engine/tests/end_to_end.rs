@@ -5,14 +5,19 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use adapter_memory::MemoryAdapter;
+use cypher_compiler::{CompileSession, CypherCompiler};
 use cypher_engine::{
     CypherQueryEngine, CypherQueryRequest, DeploymentMode, EngineConfig, EngineError,
     ResourceLimits,
 };
-use distributed_query::{DistributedCoordinator, LocalFragmentWorker};
-use query_executor::{
-    GraphOverlay, GraphOverlayEntry, RuntimeValue, TemporalBatchExecutor, VertexRecord,
+use distributed_query::{
+    DistributedCoordinator, FragmentRequest, FragmentWorker, LocalFragmentWorker, SnapshotToken,
 };
+use query_executor::{
+    ExecutionContext, GraphOverlay, GraphOverlayEntry, RuntimeValue, TemporalBatchExecutor,
+    VertexRecord,
+};
+use query_optimizer::{Optimizer, OptimizerContext};
 use temporal_storage::{
     CommitContext, ElementId, ElementRef, GraphId, LabelId, PartitionId, TemporalStore,
     VertexMutation,
@@ -47,6 +52,135 @@ fn expired_query_deadline_is_installed_on_the_execution_context() {
     assert_eq!(
         block_on(engine.execute(&coordinator, request)),
         Err(EngineError::DeadlineExceeded)
+    );
+}
+
+#[test]
+fn engine_plans_with_the_coordinators_capability_snapshot() {
+    let security = [91; 32];
+    let worker = LocalFragmentWorker::new(
+        42,
+        7,
+        3,
+        11,
+        security,
+        TemporalBatchExecutor::new(TemporalStore::new(MemoryAdapter::new())),
+    );
+    let mut coordinator = DistributedCoordinator::new(4 << 20, 16).unwrap();
+    coordinator.register(Arc::new(worker)).unwrap();
+    let engine = CypherQueryEngine::new(
+        EngineConfig::new(
+            "accounts",
+            7,
+            3,
+            11,
+            DeploymentMode::PrimaryReplica,
+            vec![42],
+            ResourceLimits::new(1 << 20, 4 << 20, 256).unwrap(),
+        )
+        .unwrap(),
+    );
+    let response = block_on(engine.execute(
+        &coordinator,
+        CypherQueryRequest::new(
+            "MATCH (n) RETURN n",
+            BTreeMap::new(),
+            ValidTime::from_micros(5),
+            TransactionTime::new(150, 0),
+            security,
+            now_ms() + 10_000,
+        ),
+    ))
+    .unwrap();
+
+    assert!(response.optimizer_trace().iter().any(|event| {
+        event.contains("capability-generation=") && event.contains("candidate_scan=Candidate")
+    }));
+}
+
+#[test]
+fn executes_changes_through_the_event_source_and_preserves_delete_metadata() {
+    let security = [73; 32];
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let element = ElementRef::vertex(GraphId::new(7), PartitionId::new(0), ElementId::new(41));
+    block_on(
+        store.commit_vertex(
+            CommitContext::new(
+                42,
+                1,
+                1,
+                TransactionTime::new(0, 0),
+                TransactionTime::new(100, 0),
+            ),
+            VertexMutation::put(
+                element,
+                LabelId::new(1),
+                Interval::new(ValidTime::from_micros(1), Some(ValidTime::from_micros(2))).unwrap(),
+                CanonicalElement::new(1, BTreeMap::new()),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    block_on(
+        store.commit_vertex(
+            CommitContext::new(
+                42,
+                2,
+                2,
+                TransactionTime::new(100, 0),
+                TransactionTime::new(200, 0),
+            ),
+            VertexMutation::delete(
+                element,
+                LabelId::new(1),
+                Interval::new(ValidTime::from_micros(1), Some(ValidTime::from_micros(2))).unwrap(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let worker =
+        LocalFragmentWorker::new(42, 7, 3, 11, security, TemporalBatchExecutor::new(store));
+    let mut coordinator = DistributedCoordinator::new(4 << 20, 16).unwrap();
+    coordinator.register(Arc::new(worker)).unwrap();
+    let engine = CypherQueryEngine::new(
+        EngineConfig::new(
+            "accounts",
+            7,
+            3,
+            11,
+            DeploymentMode::PrimaryReplica,
+            vec![42],
+            ResourceLimits::new(1 << 20, 4 << 20, 256).unwrap(),
+        )
+        .unwrap(),
+    );
+    let request = CypherQueryRequest::new(
+        "USE accounts CHANGES FOR VALID_TIME BETWEEN $from AND $to FOR SYSTEM_TIME AS OF $snapshot MATCH (n) RETURN operation(n)",
+        BTreeMap::from([
+            ("from".into(), RuntimeValue::TimestampMicros(1)),
+            ("to".into(), RuntimeValue::TimestampMicros(2)),
+            ("snapshot".into(), RuntimeValue::TimestampMicros(200)),
+        ]),
+        ValidTime::from_micros(999),
+        TransactionTime::new(999, 0),
+        security,
+        now_ms() + 10_000,
+    )
+    .with_required_applied_indexes(BTreeMap::from([(42, 2)]));
+    let response = block_on(engine.execute(&coordinator, request)).unwrap();
+    assert_eq!(
+        response
+            .batches()
+            .iter()
+            .flat_map(|batch| batch.rows())
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            RuntimeValue::String("PUT".into()),
+            RuntimeValue::String("DELETE".into())
+        ]
     );
 }
 
@@ -1280,6 +1414,59 @@ fn gathers_interval_rows_from_all_shards_without_losing_regions() {
 }
 
 #[test]
+fn gathers_changes_from_all_shards_before_coordinator_projection() {
+    let security = [74; 32];
+    let mut coordinator = DistributedCoordinator::new(4 << 20, 16).unwrap();
+    coordinator
+        .register(Arc::new(worker(8, 2, security)))
+        .unwrap();
+    coordinator
+        .register(Arc::new(worker(3, 1, security)))
+        .unwrap();
+    let engine = CypherQueryEngine::new(
+        EngineConfig::new(
+            "accounts",
+            7,
+            3,
+            11,
+            DeploymentMode::SharedNothing,
+            vec![8, 3],
+            ResourceLimits::new(1 << 20, 4 << 20, 256).unwrap(),
+        )
+        .unwrap(),
+    );
+    let response = block_on(engine.execute(
+        &coordinator,
+        CypherQueryRequest::new(
+            "USE accounts CHANGES FOR VALID_TIME BETWEEN $from AND $to FOR SYSTEM_TIME AS OF $snapshot MATCH (n) RETURN operation(n)",
+            BTreeMap::from([
+                ("from".into(), RuntimeValue::TimestampMicros(1)),
+                ("to".into(), RuntimeValue::TimestampMicros(2)),
+                ("snapshot".into(), RuntimeValue::TimestampMicros(100)),
+            ]),
+            ValidTime::from_micros(999),
+            TransactionTime::new(999, 0),
+            security,
+            now_ms() + 10_000,
+        )
+        .with_required_applied_indexes(BTreeMap::from([(8, 1), (3, 1)])),
+    ))
+    .unwrap();
+    assert_eq!(
+        response
+            .batches()
+            .iter()
+            .flat_map(|batch| batch.rows())
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            RuntimeValue::String("PUT".into()),
+            RuntimeValue::String("PUT".into())
+        ]
+    );
+}
+
+#[test]
 fn shared_nothing_aggregates_after_global_gather() {
     let security = [6; 32];
     let mut coordinator = DistributedCoordinator::new(4 << 20, 16).expect("coordinator");
@@ -1315,6 +1502,92 @@ fn shared_nothing_aggregates_after_global_gather() {
     .expect("distributed count query");
     assert_eq!(response.row_count(), 1);
     assert_eq!(response.batches()[0].rows()[0][0], RuntimeValue::Integer(2));
+}
+
+#[test]
+fn shared_nothing_count_exchanges_at_most_one_partial_row_per_shard() {
+    let security = [26; 32];
+    let shard_ids = (0..8).collect::<Vec<_>>();
+    let element_ids = (1..=16).collect::<Vec<u128>>();
+    let mut shared_coordinator =
+        DistributedCoordinator::new(4 << 20, 16).expect("shared coordinator");
+    for shard_id in &shard_ids {
+        let first = u128::from(*shard_id) * 2 + 1;
+        shared_coordinator
+            .register(Arc::new(worker_with_elements(
+                *shard_id,
+                &[first, first + 1],
+                security,
+            )))
+            .expect("shared worker");
+    }
+    let shared_engine = CypherQueryEngine::new(
+        EngineConfig::new(
+            "scale_graph",
+            7,
+            3,
+            11,
+            DeploymentMode::SharedNothing,
+            shard_ids.clone(),
+            ResourceLimits::new(1 << 20, 4 << 20, 256).expect("shared limits"),
+        )
+        .expect("shared engine"),
+    );
+
+    let mut primary_coordinator =
+        DistributedCoordinator::new(4 << 20, 16).expect("primary coordinator");
+    primary_coordinator
+        .register(Arc::new(worker_with_elements(42, &element_ids, security)))
+        .expect("primary worker");
+    let primary_engine = CypherQueryEngine::new(
+        EngineConfig::new(
+            "scale_graph",
+            7,
+            3,
+            11,
+            DeploymentMode::PrimaryReplica,
+            vec![42],
+            ResourceLimits::new(1 << 20, 4 << 20, 256).expect("primary limits"),
+        )
+        .expect("primary engine"),
+    );
+
+    for query in [
+        "USE scale_graph FOR VALID_TIME AS OF 1000 MATCH (n) RETURN count(*) AS count",
+        "USE scale_graph FOR VALID_TIME AS OF 1000 MATCH (n) RETURN count(n) AS count",
+    ] {
+        let compiled = CypherCompiler::new()
+            .compile(
+                query,
+                &CompileSession::new("scale_graph", 7, 3, 11).expect("compile session"),
+            )
+            .expect("precompiled count");
+        let request = || {
+            CypherQueryRequest::new(
+                query,
+                BTreeMap::new(),
+                ValidTime::from_micros(999),
+                TransactionTime::new(150, 0),
+                security,
+                now_ms() + 10_000,
+            )
+        };
+        let primary = block_on(primary_engine.execute(&primary_coordinator, request()))
+            .expect("primary count");
+        let shared =
+            block_on(shared_engine.execute_compiled(&shared_coordinator, &compiled, request()))
+                .expect("shared precompiled count");
+
+        assert_eq!(primary.schema(), shared.schema(), "{query}");
+        assert_eq!(primary.row_count(), 1, "{query}");
+        assert_eq!(primary.row_count(), shared.row_count(), "{query}");
+        assert_eq!(primary.batches(), shared.batches(), "{query}");
+        assert_eq!(shared.batches()[0].rows()[0][0], RuntimeValue::Integer(16));
+        assert!(
+            shard_exchange_rows(query, &shard_ids, security) <= shard_ids.len(),
+            "exchange must contain at most one partial count per shard: {query}"
+        );
+    }
 }
 
 #[test]
@@ -1498,6 +1771,63 @@ fn worker_with_elements(
         security,
         TemporalBatchExecutor::new(store),
     )
+}
+
+fn shard_exchange_rows(query: &str, shard_ids: &[u32], security: [u8; 32]) -> usize {
+    let logical = CypherCompiler::new()
+        .compile(
+            query,
+            &CompileSession::new("scale_graph", 7, 3, 11).expect("compile session"),
+        )
+        .expect("compile count")
+        .logical_plan()
+        .clone();
+    let optimized = Optimizer::new()
+        .optimize(
+            &logical,
+            OptimizerContext::new(
+                DeploymentMode::SharedNothing,
+                u32::try_from(shard_ids.len()).expect("shard count"),
+                1 << 20,
+                4 << 20,
+            )
+            .expect("optimizer context")
+            .with_shard_ids(shard_ids.to_vec())
+            .expect("shard ids"),
+        )
+        .expect("optimize count");
+    let shard = &optimized.plan().fragments()[0];
+    let snapshot =
+        SnapshotToken::new(7, 3, 11, TransactionTime::new(150, 0), security).expect("snapshot");
+    let request = FragmentRequest::new(
+        shard.id(),
+        snapshot,
+        now_ms() + 10_000,
+        shard.budget().memory_bytes(),
+        256,
+    )
+    .expect("fragment request")
+    .with_expected_shards(shard_ids.to_vec())
+    .expect("expected shards");
+    let context = ExecutionContext::default();
+
+    shard_ids
+        .iter()
+        .map(|shard_id| {
+            let first = u128::from(*shard_id) * 2 + 1;
+            let worker = worker_with_elements(*shard_id, &[first, first + 1], security);
+            block_on(worker.execute_fragment(
+                &request,
+                shard,
+                ValidTime::from_micros(1000),
+                &context,
+            ))
+            .expect("execute shard fragment")
+            .iter()
+            .map(distributed_query::WorkerBatch::row_count)
+            .sum::<usize>()
+        })
+        .sum()
 }
 
 fn interval_worker(

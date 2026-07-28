@@ -14,7 +14,8 @@ use shard_client::{
     DeleteArtifactGenerationRequest, EmbeddedShardClient, ExecuteCommand,
     GetArtifactGenerationRequest, ListArtifactGenerationHeadsRequest,
     ListArtifactGenerationsRequest, PinArtifactGenerationRequest, PutArtifactChunkRequest,
-    ReadKeysRequest, ScanRequest, ShardClient, ShardClientError, ShardRequestContext,
+    ReadKeysRequest, ScanRequest, ShardClient, ShardClientError, ShardClientStorageAdapter,
+    ShardRequestContext,
 };
 use shard_runtime::{InProcessShardGroup, MultiRaftRuntime};
 use storage_api::{
@@ -231,6 +232,34 @@ async fn embedded_contract_executes_idempotently_and_serves_proven_reads() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key(), &key);
     assert!(client.status(context(104)).await.unwrap().applied_index() > 0);
+    let read_index = client.read_barrier(context(105)).await.unwrap();
+    assert_ne!(read_index, 0);
+    assert!(client.status(context(106)).await.unwrap().applied_index() >= read_index);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shard_storage_adapter_exposes_fenced_scan_without_claiming_a_snapshot() {
+    let client = Arc::new(client().await);
+    client
+        .execute(ExecuteCommand::new(context(105), command(105)).unwrap())
+        .await
+        .unwrap();
+    let adapter_client: Arc<dyn ShardClient> = client.clone();
+    let adapter =
+        ShardClientStorageAdapter::new(adapter_client, 9, 11, 3, now_ms() + 60_000, 10).unwrap();
+    let span = KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec());
+
+    assert!(matches!(
+        adapter.begin_read_snapshot().await,
+        Err(AdapterError::UnsupportedOperation { .. })
+    ));
+    let scan = StorageAdapter::scan_fenced(&adapter, &span).await.unwrap();
+    assert_eq!(scan.entries().len(), 1);
+    assert_eq!(
+        scan.applied_log_index(),
+        adapter.applied_log_index().unwrap()
+    );
+    assert!(scan.applied_log_index() > 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

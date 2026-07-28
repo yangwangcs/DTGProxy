@@ -12,9 +12,26 @@ and leader term from `Ready.read_states`, and waits until the leader state machi
 `applied_index` reaches that index. A leadership change, quorum timeout, stopped Replica, or
 unhealthy/lagging Adapter fails closed.
 
-The resulting permit can execute `CURRENT`, `AS OF`, or `DIFF` plans. `CURRENT` never runs on a
+The resulting permit can execute `CURRENT`, `AS OF`, or `CHANGES` plans. `CURRENT` never runs on a
 Follower because safe time describes immutable historical knowledge, not the latest linearizable
 projection.
+
+`ShardService.ReadBarrier` is the independent cluster RPC for capturing this freshness proof. For
+a distributed plan containing `CHANGES`, Gateway concurrently calls it for every target Shard and
+records a per-Shard ReadIndex map in the query request. It does not derive freshness from
+`ReplicaStatus`, a temporal timestamp, or the highest index observed on another Shard.
+
+The coordinator passes only the indexes selected by physical placement. Every fragment request
+must contain a complete, nonzero entry for each target Shard. The worker then requires the exact
+one-shot scan result to satisfy
+`FencedScan.applied_log_index >= required_applied_index`. `TransactionTime` and Raft log indexes
+remain separate domains and are never converted or compared with each other.
+
+For the remote leader-only scan path, DataNode does not label an ordinary scan with a previously
+sampled status index. It obtains ReadIndex, then submits the minimum index, placement epoch and
+bounded span to the same Replica actor that serializes apply. The actor rechecks leadership and
+epoch, verifies the backend is applied through ReadIndex, performs the scan, and returns the exact
+adapter index with the rows. This is a one-operation `FencedScan`, not a reusable query snapshot.
 
 ## Follower snapshot reads
 
@@ -27,7 +44,7 @@ Follower verifies:
 - its Adapter has applied through the proof's ReadIndex and the state machine is healthy;
 - its durable `safe_ts` is at least the plan's required transaction time.
 
-For an `AS OF` request, the required time is its transaction selector. For `DIFF`, it is the upper
+For an `AS OF` request, the required time is its transaction selector. For `CHANGES`, it is the upper
 transaction bound. A `CURRENT` request is rejected before Adapter access. The fragment worker also
 fences graph, topology, snapshot, and target Shard before requesting ReadIndex.
 
@@ -45,5 +62,5 @@ cannot use the new timestamp: its applied index remains below the subsequent Rea
 
 The deterministic three-node tests cover wrong leader/epoch, quorum loss, an idle safe-time tick,
 Follower apply lag and catch-up, stale proof rejection after re-election, `CURRENT` rejection, and
-authorized `AS OF`/`DIFF` execution. The current group harness uses Memory Adapter; the same permit
+authorized `AS OF`/`CHANGES` execution. The current group harness uses Memory Adapter; the same permit
 contract is the service boundary for the durable multi-process runtime.

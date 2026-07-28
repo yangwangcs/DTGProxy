@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use adapter_memory::MemoryAdapter;
+use adapter_sidecar::{SidecarAdapter, SidecarService, SidecarTransport, SidecarTransportFuture};
 use storage_api::{
     AdapterError, AdapterFuture, CanonicalBatchScanPage, CanonicalBatchScanRequest,
-    CanonicalScanPage, KeyValue, LogicalKey, ReadSnapshot,
+    CanonicalScanPage, CanonicalScanRequest, CommittedMutationBatch, KeyValue, LogicalKey,
+    Mutation, ReadSnapshot, StorageAdapter,
 };
 use temporal_storage::{
     ElementId, ElementRef, GraphId, HistoryAnchor, HistoryDelta, HistoryEntry, HistoryReadBudget,
@@ -93,6 +97,7 @@ struct ScriptedSnapshot {
     entries: Vec<KeyValue>,
     page_items: usize,
     behavior: SnapshotBehavior,
+    scan_calls: AtomicUsize,
     batch_calls: AtomicUsize,
 }
 
@@ -104,6 +109,7 @@ impl ScriptedSnapshot {
             entries,
             page_items: usize::MAX,
             behavior: SnapshotBehavior::Normal,
+            scan_calls: AtomicUsize::new(0),
             batch_calls: AtomicUsize::new(0),
         }
     }
@@ -120,6 +126,71 @@ impl ScriptedSnapshot {
 
     fn batch_calls(&self) -> usize {
         self.batch_calls.load(Ordering::Relaxed)
+    }
+
+    fn scan_calls(&self) -> usize {
+        self.scan_calls.load(Ordering::Relaxed)
+    }
+
+    fn page_index(&self) -> u64 {
+        match self.behavior {
+            SnapshotBehavior::AppliedIndex(index) => index,
+            SnapshotBehavior::Normal | SnapshotBehavior::NonAdvancingContinuation => {
+                self.applied_log_index
+            }
+        }
+    }
+
+    fn canonical_page(
+        &self,
+        scan: &CanonicalScanRequest,
+    ) -> Result<CanonicalScanPage, AdapterError> {
+        let page_index = self.page_index();
+        if matches!(self.behavior, SnapshotBehavior::NonAdvancingContinuation) {
+            let next_start =
+                LogicalKey::in_keyspace(scan.span().keyspace(), scan.span().start().to_vec());
+            return CanonicalScanPage::new(scan, page_index, Vec::new(), Some(next_start))
+                .map_err(|error| AdapterError::Backend(error.to_string()));
+        }
+
+        let matching: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.key().keyspace() == scan.span().keyspace()
+                    && scan.span().contains(entry.key().as_bytes())
+            })
+            .cloned()
+            .collect();
+        let item_limit = self.page_items.min(scan.bounds().max_items());
+        let mut entries = Vec::new();
+        let mut retained = 0_u64;
+        let mut next_start = None;
+        for entry in matching {
+            if entries.len() == item_limit {
+                next_start = Some(entry.key().clone());
+                break;
+            }
+            let entry_bytes = u64::try_from(entry.key().as_bytes().len())
+                .unwrap()
+                .checked_add(u64::try_from(entry.value().len()).unwrap())
+                .unwrap();
+            let required = retained.checked_add(entry_bytes).unwrap();
+            if required > scan.bounds().max_bytes() {
+                if entries.is_empty() {
+                    return Err(AdapterError::ScanByteLimit {
+                        limit: scan.bounds().max_bytes(),
+                        required,
+                    });
+                }
+                next_start = Some(entry.key().clone());
+                break;
+            }
+            retained = required;
+            entries.push(entry);
+        }
+        CanonicalScanPage::new(scan, page_index, entries, next_start)
+            .map_err(|error| AdapterError::Backend(error.to_string()))
     }
 }
 
@@ -144,74 +215,27 @@ impl ReadSnapshot for ScriptedSnapshot {
         })
     }
 
+    fn scan_canonical<'a>(
+        &'a self,
+        request: &'a CanonicalScanRequest,
+    ) -> AdapterFuture<'a, CanonicalScanPage> {
+        Box::pin(async move {
+            self.scan_calls.fetch_add(1, Ordering::Relaxed);
+            self.canonical_page(request)
+        })
+    }
+
     fn scan_canonical_batch<'a>(
         &'a self,
         request: &'a CanonicalBatchScanRequest,
     ) -> AdapterFuture<'a, CanonicalBatchScanPage> {
         Box::pin(async move {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
-            let page_index = match self.behavior {
-                SnapshotBehavior::AppliedIndex(index) => index,
-                SnapshotBehavior::Normal | SnapshotBehavior::NonAdvancingContinuation => {
-                    self.applied_log_index
-                }
-            };
             let mut pages = Vec::with_capacity(request.scans().len());
             for scan in request.scans() {
-                if matches!(self.behavior, SnapshotBehavior::NonAdvancingContinuation) {
-                    let next_start = LogicalKey::in_keyspace(
-                        scan.span().keyspace(),
-                        scan.span().start().to_vec(),
-                    );
-                    pages.push(
-                        CanonicalScanPage::new(scan, page_index, Vec::new(), Some(next_start))
-                            .map_err(|error| AdapterError::Backend(error.to_string()))?,
-                    );
-                    continue;
-                }
-
-                let matching: Vec<_> = self
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        entry.key().keyspace() == scan.span().keyspace()
-                            && scan.span().contains(entry.key().as_bytes())
-                    })
-                    .cloned()
-                    .collect();
-                let item_limit = self.page_items.min(scan.bounds().max_items());
-                let mut entries = Vec::new();
-                let mut retained = 0_u64;
-                let mut next_start = None;
-                for entry in matching {
-                    if entries.len() == item_limit {
-                        next_start = Some(entry.key().clone());
-                        break;
-                    }
-                    let entry_bytes = u64::try_from(entry.key().as_bytes().len())
-                        .unwrap()
-                        .checked_add(u64::try_from(entry.value().len()).unwrap())
-                        .unwrap();
-                    let required = retained.checked_add(entry_bytes).unwrap();
-                    if required > scan.bounds().max_bytes() {
-                        if entries.is_empty() {
-                            return Err(AdapterError::ScanByteLimit {
-                                limit: scan.bounds().max_bytes(),
-                                required,
-                            });
-                        }
-                        next_start = Some(entry.key().clone());
-                        break;
-                    }
-                    retained = required;
-                    entries.push(entry);
-                }
-                pages.push(
-                    CanonicalScanPage::new(scan, page_index, entries, next_start)
-                        .map_err(|error| AdapterError::Backend(error.to_string()))?,
-                );
+                pages.push(self.canonical_page(scan)?);
             }
-            CanonicalBatchScanPage::new(request, page_index, pages)
+            CanonicalBatchScanPage::new(request, self.page_index(), pages)
                 .map_err(|error| AdapterError::Backend(error.to_string()))
         })
     }
@@ -262,6 +286,31 @@ fn point_reader_replays_only_deltas_covering_the_requested_valid_time() {
     assert_eq!(outcome.value, Some(payload("visible")));
     assert_eq!(outcome.stats.history_records, 4);
     assert_eq!(outcome.stats.payloads_decoded, 1);
+}
+
+#[test]
+fn single_point_reader_uses_one_canonical_scan_without_batch_scaffolding() {
+    let element = vertex(11);
+    let snapshot = ScriptedSnapshot::new(vec![anchor(
+        element,
+        100,
+        vec![(interval(0, 10), payload("single"))],
+    )]);
+
+    let outcome = block_on(
+        PointHistoryReader::new(HistoryReadBudget::new(16, 4096, 4096).unwrap()).read(
+            &snapshot,
+            element,
+            tx(100),
+            valid(5),
+            PropertyDemand::All,
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.value, Some(payload("single")));
+    assert_eq!(snapshot.scan_calls(), 1);
+    assert_eq!(snapshot.batch_calls(), 0);
 }
 
 #[test]
@@ -583,6 +632,57 @@ fn oversized_record_after_continuation_is_a_history_record_limit() {
 }
 
 #[test]
+fn stateful_sidecar_batch_scan_preserves_record_limit_after_continuation() {
+    let element = vertex(153);
+    let mut entries = vec![anchor(
+        element,
+        100,
+        vec![(interval(0, 10), payload(&"a".repeat(900)))],
+    )];
+    entries.extend(
+        (0..15).map(|ordinal| put(element, 101 + ordinal, interval(20, 30), payload("small"))),
+    );
+    let backend = Arc::new(MemoryAdapter::new());
+    block_on(
+        backend.apply_committed(CommittedMutationBatch {
+            shard_id: 1,
+            log_index: 1,
+            txn_id: 1,
+            mutations: entries
+                .into_iter()
+                .enumerate()
+                .map(|(sequence, entry)| {
+                    Mutation::put(
+                        u32::try_from(sequence).unwrap(),
+                        entry.key().clone(),
+                        entry.value().to_vec(),
+                    )
+                })
+                .collect(),
+        }),
+    )
+    .unwrap();
+    let adapter = block_on(SidecarAdapter::connect(StatefulServiceTransport {
+        service: Arc::new(SidecarService::new(backend, None)),
+    }))
+    .unwrap();
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+
+    assert_eq!(
+        block_on(
+            PointHistoryReader::new(HistoryReadBudget::new(16, 4096, 512).unwrap()).read(
+                snapshot.as_ref(),
+                element,
+                tx(115),
+                valid(5),
+                PropertyDemand::All,
+            )
+        ),
+        Err(TemporalStoreError::HistoryRecordByteLimit)
+    );
+}
+
+#[test]
 fn cumulative_bytes_after_continuation_are_a_history_total_limit() {
     let element = vertex(152);
     let mut entries = vec![anchor(
@@ -702,5 +802,15 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
             std::task::Poll::Ready(output) => return output,
             std::task::Poll::Pending => std::thread::yield_now(),
         }
+    }
+}
+
+struct StatefulServiceTransport {
+    service: Arc<SidecarService>,
+}
+
+impl SidecarTransport for StatefulServiceTransport {
+    fn call<'a>(&'a self, request: adapter_sidecar::Request) -> SidecarTransportFuture<'a> {
+        Box::pin(async move { Ok(self.service.dispatch(request).await) })
     }
 }

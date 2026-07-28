@@ -14,6 +14,7 @@ cypher-ast = { path = "../cypher-ast" }
 distributed-query = { path = "../distributed-query" }
 query-executor = { path = "../query-executor", default-features = false }
 query-optimizer = { path = "../query-optimizer" }
+storage-api = { path = "../storage-api" }
 procedure-runtime = { path = "../procedure-runtime" }
 analytics-api = { path = "../analytics-api" }
 analytics-ledger = { path = "../analytics-ledger" }

@@ -45,6 +45,7 @@ use crate::service::GatewayRoutingState;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(5);
 const META_ENDPOINT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const META_ENDPOINT_RETRY_ROUNDS: usize = 2;
 const DEFAULT_CLAIM_LIMIT: u32 = 16;
 const MAINTENANCE_TICK_INTERVAL: u64 = 100;
 const DEFAULT_RETENTION_MAX_GENERATIONS: usize = 2;
@@ -361,7 +362,11 @@ impl SchedulerWorker {
     fn meta_client_indexes(&self) -> impl Iterator<Item = usize> + '_ {
         let start = usize::try_from(self.preferred_meta_index.load(Ordering::Relaxed)).unwrap_or(0)
             % self.clients.len();
-        (0..self.clients.len()).map(move |offset| (start + offset) % self.clients.len())
+        (0..self
+            .clients
+            .len()
+            .saturating_mul(META_ENDPOINT_RETRY_ROUNDS))
+            .map(move |offset| (start + offset) % self.clients.len())
     }
 
     fn remember_meta_client(&self, index: usize) {

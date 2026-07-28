@@ -128,6 +128,42 @@ fn function(
             },
         ));
     }
+    if matches!(
+        function_id,
+        id if id == function_id_for("valid_from")
+            || id == function_id_for("valid_to")
+            || id == function_id_for("system_time")
+            || id == function_id_for("commit_seq")
+            || id == function_id_for("operation")
+    ) {
+        let value = value.unwrap_or(RuntimeValue::Null);
+        let metadata = match value {
+            RuntimeValue::Node(node) => node.change_metadata(),
+            RuntimeValue::Relationship(edge) => edge.change_metadata(),
+            RuntimeValue::Null => return Ok(RuntimeValue::Null),
+            value => return Err(type_mismatch("NODE or RELATIONSHIP", value.kind())),
+        };
+        let Some(metadata) = metadata else {
+            return Ok(RuntimeValue::Null);
+        };
+        return Ok(if function_id == function_id_for("valid_from") {
+            RuntimeValue::TimestampMicros(metadata.valid_from().as_micros())
+        } else if function_id == function_id_for("valid_to") {
+            metadata
+                .valid_to()
+                .map(|time| RuntimeValue::TimestampMicros(time.as_micros()))
+                .unwrap_or(RuntimeValue::Null)
+        } else if function_id == function_id_for("system_time") {
+            RuntimeValue::TimestampMicros(metadata.commit().physical_micros())
+        } else if function_id == function_id_for("commit_seq") {
+            RuntimeValue::Integer(i64::from(metadata.ordinal()))
+        } else {
+            RuntimeValue::String(match metadata.operation() {
+                temporal_storage::TemporalEventOperation::Put => "PUT".into(),
+                temporal_storage::TemporalEventOperation::Delete => "DELETE".into(),
+            })
+        });
+    }
     Err(RuntimeError::FunctionUnsupported(function_id))
 }
 

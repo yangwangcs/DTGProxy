@@ -313,7 +313,7 @@ fn degree_at(
                 .unwrap()
                 .is_some()
         })
-        .map(|vertex| VertexId::new(u128::from(vertex.id().value())))
+        .map(|vertex| VertexId::new(vertex.id().value()))
         .collect::<Vec<_>>();
     let edges = fixture
         .edges
@@ -323,8 +323,8 @@ fn degree_at(
                 .unwrap()
                 .map(|_| {
                     SnapshotEdge::new(
-                        VertexId::new(u128::from(source.id().value())),
-                        VertexId::new(u128::from(destination.id().value())),
+                        VertexId::new(source.id().value()),
+                        VertexId::new(destination.id().value()),
                         1.0,
                     )
                     .unwrap()

@@ -36,7 +36,7 @@ node supervisor must intercept that snapshot, install a generation, and reopen t
 of applying consensus position without temporal data.
 
 The recovery tests install a snapshot at index N, append and commit N+1 onward, then reconstruct
-RawNode at the Adapter's persisted N. They compare Current, transaction-time AS OF, DIFF, incoming
+RawNode at the Adapter's persisted N. They compare Current, transaction-time AS OF, CHANGES, incoming
 and outgoing adjacency, all Replica watermarks, and every logical keyspace including entry and
 transaction fingerprints. Crash schedules cover checkpoint creation, manifest publication,
 Adapter copy, follower Raft snapshot persistence, source WAL compaction, and post-publication

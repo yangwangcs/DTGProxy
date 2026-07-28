@@ -9,25 +9,44 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use analytics_api::ProjectedGraph;
 use analytics_ledger::GraphProjectionScope;
 use cypher_compiler::{CompileSession, CompiledQuery, CypherCompiler};
-use distributed_query::{DistributedCoordinator, SnapshotToken};
+use distributed_query::{ChangePlanRequest, DistributedCoordinator, SnapshotToken};
 use procedure_runtime::{JobInvocationContext, ProcedureAccess, ProcedureRegistry};
 use query_executor::{
-    CancellationToken, ExecutionContext, GraphOverlay, MAX_BATCH_ROWS, RecordBatch,
-    ResolvedTemporalScope, ResolvedValidTime, RuntimeValue, TemporalRow, resolve_temporal_scope,
+    BenchmarkAblationConfig, BenchmarkAblationCounters, CancellationToken, ChangeScanScope,
+    ExecutionContext, GraphOverlay, MAX_BATCH_ROWS, QueryExecutionMetrics, RecordBatch,
+    ResolvedTemporalScope, ResolvedValidTime, RuntimeValue, TemporalRow, resolve_change_scope,
+    resolve_temporal_scope,
 };
 pub use query_optimizer::DeploymentMode;
-use query_optimizer::{Optimizer, OptimizerContext};
-use temporal_ir::{LogicalOperator, LogicalPlan, RowSchema, TransactionTimeSpec, ValidTimeSpec};
+use query_optimizer::{AccessGuarantee, CapabilitySnapshot, Optimizer, OptimizerContext};
+use storage_api::PushdownGuarantee;
+use temporal_ir::{
+    ChangeAxis, LogicalOperator, LogicalPlan, RowSchema, ScalarExpr, TransactionTimeSpec,
+    ValidTimeSpec,
+};
 use temporal_storage::GraphId;
 use temporal_types::{Interval, TransactionTime, ValidTime};
 
 mod bolt;
 mod bolt_service;
+mod performance;
+mod system_performance;
 mod write;
 
 pub use bolt::{BoltValueError, bolt_parameter_to_runtime, runtime_value_to_bolt};
 pub use bolt_service::{
     BackendFuture, BackendQueryResult, BoltQueryBackend, BoltQueryRequest, CypherBoltService,
+};
+pub use performance::{
+    ExternalTtfr, LatencyPercentiles, MaterializedPathObservation, MaterializedRunError,
+    MaterializedRunObservation, PairedMaterializedReport, PairedReportError,
+    QueryMetricAvailability, QueryMetricUnavailableReason, QueryOverheadGateError,
+    QueryScopedMetric, QueryScopedOverhead, QueryScopedOverheadLimits, run_materialized_pair,
+    run_observed_materialized_pair,
+};
+pub use system_performance::{
+    PairedSystemPerformanceReport, PerformanceScenario, ScaleOutPerformance,
+    SystemPerformanceGateError, SystemPerformanceObservation,
 };
 pub use write::{
     MaterializedElement, MaterializedElementKind, MaterializedWriteSet, MergeConstraint,
@@ -120,10 +139,13 @@ pub struct CypherQueryRequest {
     cancellation: CancellationToken,
     graph_overlay: GraphOverlay,
     fixed_transaction_snapshot: Option<TransactionTime>,
+    required_applied_indexes: BTreeMap<u32, u64>,
     procedure_registry: Option<Arc<ProcedureRegistry>>,
     procedure_graph: Option<Arc<ProjectedGraph>>,
     procedure_access: ProcedureAccess,
     job_invocation_context: Option<JobInvocationContext>,
+    benchmark_ablations: BenchmarkAblationConfig,
+    benchmark_ablation_counters: Option<Arc<BenchmarkAblationCounters>>,
 }
 
 impl CypherQueryRequest {
@@ -145,10 +167,13 @@ impl CypherQueryRequest {
             cancellation: CancellationToken::new(),
             graph_overlay: GraphOverlay::default(),
             fixed_transaction_snapshot: None,
+            required_applied_indexes: BTreeMap::new(),
             procedure_registry: None,
             procedure_graph: None,
             procedure_access: ProcedureAccess::denied(),
             job_invocation_context: None,
+            benchmark_ablations: BenchmarkAblationConfig::default(),
+            benchmark_ablation_counters: None,
         }
     }
 
@@ -161,6 +186,15 @@ impl CypherQueryRequest {
     #[must_use]
     pub fn with_fixed_transaction_snapshot(mut self, snapshot: TransactionTime) -> Self {
         self.fixed_transaction_snapshot = Some(snapshot);
+        self
+    }
+
+    #[must_use]
+    pub fn with_required_applied_indexes(
+        mut self,
+        required_applied_indexes: BTreeMap<u32, u64>,
+    ) -> Self {
+        self.required_applied_indexes = required_applied_indexes;
         self
     }
 
@@ -201,6 +235,17 @@ impl CypherQueryRequest {
         self.job_invocation_context = Some(context);
         self
     }
+
+    #[must_use]
+    pub fn with_benchmark_ablations(
+        mut self,
+        config: BenchmarkAblationConfig,
+        counters: Arc<BenchmarkAblationCounters>,
+    ) -> Self {
+        self.benchmark_ablations = config;
+        self.benchmark_ablation_counters = Some(counters);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,6 +255,7 @@ pub struct CypherQueryResponse {
     batches: Vec<RecordBatch>,
     temporal_rows: Option<Vec<TemporalRow>>,
     optimizer_trace: Vec<String>,
+    query_scoped_overhead: QueryScopedOverhead,
 }
 
 impl CypherQueryResponse {
@@ -241,6 +287,11 @@ impl CypherQueryResponse {
     #[must_use]
     pub fn optimizer_trace(&self) -> &[String] {
         &self.optimizer_trace
+    }
+
+    #[must_use]
+    pub const fn query_scoped_overhead(&self) -> &QueryScopedOverhead {
+        &self.query_scoped_overhead
     }
 }
 
@@ -295,6 +346,7 @@ impl CypherQueryEngine {
             compiled.fingerprint(),
             request,
             None,
+            1,
         )
         .await
     }
@@ -314,8 +366,44 @@ impl CypherQueryEngine {
         let prefix = compiled
             .read_prefix_plan()
             .ok_or(EngineError::WritePrefixMissing)?;
-        self.execute_logical_plan(coordinator, &prefix, compiled.fingerprint(), request, None)
-            .await
+        self.execute_logical_plan(
+            coordinator,
+            &prefix,
+            compiled.fingerprint(),
+            request,
+            None,
+            0,
+        )
+        .await
+    }
+
+    pub async fn execute_compiled(
+        &self,
+        coordinator: &DistributedCoordinator,
+        compiled: &CompiledQuery,
+        request: CypherQueryRequest,
+    ) -> Result<CypherQueryResponse, EngineError> {
+        if request.text.is_empty()
+            || request.security_fingerprint == [0; 32]
+            || request.deadline_unix_ms == 0
+        {
+            return Err(EngineError::InvalidRequest);
+        }
+        if compiled.uses_procedures() && request.procedure_registry.is_none() {
+            return Err(EngineError::ProcedureRuntimeMissing);
+        }
+        if !compiled.is_read_only() {
+            return Err(EngineError::WriteQueryUnsupported);
+        }
+        self.execute_logical_plan(
+            coordinator,
+            compiled.logical_plan(),
+            compiled.fingerprint(),
+            request,
+            None,
+            0,
+        )
+        .await
     }
 
     pub async fn execute_child_read_prefix(
@@ -355,8 +443,15 @@ impl CypherQueryEngine {
         }
         let input = RecordBatch::try_new(argument_schema, vec![values])
             .map_err(|error| EngineError::Distributed(error.to_string()))?;
-        self.execute_logical_plan(coordinator, logical_plan, fingerprint, request, Some(input))
-            .await
+        self.execute_logical_plan(
+            coordinator,
+            logical_plan,
+            fingerprint,
+            request,
+            Some(input),
+            0,
+        )
+        .await
     }
 
     async fn execute_logical_plan(
@@ -366,13 +461,20 @@ impl CypherQueryEngine {
         fingerprint: [u8; 32],
         request: CypherQueryRequest,
         argument_input: Option<RecordBatch>,
+        compile_count: u64,
     ) -> Result<CypherQueryResponse, EngineError> {
         let deadline = request_deadline(request.deadline_unix_ms)?;
+        let change = change_spec(logical_plan)?;
         let (valid_time, transaction_time) = temporal_spec(logical_plan)?;
         let has_graph_overlay = !request.graph_overlay.is_empty();
+        let query_metrics = Arc::new(QueryExecutionMetrics::default());
         let mut context = ExecutionContext::new(request.parameters)
             .with_cancellation(request.cancellation)
-            .with_graph_overlay(request.graph_overlay);
+            .with_graph_overlay(request.graph_overlay)
+            .with_query_metrics(Arc::clone(&query_metrics));
+        if let Some(counters) = request.benchmark_ablation_counters {
+            context = context.with_benchmark_ablations(request.benchmark_ablations, counters);
+        }
         if let Some(deadline) = deadline {
             context = context.with_deadline(deadline);
         }
@@ -393,9 +495,10 @@ impl CypherQueryEngine {
             &context,
         )
         .map_err(|error| EngineError::Temporal(error.to_string()))?;
-        if request
-            .fixed_transaction_snapshot
-            .is_some_and(|snapshot| resolved.transaction_time() != snapshot)
+        if change.is_none()
+            && request
+                .fixed_transaction_snapshot
+                .is_some_and(|snapshot| resolved.transaction_time() != snapshot)
         {
             return Err(EngineError::FixedSnapshotOverride);
         }
@@ -421,6 +524,17 @@ impl CypherQueryEngine {
         if let Some(job_context) = request.job_invocation_context {
             context = context.with_job_invocation_context(job_context);
         }
+        let distributed_capabilities = coordinator
+            .capability_snapshot(&self.config.shard_ids)
+            .map_err(|error| EngineError::Distributed(error.to_string()))?;
+        let primitive_capabilities = distributed_capabilities.capabilities();
+        let capability_snapshot = CapabilitySnapshot::new(
+            distributed_capabilities.generation(),
+            optimizer_guarantee(primitive_capabilities.candidate_scan()),
+            optimizer_guarantee(primitive_capabilities.adjacency_expand()),
+            optimizer_guarantee(primitive_capabilities.change_scan()),
+        )
+        .map_err(|error| EngineError::Optimize(error.to_string()))?;
         let optimizer_context = OptimizerContext::new(
             self.config.deployment,
             u32::try_from(self.config.shard_ids.len())
@@ -431,10 +545,84 @@ impl CypherQueryEngine {
         .map_err(|error| EngineError::Optimize(error.to_string()))?
         .with_shard_ids(self.config.shard_ids.clone())
         .map_err(|error| EngineError::Optimize(error.to_string()))?
-        .with_primary_shard(self.config.shard_ids[0]);
+        .with_primary_shard(self.config.shard_ids[0])
+        .with_capability_snapshot(capability_snapshot)
+        .with_current_projection_candidate_scan(true);
         let optimized = Optimizer::new()
             .optimize(logical_plan, optimizer_context)
             .map_err(|error| EngineError::Optimize(error.to_string()))?;
+        let mut optimizer_trace = optimized
+            .trace()
+            .iter()
+            .map(|event| format!("{}: {}", event.rule(), event.detail()))
+            .collect::<Vec<_>>();
+        optimizer_trace.push(format!(
+            "capability-generation={} candidate_scan={:?} property_gather={:?} adjacency_expand={:?} change_scan={:?}",
+            distributed_capabilities.generation(),
+            primitive_capabilities.candidate_scan(),
+            primitive_capabilities.property_gather(),
+            primitive_capabilities.adjacency_expand(),
+            primitive_capabilities.change_scan(),
+        ));
+        if let Some((axis, start, end, system_snapshot)) = change {
+            if has_graph_overlay || argument_input.is_some() {
+                return Err(EngineError::ChangeExecutionUnsupported);
+            }
+            let scope = resolve_change_scope(
+                GraphId::new(self.config.graph_id),
+                axis,
+                &start,
+                &end,
+                &system_snapshot,
+                request.current_transaction_time,
+                &context,
+            )
+            .map_err(|error| EngineError::Temporal(error.to_string()))?;
+            if request
+                .fixed_transaction_snapshot
+                .is_some_and(|snapshot| scope.snapshot() != snapshot)
+            {
+                return Err(EngineError::FixedSnapshotOverride);
+            }
+            let snapshot = SnapshotToken::new(
+                self.config.graph_id,
+                self.config.schema_version,
+                self.config.topology_epoch,
+                scope.snapshot(),
+                request.security_fingerprint,
+            )
+            .map_err(|error| EngineError::Distributed(error.to_string()))?;
+            let batches = coordinator
+                .execute_change_plan(
+                    optimized.plan(),
+                    ChangePlanRequest::new(
+                        snapshot,
+                        scope,
+                        request.required_applied_indexes.clone(),
+                        request.deadline_unix_ms,
+                        self.config.limits.batch_rows,
+                    ),
+                    &context,
+                )
+                .await
+                .map_err(|error| EngineError::Distributed(error.to_string()))?;
+            let schema = batches.first().map_or_else(
+                || logical_plan.output().clone(),
+                |batch| batch.schema().clone(),
+            );
+            return Ok(CypherQueryResponse {
+                fingerprint,
+                schema,
+                batches,
+                temporal_rows: None,
+                optimizer_trace,
+                query_scoped_overhead: QueryScopedOverhead::from_execution_metrics(
+                    compile_count,
+                    1,
+                    query_metrics.snapshot(),
+                ),
+            });
+        }
         let snapshot = SnapshotToken::new(
             self.config.graph_id,
             self.config.schema_version,
@@ -521,12 +709,21 @@ impl CypherQueryEngine {
             schema,
             batches,
             temporal_rows,
-            optimizer_trace: optimized
-                .trace()
-                .iter()
-                .map(|event| format!("{}: {}", event.rule(), event.detail()))
-                .collect(),
+            optimizer_trace,
+            query_scoped_overhead: QueryScopedOverhead::from_execution_metrics(
+                compile_count,
+                1,
+                query_metrics.snapshot(),
+            ),
         })
+    }
+}
+
+const fn optimizer_guarantee(guarantee: PushdownGuarantee) -> AccessGuarantee {
+    match guarantee {
+        PushdownGuarantee::Unsupported => AccessGuarantee::Unsupported,
+        PushdownGuarantee::Candidate => AccessGuarantee::Candidate,
+        PushdownGuarantee::Exact => AccessGuarantee::Exact,
     }
 }
 
@@ -569,6 +766,48 @@ pub fn resolve_compiled_temporal_scope(
     .map_err(|error| EngineError::Temporal(error.to_string()))
 }
 
+pub fn resolve_compiled_change_scope(
+    compiled: &CompiledQuery,
+    graph_id: u64,
+    current_transaction_time: TransactionTime,
+    parameters: BTreeMap<String, RuntimeValue>,
+) -> Result<Option<ChangeScanScope>, EngineError> {
+    let scopes = compiled
+        .logical_plan()
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.operator() {
+            LogicalOperator::ChangeScan {
+                axis,
+                start,
+                end,
+                system_snapshot,
+            } => Some((*axis, start.clone(), end.clone(), system_snapshot.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some((axis, start, end, system_snapshot)) = scopes.first() else {
+        return Ok(None);
+    };
+    if !scopes
+        .iter()
+        .all(|scope| scope == scopes.first().expect("nonempty"))
+    {
+        return Err(EngineError::AmbiguousTemporalScope);
+    }
+    resolve_change_scope(
+        GraphId::new(graph_id),
+        *axis,
+        start,
+        end,
+        system_snapshot,
+        current_transaction_time,
+        &ExecutionContext::new(parameters),
+    )
+    .map(Some)
+    .map_err(|error| EngineError::Temporal(error.to_string()))
+}
+
 fn temporal_spec(
     plan: &temporal_ir::LogicalPlan,
 ) -> Result<(ValidTimeSpec, TransactionTimeSpec), EngineError> {
@@ -588,6 +827,32 @@ fn temporal_spec(
     };
     if scopes.iter().all(|scope| scope == first) {
         Ok(first.clone())
+    } else {
+        Err(EngineError::AmbiguousTemporalScope)
+    }
+}
+
+type ChangeSpec = (ChangeAxis, ScalarExpr, ScalarExpr, TransactionTimeSpec);
+
+fn change_spec(plan: &temporal_ir::LogicalPlan) -> Result<Option<ChangeSpec>, EngineError> {
+    let scopes = plan
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.operator() {
+            LogicalOperator::ChangeScan {
+                axis,
+                start,
+                end,
+                system_snapshot,
+            } => Some((*axis, start.clone(), end.clone(), system_snapshot.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = scopes.first() else {
+        return Ok(None);
+    };
+    if scopes.iter().all(|scope| scope == first) {
+        Ok(Some(first.clone()))
     } else {
         Err(EngineError::AmbiguousTemporalScope)
     }
@@ -663,6 +928,7 @@ pub enum EngineError {
     ChildImportMissing(String),
     ChildImportSchemaMismatch,
     ChildIntervalPrefixUnsupported,
+    ChangeExecutionUnsupported,
     Optimize(String),
     Distributed(String),
 }
@@ -678,13 +944,14 @@ impl Error for EngineError {}
 #[cfg(test)]
 mod tests {
     use analytics_ledger::{GraphProjectionScope, ProjectionLimits};
+    use cypher_compiler::{CompileSession, CypherCompiler};
     use procedure_runtime::JobInvocationContext;
-    use query_executor::ResolvedValidTime;
+    use query_executor::{ChangeWindow, ResolvedValidTime, RuntimeValue};
     use temporal_types::{TransactionTime, ValidTime};
 
     use super::{
         CypherQueryRequest, DeploymentMode, EngineConfig, EngineError, ResourceLimits,
-        validate_job_invocation_context,
+        resolve_compiled_change_scope, validate_job_invocation_context,
     };
 
     fn job_context(
@@ -707,6 +974,32 @@ mod tests {
             ProjectionLimits::new(18, 19, 20).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn compiled_changes_resolve_to_the_explicit_event_scope() {
+        let compiled = CypherCompiler::new()
+            .compile(
+                "USE graph CHANGES FOR VALID_TIME BETWEEN $from AND $to FOR SYSTEM_TIME AS OF $snapshot MATCH (n) RETURN n",
+                &CompileSession::new("graph", 11, 14, 13).unwrap(),
+            )
+            .unwrap();
+        let scope = resolve_compiled_change_scope(
+            &compiled,
+            11,
+            TransactionTime::new(999, 0),
+            std::collections::BTreeMap::from([
+                ("from".into(), RuntimeValue::TimestampMicros(10)),
+                ("to".into(), RuntimeValue::TimestampMicros(20)),
+                ("snapshot".into(), RuntimeValue::TimestampMicros(30)),
+            ]),
+        )
+        .unwrap()
+        .expect("change scope");
+        assert_eq!(scope.snapshot(), TransactionTime::new(30, u32::MAX));
+        assert!(
+            matches!(scope.window(), ChangeWindow::Valid(window) if window.start() == ValidTime::from_micros(10) && window.end() == Some(ValidTime::from_micros(20)))
+        );
     }
 
     fn engine_config() -> EngineConfig {

@@ -31,4 +31,4 @@ jobs:
         with:
           toolchain: 1.93.0
       - name: Run Neo4j Mapping certification
-        run: cargo test -p adapter-neo4j -- --test-threads=1
+        run: cargo test --locked -p adapter-neo4j -- --test-threads=1

@@ -5,7 +5,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
 use physical_plan::{
-    MemoryBudget, PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeader, Placement,
+    AggregatePhase, MemoryBudget, PhysicalOperator, PhysicalPlanBuilder, PhysicalPlanHeader,
+    Placement,
 };
 use query_executor::{
     EdgeRecord, ExecutionContext, GraphOverlay, GraphOverlayEntry, RuntimeValue,
@@ -283,6 +284,7 @@ fn count_named_nodes_plan() -> physical_plan::PhysicalPlan {
                     Box::new(ScalarExpr::Literal(GraphValue::String("new".into()))),
                 )),
                 PhysicalOperator::Aggregate {
+                    phase: AggregatePhase::Single,
                     grouping: Vec::new(),
                     aggregates: vec![(
                         SlotId::new(1),

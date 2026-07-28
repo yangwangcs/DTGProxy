@@ -1,4 +1,4 @@
-# DTGProxy Cedar T-Cypher Clean-Break 设计规范
+# DTGProxy T-Cypher Clean-Break 设计规范
 
 日期：2026-07-23
 
@@ -6,11 +6,11 @@
 
 取代：`2026-07-19-dtgproxy-temporal-cypher-analytics-design.md`
 
-来源：Cedar `b37d3a2` 及其 Apache-2.0 T-Cypher、向量化执行与混合路径设计。
+来源参考：Cedar `b37d3a2` 及其 Apache-2.0 T-Cypher、向量化执行与混合路径设计。
 
 ## 1. 决策与目标
 
-DTGProxy 采用 Cedar 最新 T-Cypher 的语法和时态语义，并将其适配为分布式、后端无关的 Rust 实现。迁移是 clean-break：系统只有一套 Parser、AST、Binder、Temporal IR、物理计划和生产执行器，不保留旧语法、旧计划解码器或兼容分支。
+DTGProxy 定义并版本化本规范第 3 至第 6 节的 T-Cypher 语法和时态语义，并将其实现为分布式、后端无关的 Rust 语言层。Cedar `b37d3a2` 仅作为语义来源、算法出处和实现参考，不是运行时依赖、类型依赖或后续语言版本的自动权威。迁移是 clean-break：系统只有一套 Parser、AST、Binder、Temporal IR、物理计划和生产执行器，不保留旧语法、旧计划解码器或兼容分支。
 
 唯一时态语言使用：
 
@@ -131,7 +131,7 @@ Temporal IR 删除 `Diff`，增加显式算子：
 
 ### 5.1 可见事件与区间推导
 
-对一个 logical key 和 system snapshot：先丢弃 commit timestamp 大于 cutoff 的事件；同一 `valid_from` 选择最大可见 commit；按 `valid_from` 排序，下一事件的起点推导当前 `valid_to`，末项为正无穷。状态匹配忽略 DELETE，变化查询保留 PUT/DELETE。
+对状态重建中的一个 logical key 和 system snapshot：先丢弃 commit timestamp 大于 cutoff 的事件；同一 `valid_from` 选择最大可见 commit；按 `valid_from` 排序，下一事件的起点推导当前 `valid_to`，末项为正无穷。状态匹配忽略 DELETE。`CHANGES` 不执行该状态折叠，而是按 canonical event-log 补充规范保留窗口内每条不可变 PUT/DELETE 及其原始 interval/provenance。
 
 区间扫描必须读取查询左边界的可见 predecessor，以及推导最后区间所需的窗口右侧第一个 successor。
 
@@ -162,17 +162,23 @@ frontier 按目标 shard 分桶；跨分片状态携带 Snapshot Token、segment
 
 ## 7. 唯一向量化运行时
 
-现有 `RecordBatch` 演进为列式 `ColumnBatch`，公开 schema 使用稳定 slot ID。固定宽度列使用 typed vectors 和 validity bitmap；String/Bytes/List/Map/Node/Relationship/Path 使用 offset + arena/reference。行式表示仅允许测试 oracle、Bolt 单值编码和 Adapter 边界，不得成为生产算子间协议。
+逻辑和物理计划 schema 由稳定 slot ID、ValueType 和 nullability 定义，与行式或列式布局无关。`ColumnBatch` 只在物理执行 lowering 后绑定这些 slots：固定宽度列使用 typed vectors 和 validity bitmap；String/Bytes/List/Map/Node/Relationship/Path 使用 offset + arena/reference。行式表示仅允许测试 oracle、Bolt 单值编码和 Adapter 边界，不得成为生产算子间协议。`cypher-syntax`、`cypher-ast`、`cypher-sema`、`cypher-compiler`、`temporal-ir` 和 `storage-api` 禁止依赖 `ColumnBatch` 或 `ColumnVector`。
 
 ```text
 T-Cypher -> AST -> Bound AST -> Temporal Logical IR
          -> Optimized IR -> Distributed Physical DAG
-         -> vector pipelines -> backend batch primitives
+         -> typed backend primitives -> bounded canonical pages
+         -> Adapter boundary codec -> ColumnBatch vector pipelines
 ```
+
+这里的 `ColumnBatch` 是 DTGProxy 自己的执行器 ABI，不是 Adapter SPI、后端存储模型或语言
+语义。KV、行存、列存、原生图数据库和远程 Sidecar 都只需实现同一组 typed、bounded、
+capability-aware primitives；后端可以采用任意内部布局。语言层只绑定图、时态、值类型、
+slot 和 provenance，不能根据后端是行式或列式改变查询含义。
 
 流水线以 morsel 调度。Scan/Expand/Filter/Project 尽量融合；Join/Aggregate/Distinct/Sort/Coalesce 是显式 pipeline boundary。PropertyGather 在候选和区间裁剪之后执行，避免读取被淘汰行的属性和大值。
 
-分布式 Exchange 的 payload 与本地批次使用同一 canonical columnar encoding，携带 schema fingerprint、batch sequence、checksum 和 Snapshot Token。不得把用户原始 T-Cypher 下推给后端。
+分布式 Exchange 使用独立、版本化的 canonical columnar wire encoding；`ColumnBatch` 通过显式 codec 与该格式互转，内存布局不构成网络 ABI。wire payload 携带 schema fingerprint、batch sequence、checksum 和 Snapshot Token。不得把用户原始 T-Cypher 下推给后端。
 
 ## 8. 内存、spill、取消和指标
 
@@ -210,10 +216,12 @@ RocksDB、Neo4j 和 PostgreSQL 只持久化 canonical temporal model 的后端�
 - Neo4j：受管理节点/关系及版本记录，使用属性/label/type 候选扫描；
 - PostgreSQL：规范实体、事实、邻接和索引关系表，使用参数化 SQL；
 - 所有候选必须回到 DTGProxy 执行 residual temporal semantics；
-- 只有 capability 标为 Exact 的 fragment 才能省略 residual；
+- DTGProxy 1.1 即使 capability 标为 Exact 也保留 residual；只有完成独立等价性证明后，后续版本才可省略；
 - backend generation/capability 改变使计划失效。
 
-Adapter SPI 增加批量 point/range/change scan、batch property gather 和 adjacency expand。后端不得接收原始查询，不得自行选择 system-time snapshot，不得返回未标识 snapshot 的结果。三后端读取必须由同一 temporal oracle 做差分。
+Adapter SPI 增加批量 point/range/change scan、batch property gather 和 adjacency expand。SPI 返回有界且带 snapshot/capability 标识的存储域候选页或事件页，不返回 `ColumnBatch`，也不得依赖 `query-executor`；`ColumnBatch` 转换由查询运行时在 Adapter 边界完成。后端不得接收原始查询，不得自行选择 system-time snapshot，不得返回未标识 snapshot 的结果。三后端读取必须由同一表示无关 temporal oracle 做差分。
+
+一次性 `FencedScan` 与可复用 `ReadSnapshot` 是两个不同 capability。`FencedScan` 只保证一个有界扫描结果与其 `applied_log_index` 精确对应，可用于只执行一次 canonical event-index scan 的 `CHANGES` source；分页、point/range 混合读取或多个 backend primitive 的 fragment 必须使用真实 `ReadSnapshot` 或 begin/read/end session token。禁止用全量物化、全局最高已观察索引或 single-use 对象伪装可复用 snapshot。
 
 ## 11. Crate 落点
 
@@ -223,7 +231,8 @@ Adapter SPI 增加批量 point/range/change scan、batch property gather 和 adj
 - `cypher-compiler`：FactDemandSet、区间算子、mixed segment 和 metadata lowering。
 - `temporal-ir`：唯一当前逻辑 IR，不含 Diff/legacy/version adapter。
 - `physical-plan`：typed column slots、segment expand、pipeline、spill/cancel/metrics contract。
-- `query-executor`：ColumnBatch、区间内核、向量算子、frontier、memory/spill。
+- `temporal-semantics`：表示无关的区间推导、对齐、coalesce 判等和事件可见性纯函数；只依赖 `temporal-types`，不得依赖 `query-executor`、`ColumnBatch` 或 Adapter。
+- `query-executor`：ColumnBatch、向量算子、frontier、memory/spill，并调用表示无关的时态语义核心。
 - `distributed-query`：columnar Exchange、分片 frontier 和 token fencing。
 - `cypher-engine`/`gateway-node`：Bolt、事务和结果流只接入新 compiler/runtime。
 - `storage-api` 与 adapters：批量 primitives 和 capability，不感知语言。
@@ -288,9 +297,9 @@ Adapter SPI 增加批量 point/range/change scan、batch property gather 和 adj
 
 1. 建立新 T-Cypher parser/AST/sema 与拒绝旧语法的 TCK。
 2. 替换 Temporal IR，删除 Diff 和旧 scope。
-3. 移植区间正确性内核与独立 oracle。
-4. 建立 ColumnBatch 和向量 point/range/change pipelines。
-5. 实现 demanded property、metadata 和 coalesce。
+3. 在表示无关的时态语义模块中实现并验证 interval derive、align、coalesce 纯函数及独立 oracle。
+4. 在 compiler 和 Temporal IR 中完成 FactDemandSet、metadata provenance、coalesce 判等与物理算子契约，不依赖任何批次表示。
+5. 在 Adapter 返回 bounded canonical primitive pages 之后，由 DTGProxy 边界 codec 转换为 `ColumnBatch`，再实现 point/range/change source、PropertyGather、MetadataProject 和 TemporalCoalesce 的向量化物理算子；不得要求后端提供列式布局，所有结果必须与表示无关 oracle 一致。
 6. 实现 fixed/variable/mixed segmented frontier 与全局 TRAIL。
 7. 完成 memory/spill/cancel/metrics。
 8. 接入 distributed Exchange、Snapshot fencing 和事务。

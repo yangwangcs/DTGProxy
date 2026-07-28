@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use query_executor::{
-    ExecutionContext, ResolvedValidTime, RuntimeError, RuntimeValue, resolve_temporal_scope,
+    ChangeWindow, ExecutionContext, ResolvedValidTime, RuntimeError, RuntimeValue,
+    resolve_change_scope, resolve_temporal_scope,
 };
-use temporal_ir::{ScalarExpr, TransactionTimeSpec, ValidTimeSpec};
+use temporal_ir::{ChangeAxis, ScalarExpr, TransactionTimeSpec, ValidTimeSpec};
 use temporal_storage::GraphId;
 use temporal_types::{TransactionTime, ValidTime};
 
@@ -88,4 +89,30 @@ fn rejects_reversed_intervals_and_non_temporal_parameters() {
     )
     .expect_err("string temporal parameter must fail");
     assert_eq!(error, RuntimeError::InvalidTemporalValue("STRING"));
+}
+
+#[test]
+fn resolves_parameterized_change_window_without_falling_back_to_current_state() {
+    let scope = resolve_change_scope(
+        GraphId::new(7),
+        ChangeAxis::ValidTime,
+        &ScalarExpr::Parameter("from".into()),
+        &ScalarExpr::Parameter("to".into()),
+        &TransactionTimeSpec::AsOf(ScalarExpr::Parameter("snapshot".into())),
+        TransactionTime::new(900, 1),
+        &parameters(&[("from", 10), ("to", 20), ("snapshot", 30)]),
+    )
+    .expect("change scope");
+
+    assert_eq!(
+        scope.window(),
+        ChangeWindow::Valid(
+            temporal_types::Interval::new(
+                ValidTime::from_micros(10),
+                Some(ValidTime::from_micros(20)),
+            )
+            .unwrap()
+        )
+    );
+    assert_eq!(scope.snapshot(), TransactionTime::new(30, u32::MAX));
 }

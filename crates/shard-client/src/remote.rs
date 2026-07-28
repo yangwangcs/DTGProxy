@@ -15,14 +15,19 @@ use cluster_protocol::proto::{
     ListAnalyticsArtifactGenerationHeadsRequest, ListAnalyticsArtifactGenerationHeadsResponse,
     ListAnalyticsArtifactGenerationsRequest, ListAnalyticsArtifactGenerationsResponse,
     PinAnalyticsArtifactGenerationRequest, PutAnalyticsArtifactChunkRequest,
+    QueryPushdownGuarantee as WirePushdownGuarantee, ReadBarrierRequest,
     ReadRequest as WireReadRequest, ReplicaStatusRequest, RequestContext,
     ScanRequest as WireScanRequest, ShardContext,
 };
 use data_node::{
-    ReadCodecError, decode_key_read_result, decode_key_scan_batch_bounded, encode_key_read_plan,
+    ReadCodecError, decode_candidate_scan_batch, decode_key_read_result,
+    decode_key_scan_batch_bounded, encode_candidate_scan_plan, encode_key_read_plan,
     encode_key_scan_plan,
 };
-use storage_api::KeyValue;
+use storage_api::{
+    CandidateScanPage, KeyValue, PushdownGuarantee, QueryCapabilitySnapshot,
+    QueryPrimitiveCapabilities,
+};
 use temporal_types::TransactionTime;
 use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -31,12 +36,12 @@ use tonic::{Code, Request, Status};
 use crate::{
     AdvanceArtifactFenceRequest, ArtifactChunkStream, ArtifactGenerationCursor,
     ArtifactGenerationHeadPage, ArtifactGenerationSummary, ArtifactKind, ArtifactStreamChunk,
-    DeleteArtifactGenerationRequest, ExecuteCommand, ExecuteReceipt, GetArtifactGenerationRequest,
-    ListArtifactGenerationHeadsRequest, ListArtifactGenerationsRequest, MAX_ARTIFACT_CHUNK_BYTES,
-    MAX_ARTIFACT_CHUNKS, PinArtifactGenerationRequest,
-    PutArtifactChunkRequest as ClientPutArtifactChunkRequest, ReadKeysRequest, ScanRequest,
-    ShardClient, ShardClientError, ShardClientFuture, ShardRequestContext, ShardStatus,
-    artifact_corruption, validated_artifact_stream,
+    CandidateScanCommand, DeleteArtifactGenerationRequest, ExecuteCommand, ExecuteReceipt,
+    GetArtifactGenerationRequest, ListArtifactGenerationHeadsRequest,
+    ListArtifactGenerationsRequest, MAX_ARTIFACT_CHUNK_BYTES, MAX_ARTIFACT_CHUNKS,
+    PinArtifactGenerationRequest, PutArtifactChunkRequest as ClientPutArtifactChunkRequest,
+    ReadKeysRequest, ScanRequest, ShardClient, ShardClientError, ShardClientFuture,
+    ShardRequestContext, ShardStatus, artifact_corruption, validated_artifact_stream,
 };
 
 const MAXIMUM_SCAN_BATCH_BYTES: u32 = 4 * 1024 * 1024;
@@ -401,6 +406,10 @@ impl ShardClient for RemoteShardClient {
     }
 
     fn scan<'a>(&'a self, request: ScanRequest) -> ShardClientFuture<'a, Vec<KeyValue>> {
+        Box::pin(async move { Ok(self.scan_fenced(request).await?.into_entries()) })
+    }
+
+    fn scan_fenced<'a>(&'a self, request: ScanRequest) -> ShardClientFuture<'a, crate::FencedScan> {
         Box::pin(async move {
             let context = request.context();
             let (_, route) = self.route(context)?;
@@ -499,7 +508,174 @@ impl ShardClient for RemoteShardClient {
                         "remote scan ended without a terminal batch".into(),
                     ));
                 }
-                return Ok(rows);
+                let applied_index = applied_index.ok_or_else(|| {
+                    ShardClientError::Internal("remote scan omitted its applied index".into())
+                })?;
+                return Ok(crate::FencedScan::new(applied_index, rows));
+            }
+            Err(last_error.unwrap_or(ShardClientError::NoLeader {
+                shard_id: context.shard_id(),
+            }))
+        })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        command: CandidateScanCommand,
+    ) -> ShardClientFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            let context = command.context();
+            let request = command.request().clone();
+            let (_, route) = self.route(context)?;
+            let plan = encode_candidate_scan_plan(&request)
+                .map_err(|error| ShardClientError::Internal(error.to_string()))?;
+            let candidates = Self::candidates(&route);
+            let mut last_error = None;
+            'replicas: for attempt in 0..MAXIMUM_READ_RETRY_ATTEMPTS {
+                validate_deadline(context)?;
+                let replica = candidates.get(attempt % candidates.len()).copied().ok_or(
+                    ShardClientError::NoLeader {
+                        shard_id: context.shard_id(),
+                    },
+                )?;
+                let mut client = ShardServiceClient::new(self.channel(replica)?);
+                let wire = WireScanRequest {
+                    context: Some(self.wire_context(context)),
+                    plan: plan.clone(),
+                    read_proof: Vec::new(),
+                    maximum_batch_bytes: MAXIMUM_SCAN_BATCH_BYTES,
+                };
+                let mut stream = match client.scan(Self::request(context, wire)?).await {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == Code::Unimplemented => {
+                        return Err(ShardClientError::UnsupportedQueryPrimitive(
+                            "candidate scan",
+                        ));
+                    }
+                    Err(status) => {
+                        let error = map_status(&status);
+                        if !retryable(&error) {
+                            return Err(error);
+                        }
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                let mut entries = Vec::new();
+                let mut expected_sequence = 0_u64;
+                let mut applied_index = None;
+                let mut wire_guarantee = None;
+                let mut next_start = None;
+                let mut terminal = false;
+                while let Some(batch) = stream.next().await {
+                    validate_deadline(context)?;
+                    let batch = match batch {
+                        Ok(batch) => batch,
+                        Err(status) if status.code() == Code::Unimplemented => {
+                            return Err(ShardClientError::UnsupportedQueryPrimitive(
+                                "candidate scan",
+                            ));
+                        }
+                        Err(status) => {
+                            let error = map_status(&status);
+                            if entries.is_empty() && retryable(&error) {
+                                last_error = Some(error);
+                                continue 'replicas;
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if batch.sequence != expected_sequence
+                        || applied_index.is_some_and(|index| index != batch.applied_index)
+                        || terminal
+                    {
+                        return Err(ShardClientError::Internal(
+                            "invalid remote candidate scan stream ordering".into(),
+                        ));
+                    }
+                    let (guarantee, decoded, continuation) =
+                        decode_candidate_scan_batch(&batch.arrow_record_batch)
+                            .map_err(|error| ShardClientError::Internal(error.to_string()))?;
+                    if wire_guarantee.is_some_and(|value| value != guarantee)
+                        || (!batch.terminal && continuation.is_some())
+                    {
+                        return Err(ShardClientError::Internal(
+                            "inconsistent remote candidate scan batch".into(),
+                        ));
+                    }
+                    wire_guarantee = Some(guarantee);
+                    applied_index = Some(batch.applied_index);
+                    expected_sequence = expected_sequence.saturating_add(1);
+                    terminal = batch.terminal;
+                    if terminal {
+                        next_start = continuation;
+                    }
+                    entries.extend(decoded);
+                }
+                if !terminal {
+                    return Err(ShardClientError::Internal(
+                        "remote candidate scan ended without a terminal batch".into(),
+                    ));
+                }
+                let applied_index = applied_index.ok_or_else(|| {
+                    ShardClientError::Internal(
+                        "remote candidate scan omitted its applied index".into(),
+                    )
+                })?;
+                wire_guarantee.ok_or_else(|| {
+                    ShardClientError::Internal("remote candidate scan omitted its guarantee".into())
+                })?;
+                return CandidateScanPage::new(
+                    &request,
+                    applied_index,
+                    PushdownGuarantee::Candidate,
+                    entries,
+                    next_start,
+                )
+                .map_err(|error| ShardClientError::Internal(error.to_string()));
+            }
+            Err(last_error.unwrap_or(ShardClientError::NoLeader {
+                shard_id: context.shard_id(),
+            }))
+        })
+    }
+
+    fn read_barrier<'a>(&'a self, context: ShardRequestContext) -> ShardClientFuture<'a, u64> {
+        Box::pin(async move {
+            let (_, route) = self.route(context)?;
+            let candidates = Self::candidates(&route);
+            let mut last_error = None;
+            for attempt in 0..MAXIMUM_READ_RETRY_ATTEMPTS {
+                validate_deadline(context)?;
+                let replica = candidates.get(attempt % candidates.len()).copied().ok_or(
+                    ShardClientError::NoLeader {
+                        shard_id: context.shard_id(),
+                    },
+                )?;
+                let mut client = ShardServiceClient::new(self.channel(replica)?);
+                let wire = ReadBarrierRequest {
+                    context: Some(self.wire_context(context)),
+                };
+                match client.read_barrier(Self::request(context, wire)?).await {
+                    Ok(response) if response.get_ref().read_index != 0 => {
+                        return Ok(response.into_inner().read_index);
+                    }
+                    Ok(_) => {
+                        return Err(ShardClientError::ReadBarrier(
+                            "remote ReadIndex barrier returned zero".into(),
+                        ));
+                    }
+                    Err(status) => {
+                        let error = map_status(&status);
+                        if !retryable(&error) {
+                            return Err(error);
+                        }
+                        last_error = Some(error);
+                        if attempt + 1 < MAXIMUM_READ_RETRY_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
             }
             Err(last_error.unwrap_or(ShardClientError::NoLeader {
                 shard_id: context.shard_id(),
@@ -865,9 +1041,42 @@ impl ShardClient for RemoteShardClient {
                 status.term,
                 status.applied_index,
                 TransactionTime::new(i64::MIN, 0),
+                decode_query_capabilities(&status)?,
             ))
         })
     }
+}
+
+fn decode_query_capabilities(
+    status: &cluster_protocol::proto::ReplicaStatusResponse,
+) -> Result<QueryCapabilitySnapshot, ShardClientError> {
+    if status.query_capability_generation == 0 {
+        return Err(ShardClientError::Internal(
+            "remote replica reported a zero query capability generation".into(),
+        ));
+    }
+    let decode = |wire: i32| {
+        let wire = WirePushdownGuarantee::try_from(wire).map_err(|_| {
+            ShardClientError::Internal("remote replica reported an unknown query guarantee".into())
+        })?;
+        match wire {
+            WirePushdownGuarantee::Unspecified => Err(ShardClientError::Internal(
+                "remote replica omitted a query guarantee".into(),
+            )),
+            WirePushdownGuarantee::Unsupported => Ok(PushdownGuarantee::Unsupported),
+            WirePushdownGuarantee::Candidate => Ok(PushdownGuarantee::Candidate),
+            WirePushdownGuarantee::Exact => Ok(PushdownGuarantee::Exact),
+        }
+    };
+    Ok(QueryCapabilitySnapshot::new(
+        status.query_capability_generation,
+        QueryPrimitiveCapabilities::new(
+            decode(status.candidate_scan)?,
+            decode(status.property_gather)?,
+            decode(status.adjacency_expand)?,
+            decode(status.change_scan)?,
+        ),
+    ))
 }
 
 fn wire_artifact_kind(kind: ArtifactKind) -> WireArtifactKind {

@@ -10,10 +10,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use storage_api::{
     AdapterCapabilities, AdapterCompatibilityError, AdapterDescriptorV1, AdapterError,
-    AdapterFuture, AdapterRequirement, ApplyReceipt, CommittedMutationBatch, KeySpan, KeyValue,
-    LogicalKey, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
-    LogicalSnapshotReader, MappingCompatibilityError, MappingDescriptorV1, MappingRequirement,
-    StorageAdapter,
+    AdapterFuture, AdapterRequirement, AdjacencyExpandPage, AdjacencyExpandRequest, ApplyReceipt,
+    CandidateScanPage, CandidateScanRequest, ChangeScanPage, ChangeScanRequest,
+    CommittedMutationBatch, FencedScan, KeySpan, KeyValue, LogicalKey, LogicalSnapshotChunkV1,
+    LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1, LogicalSnapshotReader,
+    MappingCompatibilityError, MappingDescriptorV1, MappingRequirement, PropertyGatherPage,
+    PropertyGatherRequest, QueryCapabilitySnapshot, QueryPrimitiveCapabilities,
+    ReadSnapshotBinding, StorageAdapter,
 };
 
 pub type AdapterFactoryFuture<'a> =
@@ -750,6 +753,37 @@ impl StorageAdapter for HotSwapAdapter {
         self.inspect_state().active.descriptor.capabilities()
     }
 
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        self.inspect_state()
+            .active
+            .adapter
+            .query_primitive_capabilities()
+    }
+
+    fn query_capability_generation(&self) -> u64 {
+        self.generation()
+    }
+
+    fn query_capability_snapshot(&self) -> QueryCapabilitySnapshot {
+        let state = self.inspect_state();
+        QueryCapabilitySnapshot::new(
+            state.generation,
+            state.active.adapter.query_primitive_capabilities(),
+        )
+    }
+
+    fn read_snapshot_binding(&self) -> Result<Option<ReadSnapshotBinding>, AdapterError> {
+        let state = self.lock_state()?;
+        Ok(Some(ReadSnapshotBinding::new(
+            state.generation,
+            state.active.adapter_arc(),
+        )?))
+    }
+
+    fn mapping_descriptor(&self) -> Option<MappingDescriptorV1> {
+        self.inspect_state().active.mapping_descriptor.clone()
+    }
+
     fn apply_committed<'a>(
         &'a self,
         batch: CommittedMutationBatch,
@@ -802,6 +836,58 @@ impl StorageAdapter for HotSwapAdapter {
             Err(error) => return Box::pin(async move { Err(error) }),
         };
         Box::pin(async move { active.scan(span).await })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        let active = match self.lock_state() {
+            Ok(state) => state.active.adapter_arc(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move { active.scan_candidates(request).await })
+    }
+
+    fn gather_properties<'a>(
+        &'a self,
+        request: &'a PropertyGatherRequest,
+    ) -> AdapterFuture<'a, PropertyGatherPage> {
+        let active = match self.lock_state() {
+            Ok(state) => state.active.adapter_arc(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move { active.gather_properties(request).await })
+    }
+
+    fn expand_adjacency<'a>(
+        &'a self,
+        request: &'a AdjacencyExpandRequest,
+    ) -> AdapterFuture<'a, AdjacencyExpandPage> {
+        let active = match self.lock_state() {
+            Ok(state) => state.active.adapter_arc(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move { active.expand_adjacency(request).await })
+    }
+
+    fn scan_changes<'a>(
+        &'a self,
+        request: &'a ChangeScanRequest,
+    ) -> AdapterFuture<'a, ChangeScanPage> {
+        let active = match self.lock_state() {
+            Ok(state) => state.active.adapter_arc(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move { active.scan_changes(request).await })
+    }
+
+    fn scan_fenced<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, FencedScan> {
+        let active = match self.lock_state() {
+            Ok(state) => state.active.adapter_arc(),
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move { active.scan_fenced(span).await })
     }
 
     fn create_physical_checkpoint(

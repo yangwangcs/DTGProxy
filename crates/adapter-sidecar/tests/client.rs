@@ -216,6 +216,65 @@ fn client_snapshot_rejects_batch_without_negotiated_feature() {
 }
 
 #[test]
+fn client_snapshot_decodes_canonical_batch_limit_errors() {
+    let descriptor = MemoryAdapter::new().descriptor();
+    let transport = ScriptedTransport::new(vec![
+        hello_response(
+            FeatureSet::BASE_ADAPTER_V1
+                .union(FeatureSet::READ_VIEW_SESSION_V1)
+                .union(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1)
+                .union(FeatureSet::CANONICAL_BATCH_SCAN_READ_VIEW_V1),
+        ),
+        Response::Descriptor(descriptor),
+        Response::Health(HealthStatus {
+            ready: true,
+            detail: "ready".to_owned(),
+        }),
+        Response::AppliedLogIndex(4),
+        Response::ReadViewStarted {
+            session_id: 7,
+            applied_log_index: 4,
+        },
+        Response::Error(RemoteError {
+            code: 9,
+            message: "scan requires 13 bytes".to_owned(),
+            retryable: false,
+            scan_limit: Some(8),
+            scan_required: Some(13),
+            scan_response_limit: None,
+            scan_response_required: None,
+        }),
+        Response::Error(RemoteError {
+            code: 10,
+            message: "scan response body requires 65 wire bytes".to_owned(),
+            retryable: false,
+            scan_limit: None,
+            scan_required: None,
+            scan_response_limit: Some(64),
+            scan_response_required: Some(65),
+        }),
+    ]);
+    let adapter = block_on(SidecarAdapter::connect(transport)).unwrap();
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+    let request = CanonicalBatchScanRequest::new(vec![canonical_request(1, 64)], 64).unwrap();
+
+    assert_eq!(
+        block_on(snapshot.scan_canonical_batch(&request)),
+        Err(AdapterError::ScanByteLimit {
+            limit: 8,
+            required: 13,
+        })
+    );
+    assert_eq!(
+        block_on(snapshot.scan_canonical_batch(&request)),
+        Err(AdapterError::ScanResponseByteLimit {
+            limit: 64,
+            required: 65,
+        })
+    );
+}
+
+#[test]
 fn client_snapshot_rejects_canonical_page_index_drift() {
     let descriptor = MemoryAdapter::new().descriptor();
     let transport = ScriptedTransport::new(vec![

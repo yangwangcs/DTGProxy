@@ -1,7 +1,8 @@
 use cypher_compiler::{CompileSession, CypherCompiler};
 use cypher_sema::QueryEffect;
 use temporal_ir::{
-    LanguageProfile, LogicalOperator, ScalarExpr, TransactionTimeSpec, ValidTimeSpec, ValueType,
+    ChangeAxis, LanguageProfile, LogicalOperator, ScalarExpr, TransactionTimeSpec, ValidTimeSpec,
+    ValueType,
 };
 
 fn session() -> CompileSession {
@@ -102,6 +103,36 @@ fn preserves_interval_and_current_transaction_time_in_ir() {
                 start: ScalarExpr::Parameter("from".into()),
                 end: ScalarExpr::Parameter("to".into()),
             } && transaction_time == &TransactionTimeSpec::Current
+    )));
+}
+
+#[test]
+fn lowers_changes_to_an_event_scan_instead_of_a_state_range() {
+    let compiled = CypherCompiler::new()
+        .compile(
+            "USE accounts CHANGES FOR VALID_TIME BETWEEN $from AND $to \
+             FOR SYSTEM_TIME AS OF $snapshot MATCH (n) RETURN n",
+            &session(),
+        )
+        .expect("change query should compile");
+
+    assert!(compiled.logical_plan().nodes().iter().any(|node| matches!(
+        node.operator(),
+        LogicalOperator::ChangeScan {
+            axis: ChangeAxis::ValidTime,
+            start,
+            end,
+            system_snapshot: TransactionTimeSpec::AsOf(snapshot),
+        } if start == &ScalarExpr::Parameter("from".into())
+            && end == &ScalarExpr::Parameter("to".into())
+            && snapshot == &ScalarExpr::Parameter("snapshot".into())
+    )));
+    assert!(!compiled.logical_plan().nodes().iter().any(|node| matches!(
+        node.operator(),
+        LogicalOperator::TemporalSlice {
+            valid_time: ValidTimeSpec::Between { .. },
+            ..
+        }
     )));
 }
 

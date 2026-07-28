@@ -51,6 +51,21 @@ fn parses_qualified_calls_lists_maps_and_indexing() {
 }
 
 #[test]
+fn normalizes_count_star_to_a_zero_argument_count() {
+    assert_eq!(
+        parse_expression("count(*)").expect("count star should parse"),
+        parse_expression("count()").expect("zero argument count should parse")
+    );
+}
+
+#[test]
+fn rejects_star_as_an_argument_to_non_count_functions() {
+    let error = parse_expression("coalesce(*)").expect_err("only count accepts star");
+
+    assert_eq!(error.code(), "DTG-CYPHER-INVALID-FUNCTION-ARGUMENT");
+}
+
+#[test]
 fn rejects_trailing_tokens_in_expression() {
     let error = parse_expression("n n").expect_err("trailing token must fail");
 

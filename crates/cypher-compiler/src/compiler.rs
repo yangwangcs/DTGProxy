@@ -8,7 +8,7 @@ use cypher_sema::{AnalyzedQuery, CypherType, QueryEffect, SemanticAnalyzer};
 use cypher_syntax::{TokenKind, lex, parse, parse_expression, parse_pattern};
 use procedure_runtime::{ProcedureAccess, ProcedureCatalog};
 use temporal_ir::{
-    ApplyKind, ApplySlotMapping, ChildPlanId, Column, LanguageProfile, LogicalApply,
+    ApplyKind, ApplySlotMapping, ChangeAxis, ChildPlanId, Column, LanguageProfile, LogicalApply,
     LogicalBatchSubtransaction, LogicalNodeId, LogicalOperator, LogicalPlan, LogicalPlanBuilder,
     MAX_APPLY_DEPTH, MAX_APPLY_INVOCATIONS, MAX_APPLY_OUTPUT_ROWS, PlanHeader, ProcedureArgument,
     ProcedureYieldBinding, ResolvedProcedure, RowSchema, ScalarExpr, SlotId, SortKey,
@@ -1746,6 +1746,40 @@ impl Lowerer<'_> {
     }
 
     fn temporal_slice(&mut self, context: &TemporalContext) -> Result<(), CompileError> {
+        if let Some(change_scope) = context
+            .scopes()
+            .iter()
+            .find(|scope| scope.mode() == TemporalMode::ChangesBetween)
+        {
+            let end = change_scope.end().ok_or_else(|| {
+                CompileError::new(
+                    "DTG-CYPHER-TEMPORAL-END-MISSING",
+                    "CHANGES temporal scope requires an end expression",
+                )
+            })?;
+            let system_snapshot = context
+                .scope(TemporalAxis::SystemTime)
+                .filter(|scope| !std::ptr::eq(*scope, change_scope))
+                .map_or(Ok(TransactionTimeSpec::Current), |scope| {
+                    Ok::<_, CompileError>(TransactionTimeSpec::AsOf(self.scalar(scope.start())?))
+                })?;
+            let input = self.ensure_root()?;
+            self.root = Some(self.builder.add(
+                LogicalOperator::ChangeScan {
+                    axis: match change_scope.axis() {
+                        TemporalAxis::ValidTime => ChangeAxis::ValidTime,
+                        TemporalAxis::SystemTime => ChangeAxis::SystemTime,
+                    },
+                    start: self.scalar(change_scope.start())?,
+                    end: self.scalar(end)?,
+                    system_snapshot,
+                },
+                vec![input],
+                self.schema.clone(),
+            )?);
+            self.temporal_inserted = true;
+            return Ok(());
+        }
         let valid_time = match context.scope(TemporalAxis::ValidTime) {
             None => ValidTimeSpec::Current,
             Some(scope) if scope.mode() == TemporalMode::StateAsOf => {

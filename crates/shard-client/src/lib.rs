@@ -14,7 +14,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use storage_api::{KeySpan, KeyValue, LogicalKey};
+use storage_api::{
+    CandidateScanPage, CandidateScanRequest, KeySpan, KeyValue, LogicalKey,
+    QueryCapabilitySnapshot, QueryPrimitiveCapabilities,
+};
 use temporal_types::TransactionTime;
 use tokio_stream::Stream;
 
@@ -802,6 +805,29 @@ impl ScanRequest {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandidateScanCommand {
+    context: ShardRequestContext,
+    request: CandidateScanRequest,
+}
+
+impl CandidateScanCommand {
+    #[must_use]
+    pub const fn new(context: ShardRequestContext, request: CandidateScanRequest) -> Self {
+        Self { context, request }
+    }
+
+    #[must_use]
+    pub const fn context(&self) -> ShardRequestContext {
+        self.context
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &CandidateScanRequest {
+        &self.request
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShardStatus {
     node_id: u64,
@@ -809,6 +835,7 @@ pub struct ShardStatus {
     term: u64,
     applied_index: u64,
     closed_timestamp: TransactionTime,
+    query_capabilities: QueryCapabilitySnapshot,
 }
 
 impl ShardStatus {
@@ -819,6 +846,7 @@ impl ShardStatus {
         term: u64,
         applied_index: u64,
         closed_timestamp: TransactionTime,
+        query_capabilities: QueryCapabilitySnapshot,
     ) -> Self {
         Self {
             node_id,
@@ -826,6 +854,7 @@ impl ShardStatus {
             term,
             applied_index,
             closed_timestamp,
+            query_capabilities,
         }
     }
 
@@ -853,9 +882,18 @@ impl ShardStatus {
     pub const fn closed_timestamp(self) -> TransactionTime {
         self.closed_timestamp
     }
+
+    #[must_use]
+    pub const fn query_capabilities(self) -> QueryCapabilitySnapshot {
+        self.query_capabilities
+    }
 }
 
 pub trait ShardClient: Send + Sync {
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        QueryPrimitiveCapabilities::NONE
+    }
+
     fn execute<'a>(&'a self, request: ExecuteCommand) -> ShardClientFuture<'a, ExecuteReceipt>;
 
     fn read_keys<'a>(
@@ -864,6 +902,28 @@ pub trait ShardClient: Send + Sync {
     ) -> ShardClientFuture<'a, Vec<Option<Vec<u8>>>>;
 
     fn scan<'a>(&'a self, request: ScanRequest) -> ShardClientFuture<'a, Vec<KeyValue>>;
+
+    fn scan_fenced<'a>(&'a self, request: ScanRequest) -> ShardClientFuture<'a, FencedScan>;
+
+    fn scan_candidates<'a>(
+        &'a self,
+        _request: CandidateScanCommand,
+    ) -> ShardClientFuture<'a, CandidateScanPage> {
+        Box::pin(async {
+            Err(ShardClientError::UnsupportedQueryPrimitive(
+                "candidate scan",
+            ))
+        })
+    }
+
+    fn read_barrier<'a>(&'a self, context: ShardRequestContext) -> ShardClientFuture<'a, u64> {
+        Box::pin(async move {
+            Err(ShardClientError::ReadBarrier(format!(
+                "Shard {} does not expose a linearizable ReadIndex barrier",
+                context.shard_id()
+            )))
+        })
+    }
 
     fn put_artifact_chunk<'a>(
         &'a self,
@@ -904,6 +964,32 @@ pub trait ShardClient: Send + Sync {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FencedScan {
+    applied_index: u64,
+    entries: Vec<KeyValue>,
+}
+
+impl FencedScan {
+    #[must_use]
+    pub const fn new(applied_index: u64, entries: Vec<KeyValue>) -> Self {
+        Self {
+            applied_index,
+            entries,
+        }
+    }
+
+    #[must_use]
+    pub const fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    #[must_use]
+    pub fn into_entries(self) -> Vec<KeyValue> {
+        self.entries
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShardClientError {
     InvalidContext,
     EmptyCommand,
@@ -919,6 +1005,7 @@ pub enum ShardClientError {
     ReadBarrier(String),
     Adapter(String),
     ScanByteLimit { limit: u64, required: u64 },
+    UnsupportedQueryPrimitive(&'static str),
     RequestMismatch { expected: u128, actual: u128 },
     Internal(String),
 }
@@ -957,6 +1044,12 @@ impl Display for ShardClientError {
                 formatter,
                 "scan requires {required} bytes, exceeding byte limit {limit}"
             ),
+            Self::UnsupportedQueryPrimitive(operation) => {
+                write!(
+                    formatter,
+                    "Shard query primitive is unsupported: {operation}"
+                )
+            }
             Self::RequestMismatch { expected, actual } => write!(
                 formatter,
                 "request ID {actual} differs from command request ID {expected}"

@@ -289,6 +289,10 @@ impl ShardClient for EmbeddedShardClient {
         &'a self,
         request: ScanRequest,
     ) -> ShardClientFuture<'a, Vec<storage_api::KeyValue>> {
+        Box::pin(async move { Ok(self.scan_fenced(request).await?.into_entries()) })
+    }
+
+    fn scan_fenced<'a>(&'a self, request: ScanRequest) -> ShardClientFuture<'a, crate::FencedScan> {
         Box::pin(async move {
             let context = request.context();
             self.validate(context)?;
@@ -302,18 +306,45 @@ impl ShardClient for EmbeddedShardClient {
             let leader = group.leader_id().ok_or(ShardClientError::NoLeader {
                 shard_id: context.shard_id(),
             })?;
-            group
+            let permit = group
                 .leader_read_permit(leader, context.placement_epoch(), self.max_ticks)
                 .await
                 .map_err(|error| ShardClientError::ReadBarrier(error.to_string()))?;
-            group
+            let adapter = group
                 .replica_adapter(leader)
                 .ok_or(ShardClientError::NoLeader {
                     shard_id: context.shard_id(),
-                })?
-                .scan(request.span())
+                })?;
+            let scan = adapter
+                .scan_fenced(request.span())
                 .await
-                .map_err(|error| ShardClientError::Adapter(error.to_string()))
+                .map_err(|error| ShardClientError::Adapter(error.to_string()))?;
+            let applied_index = scan.applied_log_index();
+            if applied_index < permit.read_index() {
+                return Err(ShardClientError::ReadBarrier(format!(
+                    "Adapter applied index {applied_index} is below ReadIndex {}",
+                    permit.read_index()
+                )));
+            }
+            Ok(crate::FencedScan::new(applied_index, scan.into_entries()))
+        })
+    }
+
+    fn read_barrier<'a>(&'a self, context: ShardRequestContext) -> ShardClientFuture<'a, u64> {
+        Box::pin(async move {
+            self.validate(context)?;
+            let mut runtime = self.runtime.lock().await;
+            let group = runtime
+                .group_mut(context.shard_id())
+                .map_err(|error| ShardClientError::Replication(error.to_string()))?;
+            let leader = group.leader_id().ok_or(ShardClientError::NoLeader {
+                shard_id: context.shard_id(),
+            })?;
+            let permit = group
+                .leader_read_permit(leader, context.placement_epoch(), self.max_ticks)
+                .await
+                .map_err(|error| ShardClientError::ReadBarrier(error.to_string()))?;
+            Ok(permit.read_index())
         })
     }
 
@@ -751,6 +782,10 @@ impl ShardClient for EmbeddedShardClient {
                 metadata.last_term,
                 metadata.applied_index,
                 metadata.closed_ts,
+                storage_api::QueryCapabilitySnapshot::new(
+                    1,
+                    storage_api::QueryPrimitiveCapabilities::NONE,
+                ),
             ))
         })
     }

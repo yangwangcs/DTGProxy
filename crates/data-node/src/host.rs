@@ -7,7 +7,10 @@ use adapter_registry::MigrationStatus;
 use raft::eraftpb::Message;
 use raft_transport::RoutedRaftMessage;
 use shard_runtime::{BackendLifecycle, ReplicaMetadata};
-use storage_api::{AdapterError, KeySpan, KeyValue, LogicalKey};
+use storage_api::{
+    AdapterError, CandidateScanPage, CandidateScanRequest, KeySpan, KeyValue, LogicalKey,
+    QueryCapabilitySnapshot, QueryPrimitiveCapabilities,
+};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::replica_actor::{ActorCommand, ReplicaActorHandle};
@@ -218,6 +221,7 @@ pub struct ReplicaStatus {
     backend_generation: u64,
     snapshot_index: u64,
     ready: bool,
+    query_capabilities: QueryCapabilitySnapshot,
 }
 
 impl ReplicaStatus {
@@ -237,6 +241,7 @@ impl ReplicaStatus {
         backend_generation: u64,
         snapshot_index: u64,
         ready: bool,
+        query_capabilities: QueryCapabilitySnapshot,
     ) -> Self {
         Self {
             graph_id,
@@ -253,6 +258,7 @@ impl ReplicaStatus {
             backend_generation,
             snapshot_index,
             ready,
+            query_capabilities,
         }
     }
 
@@ -324,6 +330,11 @@ impl ReplicaStatus {
     #[must_use]
     pub const fn ready(self) -> bool {
         self.ready
+    }
+
+    #[must_use]
+    pub const fn query_capabilities(self) -> QueryCapabilitySnapshot {
+        self.query_capabilities
     }
 }
 
@@ -996,6 +1007,52 @@ impl DataNodeHost {
         receiver.await.map_err(|_| HostError::ActorStopped)?
     }
 
+    pub async fn scan_fenced(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        request_id: u128,
+        minimum_applied_index: u64,
+        span: KeySpan,
+    ) -> Result<(u64, Vec<KeyValue>), HostError> {
+        let sender = self.sender(key)?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::FencedScan {
+                placement_epoch,
+                request_id,
+                minimum_applied_index,
+                span,
+                response,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
+    pub async fn scan_candidates_fenced(
+        &self,
+        key: ReplicaKey,
+        placement_epoch: u64,
+        request_id: u128,
+        minimum_applied_index: u64,
+        request: CandidateScanRequest,
+    ) -> Result<CandidateScanPage, HostError> {
+        let sender = self.sender(key)?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ActorCommand::FencedCandidateScan {
+                placement_epoch,
+                request_id,
+                minimum_applied_index,
+                request,
+                response,
+            })
+            .await
+            .map_err(|_| HostError::ActorStopped)?;
+        receiver.await.map_err(|_| HostError::ActorStopped)?
+    }
+
     pub async fn create_snapshot(
         &self,
         key: ReplicaKey,
@@ -1285,6 +1342,7 @@ fn dormant_status(node_id: u64, spec: &ReplicaSpec) -> ReplicaStatus {
         spec.backend_generation(),
         spec.snapshot_index(),
         spec.snapshot_index() > 0,
+        QueryCapabilitySnapshot::new(spec.backend_generation(), QueryPrimitiveCapabilities::NONE),
     )
 }
 
@@ -1297,6 +1355,7 @@ pub enum HostError {
     Snapshot(String),
     Adapter(String),
     AdapterUnavailable(String),
+    UnsupportedQueryPrimitive(&'static str),
     ScanByteLimit { limit: u64, required: u64 },
     InvalidQueueCapacity,
     InvalidReplicaKey,
@@ -1363,6 +1422,9 @@ impl HostError {
     pub(crate) fn from_adapter(error: AdapterError) -> Self {
         match error {
             AdapterError::Unavailable(message) => Self::AdapterUnavailable(message),
+            AdapterError::UnsupportedOperation { operation } => {
+                Self::UnsupportedQueryPrimitive(operation)
+            }
             AdapterError::ScanByteLimit { limit, required } => {
                 Self::ScanByteLimit { limit, required }
             }
@@ -1382,6 +1444,12 @@ impl Display for HostError {
             Self::Adapter(message) => write!(formatter, "Adapter error: {message}"),
             Self::AdapterUnavailable(message) => {
                 write!(formatter, "Adapter unavailable: {message}")
+            }
+            Self::UnsupportedQueryPrimitive(operation) => {
+                write!(
+                    formatter,
+                    "Adapter query primitive is unsupported: {operation}"
+                )
             }
             Self::ScanByteLimit { limit, required } => write!(
                 formatter,

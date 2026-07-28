@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 temporal-ir = { path = "../temporal-ir" }
+temporal-types = { path = "../temporal-types" }
 
 [lints]
 workspace = true

@@ -22,10 +22,11 @@ use shard_client::{
     ShardClientStorageAdapter, ShardRequestContext,
 };
 use storage_api::{
-    AdapterError, KeySpan, Keyspace, LogicalKey, Mutation, PreparedMutationBatch, StorageAdapter,
+    AdapterError, CandidateScanRequest, KeySpan, Keyspace, LogicalKey, Mutation,
+    PreparedMutationBatch, PushdownGuarantee, QueryPageBounds, StorageAdapter,
 };
 use tempfile::tempdir;
-use temporal_types::TransactionTime;
+use temporal_types::{TransactionTime, ValidTime};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -360,6 +361,21 @@ async fn remote_contract_matches_execute_read_scan_status_and_duplicate_semantic
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key(), &key);
+    let fenced = client
+        .scan_fenced(ScanRequest::new(
+            context(306),
+            KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        fenced.applied_index(),
+        client.status(context(307)).await.unwrap().applied_index()
+    );
+    assert_eq!(fenced.into_entries().len(), 1);
+    let read_index = client.read_barrier(context(308)).await.unwrap();
+    assert_ne!(read_index, 0);
+    assert!(client.status(context(309)).await.unwrap().applied_index() >= read_index);
     let bounded_span = KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec())
         .with_max_bytes(1)
         .unwrap();
@@ -372,9 +388,70 @@ async fn remote_contract_matches_execute_read_scan_status_and_duplicate_semantic
             required: 25,
         })
     );
+    assert_eq!(
+        client.query_primitive_capabilities().candidate_scan(),
+        PushdownGuarantee::Unsupported,
+        "the transport must not claim a backend capability before shard negotiation"
+    );
+    let negotiated = client
+        .status(context(310))
+        .await
+        .unwrap()
+        .query_capabilities();
+    assert_eq!(
+        negotiated.capabilities().candidate_scan(),
+        PushdownGuarantee::Candidate
+    );
     let adapter_client: Arc<dyn ShardClient> = client.clone();
-    let adapter =
-        ShardClientStorageAdapter::new(adapter_client, 1, 11, 3, now_ms() + 60_000, 9).unwrap();
+    let adapter = ShardClientStorageAdapter::new(adapter_client, 1, 11, 3, now_ms() + 60_000, 9)
+        .unwrap()
+        .with_query_capabilities(negotiated)
+        .unwrap();
+    let snapshot = adapter.begin_read_snapshot().await.unwrap();
+    let adapter_scan = StorageAdapter::scan_fenced(
+        &adapter,
+        &KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(adapter_scan.entries().len(), 1);
+    assert!(adapter_scan.applied_log_index() > 0);
+    assert_eq!(
+        adapter.query_primitive_capabilities().candidate_scan(),
+        PushdownGuarantee::Candidate
+    );
+    let candidate_page = adapter
+        .scan_candidates(
+            &CandidateScanRequest::new(
+                KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec()),
+                ValidTime::from_micros(100),
+                Vec::new(),
+                QueryPageBounds::new(16, 1024 * 1024).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidate_page.guarantee(), PushdownGuarantee::Candidate);
+    assert_eq!(candidate_page.entries().len(), 1);
+    assert_eq!(candidate_page.entries()[0].key(), &key);
+    assert!(candidate_page.applied_log_index() > 0);
+    let snapshot_page = snapshot
+        .scan_candidates(
+            &CandidateScanRequest::new(
+                KeySpan::prefix(Keyspace::Current, b"vertex/".to_vec()),
+                ValidTime::from_micros(100),
+                Vec::new(),
+                QueryPageBounds::new(16, 1024 * 1024).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_page.applied_log_index(),
+        snapshot.applied_log_index()
+    );
     assert_eq!(
         adapter.scan(&bounded_span).await,
         Err(AdapterError::ScanByteLimit {

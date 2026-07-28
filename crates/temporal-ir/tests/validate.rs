@@ -1,9 +1,10 @@
 use temporal_ir::{
-    ApplyKind, ApplySlotMapping, ChildPlanId, Column, LanguageProfile, LogicalApply, LogicalNode,
-    LogicalNodeId, LogicalOperator, LogicalPlan, LogicalPlanBuilder, MAX_APPLY_DEPTH,
+    ApplyKind, ApplySlotMapping, ChangeAxis, ChildPlanId, Column, LanguageProfile, LogicalApply,
+    LogicalNode, LogicalNodeId, LogicalOperator, LogicalPlan, LogicalPlanBuilder, MAX_APPLY_DEPTH,
     MAX_APPLY_INVOCATIONS, MAX_APPLY_OUTPUT_ROWS, PLAN_VERSION, PlanHeader, ProcedureArgument,
     ProcedureEffect, ProcedureIdentity, ProcedurePlacement, ProcedureYieldBinding,
-    ResolvedProcedure, RowSchema, ScalarExpr, SlotId, TemporalJoinKind, ValidationError, ValueType,
+    ResolvedProcedure, RowSchema, ScalarExpr, SlotId, TemporalJoinKind, TransactionTimeSpec,
+    ValidationError, ValueType,
 };
 use temporal_types::GraphValue;
 
@@ -71,6 +72,57 @@ fn builds_and_validates_a_typed_acyclic_plan() {
     plan.validate().expect("plan should validate");
     assert_eq!(plan.root(), filter);
     assert_eq!(plan.output(), &node_schema());
+}
+
+#[test]
+fn change_scan_is_a_bounded_unary_operator_with_validated_expressions() {
+    let mut builder = LogicalPlanBuilder::new(header());
+    let scan = builder
+        .add(
+            LogicalOperator::NodeScan {
+                binding: SlotId::new(0),
+                labels: vec![],
+            },
+            vec![],
+            node_schema(),
+        )
+        .expect("scan");
+    let change = builder
+        .add(
+            LogicalOperator::ChangeScan {
+                axis: ChangeAxis::SystemTime,
+                start: ScalarExpr::Parameter("from".into()),
+                end: ScalarExpr::Parameter("to".into()),
+                system_snapshot: TransactionTimeSpec::Current,
+            },
+            vec![scan],
+            node_schema(),
+        )
+        .expect("change scan");
+    let plan = builder.finish(change).expect("plan");
+    plan.validate().expect("change scan validates");
+
+    let mut invalid = LogicalPlanBuilder::new(header());
+    let error = invalid
+        .add(
+            LogicalOperator::ChangeScan {
+                axis: ChangeAxis::ValidTime,
+                start: ScalarExpr::Parameter("from".into()),
+                end: ScalarExpr::Parameter("to".into()),
+                system_snapshot: TransactionTimeSpec::Current,
+            },
+            vec![],
+            RowSchema::empty(),
+        )
+        .expect_err("change scan must be unary");
+    assert_eq!(
+        error,
+        ValidationError::InvalidInputCount {
+            node: LogicalNodeId::new(0),
+            expected: 1,
+            actual: 0,
+        }
+    );
 }
 
 #[test]

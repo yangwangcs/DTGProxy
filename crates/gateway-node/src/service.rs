@@ -22,11 +22,8 @@ use analytics_runtime::{
     project_snapshot_identity_part_bounded, project_valid_time_delta_part_bounded,
 };
 use cluster_protocol::proto::gateway_service_server::GatewayService;
-use cluster_protocol::proto::meta_service_client::MetaServiceClient;
-use cluster_protocol::proto::{
-    AllocateTimestampRequest, GatewaySubmitRequest, GatewaySubmitResponse, RequestContext,
-};
-use cluster_protocol::{CLUSTER_PROTOCOL_VERSION, CommonRequestContext, MAX_COMMAND_BYTES};
+use cluster_protocol::proto::{GatewaySubmitRequest, GatewaySubmitResponse};
+use cluster_protocol::{CommonRequestContext, MAX_COMMAND_BYTES};
 use control_plane::GraphDefinition;
 use cypher_compiler::{CompileSession, CompiledMutation, CompiledQuery, CypherCompiler};
 #[cfg(test)]
@@ -56,11 +53,15 @@ use shard_client::{
 };
 use storage_api::{
     AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, ApplyReceipt,
-    CommittedMutationBatch, KeySpan, KeyValue, LogicalKey, StorageAdapter,
+    CandidateScanPage, CandidateScanRequest, CommittedMutationBatch, KeySpan, KeyValue, LogicalKey,
+    QueryPrimitiveCapabilities, StorageAdapter,
 };
-use temporal_storage::{TemporalStore, TransactionOverlay, decode_graph_key, graph_key_scope};
+use temporal_storage::{
+    TemporalStore, TransactionOverlay, decode_graph_key, graph_key_prefix_scope, graph_key_scope,
+};
 use temporal_types::{Interval, TransactionTime, ValidTime};
 use timestamp_oracle::advance_timestamp;
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
@@ -74,14 +75,17 @@ use crate::analytics_coordinator::{
 use crate::analytics_scheduler::{
     AnalyticsFaultInjector, AnalyticsScheduler, AnalyticsSchedulerMetricsSnapshot,
 };
+use crate::meta_client::MetaTimestampClient;
 use crate::{AdmissionController, AdmissionError};
+#[cfg(feature = "paper-benchmark-control")]
+use crate::{BenchmarkAblationRuntime, BenchmarkQueryLease};
 
 #[derive(Clone)]
 pub struct RemoteGatewayService {
     cluster_id: [u8; 16],
     routing: Arc<RwLock<GatewayRoutingState>>,
     shard_client: Arc<RemoteShardClient>,
-    meta_endpoints: Arc<Vec<SocketAddr>>,
+    meta_timestamp_client: MetaTimestampClient,
     admission: Arc<AdmissionController>,
     max_raft_ticks: usize,
     bolt_request_nonce: u64,
@@ -89,6 +93,8 @@ pub struct RemoteGatewayService {
     bolt_transactions: Arc<Mutex<BTreeMap<u64, PendingBoltTransaction>>>,
     procedure_registry: Arc<ProcedureRegistry>,
     _scheduler: Option<Arc<AnalyticsScheduler>>,
+    #[cfg(feature = "paper-benchmark-control")]
+    benchmark_ablations: Option<Arc<BenchmarkAblationRuntime>>,
 }
 
 #[derive(Clone)]
@@ -222,15 +228,18 @@ impl ProcedureProjection {
     }
 }
 
-struct RoutedShardReadAdapter {
+pub(crate) struct RoutedShardReadAdapter {
     graph_id: u64,
     local_shard_id: u32,
     deployment: Arc<DeploymentConfig>,
-    adapters: BTreeMap<u32, ShardClientStorageAdapter>,
+    adapters: Arc<BTreeMap<u32, Arc<ShardClientStorageAdapter>>>,
 }
 
+const MAX_INFLIGHT_SHARD_READS: usize = 16;
+
 impl RoutedShardReadAdapter {
-    fn new(
+    #[allow(dead_code)]
+    pub(crate) fn new(
         client: Arc<dyn ShardClient>,
         graph_id: u64,
         local_shard_id: u32,
@@ -238,20 +247,92 @@ impl RoutedShardReadAdapter {
         deadline_unix_ms: u64,
         request_id: u128,
     ) -> Result<Self, AdapterError> {
+        let adapters =
+            Self::build_adapters(client, graph_id, &deployment, deadline_unix_ms, request_id)?;
+        Self::with_shared_adapters(graph_id, local_shard_id, deployment, adapters)
+    }
+
+    fn build_adapters(
+        client: Arc<dyn ShardClient>,
+        graph_id: u64,
+        deployment: &DeploymentConfig,
+        deadline_unix_ms: u64,
+        request_id: u128,
+    ) -> Result<Arc<BTreeMap<u32, Arc<ShardClientStorageAdapter>>>, AdapterError> {
         let mut adapters = BTreeMap::new();
         for placement in deployment.all_shards() {
             adapters.insert(
                 placement.shard_id(),
-                ShardClientStorageAdapter::new(
+                Arc::new(ShardClientStorageAdapter::new(
                     Arc::clone(&client),
                     graph_id,
                     placement.shard_id(),
                     placement.placement_epoch(),
                     deadline_unix_ms,
                     request_namespace(request_id, placement.shard_id()),
-                )?,
+                )?),
             );
         }
+        Ok(Arc::new(adapters))
+    }
+
+    async fn build_negotiated_adapters(
+        client: Arc<dyn ShardClient>,
+        graph_id: u64,
+        deployment: &DeploymentConfig,
+        deadline_unix_ms: u64,
+        request_id: u128,
+    ) -> Result<Arc<BTreeMap<u32, Arc<ShardClientStorageAdapter>>>, AdapterError> {
+        let mut tasks = JoinSet::new();
+        for placement in deployment.all_shards() {
+            let client = Arc::clone(&client);
+            let shard_id = placement.shard_id();
+            let placement_epoch = placement.placement_epoch();
+            tasks.spawn(async move {
+                let context = ShardRequestContext::new(
+                    graph_id,
+                    shard_id,
+                    placement_epoch,
+                    u128::from(request_namespace(
+                        request_id ^ 0x4454_475f_4341_5053,
+                        shard_id,
+                    )),
+                    deadline_unix_ms,
+                )
+                .map_err(|error| AdapterError::Backend(error.to_string()))?;
+                let capabilities = client
+                    .status(context)
+                    .await
+                    .map_err(|error| AdapterError::Unavailable(error.to_string()))?
+                    .query_capabilities();
+                let adapter = ShardClientStorageAdapter::new(
+                    client,
+                    graph_id,
+                    shard_id,
+                    placement_epoch,
+                    deadline_unix_ms,
+                    request_namespace(request_id, shard_id),
+                )?
+                .with_query_capabilities(capabilities)?;
+                Ok::<_, AdapterError>((shard_id, Arc::new(adapter)))
+            });
+        }
+        let mut adapters = BTreeMap::new();
+        while let Some(result) = tasks.join_next().await {
+            let (shard_id, adapter) = result.map_err(|error| {
+                AdapterError::Backend(format!("query capability negotiation task failed: {error}"))
+            })??;
+            adapters.insert(shard_id, adapter);
+        }
+        Ok(Arc::new(adapters))
+    }
+
+    fn with_shared_adapters(
+        graph_id: u64,
+        local_shard_id: u32,
+        deployment: Arc<DeploymentConfig>,
+        adapters: Arc<BTreeMap<u32, Arc<ShardClientStorageAdapter>>>,
+    ) -> Result<Self, AdapterError> {
         if !adapters.contains_key(&local_shard_id) {
             return Err(AdapterError::Backend(
                 "local query shard is absent from the deployment".into(),
@@ -269,6 +350,7 @@ impl RoutedShardReadAdapter {
         self.adapters
             .get(&self.local_shard_id)
             .expect("validated routed Adapter has its local Shard")
+            .as_ref()
     }
 
     fn adapter_for_key(
@@ -289,13 +371,29 @@ impl RoutedShardReadAdapter {
             .shard_id();
         self.adapters
             .get(&shard_id)
+            .map(AsRef::as_ref)
             .ok_or_else(|| AdapterError::Backend("routed query Shard is unavailable".into()))
     }
 
-    fn adapter_for_span(&self, span: &KeySpan) -> &ShardClientStorageAdapter {
-        let start = LogicalKey::in_keyspace(span.keyspace(), span.start().to_vec());
-        self.adapter_for_key(&start)
-            .unwrap_or_else(|_| self.local())
+    fn adapter_for_span(&self, span: &KeySpan) -> Result<&ShardClientStorageAdapter, AdapterError> {
+        let Some((graph, partition)) = graph_key_prefix_scope(span.keyspace(), span.start())
+            .map_err(|error| AdapterError::Backend(error.to_string()))?
+        else {
+            return Ok(self.local());
+        };
+        if graph.value() != self.graph_id {
+            return Err(AdapterError::Backend(
+                "query span graph does not match the routed Adapter graph".into(),
+            ));
+        }
+        let shard_id = self
+            .deployment
+            .route_scope(temporal_ir::GraphScope::new(graph, partition))
+            .shard_id();
+        self.adapters
+            .get(&shard_id)
+            .map(AsRef::as_ref)
+            .ok_or_else(|| AdapterError::Backend("routed query Shard is unavailable".into()))
     }
 }
 
@@ -306,6 +404,14 @@ impl StorageAdapter for RoutedShardReadAdapter {
 
     fn capabilities(&self) -> AdapterCapabilities {
         self.local().capabilities()
+    }
+
+    fn query_primitive_capabilities(&self) -> QueryPrimitiveCapabilities {
+        self.local().query_primitive_capabilities()
+    }
+
+    fn query_capability_generation(&self) -> u64 {
+        self.local().query_capability_generation()
     }
 
     fn apply_committed<'a>(
@@ -326,16 +432,30 @@ impl StorageAdapter for RoutedShardReadAdapter {
                     .push((index, key.clone()));
             }
             let mut output = vec![None; keys.len()];
-            for (shard_id, indexed_keys) in grouped {
-                let adapter = self.adapters.get(&shard_id).ok_or_else(|| {
-                    AdapterError::Backend("routed query Shard is unavailable".into())
-                })?;
-                let request_keys = indexed_keys
-                    .iter()
-                    .map(|(_, key)| key.clone())
-                    .collect::<Vec<_>>();
-                let values = adapter.multi_get(&request_keys).await?;
+            let mut groups = grouped.into_iter();
+            let mut tasks = JoinSet::new();
+            for _ in 0..MAX_INFLIGHT_SHARD_READS {
+                let Some((shard_id, indexed_keys)) = groups.next() else {
+                    break;
+                };
+                spawn_shard_multi_get(&mut tasks, &self.adapters, shard_id, indexed_keys)?;
+            }
+            while let Some(result) = tasks.join_next().await {
+                let (indexed_keys, values) = match result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        abort_and_drain(&mut tasks).await;
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        abort_and_drain(&mut tasks).await;
+                        return Err(AdapterError::Backend(format!(
+                            "routed multi-get task failed: {error}"
+                        )));
+                    }
+                };
                 if values.len() != indexed_keys.len() {
+                    abort_and_drain(&mut tasks).await;
                     return Err(AdapterError::Backend(
                         "routed multi-get returned the wrong result count".into(),
                     ));
@@ -343,18 +463,65 @@ impl StorageAdapter for RoutedShardReadAdapter {
                 for ((index, _), value) in indexed_keys.into_iter().zip(values) {
                     output[index] = value;
                 }
+                if let Some((shard_id, indexed_keys)) = groups.next() {
+                    spawn_shard_multi_get(&mut tasks, &self.adapters, shard_id, indexed_keys)?;
+                }
             }
             Ok(output)
         })
     }
 
     fn scan<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, Vec<KeyValue>> {
-        self.adapter_for_span(span).scan(span)
+        Box::pin(async move { self.adapter_for_span(span)?.scan(span).await })
+    }
+
+    fn scan_fenced<'a>(&'a self, span: &'a KeySpan) -> AdapterFuture<'a, storage_api::FencedScan> {
+        Box::pin(async move { self.adapter_for_span(span)?.scan_fenced(span).await })
+    }
+
+    fn scan_candidates<'a>(
+        &'a self,
+        request: &'a CandidateScanRequest,
+    ) -> AdapterFuture<'a, CandidateScanPage> {
+        Box::pin(async move {
+            self.adapter_for_span(request.span())?
+                .scan_candidates(request)
+                .await
+        })
     }
 
     fn applied_log_index(&self) -> Result<u64, AdapterError> {
         self.local().applied_log_index()
     }
+}
+
+type IndexedShardValues = (Vec<(usize, LogicalKey)>, Vec<Option<Vec<u8>>>);
+
+fn spawn_shard_multi_get(
+    tasks: &mut JoinSet<Result<IndexedShardValues, AdapterError>>,
+    adapters: &BTreeMap<u32, Arc<ShardClientStorageAdapter>>,
+    shard_id: u32,
+    indexed_keys: Vec<(usize, LogicalKey)>,
+) -> Result<(), AdapterError> {
+    let adapter = Arc::clone(
+        adapters
+            .get(&shard_id)
+            .ok_or_else(|| AdapterError::Backend("routed query Shard is unavailable".into()))?,
+    );
+    tasks.spawn(async move {
+        let request_keys = indexed_keys
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        let values = adapter.multi_get(&request_keys).await?;
+        Ok((indexed_keys, values))
+    });
+    Ok(())
+}
+
+async fn abort_and_drain<T: 'static>(tasks: &mut JoinSet<T>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 #[derive(Clone)]
@@ -385,6 +552,51 @@ impl RemoteGatewayService {
         self._scheduler
             .as_ref()
             .map(|scheduler| scheduler.metrics())
+    }
+
+    #[cfg(feature = "paper-benchmark-control")]
+    #[must_use]
+    pub fn with_benchmark_ablation_runtime(
+        mut self,
+        runtime: Arc<BenchmarkAblationRuntime>,
+    ) -> Self {
+        self.benchmark_ablations = Some(runtime);
+        self
+    }
+
+    #[cfg(feature = "paper-benchmark-control")]
+    fn acquire_benchmark_query(
+        &self,
+        token: Option<&str>,
+        transaction: Option<bolt_server::TransactionId>,
+        read_only: bool,
+    ) -> Result<Option<BenchmarkQueryLease>, bolt_server::ServiceError> {
+        let Some(runtime) = self.benchmark_ablations.as_ref() else {
+            if token.is_some() {
+                return Err(benchmark_request_error(
+                    "benchmark session control is not enabled by this Gateway",
+                ));
+            }
+            return Ok(None);
+        };
+        let active = runtime.has_active_session().map_err(benchmark_bolt_error)?;
+        let Some(token) = token else {
+            if active {
+                return Err(benchmark_request_error(
+                    "an active benchmark cell requires dtgproxy.paper.session",
+                ));
+            }
+            return Ok(None);
+        };
+        if transaction.is_some() || !read_only {
+            return Err(benchmark_request_error(
+                "benchmark sessions require auto-commit read-only queries",
+            ));
+        }
+        runtime
+            .acquire(token)
+            .map(Some)
+            .map_err(benchmark_bolt_error)
     }
 
     pub fn new(
@@ -541,6 +753,9 @@ impl RemoteGatewayService {
         }
         let deployment = DeploymentConfig::from_catalog(&graph)
             .map_err(|error| RemoteGatewayServiceError::Topology(error.to_string()))?;
+        let meta_timestamp_client =
+            MetaTimestampClient::new(cluster_id, meta_endpoints.clone(), maximum_inflight)
+                .map_err(|error| RemoteGatewayServiceError::Meta(error.to_string()))?;
         let bolt_request_nonce =
             gateway_request_nonce(cluster_id, scheduler_gateway_id.unwrap_or_default());
         let routing = Arc::new(RwLock::new(GatewayRoutingState {
@@ -602,7 +817,7 @@ impl RemoteGatewayService {
             cluster_id,
             routing,
             shard_client,
-            meta_endpoints: Arc::new(meta_endpoints),
+            meta_timestamp_client,
             admission: Arc::new(
                 AdmissionController::new(maximum_inflight)
                     .map_err(|_| RemoteGatewayServiceError::InvalidConfiguration)?,
@@ -613,6 +828,8 @@ impl RemoteGatewayService {
             bolt_transactions: Arc::new(Mutex::new(BTreeMap::new())),
             procedure_registry,
             _scheduler: scheduler,
+            #[cfg(feature = "paper-benchmark-control")]
+            benchmark_ablations: None,
         })
     }
 
@@ -784,7 +1001,7 @@ impl RemoteGatewayService {
                 BTreeMap::new(),
                 None,
                 GraphOverlay::default(),
-                None,
+                &compiled,
                 None,
             )
             .await?;
@@ -1439,7 +1656,7 @@ impl RemoteGatewayService {
                             parameters.clone(),
                             Some(fixed_snapshot),
                             graph_overlay.clone(),
-                            Some(compiled),
+                            compiled,
                             Some((prefix, &imports)),
                         )
                         .await?;
@@ -1548,7 +1765,7 @@ impl RemoteGatewayService {
                 parameters,
                 fixed_snapshot,
                 graph_overlay,
-                Some(compiled),
+                compiled,
                 None,
             )
             .await?;
@@ -2218,16 +2435,39 @@ impl RemoteGatewayService {
         parameters: BTreeMap<String, RuntimeValue>,
         fixed_snapshot: Option<TransactionTime>,
         graph_overlay: GraphOverlay,
-        read_prefix: Option<&CompiledQuery>,
+        compiled: &CompiledQuery,
         child_prefix: Option<(&temporal_ir::LogicalPlan, &BTreeMap<String, RuntimeValue>)>,
     ) -> Result<CypherQueryResponse, RemoteGatewayServiceError> {
-        let owned_compiled;
-        let compiled = if let Some(compiled) = read_prefix {
-            compiled
-        } else {
-            owned_compiled = compile_cypher(routing, text)?;
-            &owned_compiled
-        };
+        self.execute_cypher_response_with_benchmark(
+            request_id,
+            deadline_unix_ms,
+            routing,
+            text,
+            parameters,
+            fixed_snapshot,
+            graph_overlay,
+            compiled,
+            child_prefix,
+            #[cfg(feature = "paper-benchmark-control")]
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_cypher_response_with_benchmark(
+        &self,
+        request_id: u128,
+        deadline_unix_ms: u64,
+        routing: &GatewayRoutingState,
+        text: &str,
+        parameters: BTreeMap<String, RuntimeValue>,
+        fixed_snapshot: Option<TransactionTime>,
+        graph_overlay: GraphOverlay,
+        compiled: &CompiledQuery,
+        child_prefix: Option<(&temporal_ir::LogicalPlan, &BTreeMap<String, RuntimeValue>)>,
+        #[cfg(feature = "paper-benchmark-control")] benchmark: Option<&BenchmarkQueryLease>,
+    ) -> Result<CypherQueryResponse, RemoteGatewayServiceError> {
         let security_fingerprint = request_security_fingerprint(self.cluster_id, request_id);
         if compiled.uses_procedures() {
             preflight_procedure_parameters(
@@ -2251,6 +2491,43 @@ impl RemoteGatewayService {
             .iter()
             .map(|placement| placement.shard_id())
             .collect::<Vec<_>>();
+        let mut required_applied_indexes = BTreeMap::new();
+        if compiled.logical_plan().nodes().iter().any(|node| {
+            matches!(
+                node.operator(),
+                temporal_ir::LogicalOperator::ChangeScan { .. }
+            )
+        }) {
+            let mut barrier_tasks = tokio::task::JoinSet::new();
+            for placement in routing.deployment.all_shards() {
+                let client = Arc::clone(&self.shard_client);
+                let graph_id = routing.graph.graph_id();
+                let shard_id = placement.shard_id();
+                let placement_epoch = placement.placement_epoch();
+                barrier_tasks.spawn(async move {
+                    let context = ShardRequestContext::new(
+                        graph_id,
+                        shard_id,
+                        placement_epoch,
+                        u128::from(request_namespace(
+                            request_id ^ 0x4454_475f_5245_4144,
+                            shard_id,
+                        )),
+                        deadline_unix_ms,
+                    )?;
+                    client
+                        .read_barrier(context)
+                        .await
+                        .map(|read_index| (shard_id, read_index))
+                });
+            }
+            while let Some(result) = barrier_tasks.join_next().await {
+                let (shard_id, read_index) = result
+                    .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?
+                    .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
+                required_applied_indexes.insert(shard_id, read_index);
+            }
+        }
         let mode = match routing.deployment.mode() {
             DeploymentMode::PrimaryReplica => QueryDeploymentMode::PrimaryReplica,
             DeploymentMode::SharedNothing => QueryDeploymentMode::SharedNothing,
@@ -2270,14 +2547,21 @@ impl RemoteGatewayService {
         let mut coordinator = DistributedCoordinator::new(64 << 20, 64)
             .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
         let client: Arc<dyn ShardClient> = self.shard_client.clone();
+        let shared_adapters = RoutedShardReadAdapter::build_negotiated_adapters(
+            Arc::clone(&client),
+            routing.graph.graph_id(),
+            &routing.deployment,
+            deadline_unix_ms,
+            request_id,
+        )
+        .await
+        .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
         for placement in routing.deployment.all_shards() {
-            let adapter = RoutedShardReadAdapter::new(
-                Arc::clone(&client),
+            let adapter = RoutedShardReadAdapter::with_shared_adapters(
                 routing.graph.graph_id(),
                 placement.shard_id(),
                 Arc::clone(&routing.deployment),
-                deadline_unix_ms,
-                request_id,
+                Arc::clone(&shared_adapters),
             )
             .map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))?;
             coordinator
@@ -2294,9 +2578,10 @@ impl RemoteGatewayService {
         let query_snapshot = if let Some(snapshot) = fixed_snapshot {
             snapshot
         } else {
-            self.allocate_transaction_timestamps(request_id, deadline_unix_ms)
-                .await?
-                .0
+            self.meta_timestamp_client
+                .allocate_read_snapshot(request_id, deadline_unix_ms)
+                .await
+                .map_err(|error| RemoteGatewayServiceError::Meta(error.to_string()))?
         };
         let wall_clock_valid_time = ValidTime::from_micros(unix_time_micros()?);
         let current_valid_time = if child_prefix.is_some() {
@@ -2360,7 +2645,8 @@ impl RemoteGatewayService {
             security_fingerprint,
             deadline_unix_ms,
         )
-        .with_graph_overlay(graph_overlay);
+        .with_graph_overlay(graph_overlay)
+        .with_required_applied_indexes(required_applied_indexes);
         if let Some(projection) = procedure_projection {
             let job_context = JobInvocationContext::new(
                 request_id,
@@ -2386,6 +2672,10 @@ impl RemoteGatewayService {
         if let Some(snapshot) = fixed_snapshot {
             request = request.with_fixed_transaction_snapshot(snapshot);
         }
+        #[cfg(feature = "paper-benchmark-control")]
+        if let Some(lease) = benchmark {
+            request = request.with_benchmark_ablations(lease.config(), lease.counters());
+        }
         let engine = CypherQueryEngine::new(config);
         let response = if let Some((logical_plan, bindings)) = child_prefix {
             engine
@@ -2397,12 +2687,10 @@ impl RemoteGatewayService {
                     request,
                 )
                 .await
-        } else if let Some(compiled) = read_prefix {
-            engine
-                .execute_read_prefix(&coordinator, compiled, request)
-                .await
         } else {
-            engine.execute(&coordinator, request).await
+            engine
+                .execute_compiled(&coordinator, compiled, request)
+                .await
         };
         response.map_err(|error| RemoteGatewayServiceError::Query(error.to_string()))
     }
@@ -2412,53 +2700,10 @@ impl RemoteGatewayService {
         request_id: u128,
         deadline_unix_ms: u64,
     ) -> Result<(TransactionTime, TransactionTime), RemoteGatewayServiceError> {
-        let mut last_error = None;
-        for endpoint in self.meta_endpoints.iter() {
-            let address = format!("http://{endpoint}");
-            let Ok(mut client) = MetaServiceClient::connect(address).await else {
-                continue;
-            };
-            let response = client
-                .allocate_timestamp(AllocateTimestampRequest {
-                    context: Some(RequestContext {
-                        protocol_version: CLUSTER_PROTOCOL_VERSION,
-                        cluster_id: self.cluster_id.to_vec(),
-                        request_id: request_id.to_be_bytes().to_vec(),
-                        deadline_unix_ms,
-                    }),
-                    count: 3,
-                    observed_physical_ms: unix_time_ms()
-                        .map_err(|status| RemoteGatewayServiceError::Meta(status.to_string()))?,
-                })
-                .await;
-            match response {
-                Ok(response) => {
-                    let response = response.into_inner();
-                    if response.count != 3 {
-                        return Err(RemoteGatewayServiceError::Meta(
-                            "Meta returned the wrong timestamp batch size".into(),
-                        ));
-                    }
-                    let physical = response
-                        .first_physical_ms
-                        .checked_mul(1_000)
-                        .and_then(|value| i64::try_from(value).ok())
-                        .ok_or_else(|| {
-                            RemoteGatewayServiceError::Meta(
-                                "Meta timestamp physical value overflowed".into(),
-                            )
-                        })?;
-                    let start = TransactionTime::new(physical, response.first_logical);
-                    let commit = advance_timestamp(start, 2)
-                        .map_err(|error| RemoteGatewayServiceError::Meta(error.to_string()))?;
-                    return Ok((start, commit));
-                }
-                Err(error) => last_error = Some(error.to_string()),
-            }
-        }
-        Err(RemoteGatewayServiceError::Meta(
-            last_error.unwrap_or_else(|| "no Meta endpoint was reachable".into()),
-        ))
+        self.meta_timestamp_client
+            .allocate_transaction_timestamps(request_id, deadline_unix_ms)
+            .await
+            .map_err(|error| RemoteGatewayServiceError::Meta(error.to_string()))
     }
 }
 
@@ -2683,6 +2928,14 @@ impl BoltQueryBackend for RemoteGatewayService {
                 self.routing_snapshot().map_err(gateway_bolt_error)?
             };
             let compiled = compile_cypher(&routing, request.query()).map_err(gateway_bolt_error)?;
+            #[cfg(feature = "paper-benchmark-control")]
+            let benchmark_lease = self.acquire_benchmark_query(
+                benchmark_session_token(request.extra())?,
+                transaction,
+                compiled.is_read_only(),
+            )?;
+            #[cfg(not(feature = "paper-benchmark-control"))]
+            reject_benchmark_session_when_control_is_disabled(request.extra())?;
             if !compiled.is_read_only() {
                 if let Some(transaction) = transaction {
                     if mutation_plan_has_batch_subtransaction(compiled.mutation_plan()) {
@@ -2926,7 +3179,7 @@ impl BoltQueryBackend for RemoteGatewayService {
                     (Some(snapshot), overlay)
                 });
             let response = self
-                .execute_cypher_response(
+                .execute_cypher_response_with_benchmark(
                     request_id,
                     deadline,
                     &routing,
@@ -2934,8 +3187,10 @@ impl BoltQueryBackend for RemoteGatewayService {
                     request.parameters().clone(),
                     fixed_snapshot,
                     graph_overlay,
+                    &compiled,
                     None,
-                    None,
+                    #[cfg(feature = "paper-benchmark-control")]
+                    benchmark_lease.as_ref(),
                 )
                 .await
                 .map_err(gateway_bolt_error)?;
@@ -2950,6 +3205,10 @@ impl BoltQueryBackend for RemoteGatewayService {
                 .iter()
                 .flat_map(|batch| batch.rows().iter().cloned())
                 .collect::<Vec<_>>();
+            #[cfg(feature = "paper-benchmark-control")]
+            if let Some(lease) = benchmark_lease {
+                lease.complete().map_err(benchmark_bolt_error)?;
+            }
             Ok(BackendQueryResult::new(
                 fields,
                 records,
@@ -3096,6 +3355,41 @@ fn gateway_bolt_error(error: RemoteGatewayServiceError) -> bolt_server::ServiceE
         "Neo.ClientError.Statement.ExecutionFailed",
         error.to_string(),
     )
+}
+
+const BENCHMARK_SESSION_KEY: &str = "dtgproxy.paper.session";
+
+fn benchmark_session_token(
+    extra: &BTreeMap<String, bolt_protocol::Value>,
+) -> Result<Option<&str>, bolt_server::ServiceError> {
+    match extra.get(BENCHMARK_SESSION_KEY) {
+        None => Ok(None),
+        Some(bolt_protocol::Value::String(token)) if !token.is_empty() => Ok(Some(token)),
+        Some(_) => Err(benchmark_request_error(
+            "dtgproxy.paper.session must be a non-empty string",
+        )),
+    }
+}
+
+#[cfg(not(feature = "paper-benchmark-control"))]
+fn reject_benchmark_session_when_control_is_disabled(
+    extra: &BTreeMap<String, bolt_protocol::Value>,
+) -> Result<(), bolt_server::ServiceError> {
+    if extra.contains_key(BENCHMARK_SESSION_KEY) {
+        return Err(benchmark_request_error(
+            "benchmark session control is not compiled into this Gateway",
+        ));
+    }
+    Ok(())
+}
+
+fn benchmark_request_error(message: &str) -> bolt_server::ServiceError {
+    bolt_server::ServiceError::new("Neo.ClientError.Request.Invalid", message)
+}
+
+#[cfg(feature = "paper-benchmark-control")]
+fn benchmark_bolt_error(error: crate::BenchmarkControlError) -> bolt_server::ServiceError {
+    benchmark_request_error(&error.to_string())
 }
 
 fn unambiguous_response_bindings(prepared: &[PreparedCypherWrite]) -> Map<String, Value> {

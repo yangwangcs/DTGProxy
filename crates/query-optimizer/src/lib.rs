@@ -4,16 +4,61 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+pub use physical_plan::AccessGuarantee;
 use physical_plan::{
-    ExchangeKind, JoinKind, MemoryBudget, PhysicalApply, PhysicalOperator, PhysicalPlan,
-    PhysicalPlanBuilder, PhysicalPlanHeader, Placement, WriteOperation,
+    AggregatePhase, COUNT_AGGREGATE_FUNCTION_ID, ExchangeKind, JoinKind, MemoryBudget,
+    PhysicalAccess, PhysicalApply, PhysicalComparisonOperator, PhysicalOperator, PhysicalPlan,
+    PhysicalPlanBuilder, PhysicalPlanHeader, PhysicalPropertyConstraint, Placement, PrimitiveKind,
+    ResidualPolicy, WriteOperation,
 };
-use temporal_ir::{LogicalNode, LogicalNodeId, LogicalOperator, LogicalPlan, RowSchema};
+use temporal_ir::{
+    Column, LogicalNode, LogicalNodeId, LogicalOperator, LogicalPlan, RowSchema, ScalarExpr,
+    SlotId, TransactionTimeSpec, ValidTimeSpec, ValueType,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeploymentMode {
     PrimaryReplica,
     SharedNothing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilitySnapshot {
+    generation: u64,
+    candidate_scan: AccessGuarantee,
+    adjacency_expand: AccessGuarantee,
+    change_scan: AccessGuarantee,
+}
+
+impl CapabilitySnapshot {
+    pub const GENERIC: Self = Self {
+        generation: 1,
+        candidate_scan: AccessGuarantee::Unsupported,
+        adjacency_expand: AccessGuarantee::Unsupported,
+        change_scan: AccessGuarantee::Unsupported,
+    };
+
+    pub fn new(
+        generation: u64,
+        candidate_scan: AccessGuarantee,
+        adjacency_expand: AccessGuarantee,
+        change_scan: AccessGuarantee,
+    ) -> Result<Self, OptimizerError> {
+        if generation == 0 {
+            return Err(OptimizerError::InvalidCapabilityGeneration);
+        }
+        Ok(Self {
+            generation,
+            candidate_scan,
+            adjacency_expand,
+            change_scan,
+        })
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -24,6 +69,9 @@ pub struct OptimizerContext {
     memory_bytes: u64,
     spill_bytes: u64,
     shard_ids: Vec<u32>,
+    capabilities: CapabilitySnapshot,
+    current_projection_candidate_scan: bool,
+    current_transaction_scope: bool,
 }
 
 impl OptimizerContext {
@@ -46,7 +94,16 @@ impl OptimizerContext {
             memory_bytes,
             spill_bytes,
             shard_ids: (0..shard_count).collect(),
+            capabilities: CapabilitySnapshot::GENERIC,
+            current_projection_candidate_scan: false,
+            current_transaction_scope: false,
         })
+    }
+
+    #[must_use]
+    pub const fn with_current_projection_candidate_scan(mut self, enabled: bool) -> Self {
+        self.current_projection_candidate_scan = enabled;
+        self
     }
 
     #[must_use]
@@ -67,6 +124,12 @@ impl OptimizerContext {
         }
         self.shard_ids = shard_ids;
         Ok(self)
+    }
+
+    #[must_use]
+    pub const fn with_capability_snapshot(mut self, capabilities: CapabilitySnapshot) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 
@@ -118,17 +181,34 @@ impl Optimizer {
     pub fn optimize(
         &self,
         logical: &LogicalPlan,
-        context: OptimizerContext,
+        mut context: OptimizerContext,
     ) -> Result<OptimizedPlan, OptimizerError> {
         logical
             .validate()
             .map_err(|error| OptimizerError::Logical(error.to_string()))?;
+        context.current_transaction_scope = context.current_projection_candidate_scan
+            && !logical
+                .nodes()
+                .iter()
+                .any(|node| matches!(node.operator(), LogicalOperator::ChangeScan { .. }))
+            && logical
+                .nodes()
+                .iter()
+                .filter_map(|node| match node.operator() {
+                    LogicalOperator::TemporalSlice {
+                        transaction_time, ..
+                    } => Some(transaction_time),
+                    _ => None,
+                })
+                .all(|transaction_time| matches!(transaction_time, TransactionTimeSpec::Current));
         let header = PhysicalPlanHeader::new(
             logical.header().graph_id(),
             logical.header().schema_version(),
             logical.header().topology_epoch(),
             logical.header().query_fingerprint(),
         )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?
+        .with_capability_generation(context.capabilities.generation())
         .map_err(|error| OptimizerError::Physical(error.to_string()))?
         .with_expected_shards(context.shard_ids.clone())
         .map_err(|error| OptimizerError::Physical(error.to_string()))?;
@@ -192,6 +272,184 @@ impl Optimizer {
         match context.mode {
             DeploymentMode::PrimaryReplica => optimize_primary(logical, header, budget, &context),
             DeploymentMode::SharedNothing => optimize_shared(logical, header, budget, &context),
+        }
+    }
+}
+
+trait CapabilityAwareBuilder {
+    fn add_capability_fragment(
+        &mut self,
+        placement: Placement,
+        operators: Vec<PhysicalOperator>,
+        output: RowSchema,
+        budget: MemoryBudget,
+        context: &OptimizerContext,
+    ) -> Result<physical_plan::FragmentId, physical_plan::ValidationError>;
+}
+
+impl CapabilityAwareBuilder for PhysicalPlanBuilder {
+    fn add_capability_fragment(
+        &mut self,
+        placement: Placement,
+        operators: Vec<PhysicalOperator>,
+        output: RowSchema,
+        budget: MemoryBudget,
+        context: &OptimizerContext,
+    ) -> Result<physical_plan::FragmentId, physical_plan::ValidationError> {
+        let access = operators
+            .iter()
+            .enumerate()
+            .map(|(index, operator)| {
+                access_for(operator, context, candidate_constraints(&operators, index))
+            })
+            .collect();
+        self.add_fragment_with_access(placement, operators, access, output, budget)
+    }
+}
+
+fn access_for(
+    operator: &PhysicalOperator,
+    context: &OptimizerContext,
+    constraints: Vec<PhysicalPropertyConstraint>,
+) -> PhysicalAccess {
+    let (primitive, mut guarantee) = match operator {
+        PhysicalOperator::NodeScan { .. } if context.current_transaction_scope => (
+            PrimitiveKind::CandidateScan,
+            context.capabilities.candidate_scan,
+        ),
+        PhysicalOperator::NodeScan { .. } => return PhysicalAccess::Generic,
+        PhysicalOperator::RelationshipScan { .. } => return PhysicalAccess::Generic,
+        PhysicalOperator::Expand { .. } => (
+            PrimitiveKind::AdjacencyExpand,
+            context.capabilities.adjacency_expand,
+        ),
+        PhysicalOperator::ChangeScan { .. } => {
+            (PrimitiveKind::ChangeScan, context.capabilities.change_scan)
+        }
+        _ => return PhysicalAccess::Generic,
+    };
+    if primitive == PrimitiveKind::CandidateScan
+        && !constraints.is_empty()
+        && guarantee == AccessGuarantee::Exact
+    {
+        guarantee = AccessGuarantee::Candidate;
+    }
+    match guarantee {
+        AccessGuarantee::Unsupported => PhysicalAccess::Generic,
+        AccessGuarantee::Candidate | AccessGuarantee::Exact => PhysicalAccess::Primitive {
+            primitive,
+            guarantee,
+            residual: ResidualPolicy::Evaluate,
+            constraints,
+        },
+    }
+}
+
+fn candidate_constraints(
+    operators: &[PhysicalOperator],
+    operator_index: usize,
+) -> Vec<PhysicalPropertyConstraint> {
+    let Some(PhysicalOperator::NodeScan { binding, .. }) = operators.get(operator_index) else {
+        return Vec::new();
+    };
+    let Some(PhysicalOperator::Filter(predicate)) = operators.get(operator_index + 1) else {
+        return Vec::new();
+    };
+    let mut constraints = Vec::new();
+    collect_property_constraints(predicate, *binding, &mut constraints);
+    constraints
+}
+
+fn collect_property_constraints(
+    expression: &ScalarExpr,
+    binding: SlotId,
+    constraints: &mut Vec<PhysicalPropertyConstraint>,
+) {
+    if let ScalarExpr::And(left, right) = expression {
+        collect_property_constraints(left, binding, constraints);
+        collect_property_constraints(right, binding, constraints);
+        return;
+    }
+    let comparison = match expression {
+        ScalarExpr::Equal(left, right) => {
+            extract_property_constraint(left, right, binding, PhysicalComparisonOperator::Equal)
+        }
+        ScalarExpr::NotEqual(left, right) => {
+            extract_property_constraint(left, right, binding, PhysicalComparisonOperator::NotEqual)
+        }
+        ScalarExpr::Less(left, right) => {
+            extract_property_constraint(left, right, binding, PhysicalComparisonOperator::LessThan)
+        }
+        ScalarExpr::LessEqual(left, right) => extract_property_constraint(
+            left,
+            right,
+            binding,
+            PhysicalComparisonOperator::LessThanOrEqual,
+        ),
+        ScalarExpr::Greater(left, right) => extract_property_constraint(
+            left,
+            right,
+            binding,
+            PhysicalComparisonOperator::GreaterThan,
+        ),
+        ScalarExpr::GreaterEqual(left, right) => extract_property_constraint(
+            left,
+            right,
+            binding,
+            PhysicalComparisonOperator::GreaterThanOrEqual,
+        ),
+        _ => None,
+    };
+    if let Some(constraint) = comparison {
+        constraints.push(constraint);
+    }
+}
+
+fn extract_property_constraint(
+    left: &ScalarExpr,
+    right: &ScalarExpr,
+    binding: SlotId,
+    operator: PhysicalComparisonOperator,
+) -> Option<PhysicalPropertyConstraint> {
+    if let (Some(property_id), ScalarExpr::Literal(value)) = (bound_property(left, binding), right)
+    {
+        return Some(PhysicalPropertyConstraint::new(
+            property_id,
+            operator,
+            value.clone(),
+        ));
+    }
+    if let (ScalarExpr::Literal(value), Some(property_id)) = (left, bound_property(right, binding))
+    {
+        return Some(PhysicalPropertyConstraint::new(
+            property_id,
+            reverse_comparison(operator),
+            value.clone(),
+        ));
+    }
+    None
+}
+
+fn bound_property(expression: &ScalarExpr, binding: SlotId) -> Option<u32> {
+    match expression {
+        ScalarExpr::Property { value, property_id } if matches!(value.as_ref(), ScalarExpr::Slot(slot) if *slot == binding) => {
+            Some(*property_id)
+        }
+        _ => None,
+    }
+}
+
+const fn reverse_comparison(operator: PhysicalComparisonOperator) -> PhysicalComparisonOperator {
+    match operator {
+        PhysicalComparisonOperator::Equal => PhysicalComparisonOperator::Equal,
+        PhysicalComparisonOperator::NotEqual => PhysicalComparisonOperator::NotEqual,
+        PhysicalComparisonOperator::LessThan => PhysicalComparisonOperator::GreaterThan,
+        PhysicalComparisonOperator::LessThanOrEqual => {
+            PhysicalComparisonOperator::GreaterThanOrEqual
+        }
+        PhysicalComparisonOperator::GreaterThan => PhysicalComparisonOperator::LessThan,
+        PhysicalComparisonOperator::GreaterThanOrEqual => {
+            PhysicalComparisonOperator::LessThanOrEqual
         }
     }
 }
@@ -265,11 +523,12 @@ fn build_union_node(
             return Err(OptimizerError::UnsupportedUnionShape);
         }
         let coordinator = builder
-            .add_fragment(
+            .add_capability_fragment(
                 Placement::Coordinator,
                 vec![PhysicalOperator::Union { all: *all }],
                 node.output().clone(),
                 budget,
+                context,
             )
             .map_err(|error| OptimizerError::Physical(error.to_string()))?;
         for (from, schema) in [(left_fragment, left_schema), (right_fragment, right_schema)] {
@@ -293,7 +552,7 @@ fn build_union_node(
         let (right_fragment, right_schema) =
             build_union_dag(builder, logical, *right, budget, context, fragments)?;
         let coordinator = builder
-            .add_fragment(
+            .add_capability_fragment(
                 Placement::Coordinator,
                 vec![PhysicalOperator::HashJoin {
                     kind: match node.operator() {
@@ -311,6 +570,7 @@ fn build_union_node(
                 }],
                 node.output().clone(),
                 budget,
+                context,
             )
             .map_err(|error| OptimizerError::Physical(error.to_string()))?;
         builder
@@ -340,11 +600,12 @@ fn build_union_node(
         let (source, schema) =
             build_union_dag(builder, logical, *input, budget, context, fragments)?;
         let coordinator = builder
-            .add_fragment(
+            .add_capability_fragment(
                 Placement::Coordinator,
                 vec![physical(node, context)?],
                 node.output().clone(),
                 budget,
+                context,
             )
             .map_err(|error| OptimizerError::Physical(error.to_string()))?;
         builder
@@ -378,7 +639,7 @@ fn build_linear_branch(
     });
     if !has_graph_source {
         let fragment = builder
-            .add_fragment(
+            .add_capability_fragment(
                 Placement::Coordinator,
                 nodes
                     .into_iter()
@@ -386,6 +647,7 @@ fn build_linear_branch(
                     .collect::<Result<Vec<_>, _>>()?,
                 output.clone(),
                 budget,
+                context,
             )
             .map_err(|error| OptimizerError::Physical(error.to_string()))?;
         return Ok((fragment, output));
@@ -396,7 +658,7 @@ fn build_linear_branch(
         .unwrap_or(nodes.len());
     if context.mode == DeploymentMode::PrimaryReplica && split == nodes.len() {
         let fragment = builder
-            .add_fragment(
+            .add_capability_fragment(
                 Placement::Shard(context.primary_shard_id),
                 nodes
                     .into_iter()
@@ -404,6 +666,7 @@ fn build_linear_branch(
                     .collect::<Result<Vec<_>, _>>()?,
                 output.clone(),
                 budget,
+                context,
             )
             .map_err(|error| OptimizerError::Physical(error.to_string()))?;
         return Ok((fragment, output));
@@ -413,7 +676,7 @@ fn build_linear_branch(
     }
     let shard_output = nodes[split - 1].output().clone();
     let shard = builder
-        .add_fragment(
+        .add_capability_fragment(
             Placement::AllShards,
             nodes[..split]
                 .iter()
@@ -421,13 +684,14 @@ fn build_linear_branch(
                 .collect::<Result<Vec<_>, _>>()?,
             shard_output.clone(),
             budget,
+            context,
         )
         .map_err(|error| OptimizerError::Physical(error.to_string()))?;
     if split == nodes.len() {
         return Ok((shard, shard_output));
     }
     let coordinator = builder
-        .add_fragment(
+        .add_capability_fragment(
             Placement::Coordinator,
             nodes[split..]
                 .iter()
@@ -435,6 +699,7 @@ fn build_linear_branch(
                 .collect::<Result<Vec<_>, _>>()?,
             output.clone(),
             budget,
+            context,
         )
         .map_err(|error| OptimizerError::Physical(error.to_string()))?;
     builder
@@ -542,11 +807,12 @@ fn optimize_primary(
         .collect::<Result<Vec<_>, _>>()?;
     let mut builder = PhysicalPlanBuilder::new(header);
     let root = builder
-        .add_fragment(
+        .add_capability_fragment(
             Placement::Shard(context.primary_shard_id),
             operators,
             logical.output().clone(),
             budget,
+            context,
         )
         .map_err(|error| OptimizerError::Physical(error.to_string()))?;
     let plan = builder
@@ -587,6 +853,12 @@ fn optimize_shared(
     if split == 0 {
         return optimize_coordinator_only(logical, header, budget, context);
     }
+    if is_safe_global_count(logical, split) {
+        return optimize_shared_count(logical, header, budget, context, split);
+    }
+    if is_safe_exact_top_k(logical, split) {
+        return optimize_shared_top_k(logical, header, budget, context, split);
+    }
     let shard_operators = logical.nodes()[..split]
         .iter()
         .map(|node| physical(node, context))
@@ -602,19 +874,21 @@ fn optimize_shared(
     };
     let mut builder = PhysicalPlanBuilder::new(header);
     let shard = builder
-        .add_fragment(
+        .add_capability_fragment(
             Placement::AllShards,
             shard_operators,
             shard_output.clone(),
             budget,
+            context,
         )
         .map_err(|error| OptimizerError::Physical(error.to_string()))?;
     let coordinator = builder
-        .add_fragment(
+        .add_capability_fragment(
             Placement::Coordinator,
             coordinator_operators,
             logical.output().clone(),
             budget,
+            context,
         )
         .map_err(|error| OptimizerError::Physical(error.to_string()))?;
     builder
@@ -633,6 +907,278 @@ fn optimize_shared(
             ),
         }],
     })
+}
+
+const MAX_EXACT_DISTRIBUTED_TOP_K_ROWS: i64 = 4096;
+
+fn is_safe_exact_top_k(logical: &LogicalPlan, project_index: usize) -> bool {
+    let nodes = logical.nodes();
+    let suffix = nodes.get(project_index..).unwrap_or_default();
+    let (project, sort, limit, final_project) = match suffix {
+        [project, sort, limit] => (project, sort, limit, None),
+        [project, sort, limit, final_project] => (project, sort, limit, Some(final_project)),
+        _ => return false,
+    };
+    let LogicalOperator::Project { expressions } = project.operator() else {
+        return false;
+    };
+    let LogicalOperator::Sort { keys } = sort.operator() else {
+        return false;
+    };
+    let LogicalOperator::Limit {
+        count: ScalarExpr::Literal(temporal_types::GraphValue::Integer(count)),
+    } = limit.operator()
+    else {
+        return false;
+    };
+    if !(1..=MAX_EXACT_DISTRIBUTED_TOP_K_ROWS).contains(count)
+        || keys.is_empty()
+        || nodes[..project_index].iter().any(|node| {
+            node.inputs().len() > 1
+                || matches!(
+                    node.operator(),
+                    LogicalOperator::ChangeScan { .. } | LogicalOperator::Skip { .. }
+                )
+        })
+    {
+        return false;
+    }
+
+    let output_slots = project
+        .output()
+        .columns()
+        .iter()
+        .map(Column::slot)
+        .collect::<Vec<_>>();
+    let final_project_is_safe = final_project.is_none_or(|node| {
+        let LogicalOperator::Project { expressions } = node.operator() else {
+            return false;
+        };
+        expressions.len() == node.output().columns().len()
+            && expressions.iter().all(|(_, expression)| {
+                matches!(expression, ScalarExpr::Slot(slot) if output_slots.contains(slot))
+            })
+    });
+
+    output_slots.len() == expressions.len()
+        && output_slots
+            .iter()
+            .all(|slot| expressions.iter().any(|(projected, _)| projected == slot))
+        && output_slots
+            .iter()
+            .all(|slot| keys.iter().any(|key| key.slot() == *slot))
+        && sort.output() == project.output()
+        && limit.output() == project.output()
+        && final_project_is_safe
+}
+
+fn optimize_shared_top_k(
+    logical: &LogicalPlan,
+    header: PhysicalPlanHeader,
+    budget: MemoryBudget,
+    context: &OptimizerContext,
+    project_index: usize,
+) -> Result<OptimizedPlan, OptimizerError> {
+    let shard_operators = logical.nodes()[..project_index.saturating_add(3)]
+        .iter()
+        .map(|node| physical(node, context))
+        .collect::<Result<Vec<_>, _>>()?;
+    let shard_output = logical.nodes()[project_index + 2].output().clone();
+    let coordinator_operators = logical.nodes()[project_index + 1..]
+        .iter()
+        .map(|node| physical(node, context))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut builder = PhysicalPlanBuilder::new(header);
+    let shard = builder
+        .add_capability_fragment(
+            Placement::AllShards,
+            shard_operators,
+            shard_output.clone(),
+            budget,
+            context,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let coordinator = builder
+        .add_capability_fragment(
+            Placement::Coordinator,
+            coordinator_operators,
+            logical.output().clone(),
+            budget,
+            context,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    builder
+        .add_exchange(shard, coordinator, ExchangeKind::Gather, shard_output, 8)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let plan = builder
+        .finish(coordinator)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    Ok(OptimizedPlan {
+        plan,
+        trace: vec![TraceEvent {
+            rule: "partition-local-exact-top-k",
+            detail: format!(
+                "each of {} shards emits at most {MAX_EXACT_DISTRIBUTED_TOP_K_ROWS} exactly ordered rows before the final merge",
+                context.shard_count
+            ),
+        }],
+    })
+}
+
+fn is_safe_global_count(logical: &LogicalPlan, aggregate_index: usize) -> bool {
+    if logical.nodes().iter().any(|node| {
+        matches!(node.operator(), LogicalOperator::ChangeScan { .. })
+            || matches!(
+                node.operator(),
+                LogicalOperator::TemporalSlice {
+                    valid_time: ValidTimeSpec::Between { .. },
+                    ..
+                }
+            )
+    }) {
+        return false;
+    }
+    let Some(node) = logical.nodes().get(aggregate_index) else {
+        return false;
+    };
+    let LogicalOperator::Aggregate {
+        grouping,
+        aggregates,
+    } = node.operator()
+    else {
+        return false;
+    };
+    let [input_id] = node.inputs() else {
+        return false;
+    };
+    let Some(input) = logical
+        .nodes()
+        .get(usize::try_from(input_id.value()).unwrap_or(usize::MAX))
+    else {
+        return false;
+    };
+    grouping.is_empty()
+        && !aggregates.is_empty()
+        && aggregates.iter().all(|(_, expression)| {
+            let ScalarExpr::Function {
+                function_id,
+                arguments,
+            } = expression
+            else {
+                return false;
+            };
+            if *function_id != COUNT_AGGREGATE_FUNCTION_ID {
+                return false;
+            }
+            match arguments.as_slice() {
+                [] => true,
+                [ScalarExpr::Slot(slot)] => input
+                    .output()
+                    .columns()
+                    .iter()
+                    .find(|column| column.slot() == *slot)
+                    .is_some_and(|column| !column.nullable()),
+                _ => false,
+            }
+        })
+}
+
+fn optimize_shared_count(
+    logical: &LogicalPlan,
+    header: PhysicalPlanHeader,
+    budget: MemoryBudget,
+    context: &OptimizerContext,
+    aggregate_index: usize,
+) -> Result<OptimizedPlan, OptimizerError> {
+    let aggregate_node = &logical.nodes()[aggregate_index];
+    let partial_output = count_output_schema(aggregate_node)?;
+    let mut shard_operators = logical.nodes()[..=aggregate_index]
+        .iter()
+        .map(|node| physical(node, context))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(PhysicalOperator::Aggregate { phase, output, .. }) = shard_operators.last_mut() else {
+        return Err(OptimizerError::Physical(
+            "partial count split did not end at Aggregate".into(),
+        ));
+    };
+    *phase = AggregatePhase::PartialCount;
+    *output = partial_output.clone();
+
+    let mut final_aggregate = physical(aggregate_node, context)?;
+    let PhysicalOperator::Aggregate { phase, output, .. } = &mut final_aggregate else {
+        return Err(OptimizerError::Physical(
+            "partial count finalizer was not Aggregate".into(),
+        ));
+    };
+    *phase = AggregatePhase::FinalCount;
+    *output = partial_output.clone();
+    let mut coordinator_operators = vec![final_aggregate];
+    coordinator_operators.extend(
+        logical.nodes()[aggregate_index + 1..]
+            .iter()
+            .map(|node| physical(node, context))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
+    let mut builder = PhysicalPlanBuilder::new(header);
+    let shard = builder
+        .add_capability_fragment(
+            Placement::AllShards,
+            shard_operators,
+            partial_output.clone(),
+            budget,
+            context,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let coordinator = builder
+        .add_capability_fragment(
+            Placement::Coordinator,
+            coordinator_operators,
+            logical.output().clone(),
+            budget,
+            context,
+        )
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    builder
+        .add_exchange(shard, coordinator, ExchangeKind::Gather, partial_output, 8)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    let plan = builder
+        .finish(coordinator)
+        .map_err(|error| OptimizerError::Physical(error.to_string()))?;
+    Ok(OptimizedPlan {
+        plan,
+        trace: vec![TraceEvent {
+            rule: "shard-local-partial-count",
+            detail: format!(
+                "global count produces one partial row on each of {} shards before final integer sum",
+                context.shard_count
+            ),
+        }],
+    })
+}
+
+fn count_output_schema(aggregate: &LogicalNode) -> Result<RowSchema, OptimizerError> {
+    let LogicalOperator::Aggregate { aggregates, .. } = aggregate.operator() else {
+        return Err(OptimizerError::Physical(
+            "partial count split did not target an Aggregate".into(),
+        ));
+    };
+    let columns = aggregates
+        .iter()
+        .map(|(slot, _)| {
+            let column = aggregate
+                .output()
+                .columns()
+                .iter()
+                .find(|column| column.slot() == *slot)
+                .ok_or_else(|| {
+                    OptimizerError::Physical("count aggregate output slot is missing".into())
+                })?;
+            Ok(Column::new(*slot, column.name(), ValueType::Integer, false))
+        })
+        .collect::<Result<Vec<_>, OptimizerError>>()?;
+    RowSchema::new(columns).map_err(|error| OptimizerError::Physical(error.to_string()))
 }
 
 fn has_graph_source(logical: &LogicalPlan) -> bool {
@@ -654,7 +1200,7 @@ fn optimize_coordinator_only(
 ) -> Result<OptimizedPlan, OptimizerError> {
     let mut builder = PhysicalPlanBuilder::new(header);
     let root = builder
-        .add_fragment(
+        .add_capability_fragment(
             Placement::Coordinator,
             logical
                 .nodes()
@@ -663,6 +1209,7 @@ fn optimize_coordinator_only(
                 .collect::<Result<Vec<_>, _>>()?,
             logical.output().clone(),
             budget,
+            context,
         )
         .map_err(|error| OptimizerError::Physical(error.to_string()))?;
     let plan = builder
@@ -728,6 +1275,7 @@ fn physical(
             grouping,
             aggregates,
         } => PhysicalOperator::Aggregate {
+            phase: AggregatePhase::Single,
             grouping: grouping.clone(),
             aggregates: aggregates.clone(),
             output: node.output().clone(),
@@ -762,7 +1310,17 @@ fn physical(
             valid_time: valid_time.clone(),
             transaction_time: transaction_time.clone(),
         },
-        LogicalOperator::Diff => PhysicalOperator::Diff,
+        LogicalOperator::ChangeScan {
+            axis,
+            start,
+            end,
+            system_snapshot,
+        } => PhysicalOperator::ChangeScan {
+            axis: *axis,
+            start: start.clone(),
+            end: end.clone(),
+            system_snapshot: system_snapshot.clone(),
+        },
         LogicalOperator::ProcedureCall { procedure } => PhysicalOperator::Procedure {
             procedure: procedure.clone(),
             output: node.output().clone(),
@@ -849,6 +1407,7 @@ fn physical(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OptimizerError {
     InvalidContext,
+    InvalidCapabilityGeneration,
     Logical(String),
     Physical(String),
     UnsupportedUnionShape,
