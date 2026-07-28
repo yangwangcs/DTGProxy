@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
@@ -345,6 +345,39 @@ fn scan_pages_preserve_typed_128_bit_cursors_for_next_requests() {
 }
 
 #[test]
+fn committed_edges_do_not_require_local_endpoint_records() {
+    let factory = TestFactory::new();
+    let store_binding = binding("cross-shard-edge", 1);
+    let store = block_on(factory.open(store_binding.clone())).unwrap();
+    let edge = sample_edge(9, VertexId::new(101).unwrap(), VertexId::new(202).unwrap());
+
+    block_on(
+        store.apply(
+            CommittedShardBatch::new(
+                store_binding.clone(),
+                1,
+                1,
+                CommandId::new(1).unwrap(),
+                vec![LogicalMutation::PutEdge(edge.clone())],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let view = block_on(store.begin_read_view(ReadFence::new(store_binding, 1))).unwrap();
+    assert_eq!(
+        block_on(view.get_edge(EdgeRead::new(
+            edge.id(),
+            10,
+            TransactionTime::new(10).unwrap(),
+        )))
+        .unwrap(),
+        Some(edge)
+    );
+}
+
+#[test]
 fn execution_stage_failure_is_atomic() {
     let factory = TestFactory::new();
     let store_binding = binding("execution-failure", 1);
@@ -360,7 +393,7 @@ fn execution_stage_failure_is_atomic() {
                 CommandId::new(1).unwrap(),
                 vec![
                     LogicalMutation::PutVertex(first.clone()),
-                    LogicalMutation::PutVertex(second),
+                    LogicalMutation::PutVertex(second.clone()),
                 ],
             )
             .unwrap(),
@@ -368,21 +401,26 @@ fn execution_stage_failure_is_atomic() {
     )
     .unwrap();
 
-    let staged = sample_vertex(3, 1);
-    let invalid_edge = sample_edge(9, staged.id(), VertexId::new(4).unwrap());
-    let invalid_batch = CommittedShardBatch::new(
+    let first_staged = sample_vertex(3, 1);
+    let second_staged = sample_vertex(4, 1);
+    store.arm_apply_failure_after(1).unwrap();
+    let failing_batch = CommittedShardBatch::new(
         store_binding.clone(),
         1,
         2,
         CommandId::new(2).unwrap(),
         vec![
-            LogicalMutation::PutVertex(staged.clone()),
-            LogicalMutation::PutEdge(invalid_edge.clone()),
+            LogicalMutation::PutVertex(first_staged.clone()),
+            LogicalMutation::PutVertex(second_staged.clone()),
         ],
     )
     .unwrap();
-    invalid_batch.validate().unwrap();
-    assert!(block_on(store.apply(invalid_batch)).is_err());
+    assert!(matches!(
+        block_on(store.apply(failing_batch)),
+        Err(StorageError::InjectedApplyFailure {
+            staged_mutations: 1
+        })
+    ));
     assert_eq!(block_on(store.applied_index()).unwrap(), 1);
 
     let view = block_on(store.begin_read_view(ReadFence::new(store_binding, 1))).unwrap();
@@ -393,11 +431,11 @@ fn execution_stage_failure_is_atomic() {
             TransactionTime::new(10).unwrap(),
         )))
         .unwrap(),
-        Some(first)
+        Some(first.clone())
     );
     assert!(
         block_on(view.get_vertex(VertexRead::new(
-            staged.id(),
+            first_staged.id(),
             10,
             TransactionTime::new(10).unwrap(),
         )))
@@ -405,14 +443,77 @@ fn execution_stage_failure_is_atomic() {
         .is_none()
     );
     assert!(
-        block_on(view.get_edge(EdgeRead::new(
-            invalid_edge.id(),
+        block_on(view.get_vertex(VertexRead::new(
+            second_staged.id(),
             10,
             TransactionTime::new(10).unwrap(),
         )))
         .unwrap()
         .is_none()
     );
+    let scan =
+        block_on(view.scan_vertices(
+            VertexScan::new(10, TransactionTime::new(10).unwrap(), None, 16).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(scan.rows(), &[first, second]);
+    let changes = block_on(view.changes(ChangesRead::new(0, 2, 16).unwrap())).unwrap();
+    assert_eq!(changes.rows().len(), 2);
+    assert!(changes.rows().iter().all(|change| change.raft_index() == 1));
+}
+
+#[test]
+fn edge_scan_pages_return_one_latest_visible_version_per_edge_id() {
+    let factory = TestFactory::new();
+    let store_binding = binding("edge-scan-versions", 1);
+    let store = block_on(factory.open(store_binding.clone())).unwrap();
+    let source = VertexId::new(101).unwrap();
+    let target = VertexId::new(202).unwrap();
+    let old = sample_edge_version(11, source, target, 1);
+    let latest = sample_edge_version(11, source, target, 2);
+    let invisible_newest = sample_edge_temporal_version(11, source, target, 3, 20);
+    let other = sample_edge_version(12, source, target, 1);
+    block_on(
+        store.apply(
+            CommittedShardBatch::new(
+                store_binding.clone(),
+                1,
+                1,
+                CommandId::new(1).unwrap(),
+                vec![
+                    LogicalMutation::PutEdge(old),
+                    LogicalMutation::PutEdge(latest.clone()),
+                    LogicalMutation::PutEdge(invisible_newest),
+                    LogicalMutation::PutEdge(other.clone()),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let view = block_on(store.begin_read_view(ReadFence::new(store_binding, 1))).unwrap();
+    let large = block_on(
+        view.scan_edges(EdgeScan::new(10, TransactionTime::new(10).unwrap(), None, 10).unwrap()),
+    )
+    .unwrap();
+
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page =
+            block_on(view.scan_edges(
+                EdgeScan::new(10, TransactionTime::new(10).unwrap(), after, 1).unwrap(),
+            ))
+            .unwrap();
+        paged.extend_from_slice(page.rows());
+        match page.next_after() {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+
+    assert_eq!(large.rows(), &[latest, other]);
+    assert_eq!(paged, large.rows());
 }
 
 #[test]
@@ -494,18 +595,6 @@ fn deterministic_store_passes_the_public_tck() {
     block_on(run_storage_tck(&TestFactory::new())).unwrap();
 }
 
-#[test]
-fn public_tck_certifies_execution_failure_and_complete_snapshot() {
-    let factory = TestFactory::new();
-    block_on(run_storage_tck(&factory)).unwrap();
-    let audit = factory.audit.lock().unwrap().clone();
-    assert!(audit.execution_stage_failures > 0);
-    assert_eq!(
-        audit.restored_record_kinds,
-        BTreeSet::from(["edge", "metadata", "transaction", "vertex"])
-    );
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReplayRecord {
     term: u64,
@@ -529,13 +618,7 @@ struct TestStore {
     binding: ReplicaBinding,
     capabilities: CapabilityManifest,
     state: Arc<Mutex<TestState>>,
-    audit: Arc<Mutex<TestAudit>>,
-}
-
-#[derive(Clone, Default)]
-struct TestAudit {
-    execution_stage_failures: usize,
-    restored_record_kinds: BTreeSet<&'static str>,
+    apply_failure_after: Arc<Mutex<Option<usize>>>,
 }
 
 #[derive(Default)]
@@ -547,7 +630,6 @@ struct FactoryState {
 struct TestFactory {
     state: Mutex<FactoryState>,
     capabilities: CapabilityManifest,
-    audit: Arc<Mutex<TestAudit>>,
 }
 
 impl TestFactory {
@@ -555,7 +637,6 @@ impl TestFactory {
         Self {
             state: Mutex::new(FactoryState::default()),
             capabilities: capabilities(),
-            audit: Arc::new(Mutex::new(TestAudit::default())),
         }
     }
 }
@@ -596,9 +677,21 @@ impl StorageTckFactory for TestFactory {
                 binding: requested,
                 capabilities: self.capabilities.clone(),
                 state,
-                audit: Arc::clone(&self.audit),
+                apply_failure_after: Arc::new(Mutex::new(None)),
             }) as Box<dyn StorageTckStore>)
         })
+    }
+}
+
+impl StorageTckStore for TestStore {
+    fn arm_apply_failure_after(&self, staged_mutations: usize) -> Result<(), StorageError> {
+        if staged_mutations == 0 {
+            return Err(StorageError::TckViolation(
+                "apply failure must occur after at least one staged mutation".into(),
+            ));
+        }
+        *self.apply_failure_after.lock().unwrap() = Some(staged_mutations);
+        Ok(())
     }
 }
 
@@ -648,7 +741,7 @@ impl ReplicaStateStore for TestStore {
             }
 
             let mut next = state.clone();
-            for mutation in batch.mutations() {
+            for (position, mutation) in batch.mutations().iter().enumerate() {
                 match mutation {
                     LogicalMutation::PutVertex(vertex) => {
                         next.vertices
@@ -660,14 +753,6 @@ impl ReplicaStateStore for TestStore {
                         next.vertices.remove(&tombstone.id());
                     }
                     LogicalMutation::PutEdge(edge) => {
-                        if !next.vertices.contains_key(&edge.source())
-                            || !next.vertices.contains_key(&edge.target())
-                        {
-                            self.audit.lock().unwrap().execution_stage_failures += 1;
-                            return Err(StorageError::ConstraintViolation(
-                                "edge endpoints must exist during atomic application".into(),
-                            ));
-                        }
                         next.edges.push(edge.clone());
                     }
                     LogicalMutation::DeleteEdge(tombstone) => {
@@ -683,6 +768,13 @@ impl ReplicaStateStore for TestStore {
                     }
                 }
                 next.changes.push((batch.raft_index(), mutation.clone()));
+                let mut armed_failure = self.apply_failure_after.lock().unwrap();
+                if *armed_failure == Some(position + 1) {
+                    *armed_failure = None;
+                    return Err(StorageError::InjectedApplyFailure {
+                        staged_mutations: position + 1,
+                    });
+                }
             }
             next.applied_index = batch.raft_index();
             next.replay.insert(
@@ -860,15 +952,27 @@ impl TemporalReadView for TestReadView {
 
     fn scan_edges(&self, request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion, EdgeId>> {
         Box::pin(async move {
-            let mut rows = self
+            let mut latest_by_id = BTreeMap::new();
+            for edge in self
                 .state
                 .edges
                 .iter()
                 .filter(|edge| request.includes(edge))
-                .cloned()
+            {
+                let replace = latest_by_id
+                    .get(&edge.id())
+                    .is_none_or(|current: &EdgeVersion| {
+                        (edge.transaction_time(), edge.version())
+                            > (current.transaction_time(), current.version())
+                    });
+                if replace {
+                    latest_by_id.insert(edge.id(), edge.clone());
+                }
+            }
+            let mut rows = latest_by_id
+                .into_values()
+                .take(request.limit() as usize + 1)
                 .collect::<Vec<_>>();
-            rows.sort_by_key(EdgeVersion::id);
-            rows.truncate(request.limit() as usize + 1);
             let next_after = (rows.len() > request.limit() as usize)
                 .then(|| rows[request.limit() as usize - 1].id());
             rows.truncate(request.limit() as usize);
@@ -1054,7 +1158,6 @@ impl LogicalSnapshotSink for TestStore {
                 header,
                 chunks: Vec::new(),
                 state: Arc::clone(&self.state),
-                audit: Arc::clone(&self.audit),
             }) as Box<dyn LogicalSnapshotWriter>)
         })
     }
@@ -1065,7 +1168,6 @@ struct TestSnapshotWriter {
     header: SnapshotHeader,
     chunks: Vec<SnapshotChunk>,
     state: Arc<Mutex<TestState>>,
-    audit: Arc<Mutex<TestAudit>>,
 }
 
 impl LogicalSnapshotWriter for TestSnapshotWriter {
@@ -1109,35 +1211,15 @@ impl LogicalSnapshotWriter for TestSnapshotWriter {
             {
                 match record {
                     SnapshotRecord::Vertex(vertex) => {
-                        self.audit
-                            .lock()
-                            .unwrap()
-                            .restored_record_kinds
-                            .insert("vertex");
                         next.vertices.entry(vertex.id()).or_default().push(vertex);
                     }
                     SnapshotRecord::Edge(edge) => {
-                        self.audit
-                            .lock()
-                            .unwrap()
-                            .restored_record_kinds
-                            .insert("edge");
                         next.edges.push(edge);
                     }
                     SnapshotRecord::Transaction(transaction) => {
-                        self.audit
-                            .lock()
-                            .unwrap()
-                            .restored_record_kinds
-                            .insert("transaction");
                         next.transactions.push(transaction);
                     }
                     SnapshotRecord::ReplicaMetadata(metadata) => {
-                        self.audit
-                            .lock()
-                            .unwrap()
-                            .restored_record_kinds
-                            .insert("metadata");
                         next.metadata.push(metadata);
                     }
                 }
@@ -1152,7 +1234,6 @@ impl LogicalSnapshotWriter for TestSnapshotWriter {
     }
 }
 
-#[allow(dead_code)]
 fn sample_vertex(id: u128, version: u64) -> VertexVersion {
     VertexVersion::new(
         VertexId::new(id).unwrap(),
@@ -1165,14 +1246,28 @@ fn sample_vertex(id: u128, version: u64) -> VertexVersion {
 }
 
 fn sample_edge(id: u128, source: VertexId, target: VertexId) -> EdgeVersion {
+    sample_edge_version(id, source, target, 1)
+}
+
+fn sample_edge_version(id: u128, source: VertexId, target: VertexId, version: u64) -> EdgeVersion {
+    sample_edge_temporal_version(id, source, target, version, version as i64)
+}
+
+fn sample_edge_temporal_version(
+    id: u128,
+    source: VertexId,
+    target: VertexId,
+    version: u64,
+    transaction_time: i64,
+) -> EdgeVersion {
     EdgeVersion::new(
         EdgeId::new(id).unwrap(),
         source,
         target,
         "knows",
-        Version::new(1),
+        Version::new(version),
         ValidInterval::new(0, 100).unwrap(),
-        TransactionTime::new(1).unwrap(),
+        TransactionTime::new(transaction_time).unwrap(),
         BTreeMap::from([("weight".to_owned(), Value::Integer(7))]),
     )
     .unwrap()

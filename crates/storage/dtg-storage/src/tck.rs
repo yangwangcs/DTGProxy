@@ -11,14 +11,16 @@ use crate::{
     TransactionState, VertexId, VertexRead, VertexScan, VertexVersion,
 };
 
+/// Certification-only adapter implemented by provider test harnesses.
+///
+/// Production store types need not expose fault controls through
+/// [`ReplicaStateStore`]; a provider may wrap its store for TCK execution.
 pub trait StorageTckStore:
     ReplicaStateStore + LogicalSnapshotSource + LogicalSnapshotSink + PushdownExecutor
 {
-}
-
-impl<T> StorageTckStore for T where
-    T: ReplicaStateStore + LogicalSnapshotSource + LogicalSnapshotSink + PushdownExecutor
-{
+    /// TCK-only fault control. The next apply must fail after this many
+    /// mutations have been staged privately and before any state is published.
+    fn arm_apply_failure_after(&self, staged_mutations: usize) -> Result<(), StorageError>;
 }
 
 pub trait StorageTckFactory: Send + Sync {
@@ -63,10 +65,26 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             second_vertex.id(),
             "first-edge",
         )?;
+        let latest_first_edge = sample_edge_version(
+            u128::from(u64::MAX) + 201,
+            first_vertex.id(),
+            second_vertex.id(),
+            "first-edge-corrected",
+            2,
+        )?;
+        let invisible_newest_first_edge = sample_edge_temporal_version(
+            u128::from(u64::MAX) + 201,
+            first_vertex.id(),
+            second_vertex.id(),
+            "first-edge-future",
+            3,
+            20,
+        )?;
+        let remote_vertex = VertexId::new(u128::from(u64::MAX) + 103)?;
         let second_edge = sample_edge(
             u128::from(u64::MAX) + 202,
             second_vertex.id(),
-            first_vertex.id(),
+            remote_vertex,
             "second-edge",
         )?;
         let transaction = sample_transaction(301)?;
@@ -78,6 +96,8 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             SnapshotRecord::Vertex(first_vertex.clone()),
             SnapshotRecord::Vertex(second_vertex.clone()),
             SnapshotRecord::Edge(first_edge.clone()),
+            SnapshotRecord::Edge(latest_first_edge.clone()),
+            SnapshotRecord::Edge(invisible_newest_first_edge.clone()),
             SnapshotRecord::Edge(second_edge.clone()),
             SnapshotRecord::Transaction(transaction.clone()),
             SnapshotRecord::ReplicaMetadata(metadata.clone()),
@@ -102,6 +122,8 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
                 LogicalMutation::PutVertex(first_vertex.clone()),
                 LogicalMutation::PutVertex(second_vertex.clone()),
                 LogicalMutation::PutEdge(first_edge.clone()),
+                LogicalMutation::PutEdge(latest_first_edge.clone()),
+                LogicalMutation::PutEdge(invisible_newest_first_edge.clone()),
                 LogicalMutation::PutEdge(second_edge.clone()),
                 LogicalMutation::PutTransaction(transaction.clone()),
                 LogicalMutation::PutReplicaMetadata(metadata.clone()),
@@ -155,7 +177,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
                     TransactionTime::new(10).map_err(kernel_error)?,
                 ))
                 .await?
-                == Some(first_edge.clone()),
+                == Some(latest_first_edge.clone()),
             "typed edge mutation was not visible after atomic apply",
         )?;
 
@@ -167,14 +189,9 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
                 == canonical_snapshot_records(expected_snapshot_records.clone()),
             "snapshot export did not preserve seeded typed logical records",
         )?;
-        let staged_vertex = sample_vertex(u128::from(u64::MAX) + 103, 1, "staged")?;
-        let missing_vertex = VertexId::new(u128::from(u64::MAX) + 104)?;
-        let invalid_edge = sample_edge(
-            u128::from(u64::MAX) + 203,
-            staged_vertex.id(),
-            missing_vertex,
-            "invalid-edge",
-        )?;
+        let staged_vertex = sample_vertex(u128::from(u64::MAX) + 104, 1, "staged")?;
+        let second_staged_vertex = sample_vertex(u128::from(u64::MAX) + 105, 1, "second-staged")?;
+        primary.arm_apply_failure_after(1)?;
         let execution_failure = CommittedShardBatch::new(
             primary_binding.clone(),
             4,
@@ -182,13 +199,20 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             CommandId::new(7002)?,
             vec![
                 LogicalMutation::PutVertex(staged_vertex.clone()),
-                LogicalMutation::PutEdge(invalid_edge.clone()),
+                LogicalMutation::PutVertex(second_staged_vertex.clone()),
             ],
         )?;
         execution_failure.validate()?;
         require_error(
             primary.apply(execution_failure).await,
-            |error| matches!(error, StorageError::ConstraintViolation(_)),
+            |error| {
+                matches!(
+                    error,
+                    StorageError::InjectedApplyFailure {
+                        staged_mutations: 1
+                    }
+                )
+            },
             "execution-stage mutation failure was accepted",
         )?;
         require(
@@ -218,14 +242,37 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         )?;
         require(
             after_failed_view
-                .get_edge(EdgeRead::new(
-                    invalid_edge.id(),
+                .get_vertex(VertexRead::new(
+                    second_staged_vertex.id(),
                     10,
                     TransactionTime::new(10).map_err(kernel_error)?,
                 ))
                 .await?
                 .is_none(),
-            "execution-stage failure leaked a staged edge",
+            "execution-stage failure leaked a second staged vertex",
+        )?;
+        let after_failed_scan = after_failed_view
+            .scan_vertices(VertexScan::new(
+                10,
+                TransactionTime::new(10).map_err(kernel_error)?,
+                None,
+                16,
+            )?)
+            .await?;
+        require(
+            after_failed_scan.rows() == [first_vertex.clone(), second_vertex.clone()],
+            "execution-stage failure changed logical scan visibility",
+        )?;
+        let after_failed_changes = after_failed_view
+            .changes(crate::ChangesRead::new(0, 2, 32)?)
+            .await?;
+        require(
+            after_failed_changes.rows().len() == first_batch.mutations().len()
+                && after_failed_changes
+                    .rows()
+                    .iter()
+                    .all(|change| change.raft_index() == 1),
+            "execution-stage failure leaked change-index visibility",
         )?;
 
         let drifted_fence =
@@ -411,38 +458,42 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             "vertex scan continuation did not construct the next request losslessly",
         )?;
 
-        let first_edge_page = current
+        let large_edge_page = current
             .scan_edges(EdgeScan::new(
                 10,
                 TransactionTime::new(10).map_err(kernel_error)?,
                 None,
-                1,
+                16,
             )?)
             .await?;
-        let edge_cursor = first_edge_page.next_after().ok_or_else(|| {
-            StorageError::TckViolation("edge scan omitted its typed continuation".into())
-        })?;
+        let mut paged_edges = Vec::new();
+        let mut edge_after = None;
+        loop {
+            let page = current
+                .scan_edges(EdgeScan::new(
+                    10,
+                    TransactionTime::new(10).map_err(kernel_error)?,
+                    edge_after,
+                    1,
+                )?)
+                .await?;
+            paged_edges.extend_from_slice(page.rows());
+            match page.next_after() {
+                Some(cursor) => {
+                    require(
+                        page.rows().last().is_some_and(|edge| edge.id() == cursor)
+                            && cursor.get() > u128::from(u64::MAX),
+                        "edge scan cursor did not preserve the last returned 128-bit identity",
+                    )?;
+                    edge_after = Some(cursor);
+                }
+                None => break,
+            }
+        }
         require(
-            first_edge_page.rows().len() == 1
-                && first_edge_page.rows()[0] == first_edge
-                && edge_cursor == first_edge_page.rows()[0].id()
-                && edge_cursor.get() > u128::from(u64::MAX),
-            "edge scan cursor did not preserve the last returned 128-bit identity",
-        )?;
-        let second_edge_page = current
-            .scan_edges(EdgeScan::new(
-                10,
-                TransactionTime::new(10).map_err(kernel_error)?,
-                Some(edge_cursor),
-                1,
-            )?)
-            .await?;
-        require(
-            second_edge_page.rows().len() == 1
-                && second_edge_page.rows()[0] == second_edge
-                && second_edge_page.rows()[0].id() > edge_cursor
-                && second_edge_page.next_after().is_none(),
-            "edge scan continuation did not construct the next request losslessly",
+            large_edge_page.rows() == [latest_first_edge, second_edge]
+                && paged_edges == large_edge_page.rows(),
+            "edge scan pagination skipped, duplicated, or returned multiple versions per edge ID",
         )?;
 
         let mut reader = primary
@@ -577,14 +628,35 @@ fn sample_edge(
     target: VertexId,
     edge_type: &str,
 ) -> Result<EdgeVersion, StorageError> {
+    sample_edge_version(id, source, target, edge_type, 1)
+}
+
+fn sample_edge_version(
+    id: u128,
+    source: VertexId,
+    target: VertexId,
+    edge_type: &str,
+    version: u64,
+) -> Result<EdgeVersion, StorageError> {
+    sample_edge_temporal_version(id, source, target, edge_type, version, version as i64)
+}
+
+fn sample_edge_temporal_version(
+    id: u128,
+    source: VertexId,
+    target: VertexId,
+    edge_type: &str,
+    version: u64,
+    transaction_time: i64,
+) -> Result<EdgeVersion, StorageError> {
     EdgeVersion::new(
         EdgeId::new(id)?,
         source,
         target,
         edge_type,
-        Version::new(1),
+        Version::new(version),
         ValidInterval::new(0, 100).map_err(kernel_error)?,
-        TransactionTime::new(1).map_err(kernel_error)?,
+        TransactionTime::new(transaction_time).map_err(kernel_error)?,
         BTreeMap::from([("weight".to_owned(), Value::Integer(7))]),
     )
 }

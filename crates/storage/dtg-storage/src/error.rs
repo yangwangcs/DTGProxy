@@ -7,8 +7,10 @@ pub enum StorageError {
     InvalidBinding(String),
     InvalidCapability(String),
     InvalidMutation(String),
-    ConstraintViolation(String),
     InvalidBatch(String),
+    InjectedApplyFailure {
+        staged_mutations: usize,
+    },
     StaleBinding {
         expected: Box<ReplicaBinding>,
         actual: Box<ReplicaBinding>,
@@ -46,8 +48,8 @@ impl StorageError {
             Self::InvalidBinding(_) => "DTG-STORAGE-BINDING",
             Self::InvalidCapability(_) => "DTG-STORAGE-CAPABILITY",
             Self::InvalidMutation(_) => "DTG-STORAGE-MUTATION",
-            Self::ConstraintViolation(_) => "DTG-STORAGE-CONSTRAINT",
             Self::InvalidBatch(_) => "DTG-STORAGE-BATCH",
+            Self::InjectedApplyFailure { .. } => "DTG-STORAGE-INJECTED-APPLY",
             Self::StaleBinding { .. } => "DTG-STORAGE-STALE-BINDING",
             Self::NamespaceOwnerMismatch { .. } => "DTG-STORAGE-NAMESPACE-OWNER",
             Self::NonMonotonicIndex { .. } => "DTG-STORAGE-RAFT-INDEX",
@@ -73,7 +75,6 @@ impl fmt::Display for StorageError {
             Self::InvalidBinding(message)
             | Self::InvalidCapability(message)
             | Self::InvalidMutation(message)
-            | Self::ConstraintViolation(message)
             | Self::InvalidBatch(message)
             | Self::CorruptSnapshot(message)
             | Self::InvalidConsensus(message)
@@ -99,6 +100,10 @@ impl fmt::Display for StorageError {
                 "read fence {requested} is unavailable at applied index {applied}"
             ),
             Self::CapabilityDrift => formatter.write_str("capability digest changed"),
+            Self::InjectedApplyFailure { staged_mutations } => write!(
+                formatter,
+                "injected apply failure after staging {staged_mutations} mutations"
+            ),
             Self::Unsupported => formatter.write_str("operation is unsupported"),
             Self::SnapshotIdentityMismatch => {
                 formatter.write_str("snapshot logical identity does not match target")

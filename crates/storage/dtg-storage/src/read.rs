@@ -337,6 +337,11 @@ impl VertexScan {
     }
 }
 
+/// A point-in-time logical edge scan.
+///
+/// Results contain at most one edge per [`EdgeId`]: the visible version with
+/// the greatest `(transaction_time, version)`, ordered by `EdgeId`. The cursor
+/// is exclusive and names the last logical edge identity returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeScan {
     valid_at: i64,
@@ -431,5 +436,6 @@ pub trait TemporalReadView: Send + Sync {
         &self,
         request: VertexScan,
     ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>>;
+    /// Returns the latest visible version per edge identity, ordered by edge ID.
     fn scan_edges(&self, request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion, EdgeId>>;
 }
