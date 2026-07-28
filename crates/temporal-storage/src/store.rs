@@ -3195,6 +3195,16 @@ pub enum TemporalStoreError {
     UnexpectedHistoryAnchor,
     MissingHistoryAnchor,
     HistoryChainTooDeep,
+    InvalidHistoryReadBudget,
+    HistoryRecordByteLimit,
+    HistoryTotalByteLimit,
+    HistoryAppliedIndexMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    HistoryContinuationNotAdvancing,
+    UnexpectedHistoryKey,
+    HistoryKeyTimestampMismatch,
     InvalidDiffOrder,
     InvalidScanBudget,
     ScanEntryLimit,
@@ -3296,6 +3306,28 @@ impl Display for TemporalStoreError {
             }
             Self::HistoryChainTooDeep => {
                 formatter.write_str("history delta chain exceeds the configured replay limit")
+            }
+            Self::InvalidHistoryReadBudget => {
+                formatter.write_str("history read budget is invalid")
+            }
+            Self::HistoryRecordByteLimit => {
+                formatter.write_str("history record exceeds its byte budget")
+            }
+            Self::HistoryTotalByteLimit => {
+                formatter.write_str("history replay exceeds its total byte budget")
+            }
+            Self::HistoryAppliedIndexMismatch { expected, actual } => write!(
+                formatter,
+                "history scan page applied index {actual} does not match snapshot {expected}"
+            ),
+            Self::HistoryContinuationNotAdvancing => {
+                formatter.write_str("history scan continuation does not advance")
+            }
+            Self::UnexpectedHistoryKey => {
+                formatter.write_str("history scan returned an unexpected key")
+            }
+            Self::HistoryKeyTimestampMismatch => {
+                formatter.write_str("history key timestamp does not match its record")
             }
             Self::InvalidDiffOrder => {
                 formatter.write_str("DIFF start transaction must not follow its end")

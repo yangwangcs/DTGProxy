@@ -3,6 +3,7 @@
 mod canonical;
 mod diff;
 mod history;
+mod history_reader;
 mod key;
 mod mapping_tck;
 mod observed_adapter;
@@ -18,6 +19,10 @@ pub use canonical::{
     encode_canonical_graph_entry,
 };
 pub use diff::{TemporalChange, TemporalChangeKind};
+pub use history_reader::{
+    HistoryReadBudget, HistoryReadStats, PointHistoryOutcome, PointHistoryReader,
+    PointHistoryRequest, PropertyDemand,
+};
 pub use key::{
     EdgeTypeId, ElementId, ElementKind, ElementRef, GraphId, GraphKey, KeyCodecError, LabelId,
     PartitionId, cross_in_adjacency_key, cross_in_adjacency_prefix, cross_out_adjacency_key,
