@@ -1555,7 +1555,13 @@ impl Neo4jReadSnapshot<'_> {
             let grouped = grouped.get_mut(ordinal).ok_or_else(|| {
                 AdapterError::Backend("Neo4j batch scan returned an unknown ordinal".into())
             })?;
-            grouped.push(vec![row[1].clone(), row[2].clone()]);
+            let logical_key = row.get(1).cloned().ok_or_else(|| {
+                AdapterError::Backend("Neo4j batch scan row is missing logical key".into())
+            })?;
+            let value = row.get(2).cloned().ok_or_else(|| {
+                AdapterError::Backend("Neo4j batch scan row is missing value".into())
+            })?;
+            grouped.push(vec![logical_key, value]);
         }
         let mut pages = Vec::with_capacity(request.scans().len());
         for (scan, rows) in request.scans().iter().zip(grouped) {
@@ -3379,6 +3385,37 @@ mod tests {
             bounded_canonical_page(rows, &request),
             Err(AdapterError::Backend(message)) if message.contains("canonical order")
         ));
+    }
+
+    #[test]
+    fn canonical_batch_scan_rejects_truncated_remote_rows_without_panicking() {
+        let (endpoint, _requests, server) = mock_query_api(vec![
+            MockResponse::json(
+                r#"{"data":{"values":[["000000000000002a"]]},"errors":[],"transaction":{"id":"tx-batch-truncated"}}"#,
+            ),
+            MockResponse::json(
+                r#"{"data":{"values":[[0]]},"errors":[],"transaction":{"id":"tx-batch-truncated"}}"#,
+            ),
+            MockResponse::json(r#"{"errors":[]}"#),
+        ]);
+        let adapter = test_adapter(&endpoint);
+        let snapshot = block_on(StorageAdapter::begin_read_snapshot(&adapter)).unwrap();
+        let scan = CanonicalScanRequest::new(
+            KeySpan::prefix(Keyspace::TemporalIndex, Vec::new()),
+            storage_api::QueryPageBounds::new(1, 64).unwrap(),
+        )
+        .unwrap();
+        let request = CanonicalBatchScanRequest::new(vec![scan], 64).unwrap();
+
+        let result = block_on(snapshot.scan_canonical_batch(&request));
+
+        assert!(matches!(
+            result,
+            Err(AdapterError::Backend(message))
+                if message == "Neo4j batch scan row is missing logical key"
+        ));
+        drop(snapshot);
+        server.join().unwrap();
     }
 
     #[test]
