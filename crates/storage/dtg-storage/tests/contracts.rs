@@ -416,14 +416,14 @@ fn execution_stage_failure_is_atomic() {
     )
     .unwrap();
     assert!(matches!(
-        block_on(store.apply(failing_batch)),
+        block_on(store.apply(failing_batch.clone())),
         Err(StorageError::InjectedApplyFailure {
             staged_mutations: 1
         })
     ));
     assert_eq!(block_on(store.applied_index()).unwrap(), 1);
 
-    let view = block_on(store.begin_read_view(ReadFence::new(store_binding, 1))).unwrap();
+    let view = block_on(store.begin_read_view(ReadFence::new(store_binding.clone(), 1))).unwrap();
     assert_eq!(
         block_on(view.get_vertex(VertexRead::new(
             first.id(),
@@ -460,6 +460,35 @@ fn execution_stage_failure_is_atomic() {
     let changes = block_on(view.changes(ChangesRead::new(0, 2, 16).unwrap())).unwrap();
     assert_eq!(changes.rows().len(), 2);
     assert!(changes.rows().iter().all(|change| change.raft_index() == 1));
+
+    let retry = block_on(store.apply(failing_batch.clone())).unwrap();
+    assert!(!retry.replayed());
+    assert_eq!(block_on(store.applied_index()).unwrap(), 2);
+    let committed = block_on(store.begin_read_view(ReadFence::new(store_binding, 2))).unwrap();
+    for vertex in [&first_staged, &second_staged] {
+        assert_eq!(
+            block_on(committed.get_vertex(VertexRead::new(
+                vertex.id(),
+                10,
+                TransactionTime::new(10).unwrap(),
+            )))
+            .unwrap(),
+            Some(vertex.clone())
+        );
+    }
+    let committed_changes =
+        block_on(committed.changes(ChangesRead::new(1, 2, 16).unwrap())).unwrap();
+    assert_eq!(committed_changes.rows().len(), 2);
+    assert!(
+        committed_changes
+            .rows()
+            .iter()
+            .all(|change| change.raft_index() == 2)
+    );
+
+    let replay = block_on(store.apply(failing_batch)).unwrap();
+    assert!(replay.replayed());
+    assert_eq!(block_on(store.applied_index()).unwrap(), 2);
 }
 
 #[test]
@@ -595,6 +624,17 @@ fn deterministic_store_passes_the_public_tck() {
     block_on(run_storage_tck(&TestFactory::new())).unwrap();
 }
 
+#[test]
+fn public_tck_rejects_an_injected_failure_that_is_not_one_shot() {
+    let factory = TestFactory::with_persistent_apply_failure();
+    assert!(matches!(
+        block_on(run_storage_tck(&factory)),
+        Err(StorageError::InjectedApplyFailure {
+            staged_mutations: 1
+        })
+    ));
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReplayRecord {
     term: u64,
@@ -619,6 +659,7 @@ struct TestStore {
     capabilities: CapabilityManifest,
     state: Arc<Mutex<TestState>>,
     apply_failure_after: Arc<Mutex<Option<usize>>>,
+    persistent_apply_failure: bool,
 }
 
 #[derive(Default)]
@@ -630,6 +671,7 @@ struct FactoryState {
 struct TestFactory {
     state: Mutex<FactoryState>,
     capabilities: CapabilityManifest,
+    persistent_apply_failure: bool,
 }
 
 impl TestFactory {
@@ -637,6 +679,14 @@ impl TestFactory {
         Self {
             state: Mutex::new(FactoryState::default()),
             capabilities: capabilities(),
+            persistent_apply_failure: false,
+        }
+    }
+
+    fn with_persistent_apply_failure() -> Self {
+        Self {
+            persistent_apply_failure: true,
+            ..Self::new()
         }
     }
 }
@@ -678,6 +728,7 @@ impl StorageTckFactory for TestFactory {
                 capabilities: self.capabilities.clone(),
                 state,
                 apply_failure_after: Arc::new(Mutex::new(None)),
+                persistent_apply_failure: self.persistent_apply_failure,
             }) as Box<dyn StorageTckStore>)
         })
     }
@@ -770,7 +821,9 @@ impl ReplicaStateStore for TestStore {
                 next.changes.push((batch.raft_index(), mutation.clone()));
                 let mut armed_failure = self.apply_failure_after.lock().unwrap();
                 if *armed_failure == Some(position + 1) {
-                    *armed_failure = None;
+                    if !self.persistent_apply_failure {
+                        *armed_failure = None;
+                    }
                     return Err(StorageError::InjectedApplyFailure {
                         staged_mutations: position + 1,
                     });

@@ -92,7 +92,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             "lease-owner",
             Value::String("replica-tck-primary".to_owned()),
         )?;
-        let expected_snapshot_records = vec![
+        let mut expected_snapshot_records = vec![
             SnapshotRecord::Vertex(first_vertex.clone()),
             SnapshotRecord::Vertex(second_vertex.clone()),
             SnapshotRecord::Edge(first_edge.clone()),
@@ -204,7 +204,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         )?;
         execution_failure.validate()?;
         require_error(
-            primary.apply(execution_failure).await,
+            primary.apply(execution_failure.clone()).await,
             |error| {
                 matches!(
                     error,
@@ -275,8 +275,59 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             "execution-stage failure leaked change-index visibility",
         )?;
 
+        let retry_receipt = primary.apply(execution_failure.clone()).await?;
+        require(
+            !retry_receipt.replayed(),
+            "retry after injected failure was incorrectly marked as replay",
+        )?;
+        require(
+            primary.applied_index().await? == 2,
+            "retry after injected failure did not advance the applied index",
+        )?;
+        let committed_after_retry = primary
+            .begin_read_view(ReadFence::new(primary_binding.clone(), 2))
+            .await?;
+        for vertex in [&staged_vertex, &second_staged_vertex] {
+            require(
+                committed_after_retry
+                    .get_vertex(VertexRead::new(
+                        vertex.id(),
+                        10,
+                        TransactionTime::new(10).map_err(kernel_error)?,
+                    ))
+                    .await?
+                    == Some(vertex.clone()),
+                "retry after injected failure did not publish every mutation",
+            )?;
+        }
+        let retry_changes = committed_after_retry
+            .changes(crate::ChangesRead::new(1, 2, 16)?)
+            .await?;
+        require(
+            retry_changes.rows().len() == execution_failure.mutations().len()
+                && retry_changes
+                    .rows()
+                    .iter()
+                    .zip(execution_failure.mutations())
+                    .all(|(change, mutation)| {
+                        change.raft_index() == 2 && change.mutation() == mutation
+                    }),
+            "retry after injected failure did not publish its complete change set",
+        )?;
+        let retry_replay = primary.apply(execution_failure).await?;
+        require(
+            retry_replay.replayed(),
+            "successful retry was not subsequently idempotent",
+        )?;
+        require(
+            primary.applied_index().await? == 2,
+            "idempotent retry replay advanced the applied index",
+        )?;
+        expected_snapshot_records.push(SnapshotRecord::Vertex(staged_vertex.clone()));
+        expected_snapshot_records.push(SnapshotRecord::Vertex(second_staged_vertex.clone()));
+
         let drifted_fence =
-            ReadFence::with_capability_digest(primary_binding.clone(), 1, Digest32::new([9; 32]));
+            ReadFence::with_capability_digest(primary_binding.clone(), 2, Digest32::new([9; 32]));
         require_error(
             primary.begin_read_view(drifted_fence.clone()).await,
             |error| matches!(error, StorageError::CapabilityDrift),
@@ -293,7 +344,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         let replay = primary.apply(first_batch.clone()).await?;
         require(replay.replayed(), "identical replay was not idempotent")?;
         require(
-            primary.applied_index().await? == 1,
+            primary.applied_index().await? == 2,
             "replay advanced the index",
         )?;
 
@@ -315,9 +366,9 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         let skipped_index = CommittedShardBatch::new(
             primary_binding.clone(),
             4,
-            3,
+            4,
             CommandId::new(7003)?,
-            vec![LogicalMutation::PutVertex(sample_vertex(104, 1, "skip")?)],
+            vec![LogicalMutation::PutVertex(sample_vertex(106, 1, "skip")?)],
         )?;
         require_error(
             primary.apply(skipped_index).await,
@@ -325,8 +376,8 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
                 matches!(
                     error,
                     StorageError::NonMonotonicIndex {
-                        applied: 1,
-                        proposed: 3
+                        applied: 2,
+                        proposed: 4
                     }
                 )
             },
@@ -337,9 +388,9 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         let stale_batch = CommittedShardBatch::new(
             stale_binding,
             4,
-            2,
-            CommandId::new(7002)?,
-            vec![LogicalMutation::PutVertex(sample_vertex(105, 1, "stale")?)],
+            3,
+            CommandId::new(7004)?,
+            vec![LogicalMutation::PutVertex(sample_vertex(107, 1, "stale")?)],
         )?;
         require_error(
             primary.apply(stale_batch).await,
@@ -347,13 +398,13 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             "stale binding was accepted",
         )?;
         require(
-            primary.applied_index().await? == 1,
+            primary.applied_index().await? == 2,
             "rejected apply changed the index",
         )?;
         let after_rejections = primary
-            .begin_read_view(ReadFence::new(primary_binding.clone(), 1))
+            .begin_read_view(ReadFence::new(primary_binding.clone(), 2))
             .await?;
-        for rejected_id in [103, 104, 105] {
+        for rejected_id in [103, 106, 107] {
             require(
                 after_rejections
                     .get_vertex(VertexRead::new(
@@ -370,7 +421,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         let point = CapabilityManifest::from_names(["point"])?;
         let exact_request = PushdownRequest::new(
             SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
-            current_fence.clone(),
+            ReadFence::new(primary_binding.clone(), 2),
             point,
             PushdownOperation::Vertex(first_read),
         )?;
@@ -385,7 +436,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
 
         let residual_request = PushdownRequest::new(
             SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
-            current_fence.clone(),
+            ReadFence::new(primary_binding.clone(), 2),
             CapabilityManifest::from_names(["point", "typed-property-predicate"])?,
             PushdownOperation::Vertex(VertexRead::new(
                 first_vertex.id(),
@@ -407,7 +458,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
 
         let unsupported_request = PushdownRequest::new(
             SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
-            current_fence.clone(),
+            ReadFence::new(primary_binding.clone(), 2),
             CapabilityManifest::from_names(["selected-partial-aggregate"])?,
             PushdownOperation::VertexScan(VertexScan::new(
                 10,
@@ -497,7 +548,10 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         )?;
 
         let mut reader = primary
-            .begin_snapshot(current_fence, SnapshotRequest::new(9001, 1)?)
+            .begin_snapshot(
+                ReadFence::new(primary_binding.clone(), 2),
+                SnapshotRequest::new(9001, 1)?,
+            )
             .await?;
         let header = reader.header().clone();
         let mut chunks = Vec::new();
@@ -506,7 +560,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
         }
         let manifest = reader.finish().await?;
         require(
-            chunks.len() == before_failed_apply.len(),
+            chunks.len() == expected_snapshot_records.len(),
             "snapshot chunk bound was not honored",
         )?;
 
@@ -542,7 +596,7 @@ pub fn run_storage_tck(factory: &dyn StorageTckFactory) -> StoreFuture<'_, ()> {
             "restore receipt lost manifest identity",
         )?;
         let restored_export =
-            export_snapshot_records(&*restored, &restored_binding, 1, 9002, 2).await?;
+            export_snapshot_records(&*restored, &restored_binding, 2, 9002, 2).await?;
         require_complete_snapshot_categories(&restored_export)?;
         require(
             canonical_snapshot_records(restored_export)

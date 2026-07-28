@@ -8,6 +8,8 @@ pub enum StorageError {
     InvalidCapability(String),
     InvalidMutation(String),
     InvalidBatch(String),
+    /// Certification-only failure injected after private mutation staging.
+    /// Production providers must not use this for business constraint failures.
     InjectedApplyFailure {
         staged_mutations: usize,
     },

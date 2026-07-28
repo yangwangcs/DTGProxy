@@ -300,8 +300,8 @@ impl ReplicaMetadata {
 pub enum LogicalMutation {
     PutVertex(VertexVersion),
     DeleteVertex(VertexTombstone),
-    /// Requires both endpoints to exist in the pre-batch state or an earlier mutation in the
-    /// same atomic batch. Providers reject a missing endpoint with a constraint violation.
+    /// Applies a committed edge version without resolving its endpoints locally.
+    /// Referential and identity constraints belong to execution and may span Shards.
     PutEdge(EdgeVersion),
     DeleteEdge(EdgeTombstone),
     PutTransaction(TransactionRecord),
