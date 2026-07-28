@@ -6,9 +6,9 @@ use std::task::{Context, Poll, Wake, Waker};
 use adapter_memory::MemoryAdapter;
 use storage_api::{CommittedMutationBatch, KeySpan, Keyspace, Mutation, StorageAdapter};
 use temporal_storage::{
-    CommitContext, ElementId, ElementRef, GraphId, HistoryAnchor, HistoryEntry, LabelId,
-    PartitionId, ProjectionRecord, TemporalStore, TemporalStoreError, ValidSegment, VertexMutation,
-    history_anchor_key, history_prefix,
+    CommitContext, ElementId, ElementRef, GraphId, HistoryAnchor, HistoryEntry, HistoryReadBudget,
+    LabelId, PartitionId, ProjectionRecord, TemporalStore, TemporalStoreError, ValidSegment,
+    VertexMutation, history_anchor_key, history_prefix,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -83,6 +83,45 @@ fn policy_writes_at_most_fifteen_deltas_before_a_new_anchor() {
     assert_eq!(
         block_on(store.vertex_as_of(vertex(), valid(50), tx(1_750))).unwrap(),
         Some(payload(17))
+    );
+}
+
+#[test]
+fn snapshot_bound_point_reads_remain_at_the_snapshot_applied_index() {
+    let store = TemporalStore::new(MemoryAdapter::new());
+    let label = LabelId::new(1);
+    block_on(store.commit_vertex(
+        context(1, 0, 100),
+        VertexMutation::put(vertex(), label, interval(), payload(1)).unwrap(),
+    ))
+    .unwrap();
+    let snapshot = block_on(store.begin_read_snapshot()).unwrap();
+    assert_eq!(snapshot.applied_log_index(), 1);
+
+    block_on(store.commit_vertex(
+        context(2, 100, 200),
+        VertexMutation::put(vertex(), label, interval(), payload(2)).unwrap(),
+    ))
+    .unwrap();
+    let budget = HistoryReadBudget::new(16, 128 * 1024, 64 * 1024).unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(
+            block_on(store.vertex_as_of_in_snapshot(
+                snapshot.as_ref(),
+                vertex(),
+                valid(50),
+                tx(250),
+                budget,
+            ))
+            .unwrap(),
+            Some(payload(1))
+        );
+    }
+    assert_eq!(snapshot.applied_log_index(), 1);
+    assert_eq!(
+        block_on(store.vertex_as_of(vertex(), valid(50), tx(250))).unwrap(),
+        Some(payload(2))
     );
 }
 

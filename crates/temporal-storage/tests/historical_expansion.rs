@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use adapter_memory::MemoryAdapter;
 use temporal_storage::{
-    CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId, LabelId, PartitionId,
-    TemporalStore, TemporalTransaction, VertexMutation,
+    AdapterCallObserver, CommitContext, EdgeMutation, EdgeTypeId, ElementId, ElementRef, GraphId,
+    LabelId, ObservedStorageAdapter, PartitionId, TemporalStore, TemporalTransaction,
+    VertexMutation,
 };
 use temporal_types::{CanonicalElement, GraphValue, Interval, TransactionTime, ValidTime};
 
@@ -81,6 +83,79 @@ fn historical_edge_lookup_and_expansion_include_edges_absent_from_current_adjace
             .unwrap();
     assert_eq!(outgoing, vec![historical.clone()]);
     assert_eq!(incoming, vec![historical]);
+}
+
+#[derive(Default)]
+struct HistoryScanCounter {
+    canonical_scans: AtomicU64,
+    canonical_batch_scans: AtomicU64,
+}
+
+impl AdapterCallObserver for HistoryScanCounter {
+    fn record_adapter_call(&self) {}
+
+    fn record_canonical_scan(&self) {
+        self.canonical_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_canonical_batch_scan(&self) {
+        self.canonical_batch_scans.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn historical_expansion_batches_matching_edge_replay() {
+    let counter = Arc::new(HistoryScanCounter::default());
+    let adapter = ObservedStorageAdapter::new(MemoryAdapter::new(), Arc::clone(&counter));
+    let store = TemporalStore::new(adapter);
+    let lifetime = interval(i64::MIN, None);
+    let mut initial = TemporalTransaction::new()
+        .with_vertex(
+            VertexMutation::put(vertex(1), LabelId::new(1), lifetime, payload("source")).unwrap(),
+        )
+        .with_vertex(
+            VertexMutation::put(vertex(2), LabelId::new(1), lifetime, payload("destination"))
+                .unwrap(),
+        );
+    let mut deleted = TemporalTransaction::new();
+    for edge_id in 10..19 {
+        initial = initial.with_edge(
+            EdgeMutation::put(
+                edge(edge_id),
+                EdgeTypeId::new(9),
+                ElementId::new(1),
+                ElementId::new(2),
+                lifetime,
+                payload(&format!("historical-edge-{edge_id}")),
+            )
+            .unwrap(),
+        );
+        deleted = deleted.with_edge(
+            EdgeMutation::delete(
+                edge(edge_id),
+                EdgeTypeId::new(9),
+                ElementId::new(1),
+                ElementId::new(2),
+                lifetime,
+            )
+            .unwrap(),
+        );
+    }
+    block_on(store.commit_transaction(context(1, 0, 100), initial)).unwrap();
+    block_on(store.commit_transaction(context(2, 100, 200), deleted)).unwrap();
+
+    let edges = block_on(store.expand_out_as_of(
+        graph(),
+        partition(),
+        ElementId::new(1),
+        valid(5),
+        tx(150),
+    ))
+    .unwrap();
+
+    assert_eq!(edges.len(), 9);
+    assert_eq!(counter.canonical_batch_scans.load(Ordering::Relaxed), 1);
+    assert_eq!(counter.canonical_scans.load(Ordering::Relaxed), 0);
 }
 
 fn graph() -> GraphId {
