@@ -29,13 +29,7 @@ struct Parser<'a> {
 }
 impl Parser<'_> {
     fn program(&mut self) -> Result<Program, LanguageError> {
-        if self.at_word("DIFF")
-            || self.at_word("AT")
-            || self.at_word("LEGACY")
-            || self.at_word("COMPAT")
-            || self.at_word("V1")
-            || self.at_word("V2")
-        {
+        if self.at_removed_syntax() {
             return Err(self.removed("removed compatibility or temporal syntax"));
         }
         let graph = if self.take_word("USE") {
@@ -43,6 +37,9 @@ impl Parser<'_> {
         } else {
             None
         };
+        if self.at_removed_syntax() {
+            return Err(self.removed("removed compatibility or temporal syntax"));
+        }
         let statement = if self.take_word("BEGIN") {
             Statement::Boundary(Boundary::Begin)
         } else if self.take_word("COMMIT") {
@@ -63,13 +60,7 @@ impl Parser<'_> {
             Statement::Query(self.query()?)
         };
         if !matches!(self.current().kind, TokenKind::End) {
-            if self.at_word("AT")
-                || self.at_word("DIFF")
-                || self.at_word("LEGACY")
-                || self.at_word("COMPAT")
-                || self.at_word("V1")
-                || self.at_word("V2")
-            {
+            if self.at_removed_syntax() {
                 return Err(self.removed("removed compatibility or temporal syntax"));
             }
             return Err(self.error("unexpected trailing input"));
@@ -124,13 +115,15 @@ impl Parser<'_> {
         } else {
             None
         };
+        if self.at_removed_syntax() {
+            return Err(self.removed("removed compatibility or temporal syntax"));
+        }
+        self.expect_word("RETURN")?;
         let mut returns = Vec::new();
-        if self.take_word("RETURN") {
-            loop {
-                returns.push(self.expr()?);
-                if !self.take_symbol(',') {
-                    break;
-                }
+        loop {
+            returns.push(self.expr()?);
+            if !self.take_symbol(',') {
+                break;
             }
         }
         Ok(crate::ast::Query {
@@ -475,6 +468,11 @@ impl Parser<'_> {
             }
             _ => Err(self.error("identifier expected")),
         }
+    }
+    fn at_removed_syntax(&self) -> bool {
+        ["DIFF", "AT", "LEGACY", "COMPAT", "V1", "V2"]
+            .iter()
+            .any(|word| self.at_word(word))
     }
     fn error(&self, message: &str) -> LanguageError {
         LanguageError::parse(message, self.current().start, self.current().end)

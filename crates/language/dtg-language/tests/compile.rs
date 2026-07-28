@@ -443,6 +443,12 @@ fn statement_wide_changes_axes_cannot_be_hidden_by_match_overrides() {
 }
 
 #[test]
+fn standalone_match_requires_a_return_clause() {
+    let error = compile("MATCH (n)", &EmptySchemaCatalog).unwrap_err();
+    assert_eq!(error.code(), "DTG-LANG-PARSE");
+}
+
+#[test]
 fn repeated_bindings_inside_one_pattern_fail_closed() {
     for source in [
         "MATCH (a)-[r]->(b)-[s]->(a) RETURN a",
@@ -716,4 +722,10 @@ fn removed_temporal_syntax_is_rejected() {
         let error = compile(source, &EmptySchemaCatalog).unwrap_err();
         assert_eq!(error.code(), "DTG-LANG-REMOVED-SYNTAX");
     }
+}
+
+#[test]
+fn removed_syntax_after_graph_scope_preserves_its_stable_error_code() {
+    let error = compile("USE accounts DIFF GRAPH accounts", &EmptySchemaCatalog).unwrap_err();
+    assert_eq!(error.code(), "DTG-LANG-REMOVED-SYNTAX");
 }
