@@ -96,6 +96,24 @@ impl LogicalPlan {
             nodes: Vec::new(),
         }
     }
+
+    pub fn contains_scope(&self, scope: TemporalScope) -> bool {
+        self.contains_scope_ref(&scope)
+    }
+
+    fn contains_scope_ref(&self, scope: &TemporalScope) -> bool {
+        self.nodes.iter().any(|node| match &node.kind {
+            LogicalNodeKind::NodeScan(scan) => scan.read_scope.transaction_time == *scope,
+            LogicalNodeKind::RelationshipScan(scan) => scan.read_scope.transaction_time == *scope,
+            LogicalNodeKind::VertexLookup(lookup) => lookup.read_scope.transaction_time == *scope,
+            LogicalNodeKind::RelationshipLookup(lookup) => {
+                lookup.read_scope.transaction_time == *scope
+            }
+            LogicalNodeKind::Expand(expand) => expand.read_scope.transaction_time == *scope,
+            LogicalNodeKind::Subquery(subquery) => subquery.plan.contains_scope_ref(scope),
+            _ => false,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]

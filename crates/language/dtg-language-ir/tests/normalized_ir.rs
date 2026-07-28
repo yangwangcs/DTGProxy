@@ -154,6 +154,104 @@ fn programs_have_an_inspectable_default_or_explicit_graph_scope() {
 }
 
 #[test]
+fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
+    let scan_scope = TemporalScope::AsOf(TimeExpr::Parameter("scan".into()));
+    let lookup_scope = TemporalScope::AsOf(TimeExpr::Parameter("lookup".into()));
+    let expand_scope = TemporalScope::Changes {
+        from: TimeExpr::Parameter("from".into()),
+        to: TimeExpr::Parameter("to".into()),
+    };
+    let nested_scope = TemporalScope::AsOf(TimeExpr::Parameter("nested".into()));
+    let plan = LogicalPlan {
+        root: LogicalNodeId::new(1),
+        nodes: vec![
+            LogicalNode {
+                id: LogicalNodeId::new(1),
+                kind: LogicalNodeKind::NodeScan(NodeScan {
+                    variable: "v".into(),
+                    labels: Vec::new(),
+                    read_scope: ReadScope {
+                        transaction_time: scan_scope.clone(),
+                        valid_time: None,
+                    },
+                }),
+            },
+            LogicalNode {
+                id: LogicalNodeId::new(2),
+                kind: LogicalNodeKind::RelationshipScan(RelationshipScan {
+                    variable: "r".into(),
+                    relationship_types: Vec::new(),
+                    read_scope: ReadScope {
+                        transaction_time: scan_scope.clone(),
+                        valid_time: None,
+                    },
+                }),
+            },
+            LogicalNode {
+                id: LogicalNodeId::new(3),
+                kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                    variable: "lookup_v".into(),
+                    id: LogicalExpr::Parameter("id".into()),
+                    labels: Vec::new(),
+                    read_scope: ReadScope {
+                        transaction_time: lookup_scope.clone(),
+                        valid_time: None,
+                    },
+                }),
+            },
+            LogicalNode {
+                id: LogicalNodeId::new(4),
+                kind: LogicalNodeKind::RelationshipLookup(RelationshipLookup {
+                    variable: "lookup_r".into(),
+                    id: LogicalExpr::Parameter("id".into()),
+                    relationship_types: Vec::new(),
+                    read_scope: ReadScope {
+                        transaction_time: lookup_scope.clone(),
+                        valid_time: None,
+                    },
+                }),
+            },
+            LogicalNode {
+                id: LogicalNodeId::new(5),
+                kind: LogicalNodeKind::Expand(Expand {
+                    input: LogicalNodeId::new(1),
+                    source: "v".into(),
+                    relationship: "expanded_r".into(),
+                    destination: "other".into(),
+                    direction: ExpandDirection::Outgoing,
+                    relationship_types: Vec::new(),
+                    read_scope: ReadScope {
+                        transaction_time: expand_scope.clone(),
+                        valid_time: None,
+                    },
+                }),
+            },
+            LogicalNode {
+                id: LogicalNodeId::new(6),
+                kind: LogicalNodeKind::Subquery(Subquery {
+                    input: None,
+                    plan: Box::new(plan(LogicalNodeKind::NodeScan(NodeScan {
+                        variable: "nested_v".into(),
+                        labels: Vec::new(),
+                        read_scope: ReadScope {
+                            transaction_time: nested_scope.clone(),
+                            valid_time: None,
+                        },
+                    }))),
+                    correlated_variables: Vec::new(),
+                }),
+            },
+        ],
+    };
+
+    assert!(plan.contains_scope(scan_scope));
+    assert!(plan.contains_scope(lookup_scope));
+    assert!(plan.contains_scope(expand_scope));
+    assert!(plan.contains_scope(nested_scope));
+    assert!(!plan.contains_scope(TemporalScope::AsOf(TimeExpr::Parameter("missing".into(),))));
+}
+
+#[test]
 fn point_lookups_and_valid_time_read_scopes_are_public_and_validate_parameters() {
     let valid_program = program(LogicalStatement::Query(plan(
         LogicalNodeKind::VertexLookup(VertexLookup {
