@@ -1,7 +1,7 @@
 use dtg_language::{EmptySchemaCatalog, SchemaCatalog, compile};
 use dtg_language_ir::{
-    GraphId, GraphScope, LogicalMutation, LogicalNodeKind, LogicalStatement, TemporalScope, TimeExpr,
-    ValidInterval, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate,
+    ExpandDirection, GraphId, GraphScope, LogicalMutation, LogicalNodeKind, LogicalStatement,
+    TemporalScope, TimeExpr, ValidInterval, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate,
 };
 
 struct Catalog;
@@ -188,6 +188,40 @@ fn valid_from_literals_compile_and_invalid_expressions_fail_semantically() {
         let error = compile(source, &EmptySchemaCatalog).unwrap_err();
         assert_eq!(error.code(), "DTG-LANG-TYPE");
     }
+}
+
+#[test]
+fn multiple_matches_properties_and_where_are_preserved_in_the_plan() {
+    let program = compile(
+        "MATCH (a:Person {id: $id}) MATCH (b:Person) WHERE a.id = b.id RETURN a",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = program.statement else {
+        panic!("expected query");
+    };
+    assert!(
+        plan.nodes
+            .iter()
+            .any(|node| matches!(node.kind, LogicalNodeKind::Join(_)))
+    );
+    assert!(
+        plan.nodes
+            .iter()
+            .any(|node| matches!(node.kind, LogicalNodeKind::Filter { .. }))
+    );
+}
+
+#[test]
+fn undirected_relationships_normalize_to_either_expansion() {
+    let program = compile("MATCH (a)-[r:KNOWS]-(b) RETURN a", &EmptySchemaCatalog).unwrap();
+    let LogicalStatement::Query(plan) = program.statement else {
+        panic!("expected query");
+    };
+    assert!(plan.nodes.iter().any(|node| matches!(
+        node.kind,
+        LogicalNodeKind::Expand(ref expand) if expand.direction == ExpandDirection::Either
+    )));
 }
 
 #[test]
