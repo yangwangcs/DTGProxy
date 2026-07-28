@@ -656,6 +656,10 @@ version = "1.0.0"
 [[package]]
 name = "dtg-language"
 version = "1.0.0"
+dependencies = [
+ "dtg-kernel",
+ "dtg-language-ir",
+]
 
 [[package]]
 name = "dtg-language-ir"

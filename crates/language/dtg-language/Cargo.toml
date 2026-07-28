@@ -7,3 +7,10 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+dtg-kernel = { path = "../../kernel/dtg-kernel" }
+dtg-language-ir = { path = "../dtg-language-ir" }
+
+[dev-dependencies]
+dtg-language-ir = { path = "../dtg-language-ir" }
