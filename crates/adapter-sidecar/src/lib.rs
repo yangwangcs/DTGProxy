@@ -17,13 +17,14 @@ use std::time::Duration;
 use prost::Message;
 use storage_api::{
     ADAPTER_SPI_VERSION, AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture,
-    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalScanPage,
-    CanonicalScanRequest, CommittedMutationBatch, ComparisonOperator, Durability, KeySpan,
-    KeyValue, Keyspace, LOGICAL_SNAPSHOT_FORMAT_VERSION, LogicalKey, LogicalSnapshotChunkV1,
-    LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
-    LogicalSnapshotReader, MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES, MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES,
-    Mutation, MutationOperation, PropertyConstraint, PropertyId, PushdownGuarantee,
-    QueryPageBounds, QueryPrimitiveCapabilities, ReadSnapshot, SnapshotCapability, StorageAdapter,
+    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalBatchScanPage,
+    CanonicalBatchScanRequest, CanonicalScanPage, CanonicalScanRequest, CommittedMutationBatch,
+    ComparisonOperator, Durability, KeySpan, KeyValue, Keyspace, LOGICAL_SNAPSHOT_FORMAT_VERSION,
+    LogicalKey, LogicalSnapshotChunkV1, LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1,
+    LogicalSnapshotManifestV1, LogicalSnapshotReader, MAX_LOGICAL_SNAPSHOT_CHUNK_BYTES,
+    MAX_LOGICAL_SNAPSHOT_CHUNK_ENTRIES, Mutation, MutationOperation, PropertyConstraint,
+    PropertyId, PushdownGuarantee, QueryPageBounds, QueryPrimitiveCapabilities, ReadSnapshot,
+    SnapshotCapability, StorageAdapter,
 };
 use temporal_types::{GraphValue, ValidTime};
 
@@ -52,6 +53,7 @@ impl FeatureSet {
     pub const READ_VIEW_SESSION_V1: Self = Self(1 << 4);
     pub const CANONICAL_SCAN_READ_VIEW_V1: Self = Self(1 << 5);
     pub const CANDIDATE_SCAN_READ_VIEW_V1: Self = Self(1 << 6);
+    pub const CANONICAL_BATCH_SCAN_READ_VIEW_V1: Self = Self(1 << 7);
     pub const ALL: Self = Self(
         Self::BASE_ADAPTER_V1.0
             | Self::LOGICAL_EXPORT_SESSION_V1.0
@@ -59,7 +61,8 @@ impl FeatureSet {
             | Self::RESUMABLE_ORDINAL_REPLAY_V1.0
             | Self::READ_VIEW_SESSION_V1.0
             | Self::CANONICAL_SCAN_READ_VIEW_V1.0
-            | Self::CANDIDATE_SCAN_READ_VIEW_V1.0,
+            | Self::CANDIDATE_SCAN_READ_VIEW_V1.0
+            | Self::CANONICAL_BATCH_SCAN_READ_VIEW_V1.0,
     );
     pub const EMPTY: Self = Self(0);
 
@@ -111,7 +114,8 @@ impl HelloRequest {
                 .union(FeatureSet::RESUMABLE_ORDINAL_REPLAY_V1)
                 .union(FeatureSet::READ_VIEW_SESSION_V1)
                 .union(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1)
-                .union(FeatureSet::CANDIDATE_SCAN_READ_VIEW_V1),
+                .union(FeatureSet::CANDIDATE_SCAN_READ_VIEW_V1)
+                .union(FeatureSet::CANONICAL_BATCH_SCAN_READ_VIEW_V1),
             max_payload_bytes: u32::try_from(MAX_FRAME_PAYLOAD_BYTES)
                 .expect("frame maximum fits in u32"),
         }
@@ -277,6 +281,10 @@ pub enum Request {
         session_id: u128,
         request: CandidateScanRequest,
     },
+    ReadViewCanonicalBatchScan {
+        session_id: u128,
+        request: CanonicalBatchScanRequest,
+    },
     EndReadView {
         session_id: u128,
     },
@@ -298,6 +306,7 @@ impl Request {
                 | Self::ReadViewScan { .. }
                 | Self::ReadViewCanonicalScan { .. }
                 | Self::ReadViewCandidateScan { .. }
+                | Self::ReadViewCanonicalBatchScan { .. }
         )
     }
 }
@@ -355,10 +364,21 @@ pub enum Response {
         entries: Vec<KeyValue>,
         next_start: Option<LogicalKey>,
     },
+    ReadViewCanonicalBatchScan {
+        session_id: u128,
+        applied_log_index: u64,
+        pages: Vec<CanonicalBatchPageResponse>,
+    },
     ReadViewEnded {
         session_id: u128,
     },
     Error(RemoteError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBatchPageResponse {
+    pub entries: Vec<KeyValue>,
+    pub next_start: Option<LogicalKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -992,6 +1012,7 @@ pub async fn dispatch_request(adapter: &dyn StorageAdapter, request: Request) ->
         | Request::ReadViewMultiGet { .. }
         | Request::ReadViewScan { .. }
         | Request::ReadViewCanonicalScan { .. }
+        | Request::ReadViewCanonicalBatchScan { .. }
         | Request::ReadViewCandidateScan { .. }
         | Request::EndReadView { .. } => Response::Error(RemoteError {
             code: RemoteErrorCode::FeatureUnsupported as u32,
@@ -1437,6 +1458,9 @@ impl<T: SidecarTransport> StorageAdapter for SidecarAdapter<T> {
                         canonical_scan: self
                             .negotiated_features
                             .contains(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1),
+                        canonical_batch_scan: self
+                            .negotiated_features
+                            .contains(FeatureSet::CANONICAL_BATCH_SCAN_READ_VIEW_V1),
                         candidate_scan: self.descriptor.capabilities().predicate_pushdown
                             && self
                                 .negotiated_features
@@ -1471,6 +1495,7 @@ struct SidecarReadSnapshot<'transport, T: SidecarTransport> {
     session_id: u128,
     applied_log_index: u64,
     canonical_scan: bool,
+    canonical_batch_scan: bool,
     candidate_scan: bool,
 }
 
@@ -1690,6 +1715,90 @@ impl<T: SidecarTransport> ReadSnapshot for SidecarReadSnapshot<'_, T> {
             }
         })
     }
+
+    fn scan_canonical_batch<'a>(
+        &'a self,
+        request: &'a CanonicalBatchScanRequest,
+    ) -> AdapterFuture<'a, CanonicalBatchScanPage> {
+        Box::pin(async move {
+            if !self.canonical_batch_scan {
+                return Err(AdapterError::UnsupportedOperation {
+                    operation: "snapshot canonical batch scan",
+                });
+            }
+            let response = self
+                .transport
+                .call(Request::ReadViewCanonicalBatchScan {
+                    session_id: self.session_id,
+                    request: request.clone(),
+                })
+                .await
+                .map_err(AdapterError::from)?;
+            match response {
+                Response::ReadViewCanonicalBatchScan {
+                    session_id,
+                    applied_log_index,
+                    pages,
+                } if session_id == self.session_id => {
+                    if applied_log_index != self.applied_log_index {
+                        return Err(AdapterError::from(
+                            SidecarClientError::InvalidSnapshotResponse(format!(
+                                "read-view canonical batch scan index {applied_log_index} differs from fixed index {}",
+                                self.applied_log_index
+                            )),
+                        ));
+                    }
+                    if pages.len() != request.scans().len() {
+                        return Err(AdapterError::from(
+                            SidecarClientError::InvalidSnapshotResponse(
+                                "canonical batch response changed page cardinality".into(),
+                            ),
+                        ));
+                    }
+                    let pages = request
+                        .scans()
+                        .iter()
+                        .zip(pages)
+                        .map(|(scan, page)| {
+                            CanonicalScanPage::new(
+                                scan,
+                                applied_log_index,
+                                page.entries,
+                                page.next_start,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| {
+                            AdapterError::from(SidecarClientError::InvalidSnapshotResponse(
+                                error.to_string(),
+                            ))
+                        })?;
+                    CanonicalBatchScanPage::new(request, applied_log_index, pages).map_err(
+                        |error| {
+                            AdapterError::from(SidecarClientError::InvalidSnapshotResponse(
+                                error.to_string(),
+                            ))
+                        },
+                    )
+                }
+                Response::Error(error)
+                    if error.code == RemoteErrorCode::FeatureUnsupported as u32
+                        || error.code == 7 =>
+                {
+                    Err(AdapterError::UnsupportedOperation {
+                        operation: "snapshot canonical batch scan",
+                    })
+                }
+                Response::Error(error) => {
+                    Err(AdapterError::from(SidecarClientError::Remote(error)))
+                }
+                response => Err(AdapterError::from(unexpected_response(
+                    "read-view-canonical-batch-scan",
+                    &response,
+                ))),
+            }
+        })
+    }
 }
 
 impl<T: SidecarTransport> Drop for SidecarReadSnapshot<'_, T> {
@@ -1830,6 +1939,7 @@ const fn response_name(response: &Response) -> &'static str {
         Response::ReadViewMultiGet { .. } => "read-view-multi-get",
         Response::ReadViewScan { .. } => "read-view-scan",
         Response::ReadViewCanonicalScan { .. } => "read-view-canonical-scan",
+        Response::ReadViewCanonicalBatchScan { .. } => "read-view-canonical-batch-scan",
         Response::ReadViewCandidateScan { .. } => "read-view-candidate-scan",
         Response::ReadViewEnded { .. } => "read-view-ended",
         Response::Error(_) => "error",
@@ -2136,6 +2246,15 @@ impl ProtocolMessage for Request {
                     request: Some(encode_candidate_scan_request(request)?),
                 },
             ),
+            Self::ReadViewCanonicalBatchScan {
+                session_id,
+                request,
+            } => wire::request_envelope::Body::ReadViewCanonicalBatchScan(
+                wire::ReadViewCanonicalBatchScanRequest {
+                    session_id: encode_u128(*session_id),
+                    request: Some(encode_canonical_batch_scan_request(request)?),
+                },
+            ),
             Self::EndReadView { session_id } => {
                 wire::request_envelope::Body::EndReadView(wire::EndReadViewRequest {
                     session_id: encode_u128(*session_id),
@@ -2254,6 +2373,16 @@ impl ProtocolMessage for Request {
                     session_id: decode_session_id(&request.session_id)?,
                     request: decode_candidate_scan_request(request.request.ok_or(
                         ProtocolError::MissingSnapshotField("read-view candidate scan request"),
+                    )?)?,
+                })
+            }
+            wire::request_envelope::Body::ReadViewCanonicalBatchScan(request) => {
+                Ok(Self::ReadViewCanonicalBatchScan {
+                    session_id: decode_session_id(&request.session_id)?,
+                    request: decode_canonical_batch_scan_request(request.request.ok_or(
+                        ProtocolError::MissingSnapshotField(
+                            "read-view canonical batch scan request",
+                        ),
                     )?)?,
                 })
             }
@@ -2423,6 +2552,17 @@ impl ProtocolMessage for Response {
                     guarantee: encode_pushdown_guarantee(*guarantee),
                     entries: entries.iter().map(encode_key_value).collect(),
                     next_start: next_start.as_ref().map(encode_key),
+                },
+            ),
+            Self::ReadViewCanonicalBatchScan {
+                session_id,
+                applied_log_index,
+                pages,
+            } => wire::response_envelope::Body::ReadViewCanonicalBatchScan(
+                wire::ReadViewCanonicalBatchScanResponse {
+                    session_id: encode_u128(*session_id),
+                    applied_log_index: *applied_log_index,
+                    pages: pages.iter().map(encode_canonical_scan_page).collect(),
                 },
             ),
             Self::ReadViewEnded { session_id } => {
@@ -2628,6 +2768,17 @@ impl ProtocolMessage for Response {
                         .map(decode_key_value)
                         .collect::<Result<_, _>>()?,
                     next_start: response.next_start.map(decode_key).transpose()?,
+                })
+            }
+            wire::response_envelope::Body::ReadViewCanonicalBatchScan(response) => {
+                Ok(Self::ReadViewCanonicalBatchScan {
+                    session_id: decode_session_id(&response.session_id)?,
+                    applied_log_index: response.applied_log_index,
+                    pages: response
+                        .pages
+                        .into_iter()
+                        .map(decode_canonical_scan_page)
+                        .collect::<Result<_, _>>()?,
                 })
             }
             wire::response_envelope::Body::ReadViewEnded(response) => Ok(Self::ReadViewEnded {
@@ -3123,6 +3274,55 @@ fn decode_canonical_scan_request(
     .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))?;
     CanonicalScanRequest::new(span, bounds)
         .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))
+}
+
+fn encode_canonical_batch_scan_request(
+    request: &CanonicalBatchScanRequest,
+) -> Result<wire::CanonicalBatchScanRequest, ProtocolError> {
+    Ok(wire::CanonicalBatchScanRequest {
+        scans: request
+            .scans()
+            .iter()
+            .map(encode_canonical_scan_request)
+            .collect::<Result<_, _>>()?,
+        max_total_bytes: request.max_total_bytes(),
+    })
+}
+
+fn decode_canonical_batch_scan_request(
+    request: wire::CanonicalBatchScanRequest,
+) -> Result<CanonicalBatchScanRequest, ProtocolError> {
+    CanonicalBatchScanRequest::new(
+        request
+            .scans
+            .into_iter()
+            .map(decode_canonical_scan_request)
+            .collect::<Result<_, _>>()?,
+        request.max_total_bytes,
+    )
+    .map_err(|error| ProtocolError::InvalidSpan(error.to_string()))
+}
+
+fn encode_canonical_scan_page(
+    page: &CanonicalBatchPageResponse,
+) -> wire::CanonicalScanPageResponse {
+    wire::CanonicalScanPageResponse {
+        entries: page.entries.iter().map(encode_key_value).collect(),
+        next_start: page.next_start.as_ref().map(encode_key),
+    }
+}
+
+fn decode_canonical_scan_page(
+    page: wire::CanonicalScanPageResponse,
+) -> Result<CanonicalBatchPageResponse, ProtocolError> {
+    Ok(CanonicalBatchPageResponse {
+        entries: page
+            .entries
+            .into_iter()
+            .map(decode_key_value)
+            .collect::<Result<_, _>>()?,
+        next_start: page.next_start.map(decode_key).transpose()?,
+    })
 }
 
 fn encode_candidate_scan_request(
@@ -3889,6 +4089,22 @@ mod wire {
     }
 
     #[derive(Clone, PartialEq, Message)]
+    pub struct CanonicalBatchScanRequest {
+        #[prost(message, repeated, tag = "1")]
+        pub scans: Vec<CanonicalScanRequest>,
+        #[prost(uint64, tag = "2")]
+        pub max_total_bytes: u64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewCanonicalBatchScanRequest {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(message, optional, tag = "2")]
+        pub request: Option<CanonicalBatchScanRequest>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
     pub struct GraphValueList {
         #[prost(message, repeated, tag = "1")]
         pub values: Vec<GraphValue>,
@@ -3969,7 +4185,7 @@ mod wire {
         pub spi_version: u32,
         #[prost(
             oneof = "request_envelope::Body",
-            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
         )]
         pub body: Option<request_envelope::Body>,
     }
@@ -3979,8 +4195,8 @@ mod wire {
             AbortSessionRequest, ApplyRequest, BeginExportRequest, BeginReadViewRequest,
             BeginRestoreRequest, EndReadViewRequest, ExportNextRequest, FinishRestoreRequest,
             HelloRequest, MultiGetRequest, ReadViewCandidateScanRequest,
-            ReadViewCanonicalScanRequest, ReadViewMultiGetRequest, ReadViewScanRequest,
-            RestoreChunkRequest, ScanRequest,
+            ReadViewCanonicalBatchScanRequest, ReadViewCanonicalScanRequest,
+            ReadViewMultiGetRequest, ReadViewScanRequest, RestoreChunkRequest, ScanRequest,
         };
         use prost::Oneof;
 
@@ -4024,6 +4240,8 @@ mod wire {
             ReadViewCanonicalScan(ReadViewCanonicalScanRequest),
             #[prost(message, tag = "20")]
             ReadViewCandidateScan(ReadViewCandidateScanRequest),
+            #[prost(message, tag = "21")]
+            ReadViewCanonicalBatchScan(ReadViewCanonicalBatchScanRequest),
         }
     }
 
@@ -4266,6 +4484,24 @@ mod wire {
     }
 
     #[derive(Clone, PartialEq, Message)]
+    pub struct CanonicalScanPageResponse {
+        #[prost(message, repeated, tag = "1")]
+        pub entries: Vec<KeyValue>,
+        #[prost(message, optional, tag = "2")]
+        pub next_start: Option<LogicalKey>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub struct ReadViewCanonicalBatchScanResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        pub session_id: Vec<u8>,
+        #[prost(uint64, tag = "2")]
+        pub applied_log_index: u64,
+        #[prost(message, repeated, tag = "3")]
+        pub pages: Vec<CanonicalScanPageResponse>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
     pub struct ReadViewEndedResponse {
         #[prost(bytes = "vec", tag = "1")]
         pub session_id: Vec<u8>,
@@ -4277,7 +4513,7 @@ mod wire {
         pub spi_version: u32,
         #[prost(
             oneof = "response_envelope::Body",
-            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
+            tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
         )]
         pub body: Option<response_envelope::Body>,
     }
@@ -4286,10 +4522,10 @@ mod wire {
         use super::{
             ApplyResponse, DescriptorResponse, ErrorResponse, ExportChunkResponse,
             ExportCompleteResponse, ExportStartedResponse, HealthResponse, HelloResponse,
-            MultiGetResponse, ReadViewCandidateScanResponse, ReadViewCanonicalScanResponse,
-            ReadViewEndedResponse, ReadViewMultiGetResponse, ReadViewScanResponse,
-            ReadViewStartedResponse, RestoreChunkAcceptedResponse, RestoreCompleteResponse,
-            RestoreStartedResponse, ScanResponse, SessionAbortedResponse,
+            MultiGetResponse, ReadViewCandidateScanResponse, ReadViewCanonicalBatchScanResponse,
+            ReadViewCanonicalScanResponse, ReadViewEndedResponse, ReadViewMultiGetResponse,
+            ReadViewScanResponse, ReadViewStartedResponse, RestoreChunkAcceptedResponse,
+            RestoreCompleteResponse, RestoreStartedResponse, ScanResponse, SessionAbortedResponse,
         };
         use prost::Oneof;
 
@@ -4337,6 +4573,8 @@ mod wire {
             ReadViewCanonicalScan(ReadViewCanonicalScanResponse),
             #[prost(message, tag = "22")]
             ReadViewCandidateScan(ReadViewCandidateScanResponse),
+            #[prost(message, tag = "23")]
+            ReadViewCanonicalBatchScan(ReadViewCanonicalBatchScanResponse),
         }
     }
 }

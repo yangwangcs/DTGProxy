@@ -18,10 +18,10 @@ use serde_json::{Value, json};
 use storage_api::{
     ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
     AdapterFuture, AdjacencyEntry, AdjacencyExpandPage, AdjacencyExpandRequest, ApplyReceipt,
-    BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalRestoreSession,
-    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
-    CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
-    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
+    BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalBatchScanPage,
+    CanonicalBatchScanRequest, CanonicalRestoreSession, CanonicalScanPage, CanonicalScanRequest,
+    ChangeScanPage, ChangeScanRequest, CommittedMutationBatch, Durability, KeySpan, KeyValue,
+    Keyspace, LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
     LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
     LogicalSnapshotReader, MappingCapabilities, MappingDescriptorV1, MappingFuture,
     MutationOperation, PreparedMappingTransaction, PropertyGatherPage, PropertyGatherRequest,
@@ -260,6 +260,27 @@ RETURN count(record)
 
 const MULTI_GET_CYPHER: &str = "UNWIND $keys AS requested OPTIONAL MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: requested.keyspace, logical_key_hex: requested.logical_key_hex, present: true}) RETURN requested.ordinal, record.value_base64 ORDER BY requested.ordinal";
 const SCAN_CYPHER: &str = "MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= $start_hex AND ($end_hex IS NULL OR record.logical_key_hex < $end_hex) RETURN record.logical_key_hex, record.value_base64 ORDER BY record.logical_key_hex LIMIT $limit";
+pub const CANONICAL_BATCH_SCAN_CYPHER: &str = r#"
+UNWIND $ranges AS range
+CALL (range) {
+  MATCH (record:DTGCanonicalRecord {
+    instance_id: $instance_id,
+    keyspace: range.keyspace,
+    present: true
+  })
+  WHERE record.logical_key_hex >= range.start_hex
+    AND (range.end_hex IS NULL OR record.logical_key_hex < range.end_hex)
+    AND (range.required_prefix_hex IS NULL OR
+         record.logical_key_hex STARTS WITH range.required_prefix_hex)
+  WITH range, record
+  ORDER BY record.logical_key_hex
+  LIMIT range.max_items + 1
+  RETURN range.ordinal AS ordinal, record.logical_key_hex AS logical_key_hex,
+         record.value_base64 AS value_base64, range.max_bytes AS max_bytes
+}
+RETURN ordinal, logical_key_hex, value_base64, max_bytes
+ORDER BY ordinal, logical_key_hex
+"#;
 const CANDIDATE_SCAN_CYPHER: &str = "MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= $start_hex AND ($end_hex IS NULL OR record.logical_key_hex < $end_hex) AND (record.valid_min_micros IS NULL OR record.valid_min_micros <= $valid_time_micros) AND (record.valid_max_micros IS NULL OR $valid_time_micros < record.valid_max_micros) AND all(constraint IN $constraints WHERE constraint.operator <> 'equal' OR record.property_equal_tokens IS NULL OR constraint.token IN record.property_equal_tokens) RETURN record.logical_key_hex, record.value_base64 ORDER BY record.logical_key_hex LIMIT $limit";
 const PROPERTY_GATHER_CYPHER: &str = "UNWIND $keys AS requested OPTIONAL MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: requested.keyspace, logical_key_hex: requested.logical_key_hex, present: true}) RETURN requested.ordinal, record.value_base64 ORDER BY requested.ordinal";
 const ADJACENCY_EXPAND_CYPHER: &str = "UNWIND $spans AS requested MATCH (record:DTGCanonicalRecord {instance_id: $instance_id, keyspace: $keyspace, present: true}) WHERE record.logical_key_hex >= requested.start_hex AND (requested.end_hex IS NULL OR record.logical_key_hex < requested.end_hex) RETURN requested.ordinal, record.logical_key_hex, record.value_base64 ORDER BY requested.ordinal, record.logical_key_hex LIMIT $limit";
@@ -1493,6 +1514,61 @@ struct Neo4jReadSnapshot<'a> {
 }
 
 impl Neo4jReadSnapshot<'_> {
+    fn scan_canonical_batch_page(
+        &self,
+        request: &CanonicalBatchScanRequest,
+    ) -> Result<CanonicalBatchScanPage, AdapterError> {
+        let ranges = request
+            .scans()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, scan)| {
+                Ok(json!({
+                    "ordinal": ordinal,
+                    "keyspace": scan.span().keyspace().tag(),
+                    "start_hex": hex(scan.span().start()),
+                    "end_hex": scan.span().end().map(hex),
+                    "required_prefix_hex": scan.span().required_prefix().map(hex),
+                    "max_items": primitive_query_limit(scan.bounds())?,
+                    "max_bytes": scan.bounds().max_bytes(),
+                }))
+            })
+            .collect::<Result<Vec<_>, AdapterError>>()?;
+        let rows = self
+            .transaction
+            .lock()
+            .map_err(|_| AdapterError::LockPoisoned)?
+            .execute_bounded(
+                CANONICAL_BATCH_SCAN_CYPHER,
+                json!({"instance_id": self.instance_id, "ranges": ranges}),
+                canonical_batch_body_limit(request),
+            )?;
+        let mut grouped = vec![Vec::new(); request.scans().len()];
+        for row in rows {
+            let ordinal = row
+                .first()
+                .and_then(Value::as_u64)
+                .and_then(|ordinal| usize::try_from(ordinal).ok())
+                .ok_or_else(|| {
+                    AdapterError::Backend("Neo4j batch scan omitted an ordinal".into())
+                })?;
+            let grouped = grouped.get_mut(ordinal).ok_or_else(|| {
+                AdapterError::Backend("Neo4j batch scan returned an unknown ordinal".into())
+            })?;
+            grouped.push(vec![row[1].clone(), row[2].clone()]);
+        }
+        let mut pages = Vec::with_capacity(request.scans().len());
+        for (scan, rows) in request.scans().iter().zip(grouped) {
+            let (entries, next_start) = bounded_canonical_page(rows, scan)?;
+            pages.push(
+                CanonicalScanPage::new(scan, self.applied_log_index, entries, next_start)
+                    .map_err(query_page_error)?,
+            );
+        }
+        CanonicalBatchScanPage::new(request, self.applied_log_index, pages)
+            .map_err(query_page_error)
+    }
+
     fn scan_candidates_page(
         &self,
         request: &CandidateScanRequest,
@@ -1736,6 +1812,13 @@ impl ReadSnapshot for Neo4jReadSnapshot<'_> {
         })
     }
 
+    fn scan_canonical_batch<'a>(
+        &'a self,
+        request: &'a CanonicalBatchScanRequest,
+    ) -> AdapterFuture<'a, CanonicalBatchScanPage> {
+        Box::pin(async move { self.scan_canonical_batch_page(request) })
+    }
+
     fn scan_candidates<'a>(
         &'a self,
         request: &'a CandidateScanRequest,
@@ -1814,6 +1897,16 @@ fn canonical_scan_body_limit(request: &CanonicalScanRequest) -> u64 {
     NEO4J_SCAN_ENVELOPE_BYTES
         .saturating_add(bounds.max_bytes().saturating_mul(2))
         .saturating_add(rows.saturating_mul(NEO4J_SCAN_ROW_OVERHEAD_BYTES))
+        .min(MAX_NEO4J_SCAN_BODY_BYTES)
+}
+
+fn canonical_batch_body_limit(request: &CanonicalBatchScanRequest) -> u64 {
+    request
+        .scans()
+        .iter()
+        .fold(NEO4J_SCAN_ENVELOPE_BYTES, |limit, scan| {
+            limit.saturating_add(canonical_scan_body_limit(scan))
+        })
         .min(MAX_NEO4J_SCAN_BODY_BYTES)
 }
 

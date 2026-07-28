@@ -52,6 +52,8 @@ message ReadViewMultiGetRequest { bytes session_id = 1; repeated LogicalKey keys
 message ReadViewScanRequest { bytes session_id = 1; ScanRequest span = 2; }
 message CanonicalScanRequest { ScanRequest span = 1; uint64 max_items = 2; uint64 max_bytes = 3; }
 message ReadViewCanonicalScanRequest { bytes session_id = 1; CanonicalScanRequest request = 2; }
+message CanonicalBatchScanRequest { repeated CanonicalScanRequest scans = 1; uint64 max_total_bytes = 2; }
+message ReadViewCanonicalBatchScanRequest { bytes session_id = 1; CanonicalBatchScanRequest request = 2; }
 message GraphValueList { repeated GraphValue values = 1; }
 message GraphValue {
   oneof kind {
@@ -97,6 +99,7 @@ message RequestEnvelope {
     EndReadViewRequest end_read_view = 18;
     ReadViewCanonicalScanRequest read_view_canonical_scan = 19;
     ReadViewCandidateScanRequest read_view_candidate_scan = 20;
+    ReadViewCanonicalBatchScanRequest read_view_canonical_batch_scan = 21;
   }
 }
 
@@ -197,6 +200,15 @@ message ReadViewCandidateScanResponse {
   repeated KeyValue entries = 4;
   LogicalKey next_start = 5;
 }
+message CanonicalScanPageResponse {
+  repeated KeyValue entries = 1;
+  LogicalKey next_start = 2;
+}
+message ReadViewCanonicalBatchScanResponse {
+  bytes session_id = 1;
+  uint64 applied_log_index = 2;
+  repeated CanonicalScanPageResponse pages = 3;
+}
 message ReadViewEndedResponse { bytes session_id = 1; }
 message ResponseEnvelope {
   uint32 spi_version = 1;
@@ -222,5 +234,6 @@ message ResponseEnvelope {
     ReadViewEndedResponse read_view_ended = 20;
     ReadViewCanonicalScanResponse read_view_canonical_scan = 21;
     ReadViewCandidateScanResponse read_view_candidate_scan = 22;
+    ReadViewCanonicalBatchScanResponse read_view_canonical_batch_scan = 23;
   }
 }

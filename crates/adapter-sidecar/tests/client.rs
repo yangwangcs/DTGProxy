@@ -11,9 +11,10 @@ use adapter_sidecar::{
     SidecarTransportFuture,
 };
 use storage_api::{
-    AdapterError, ApplyReceipt, CandidateScanRequest, CanonicalScanRequest, CommittedMutationBatch,
-    ComparisonOperator, KeySpan, KeyValue, Keyspace, LogicalKey, Mutation, PropertyConstraint,
-    PropertyId, PushdownGuarantee, QueryPageBounds, StorageAdapter,
+    AdapterError, ApplyReceipt, CandidateScanRequest, CanonicalBatchScanRequest,
+    CanonicalScanRequest, CommittedMutationBatch, ComparisonOperator, KeySpan, KeyValue, Keyspace,
+    LogicalKey, Mutation, PropertyConstraint, PropertyId, PushdownGuarantee, QueryPageBounds,
+    StorageAdapter,
 };
 use temporal_types::{GraphValue, ValidTime};
 
@@ -130,6 +131,88 @@ fn client_snapshot_preserves_canonical_page_index_bounds_and_continuation() {
     assert_eq!(next.applied_log_index(), 1);
     assert_eq!(next.entries()[0].key(), &key(b"vertex/2"));
     assert_eq!(next.next_start(), None);
+}
+
+#[test]
+fn client_snapshot_sends_one_ordered_batch_exchange() {
+    let backend = Arc::new(MemoryAdapter::new());
+    block_on(backend.apply_committed(CommittedMutationBatch {
+        shard_id: 1,
+        log_index: 1,
+        txn_id: 1,
+        mutations: vec![
+            Mutation::put(0, key(b"a/1"), b"one".to_vec()),
+            Mutation::put(1, key(b"b/1"), b"two".to_vec()),
+        ],
+    }))
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let adapter = block_on(SidecarAdapter::connect(ServiceTransport {
+        service: Arc::new(SidecarService::new(backend, None)),
+        requests: Arc::clone(&requests),
+    }))
+    .unwrap();
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+    let request = CanonicalBatchScanRequest::new(
+        [b"b/".as_slice(), b"a/".as_slice()]
+            .into_iter()
+            .map(|prefix| {
+                CanonicalScanRequest::new(
+                    KeySpan::prefix(Keyspace::Current, prefix.to_vec()),
+                    QueryPageBounds::new(1, 64).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect(),
+        128,
+    )
+    .unwrap();
+    requests.lock().unwrap().clear();
+
+    let page = block_on(snapshot.scan_canonical_batch(&request)).unwrap();
+
+    assert_eq!(page.pages()[0].entries()[0].key(), &key(b"b/1"));
+    assert_eq!(page.pages()[1].entries()[0].key(), &key(b"a/1"));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(
+        &requests[0],
+        adapter_sidecar::Request::ReadViewCanonicalBatchScan { request: sent, .. }
+            if sent == &request
+    ));
+}
+
+#[test]
+fn client_snapshot_rejects_batch_without_negotiated_feature() {
+    let descriptor = MemoryAdapter::new().descriptor();
+    let transport = ScriptedTransport::new(vec![
+        hello_response(
+            FeatureSet::BASE_ADAPTER_V1
+                .union(FeatureSet::READ_VIEW_SESSION_V1)
+                .union(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1),
+        ),
+        Response::Descriptor(descriptor),
+        Response::Health(HealthStatus {
+            ready: true,
+            detail: "ready".to_owned(),
+        }),
+        Response::AppliedLogIndex(4),
+        Response::ReadViewStarted {
+            session_id: 7,
+            applied_log_index: 4,
+        },
+        Response::ReadViewEnded { session_id: 7 },
+    ]);
+    let adapter = block_on(SidecarAdapter::connect(transport)).unwrap();
+    let snapshot = block_on(adapter.begin_read_snapshot()).unwrap();
+    let request = CanonicalBatchScanRequest::new(vec![canonical_request(1, 64)], 64).unwrap();
+
+    assert!(matches!(
+        block_on(snapshot.scan_canonical_batch(&request)),
+        Err(AdapterError::UnsupportedOperation {
+            operation: "snapshot canonical batch scan"
+        })
+    ));
 }
 
 #[test]

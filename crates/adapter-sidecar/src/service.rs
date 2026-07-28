@@ -12,9 +12,10 @@ use adapter_registry::{
 };
 use storage_api::{
     AdapterDescriptorV1, AdapterError, AdapterRequirement, CandidateScanPage, CandidateScanRequest,
-    CanonicalScanPage, CanonicalScanRequest, KeySpan, KeyValue, LogicalKey,
-    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotHeaderV1,
-    LogicalSnapshotManifestV1, LogicalSnapshotReader, PushdownGuarantee, StorageAdapter,
+    CanonicalBatchScanPage, CanonicalBatchScanRequest, CanonicalScanPage, CanonicalScanRequest,
+    KeySpan, KeyValue, LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1,
+    LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1, LogicalSnapshotReader, PushdownGuarantee,
+    StorageAdapter,
 };
 
 use super::{
@@ -128,6 +129,10 @@ enum ReadViewCommand {
         request: CanonicalScanRequest,
         reply: mpsc::SyncSender<Result<CanonicalScanPage, RemoteError>>,
     },
+    CanonicalBatchScan {
+        request: CanonicalBatchScanRequest,
+        reply: mpsc::SyncSender<Result<CanonicalBatchScanPage, RemoteError>>,
+    },
     CandidateScan {
         request: CandidateScanRequest,
         reply: mpsc::SyncSender<Result<CandidateScanPage, RemoteError>>,
@@ -186,6 +191,11 @@ impl ReadViewWorker {
                         }
                         ReadViewCommand::CanonicalScan { request, reply } => {
                             let result = block_on_dispatch(snapshot.scan_canonical(&request))
+                                .map_err(|error| super::encode_adapter_error(&error));
+                            let _ = reply.send(result);
+                        }
+                        ReadViewCommand::CanonicalBatchScan { request, reply } => {
+                            let result = block_on_dispatch(snapshot.scan_canonical_batch(&request))
                                 .map_err(|error| super::encode_adapter_error(&error));
                             let _ = reply.send(result);
                         }
@@ -260,6 +270,15 @@ impl ReadViewHandle {
         response.recv().map_err(|_| worker_stopped_error())?
     }
 
+    fn scan_canonical_batch(
+        &self,
+        request: CanonicalBatchScanRequest,
+    ) -> Result<CanonicalBatchScanPage, RemoteError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.send(ReadViewCommand::CanonicalBatchScan { request, reply })?;
+        response.recv().map_err(|_| worker_stopped_error())?
+    }
+
     fn send(&self, command: ReadViewCommand) -> Result<(), RemoteError> {
         match self.commands.try_send(command) {
             Ok(()) => Ok(()),
@@ -319,6 +338,7 @@ impl SidecarService {
         let mut features = FeatureSet::BASE_ADAPTER_V1
             .union(FeatureSet::READ_VIEW_SESSION_V1)
             .union(FeatureSet::CANONICAL_SCAN_READ_VIEW_V1);
+        features = features.union(FeatureSet::CANONICAL_BATCH_SCAN_READ_VIEW_V1);
         if active.capabilities().predicate_pushdown
             && active.query_primitive_capabilities().candidate_scan()
                 != PushdownGuarantee::Unsupported
@@ -436,6 +456,10 @@ impl SidecarService {
                 session_id,
                 request,
             } => self.read_view_canonical_scan(session_id, request),
+            Request::ReadViewCanonicalBatchScan {
+                session_id,
+                request,
+            } => self.read_view_canonical_batch_scan(session_id, request),
             Request::ReadViewCandidateScan {
                 session_id,
                 request,
@@ -527,6 +551,29 @@ impl SidecarService {
             guarantee: page.guarantee(),
             entries: page.entries().to_vec(),
             next_start: page.next_start().cloned(),
+        })
+    }
+
+    fn read_view_canonical_batch_scan(
+        &self,
+        session_id: u128,
+        request: CanonicalBatchScanRequest,
+    ) -> Result<Response, RemoteError> {
+        let worker = self.read_view_handle(session_id)?;
+        let page = worker.scan_canonical_batch(request)?;
+        let applied_log_index = page.applied_log_index();
+        let pages = page
+            .into_pages()
+            .into_iter()
+            .map(|page| super::CanonicalBatchPageResponse {
+                entries: page.entries().to_vec(),
+                next_start: page.next_start().cloned(),
+            })
+            .collect();
+        Ok(Response::ReadViewCanonicalBatchScan {
+            session_id,
+            applied_log_index,
+            pages,
         })
     }
 

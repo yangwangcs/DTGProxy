@@ -6,9 +6,9 @@ use adapter_sidecar::{
 };
 use storage_api::{
     ADAPTER_SPI_VERSION, AdapterCapabilities, AdapterDescriptorV1, ApplyReceipt, BackendFamily,
-    CandidateScanRequest, CommittedMutationBatch, ComparisonOperator, Durability, KeySpan,
-    KeyValue, Keyspace, LogicalKey, Mutation, PropertyConstraint, PropertyId, PushdownGuarantee,
-    QueryPageBounds, SnapshotCapability,
+    CandidateScanRequest, CanonicalBatchScanRequest, CanonicalScanRequest, CommittedMutationBatch,
+    ComparisonOperator, Durability, KeySpan, KeyValue, Keyspace, LogicalKey, Mutation,
+    PropertyConstraint, PropertyId, PushdownGuarantee, QueryPageBounds, SnapshotCapability,
 };
 use temporal_types::{GraphValue, ValidTime};
 
@@ -69,6 +69,10 @@ fn every_request_round_trips_through_a_versioned_checksummed_frame() {
             session_id: 17,
             request: candidate_request(),
         },
+        Request::ReadViewCanonicalBatchScan {
+            session_id: 17,
+            request: canonical_batch_request(),
+        },
     ];
     for (ordinal, request) in requests.into_iter().enumerate() {
         let request_id = u128::try_from(ordinal).unwrap().saturating_add(1);
@@ -108,6 +112,26 @@ fn every_response_round_trips_without_losing_empty_and_missing_values() {
             )],
             next_start: Some(key(Keyspace::Current, b"vertex/2")),
         },
+        Response::ReadViewCanonicalBatchScan {
+            session_id: 17,
+            applied_log_index: 44,
+            pages: vec![
+                adapter_sidecar::CanonicalBatchPageResponse {
+                    entries: vec![KeyValue::new(
+                        key(Keyspace::Current, b"a/1"),
+                        b"one".to_vec(),
+                    )],
+                    next_start: None,
+                },
+                adapter_sidecar::CanonicalBatchPageResponse {
+                    entries: vec![KeyValue::new(
+                        key(Keyspace::Current, b"b/1"),
+                        b"two".to_vec(),
+                    )],
+                    next_start: None,
+                },
+            ],
+        },
         Response::Error(RemoteError {
             code: 503,
             message: "retry later".to_owned(),
@@ -135,6 +159,52 @@ fn every_response_round_trips_without_losing_empty_and_missing_values() {
         assert_eq!(decoded.request_id(), request_id);
         assert_eq!(decoded.message(), &response);
     }
+}
+
+fn canonical_batch_request() -> CanonicalBatchScanRequest {
+    CanonicalBatchScanRequest::new(
+        [b"a/".as_slice(), b"b/".as_slice()]
+            .into_iter()
+            .map(|prefix| {
+                CanonicalScanRequest::new(
+                    KeySpan::prefix(Keyspace::Current, prefix.to_vec()),
+                    QueryPageBounds::new(2, 64).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect(),
+        128,
+    )
+    .unwrap()
+}
+
+#[test]
+fn canonical_batch_feature_and_envelope_fields_are_append_only() {
+    assert_eq!(
+        adapter_sidecar::FeatureSet::CANONICAL_BATCH_SCAN_READ_VIEW_V1.bits(),
+        1 << 7
+    );
+
+    let request = encode_frame(
+        1,
+        &Request::ReadViewCanonicalBatchScan {
+            session_id: 17,
+            request: canonical_batch_request(),
+        },
+    )
+    .unwrap();
+    assert!(request[28..request.len() - 4].contains(&0xaa));
+
+    let response = encode_frame(
+        2,
+        &Response::ReadViewCanonicalBatchScan {
+            session_id: 17,
+            applied_log_index: 44,
+            pages: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert!(response[28..response.len() - 4].contains(&0xba));
 }
 
 fn candidate_request() -> CandidateScanRequest {

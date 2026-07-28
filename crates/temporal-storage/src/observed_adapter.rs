@@ -4,14 +4,23 @@ use std::sync::Arc;
 use storage_api::{
     AdapterCapabilities, AdapterDescriptorV1, AdapterError, AdapterFuture, AdjacencyExpandPage,
     AdjacencyExpandRequest, ApplyReceipt, CandidateScanPage, CandidateScanRequest,
-    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
-    CommittedMutationBatch, FencedScan, KeySpan, KeyValue, LogicalKey, MappingDescriptorV1,
-    PropertyGatherPage, PropertyGatherRequest, QueryCapabilitySnapshot, QueryPrimitiveCapabilities,
-    ReadSnapshot, ReadSnapshotBinding, StorageAdapter,
+    CanonicalBatchScanPage, CanonicalBatchScanRequest, CanonicalScanPage, CanonicalScanRequest,
+    ChangeScanPage, ChangeScanRequest, CommittedMutationBatch, FencedScan, KeySpan, KeyValue,
+    LogicalKey, MappingDescriptorV1, PropertyGatherPage, PropertyGatherRequest,
+    QueryCapabilitySnapshot, QueryPrimitiveCapabilities, ReadSnapshot, ReadSnapshotBinding,
+    StorageAdapter,
 };
 
 pub trait AdapterCallObserver: Send + Sync {
     fn record_adapter_call(&self);
+
+    fn record_canonical_scan(&self) {
+        self.record_adapter_call();
+    }
+
+    fn record_canonical_batch_scan(&self) {
+        self.record_adapter_call();
+    }
 }
 
 impl<F> AdapterCallObserver for F
@@ -84,8 +93,16 @@ impl ReadSnapshot for ObservedReadSnapshot<'_> {
         &'a self,
         request: &'a CanonicalScanRequest,
     ) -> AdapterFuture<'a, CanonicalScanPage> {
-        self.observer.record_adapter_call();
+        self.observer.record_canonical_scan();
         self.inner.scan_canonical(request)
+    }
+
+    fn scan_canonical_batch<'a>(
+        &'a self,
+        request: &'a CanonicalBatchScanRequest,
+    ) -> AdapterFuture<'a, CanonicalBatchScanPage> {
+        self.observer.record_canonical_batch_scan();
+        self.inner.scan_canonical_batch(request)
     }
 
     fn scan_candidates<'a>(
@@ -170,7 +187,7 @@ where
         &'a self,
         request: &'a CanonicalScanRequest,
     ) -> AdapterFuture<'a, CanonicalScanPage> {
-        self.observe();
+        self.observer.record_canonical_scan();
         self.inner.scan_canonical(request)
     }
 

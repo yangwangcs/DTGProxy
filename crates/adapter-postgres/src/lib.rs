@@ -14,10 +14,10 @@ use postgres::{Client, GenericClient, IsolationLevel, NoTls, Transaction};
 use storage_api::{
     ADAPTER_META_APPLIED_LOG_INDEX_KEY, AdapterCapabilities, AdapterDescriptorV1, AdapterError,
     AdapterFuture, AdjacencyCursor, AdjacencyEntry, AdjacencyExpandPage, AdjacencyExpandRequest,
-    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalRestoreSession,
-    CanonicalScanPage, CanonicalScanRequest, ChangeScanPage, ChangeScanRequest,
-    CommittedMutationBatch, Durability, KeySpan, KeyValue, Keyspace, LogicalKey,
-    LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
+    ApplyReceipt, BackendFamily, CandidateScanPage, CandidateScanRequest, CanonicalBatchScanPage,
+    CanonicalBatchScanRequest, CanonicalRestoreSession, CanonicalScanPage, CanonicalScanRequest,
+    ChangeScanPage, ChangeScanRequest, CommittedMutationBatch, Durability, KeySpan, KeyValue,
+    Keyspace, LogicalKey, LogicalSnapshotAccumulator, LogicalSnapshotChunkV1, LogicalSnapshotError,
     LogicalSnapshotExportRequest, LogicalSnapshotHeaderV1, LogicalSnapshotManifestV1,
     LogicalSnapshotReader, MappingBackedAdapter, MappingCapabilities, MappingDescriptorV1,
     MappingFuture, MappingRequirement, MutationOperation, PreparedMappingTransaction,
@@ -349,6 +349,96 @@ SELECT logical_key, canonical_value FROM canonical_keys
    AND ($4::bytea IS NULL OR logical_key < $4)
  ORDER BY logical_key
  LIMIT $5
+"#;
+pub const POSTGRES_CANONICAL_BATCH_SCAN_SQL: &str = r#"
+WITH canonical_keys(keyspace, logical_key, canonical_value, identity_kind, identity_fields) AS (
+    SELECT 1::smallint, decode('01', 'hex') || graph_id || partition_id || vertex_id,
+           NULL::bytea, 1::smallint, label_id
+      FROM dtgproxy.vertex_identity WHERE instance_id = $1
+    UNION ALL
+    SELECT 1::smallint, decode('02', 'hex') || graph_id || partition_id || edge_id,
+           NULL::bytea, 2::smallint,
+           edge_type || source_partition || source_id || destination_partition || destination_id
+      FROM dtgproxy.edge_identity WHERE instance_id = $1
+    UNION ALL
+    SELECT 2::smallint, decode('08', 'hex') || graph_id || partition_id || vertex_id,
+           projection, 0::smallint, NULL::bytea
+      FROM dtgproxy.vertex_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 2::smallint, decode('09', 'hex') || graph_id || partition_id || edge_id,
+           projection, 0::smallint, NULL::bytea
+      FROM dtgproxy.edge_current WHERE instance_id = $1
+    UNION ALL
+    SELECT 3::smallint, decode(lpad(to_hex(key_tag::integer), 2, '0'), 'hex') || graph_id ||
+           local_partition || local_endpoint || edge_type || bucket ||
+           CASE WHEN key_tag = 18 THEN remote_partition ELSE ''::bytea END || remote_endpoint ||
+           CASE WHEN key_tag = 18 THEN edge_partition ELSE ''::bytea END || edge_id,
+           projection, 0::smallint, NULL::bytea
+      FROM dtgproxy.out_adjacency WHERE instance_id = $1
+    UNION ALL
+    SELECT 4::smallint, decode(lpad(to_hex(key_tag::integer), 2, '0'), 'hex') || graph_id ||
+           local_partition || local_endpoint || edge_type || bucket ||
+           CASE WHEN key_tag = 19 THEN remote_partition ELSE ''::bytea END || remote_endpoint ||
+           CASE WHEN key_tag = 19 THEN edge_partition ELSE ''::bytea END || edge_id,
+           projection, 0::smallint, NULL::bytea
+      FROM dtgproxy.in_adjacency WHERE instance_id = $1
+    UNION ALL
+    SELECT 5::smallint, decode('20', 'hex') || graph_id || partition_id ||
+           decode(lpad(to_hex(element_kind::integer), 2, '0'), 'hex') || element_id ||
+           decode(translate(encode(int8send(transaction_physical # '-9223372036854775808'::bigint) || transaction_logical, 'hex'),
+                            '0123456789abcdef', 'fedcba9876543210'), 'hex') || segment_id,
+           history_value, 0::smallint, NULL::bytea
+      FROM dtgproxy.history WHERE instance_id = $1
+    UNION ALL
+    SELECT keyspace, logical_key, value, 0::smallint, NULL::bytea
+      FROM dtgproxy.opaque_records WHERE instance_id = $1
+    UNION ALL
+    SELECT 7::smallint, decode('01', 'hex') || log_index, fingerprint, 0::smallint, NULL::bytea
+      FROM dtgproxy.replay_log WHERE instance_id = $1
+    UNION ALL
+    SELECT 7::smallint, decode('02', 'hex') || txn_id || sequence, fingerprint, 0::smallint, NULL::bytea
+      FROM dtgproxy.replay_mutation WHERE instance_id = $1
+    UNION ALL
+    SELECT 0::smallint, $9::bytea, applied_log_index, 0::smallint, NULL::bytea
+      FROM dtgproxy.adapter_instance WHERE instance_id = $1 AND has_applied_index_record
+), requested(input_ordinal, keyspace, start_key, end_key, required_prefix, max_items, max_bytes) AS (
+    SELECT input_ordinal, keyspace, start_key, end_key, required_prefix, max_items, max_bytes
+      FROM unnest($2::bigint[], $3::smallint[], $4::bytea[], $5::bytea[],
+                  $6::bytea[], $7::bigint[], $8::bigint[])
+           WITH ORDINALITY AS input(input_ordinal, keyspace, start_key, end_key,
+                                    required_prefix, max_items, max_bytes, array_ordinal)
+), selected AS (
+    SELECT requested.input_ordinal, canonical.logical_key, canonical.canonical_value,
+           canonical.identity_kind, canonical.identity_fields, requested.max_items,
+           requested.max_bytes,
+           sum(octet_length(canonical.logical_key) +
+               coalesce(octet_length(canonical.canonical_value), octet_length(canonical.identity_fields), 0))
+               OVER (PARTITION BY requested.input_ordinal ORDER BY canonical.logical_key) AS retained_bytes,
+           row_number() OVER (PARTITION BY requested.input_ordinal ORDER BY canonical.logical_key) AS row_ordinal
+      FROM requested
+      JOIN LATERAL (
+          SELECT logical_key, canonical_value, identity_kind, identity_fields
+            FROM canonical_keys
+           WHERE keyspace = requested.keyspace
+             AND logical_key >= requested.start_key
+             AND (requested.end_key IS NULL OR logical_key < requested.end_key)
+             AND (requested.required_prefix IS NULL OR
+                  substring(logical_key FROM 1 FOR octet_length(requested.required_prefix)) = requested.required_prefix)
+           ORDER BY logical_key
+           LIMIT requested.max_items + 1
+      ) AS canonical ON TRUE
+), bounded AS (
+    SELECT selected.*,
+           lag(retained_bytes) OVER (PARTITION BY input_ordinal ORDER BY logical_key)
+               AS previous_retained_bytes
+      FROM selected
+)
+SELECT input_ordinal, logical_key, canonical_value, identity_kind, identity_fields,
+       max_items, max_bytes, retained_bytes, row_ordinal
+  FROM bounded
+ WHERE retained_bytes <= max_bytes OR previous_retained_bytes IS NULL
+    OR previous_retained_bytes <= max_bytes
+ ORDER BY input_ordinal, logical_key
 "#;
 pub const POSTGRES_TYPED_CANDIDATE_SCAN_SQL: &str = r#"
 WITH candidate_keys(keyspace, logical_key) AS (
@@ -1714,6 +1804,88 @@ impl PostgresReadSnapshot {
             .map_err(|error| AdapterError::Backend(error.to_string()))
     }
 
+    fn scan_canonical_batch_page(
+        &self,
+        request: &CanonicalBatchScanRequest,
+    ) -> Result<CanonicalBatchScanPage, AdapterError> {
+        let input_ordinals = (0..request.scans().len())
+            .map(|ordinal| i64::try_from(ordinal).unwrap_or(i64::MAX))
+            .collect::<Vec<_>>();
+        let keyspaces = request
+            .scans()
+            .iter()
+            .map(|scan| i16::from(scan.span().keyspace().tag()))
+            .collect::<Vec<_>>();
+        let starts = request
+            .scans()
+            .iter()
+            .map(|scan| scan.span().start().to_vec())
+            .collect::<Vec<_>>();
+        let ends = request
+            .scans()
+            .iter()
+            .map(|scan| scan.span().end().map(<[u8]>::to_vec))
+            .collect::<Vec<_>>();
+        let required_prefixes = request
+            .scans()
+            .iter()
+            .map(|scan| scan.span().required_prefix().map(<[u8]>::to_vec))
+            .collect::<Vec<_>>();
+        let max_items = request
+            .scans()
+            .iter()
+            .map(|scan| i64::try_from(scan.bounds().max_items()).unwrap_or(i64::MAX))
+            .collect::<Vec<_>>();
+        let max_bytes = request
+            .scans()
+            .iter()
+            .map(|scan| i64::try_from(scan.bounds().max_bytes()).unwrap_or(i64::MAX))
+            .collect::<Vec<_>>();
+        let mut client = self.client()?;
+        let rows = client
+            .query(
+                POSTGRES_CANONICAL_BATCH_SCAN_SQL,
+                &[
+                    &self.instance_id,
+                    &input_ordinals,
+                    &keyspaces,
+                    &starts,
+                    &ends,
+                    &required_prefixes,
+                    &max_items,
+                    &max_bytes,
+                    &ADAPTER_META_APPLIED_LOG_INDEX_KEY,
+                ],
+            )
+            .map_err(adapter_pg_error)?;
+        let mut grouped = vec![Vec::new(); request.scans().len()];
+        for row in rows {
+            let ordinal = usize::try_from(row.get::<_, i64>(0)).map_err(|_| {
+                AdapterError::Backend("canonical batch scan returned an invalid ordinal".into())
+            })?;
+            let scan = request.scans().get(ordinal).ok_or_else(|| {
+                AdapterError::Backend("canonical batch scan returned an unknown ordinal".into())
+            })?;
+            let key = LogicalKey::in_keyspace(scan.span().keyspace(), row.get(1));
+            let stored_value = row.get::<_, Option<Vec<u8>>>(2);
+            let identity_kind = row.get::<_, i16>(3);
+            let identity_fields = row.get::<_, Option<Vec<u8>>>(4);
+            let value = postgres_batch_value(&key, stored_value, identity_kind, identity_fields)?;
+            grouped[ordinal].push(KeyValue::new(key, value));
+        }
+
+        let mut pages = Vec::with_capacity(request.scans().len());
+        for (scan, entries) in request.scans().iter().zip(grouped) {
+            let (entries, next_start) = bound_postgres_batch_entries(entries, scan)?;
+            pages.push(
+                CanonicalScanPage::new(scan, self.applied_log_index, entries, next_start)
+                    .map_err(query_primitive_error)?,
+            );
+        }
+        CanonicalBatchScanPage::new(request, self.applied_log_index, pages)
+            .map_err(query_primitive_error)
+    }
+
     fn scan_candidate_page(
         &self,
         request: &CandidateScanRequest,
@@ -1947,6 +2119,13 @@ impl ReadSnapshot for PostgresReadSnapshot {
         Box::pin(async move { self.scan_canonical_page(request) })
     }
 
+    fn scan_canonical_batch<'a>(
+        &'a self,
+        request: &'a CanonicalBatchScanRequest,
+    ) -> AdapterFuture<'a, CanonicalBatchScanPage> {
+        Box::pin(async move { self.scan_canonical_batch_page(request) })
+    }
+
     fn scan_candidates<'a>(
         &'a self,
         request: &'a CandidateScanRequest,
@@ -1971,6 +2150,89 @@ impl Drop for PostgresReadSnapshot {
             self.finished = true;
         }
     }
+}
+
+fn postgres_batch_value(
+    key: &LogicalKey,
+    stored_value: Option<Vec<u8>>,
+    identity_kind: i16,
+    identity_fields: Option<Vec<u8>>,
+) -> Result<Vec<u8>, AdapterError> {
+    if let Some(value) = stored_value {
+        return Ok(value);
+    }
+    let fields = identity_fields.ok_or_else(|| {
+        AdapterError::Backend("canonical batch scan omitted a stored value".into())
+    })?;
+    match (
+        identity_kind,
+        decode_graph_key(key).map_err(query_primitive_error)?,
+    ) {
+        (1, GraphKey::VertexIdentity(element)) => VertexIdentity::new(
+            element,
+            temporal_storage::LabelId::new(read_u32(fields, "label_id")?),
+        )
+        .map(|value| value.encode())
+        .map_err(query_primitive_error),
+        (2, GraphKey::EdgeIdentity(element)) if fields.len() == 44 => {
+            let source = temporal_storage::ElementRef::vertex(
+                element.graph(),
+                temporal_storage::PartitionId::new(read_u32(
+                    fields[4..8].to_vec(),
+                    "source_partition",
+                )?),
+                temporal_storage::ElementId::new(read_u128(fields[8..24].to_vec(), "source_id")?),
+            );
+            let destination = temporal_storage::ElementRef::vertex(
+                element.graph(),
+                temporal_storage::PartitionId::new(read_u32(
+                    fields[24..28].to_vec(),
+                    "destination_partition",
+                )?),
+                temporal_storage::ElementId::new(read_u128(
+                    fields[28..44].to_vec(),
+                    "destination_id",
+                )?),
+            );
+            EdgeIdentity::new_between(
+                element,
+                temporal_storage::EdgeTypeId::new(read_u32(fields[0..4].to_vec(), "edge_type")?),
+                source,
+                destination,
+            )
+            .map(|value| value.encode())
+            .map_err(query_primitive_error)
+        }
+        _ => Err(AdapterError::Backend(
+            "canonical batch scan returned invalid identity fields".into(),
+        )),
+    }
+}
+
+fn bound_postgres_batch_entries(
+    entries: Vec<KeyValue>,
+    request: &CanonicalScanRequest,
+) -> Result<(Vec<KeyValue>, Option<LogicalKey>), AdapterError> {
+    let mut retained_entries = Vec::new();
+    let mut retained_bytes = 0_u64;
+    for entry in entries {
+        if retained_entries.len() == request.bounds().max_items() {
+            return Ok((retained_entries, Some(entry.key().clone())));
+        }
+        let required = retained_bytes.saturating_add(key_value_bytes(&entry));
+        if required > request.bounds().max_bytes() {
+            if retained_entries.is_empty() {
+                return Err(AdapterError::ScanByteLimit {
+                    limit: request.bounds().max_bytes(),
+                    required,
+                });
+            }
+            return Ok((retained_entries, Some(entry.key().clone())));
+        }
+        retained_bytes = required;
+        retained_entries.push(entry);
+    }
+    Ok((retained_entries, None))
 }
 
 fn page_query_limit(bounds: QueryPageBounds) -> Result<i64, AdapterError> {
