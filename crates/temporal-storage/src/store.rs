@@ -13,7 +13,7 @@ use storage_api::{
 use temporal_types::{CanonicalElement, Interval, TransactionTime, ValidTime};
 
 use crate::diff::{TemporalChange, diff_projections};
-use crate::history::{MAX_CHAIN_ENTRIES, entry_for_commit, reconstruct};
+use crate::history::{MAX_CHAIN_ENTRIES, entry_for_commit};
 use crate::history_materializer::ProjectionEditor;
 use crate::key::temporal_event_commit_prefix;
 use crate::key::temporal_event_valid_prefix;
@@ -3236,17 +3236,6 @@ where
         Ok((entries, scanned_bytes, applied_log_index))
     }
 
-    async fn load_projection_at(
-        &self,
-        element: ElementRef,
-        transaction_time: TransactionTime,
-    ) -> Result<Option<ProjectionRecord>, TemporalStoreError> {
-        let entries = self
-            .load_history_chain_at(element, transaction_time)
-            .await?;
-        reconstruct(&entries)
-    }
-
     async fn diff_element(
         &self,
         element: ElementRef,
@@ -3442,7 +3431,6 @@ pub enum TemporalStoreError {
     UnexpectedVertexIdentityKey,
     UnexpectedEdgeIdentityKey,
     UnexpectedAdjacencyKey,
-    UnexpectedHistoryAnchor,
     MissingHistoryAnchor,
     HistoryChainTooDeep,
     InvalidHistoryReadBudget,
@@ -3547,9 +3535,6 @@ impl Display for TemporalStoreError {
             }
             Self::UnexpectedAdjacencyKey => {
                 formatter.write_str("adjacency scan returned an unexpected key type")
-            }
-            Self::UnexpectedHistoryAnchor => {
-                formatter.write_str("history delta chain contains an unexpected nested anchor")
             }
             Self::MissingHistoryAnchor => {
                 formatter.write_str("history delta chain does not terminate at an anchor")

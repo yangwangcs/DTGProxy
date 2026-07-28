@@ -11,7 +11,6 @@ mod observed_adapter;
 mod overlay;
 mod record;
 mod record_ref;
-mod rewrite;
 mod store;
 mod transaction;
 
