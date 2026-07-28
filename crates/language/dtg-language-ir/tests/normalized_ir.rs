@@ -155,8 +155,12 @@ fn programs_have_an_inspectable_default_or_explicit_graph_scope() {
 
 #[test]
 fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
-    let scan_scope = TemporalScope::AsOf(TimeExpr::Parameter("scan".into()));
-    let lookup_scope = TemporalScope::AsOf(TimeExpr::Parameter("lookup".into()));
+    let node_scan_scope = TemporalScope::AsOf(TimeExpr::Parameter("node_scan".into()));
+    let relationship_scan_scope =
+        TemporalScope::AsOf(TimeExpr::Parameter("relationship_scan".into()));
+    let vertex_lookup_scope = TemporalScope::AsOf(TimeExpr::Parameter("vertex_lookup".into()));
+    let relationship_lookup_scope =
+        TemporalScope::AsOf(TimeExpr::Parameter("relationship_lookup".into()));
     let expand_scope = TemporalScope::Changes {
         from: TimeExpr::Parameter("from".into()),
         to: TimeExpr::Parameter("to".into()),
@@ -171,7 +175,7 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
                     variable: "v".into(),
                     labels: Vec::new(),
                     read_scope: ReadScope {
-                        transaction_time: scan_scope.clone(),
+                        transaction_time: node_scan_scope.clone(),
                         valid_time: None,
                     },
                 }),
@@ -182,7 +186,7 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
                     variable: "r".into(),
                     relationship_types: Vec::new(),
                     read_scope: ReadScope {
-                        transaction_time: scan_scope.clone(),
+                        transaction_time: relationship_scan_scope.clone(),
                         valid_time: None,
                     },
                 }),
@@ -194,7 +198,7 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
                     id: LogicalExpr::Parameter("id".into()),
                     labels: Vec::new(),
                     read_scope: ReadScope {
-                        transaction_time: lookup_scope.clone(),
+                        transaction_time: vertex_lookup_scope.clone(),
                         valid_time: None,
                     },
                 }),
@@ -206,7 +210,7 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
                     id: LogicalExpr::Parameter("id".into()),
                     relationship_types: Vec::new(),
                     read_scope: ReadScope {
-                        transaction_time: lookup_scope.clone(),
+                        transaction_time: relationship_lookup_scope.clone(),
                         valid_time: None,
                     },
                 }),
@@ -248,8 +252,10 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
         ],
     };
 
-    assert!(plan.contains_scope(scan_scope));
-    assert!(plan.contains_scope(lookup_scope));
+    assert!(plan.contains_scope(node_scan_scope));
+    assert!(plan.contains_scope(relationship_scan_scope));
+    assert!(plan.contains_scope(vertex_lookup_scope));
+    assert!(plan.contains_scope(relationship_lookup_scope));
     assert!(plan.contains_scope(expand_scope));
     assert!(plan.contains_scope(nested_scope));
     assert!(!plan.contains_scope(TemporalScope::AsOf(TimeExpr::Parameter("missing".into(),))));
