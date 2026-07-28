@@ -240,7 +240,7 @@ fn point_reader_replays_only_deltas_covering_the_requested_valid_time() {
 
     assert_eq!(outcome.value, Some(payload("visible")));
     assert_eq!(outcome.stats.history_records, 4);
-    assert_eq!(outcome.stats.payloads_decoded, 2);
+    assert_eq!(outcome.stats.payloads_decoded, 1);
 }
 
 #[test]
@@ -513,11 +513,10 @@ fn nine_distinct_one_page_requests_use_one_batch_call() {
         .collect();
 
     let outcomes = block_on(
-        PointHistoryReader::new(HistoryReadBudget::new(16, 4096, 4096).unwrap()).read_batch(
-            &snapshot,
-            &requests,
-            PropertyDemand::All,
-        ),
+        PointHistoryReader::new(
+            HistoryReadBudget::new(16, storage_api::MAX_QUERY_PAGE_BYTES, 4096).unwrap(),
+        )
+        .read_batch(&snapshot, &requests, PropertyDemand::All),
     )
     .unwrap();
 
@@ -526,6 +525,41 @@ fn nine_distinct_one_page_requests_use_one_batch_call() {
     for (ordinal, outcome) in outcomes.into_iter().enumerate() {
         assert_eq!(outcome.value, Some(payload(&format!("value-{ordinal}"))));
     }
+}
+
+#[test]
+fn overwritten_payloads_are_not_decoded_or_copied_into_the_final_result() {
+    let element = vertex(150);
+    let final_payload = payload("final");
+    let snapshot = ScriptedSnapshot::new(vec![
+        anchor(element, 100, vec![(interval(0, 10), payload("anchor"))]),
+        put(element, 200, interval(0, 10), payload("overwritten")),
+        put(element, 300, interval(0, 10), final_payload.clone()),
+    ]);
+
+    let outcome = block_on(
+        PointHistoryReader::new(HistoryReadBudget::new(16, 4096, 4096).unwrap()).read(
+            &snapshot,
+            element,
+            tx(300),
+            valid(5),
+            PropertyDemand::Selected(&[1]),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.value,
+        Some(CanonicalElement::new(
+            1,
+            BTreeMap::from([(1, GraphValue::String("final".to_owned()))]),
+        ))
+    );
+    assert_eq!(outcome.stats.payloads_decoded, 1);
+    assert_eq!(
+        outcome.stats.payload_bytes_copied,
+        u64::try_from(final_payload.encode().unwrap().len()).unwrap() * 2
+    );
 }
 
 #[test]

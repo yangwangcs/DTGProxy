@@ -137,7 +137,7 @@ impl PointHistoryReader {
             ranges[range_ordinal].points.push(PointReplay {
                 ordinal,
                 valid_time: request.valid_time,
-                deltas: Vec::new(),
+                replacement: None,
                 payload_bytes_copied: 0,
             });
         }
@@ -204,9 +204,20 @@ impl PointHistoryReader {
                 .max_total_bytes
                 .checked_sub(range.stats.history_bytes)
                 .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
+            let maximum_record_bytes = self
+                .budget
+                .max_record_bytes
+                .checked_add(key_bytes)
+                .ok_or(TemporalStoreError::HistoryTotalByteLimit)?
+                .checked_mul(
+                    u64::try_from(remaining_records)
+                        .map_err(|_| TemporalStoreError::HistoryTotalByteLimit)?,
+                )
+                .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
             let requested_bytes = remaining_value_bytes
                 .checked_add(key_overhead)
                 .ok_or(TemporalStoreError::HistoryTotalByteLimit)?
+                .min(maximum_record_bytes)
                 .min(MAX_QUERY_PAGE_BYTES);
             let next_aggregate = aggregate_bytes
                 .checked_add(requested_bytes)
@@ -250,15 +261,14 @@ impl PointHistoryReader {
                 HistoryEntryRef::Delta(delta) => {
                     range.saw_delta = true;
                     for point in &mut range.points {
-                        if !delta.changed_valid().contains(point.valid_time) {
+                        if point.replacement.is_some()
+                            || !delta.changed_valid().contains(point.valid_time)
+                        {
                             continue;
                         }
-                        point.deltas.push(match delta.operation() {
+                        point.replacement = Some(match delta.operation() {
                             HistoryOperationRef::Put(payload) => {
-                                point.payload_bytes_copied = point
-                                    .payload_bytes_copied
-                                    .checked_add(payload_len(payload)?)
-                                    .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
+                                point.payload_bytes_copied = payload_len(payload)?;
                                 OwnedPointDelta::Put(payload.encoded().to_vec())
                             }
                             HistoryOperationRef::Delete => OwnedPointDelta::Delete,
@@ -272,20 +282,18 @@ impl PointHistoryReader {
                     for point in &range.points {
                         let mut stats = range.stats;
                         stats.payload_bytes_copied = point.payload_bytes_copied;
-                        let mut value = match anchor.projection().visible_at(point.valid_time)? {
-                            Some(payload) => Some(decode_payload(payload, demand, &mut stats)?),
-                            None => None,
-                        };
-                        for delta in point.deltas.iter().rev() {
-                            match delta {
-                                OwnedPointDelta::Put(encoded) => {
-                                    let payload = CanonicalElementRef::parse(encoded)
-                                        .map_err(crate::RecordCodecError::Canonical)?;
-                                    value = Some(decode_payload(payload, demand, &mut stats)?);
-                                }
-                                OwnedPointDelta::Delete => value = None,
+                        let value = match &point.replacement {
+                            Some(OwnedPointDelta::Put(encoded)) => {
+                                let payload = CanonicalElementRef::parse(encoded)
+                                    .map_err(crate::RecordCodecError::Canonical)?;
+                                Some(decode_payload(payload, demand, &mut stats)?)
                             }
-                        }
+                            Some(OwnedPointDelta::Delete) => None,
+                            None => match anchor.projection().visible_at(point.valid_time)? {
+                                Some(payload) => Some(decode_payload(payload, demand, &mut stats)?),
+                                None => None,
+                            },
+                        };
                         outcomes[point.ordinal] = Some(PointHistoryOutcome { value, stats });
                     }
                     range.complete = true;
@@ -348,7 +356,7 @@ impl RangeReplay {
 struct PointReplay {
     ordinal: usize,
     valid_time: ValidTime,
-    deltas: Vec<OwnedPointDelta>,
+    replacement: Option<OwnedPointDelta>,
     payload_bytes_copied: u64,
 }
 
