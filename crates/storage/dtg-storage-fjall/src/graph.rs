@@ -10,9 +10,9 @@ use std::sync::{Condvar, Mutex};
 
 use dtg_storage::{
     ApplyReceipt, CapabilityManifest, ChangeRecord, CommittedShardBatch, EdgeId, EdgeTombstone,
-    EdgeVersion, LogicalMutation, ReadFence, ReplicaBinding, ReplicaStateStore, SnapshotRecord,
-    SnapshotReplayRecord, StorageError, StoreFuture, TemporalReadView, VertexTombstone,
-    VertexVersion,
+    EdgeVersion, LogicalMutation, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore,
+    SnapshotRecord, SnapshotReplayRecord, StorageError, StoreFuture, TemporalReadView,
+    TransactionId, TransactionRecord, VertexTombstone, VertexVersion,
 };
 use fjall::{Keyspace, OwnedWriteBatch, PersistMode};
 
@@ -368,10 +368,12 @@ impl FjallReplicaStore {
             }
         }
         changes.sort_by_key(ChangeRecord::cursor);
-        validate_restored_state(
+        let authenticated_current = validate_restored_state(
             &self.inner.binding,
             applied_index,
             &history,
+            &transactions,
+            &metadata,
             &replay,
             &changes,
         )?;
@@ -394,7 +396,7 @@ impl FjallReplicaStore {
                 )?;
             }
         }
-        for transaction in &transactions {
+        for transaction in authenticated_current.transactions.values() {
             let mutation = LogicalMutation::PutTransaction(transaction.clone());
             stage_current_mutation(
                 &self.inner.namespace,
@@ -403,7 +405,7 @@ impl FjallReplicaStore {
                 &mut EdgeAdjacencyState::default(),
             )?;
         }
-        for record in &metadata {
+        for record in authenticated_current.metadata.values() {
             let mutation = LogicalMutation::PutReplicaMetadata(record.clone());
             stage_current_mutation(
                 &self.inner.namespace,
@@ -604,13 +606,20 @@ fn stage_current_mutation(
     Ok(())
 }
 
+struct AuthenticatedCurrentState {
+    transactions: BTreeMap<TransactionId, TransactionRecord>,
+    metadata: BTreeMap<String, ReplicaMetadata>,
+}
+
 fn validate_restored_state(
     binding: &ReplicaBinding,
     applied_index: u64,
     history: &[LogicalMutation],
+    transactions: &[TransactionRecord],
+    metadata: &[ReplicaMetadata],
     replay: &[SnapshotReplayRecord],
     changes: &[ChangeRecord],
-) -> Result<(), StorageError> {
+) -> Result<AuthenticatedCurrentState, StorageError> {
     let mut replay_indices = replay
         .iter()
         .map(SnapshotReplayRecord::raft_index)
@@ -688,7 +697,72 @@ fn validate_restored_state(
             "snapshot graph history does not match authenticated changes".into(),
         ));
     }
-    Ok(())
+    let supplied_transactions = unique_transaction_map(transactions)?;
+    let supplied_metadata = unique_metadata_map(metadata)?;
+    let mut authenticated_transactions = BTreeMap::new();
+    let mut authenticated_metadata = BTreeMap::new();
+    for change in changes {
+        match change.mutation() {
+            LogicalMutation::PutTransaction(transaction) => {
+                authenticated_transactions.insert(transaction.id(), transaction.clone());
+            }
+            LogicalMutation::PutReplicaMetadata(metadata) => {
+                authenticated_metadata.insert(metadata.name().to_owned(), metadata.clone());
+            }
+            LogicalMutation::PutVertex(_)
+            | LogicalMutation::DeleteVertex(_)
+            | LogicalMutation::PutEdge(_)
+            | LogicalMutation::DeleteEdge(_) => {}
+        }
+    }
+    if supplied_transactions != authenticated_transactions {
+        return Err(StorageError::CorruptSnapshot(
+            "snapshot transaction state does not match authenticated changes".into(),
+        ));
+    }
+    if supplied_metadata != authenticated_metadata {
+        return Err(StorageError::CorruptSnapshot(
+            "snapshot replica metadata does not match authenticated changes".into(),
+        ));
+    }
+    Ok(AuthenticatedCurrentState {
+        transactions: authenticated_transactions,
+        metadata: authenticated_metadata,
+    })
+}
+
+fn unique_transaction_map(
+    transactions: &[TransactionRecord],
+) -> Result<BTreeMap<TransactionId, TransactionRecord>, StorageError> {
+    let mut records = BTreeMap::new();
+    for transaction in transactions {
+        if records
+            .insert(transaction.id(), transaction.clone())
+            .is_some()
+        {
+            return Err(StorageError::CorruptSnapshot(
+                "snapshot transaction state contains duplicate identifiers".into(),
+            ));
+        }
+    }
+    Ok(records)
+}
+
+fn unique_metadata_map(
+    metadata: &[ReplicaMetadata],
+) -> Result<BTreeMap<String, ReplicaMetadata>, StorageError> {
+    let mut records = BTreeMap::new();
+    for record in metadata {
+        if records
+            .insert(record.name().to_owned(), record.clone())
+            .is_some()
+        {
+            return Err(StorageError::CorruptSnapshot(
+                "snapshot replica metadata contains duplicate names".into(),
+            ));
+        }
+    }
+    Ok(records)
 }
 
 fn graph_history_multiset<'a>(

@@ -14,11 +14,11 @@ use dtg_storage::SnapshotReplayRecord;
 use dtg_storage::{
     ArtifactChunk, ArtifactKey, ArtifactKind, ArtifactManifest, ArtifactStore, BackendClass,
     BindingRole, CapabilityManifest, CommandId, CommittedShardBatch, ConsensusCommandEnvelope,
-    ConsensusEntry, ConsensusStore, EdgeId, EdgeTombstone, EdgeVersion, LogicalMutation,
+    ConsensusEntry, ConsensusStore, Digest32, EdgeId, EdgeTombstone, EdgeVersion, LogicalMutation,
     LogicalSnapshotSink, LogicalSnapshotSource, ProviderKind, ReadFence, ReplicaBinding,
-    ReplicaStateStore, SnapshotChunk, SnapshotManifest, SnapshotRecord, SnapshotRequest,
-    StorageError, TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead,
-    VertexVersion,
+    ReplicaMetadata, ReplicaStateStore, SnapshotChunk, SnapshotManifest, SnapshotRecord,
+    SnapshotRequest, StorageError, TransactionId, TransactionRecord, TransactionState,
+    TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion,
 };
 use dtg_storage_fjall::{FjallArtifactStore, FjallConsensusStore, FjallReplicaStore};
 use fjall::{Database, KeyspaceCreateOptions};
@@ -91,6 +91,25 @@ fn edge(id: u128, source: u128, target: u128, version: u64) -> EdgeVersion {
         BTreeMap::new(),
     )
     .unwrap()
+}
+
+fn transaction(
+    id: u128,
+    state: TransactionState,
+    transaction_time: i64,
+    digest_byte: u8,
+) -> TransactionRecord {
+    TransactionRecord::new(
+        TransactionId::new(id).unwrap(),
+        state,
+        TransactionTime::new(transaction_time).unwrap(),
+        Digest32::new([digest_byte; 32]),
+    )
+    .unwrap()
+}
+
+fn replica_metadata(name: &str, value: &str) -> ReplicaMetadata {
+    ReplicaMetadata::new(name, Value::String(value.to_owned())).unwrap()
 }
 
 fn export(
@@ -816,6 +835,248 @@ fn restore_rejects_altered_graph_history_without_publication() {
             .unwrap();
         records[position] = SnapshotRecord::Vertex(vertex(20, 1));
     });
+}
+
+#[derive(Clone, Copy)]
+enum CurrentStateFamily {
+    Transaction,
+    ReplicaMetadata,
+}
+
+#[derive(Clone, Copy)]
+enum CurrentStateCorruption {
+    Missing,
+    Altered,
+    Extra,
+    Duplicate,
+}
+
+#[test]
+fn restore_rejects_missing_transaction_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "missing-transaction",
+        CurrentStateFamily::Transaction,
+        CurrentStateCorruption::Missing,
+    );
+}
+
+#[test]
+fn restore_rejects_altered_transaction_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "altered-transaction",
+        CurrentStateFamily::Transaction,
+        CurrentStateCorruption::Altered,
+    );
+}
+
+#[test]
+fn restore_rejects_extra_transaction_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "extra-transaction",
+        CurrentStateFamily::Transaction,
+        CurrentStateCorruption::Extra,
+    );
+}
+
+#[test]
+fn restore_rejects_duplicate_transaction_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "duplicate-transaction",
+        CurrentStateFamily::Transaction,
+        CurrentStateCorruption::Duplicate,
+    );
+}
+
+#[test]
+fn restore_rejects_missing_replica_metadata_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "missing-replica-metadata",
+        CurrentStateFamily::ReplicaMetadata,
+        CurrentStateCorruption::Missing,
+    );
+}
+
+#[test]
+fn restore_rejects_altered_replica_metadata_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "altered-replica-metadata",
+        CurrentStateFamily::ReplicaMetadata,
+        CurrentStateCorruption::Altered,
+    );
+}
+
+#[test]
+fn restore_rejects_extra_replica_metadata_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "extra-replica-metadata",
+        CurrentStateFamily::ReplicaMetadata,
+        CurrentStateCorruption::Extra,
+    );
+}
+
+#[test]
+fn restore_rejects_duplicate_replica_metadata_current_state_without_publication() {
+    assert_current_state_corruption_rejected(
+        "duplicate-replica-metadata",
+        CurrentStateFamily::ReplicaMetadata,
+        CurrentStateCorruption::Duplicate,
+    );
+}
+
+fn assert_current_state_corruption_rejected(
+    label: &str,
+    family: CurrentStateFamily,
+    corruption: CurrentStateCorruption,
+) {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding(&format!("current-state-source-{label}"), 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(460).unwrap(),
+                vec![
+                    LogicalMutation::PutTransaction(transaction(
+                        10,
+                        TransactionState::Prepared,
+                        1,
+                        1,
+                    )),
+                    LogicalMutation::PutReplicaMetadata(replica_metadata(
+                        "lease-owner",
+                        "source-old",
+                    )),
+                    LogicalMutation::PutVertex(vertex(1, 1)),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let expected_transaction = transaction(10, TransactionState::Committed, 2, 2);
+    let expected_metadata = replica_metadata("lease-owner", "source-final");
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                2,
+                2,
+                CommandId::new(461).unwrap(),
+                vec![
+                    LogicalMutation::PutTransaction(expected_transaction.clone()),
+                    LogicalMutation::PutTransaction(transaction(
+                        11,
+                        TransactionState::Aborted,
+                        2,
+                        3,
+                    )),
+                    LogicalMutation::PutReplicaMetadata(expected_metadata.clone()),
+                    LogicalMutation::PutReplicaMetadata(replica_metadata(
+                        "generation",
+                        "source-secondary",
+                    )),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (header, _, _, mut corrupted_records) = export(&source, &source_binding, 2, 460);
+
+    let position = corrupted_records
+        .iter()
+        .position(|record| match (family, record) {
+            (CurrentStateFamily::Transaction, SnapshotRecord::Transaction(transaction)) => {
+                transaction.id() == expected_transaction.id()
+            }
+            (CurrentStateFamily::ReplicaMetadata, SnapshotRecord::ReplicaMetadata(metadata)) => {
+                metadata.name() == expected_metadata.name()
+            }
+            _ => false,
+        })
+        .unwrap();
+    match (family, corruption) {
+        (_, CurrentStateCorruption::Missing) => {
+            corrupted_records.remove(position);
+        }
+        (CurrentStateFamily::Transaction, CurrentStateCorruption::Altered) => {
+            corrupted_records[position] =
+                SnapshotRecord::Transaction(transaction(10, TransactionState::Aborted, 9, 9));
+        }
+        (CurrentStateFamily::ReplicaMetadata, CurrentStateCorruption::Altered) => {
+            corrupted_records[position] = SnapshotRecord::ReplicaMetadata(replica_metadata(
+                "lease-owner",
+                "attacker-altered",
+            ));
+        }
+        (CurrentStateFamily::Transaction, CurrentStateCorruption::Extra) => {
+            corrupted_records.push(SnapshotRecord::Transaction(transaction(
+                99,
+                TransactionState::Committed,
+                9,
+                9,
+            )));
+        }
+        (CurrentStateFamily::ReplicaMetadata, CurrentStateCorruption::Extra) => {
+            corrupted_records.push(SnapshotRecord::ReplicaMetadata(replica_metadata(
+                "attacker-extra",
+                "injected",
+            )));
+        }
+        (CurrentStateFamily::Transaction, CurrentStateCorruption::Duplicate)
+        | (CurrentStateFamily::ReplicaMetadata, CurrentStateCorruption::Duplicate) => {
+            corrupted_records.push(corrupted_records[position].clone());
+        }
+    }
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_binding = binding(&format!("current-state-target-{label}"), 2);
+    let target = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    block_on(
+        target.apply(
+            CommittedShardBatch::new(
+                target_binding.clone(),
+                9,
+                1,
+                CommandId::new(860).unwrap(),
+                vec![
+                    LogicalMutation::PutVertex(vertex(80, 1)),
+                    LogicalMutation::PutTransaction(transaction(
+                        80,
+                        TransactionState::Prepared,
+                        1,
+                        8,
+                    )),
+                    LogicalMutation::PutReplicaMetadata(replica_metadata("dirty-owner", "target")),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (_, _, _, dirty_records_before) = export(&target, &target_binding, 1, 860);
+
+    let chunks = corrupted_records
+        .chunks(3)
+        .enumerate()
+        .map(|(chunk_ordinal, records)| {
+            SnapshotChunk::new(header.snapshot_id(), chunk_ordinal as u64, records.to_vec())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let manifest = SnapshotManifest::new(&header, &chunks).unwrap();
+    let mut writer = block_on(target.begin_restore(target_binding.clone(), header)).unwrap();
+    for chunk in chunks {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    let error = block_on(writer.commit(manifest)).unwrap_err();
+    assert_eq!(error.code(), "DTG-STORAGE-SNAPSHOT-CORRUPT", "{label}");
+    assert_eq!(block_on(target.applied_index()).unwrap(), 1, "{label}");
+    let (_, _, _, dirty_records_after) = export(&target, &target_binding, 1, 861);
+    assert_eq!(dirty_records_after, dirty_records_before, "{label}");
 }
 
 fn assert_graph_history_corruption_rejected(
