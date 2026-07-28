@@ -564,6 +564,59 @@ fn concurrent_handles_publish_exactly_one_divergent_next_batch() {
 
 #[cfg(feature = "tck")]
 #[test]
+fn duplicate_apply_pause_arm_preserves_first_token_without_orphaning_future_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_binding = binding("duplicate-apply-pause", 1);
+    let store = FjallReplicaStore::open(dir.path(), store_binding.clone()).unwrap();
+    let first_pause = store.arm_tck_apply_before_commit_pause().unwrap();
+    match store.arm_tck_apply_before_commit_pause() {
+        Ok(_) => panic!("duplicate apply pause arm unexpectedly succeeded"),
+        Err(StorageError::Internal(message)) => {
+            assert_eq!(message, "Fjall graph pause point is already armed");
+        }
+        Err(error) => panic!("duplicate apply pause arm returned {error:?}"),
+    }
+
+    let paused_store = store.clone();
+    let paused_binding = store_binding.clone();
+    let paused_apply = thread::spawn(move || {
+        block_on(
+            paused_store.apply(
+                CommittedShardBatch::new(
+                    paused_binding,
+                    1,
+                    1,
+                    CommandId::new(601).unwrap(),
+                    vec![LogicalMutation::PutVertex(vertex(601, 1))],
+                )
+                .unwrap(),
+            ),
+        )
+    });
+    first_pause.wait_until_reached().unwrap();
+    first_pause.release().unwrap();
+    assert!(paused_apply.join().unwrap().is_ok());
+
+    assert!(
+        block_on(
+            store.apply(
+                CommittedShardBatch::new(
+                    store_binding.clone(),
+                    2,
+                    2,
+                    CommandId::new(602).unwrap(),
+                    vec![LogicalMutation::PutVertex(vertex(602, 2))],
+                )
+                .unwrap(),
+            )
+        )
+        .is_ok()
+    );
+    assert_eq!(block_on(store.applied_index()).unwrap(), 2);
+}
+
+#[cfg(feature = "tck")]
+#[test]
 fn apply_racing_restore_finishes_as_one_complete_serial_outcome() {
     let source_dir = tempfile::tempdir().unwrap();
     let target_dir = tempfile::tempdir().unwrap();

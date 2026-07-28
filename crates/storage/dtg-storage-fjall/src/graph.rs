@@ -228,10 +228,15 @@ impl FjallReplicaStore {
     fn arm_graph_pause(&self, point: GraphPausePoint) -> Result<FjallGraphPause, StorageError> {
         let state = Arc::new(GraphPauseState::new());
         let mut pauses = lock(&self.inner.graph_pauses)?;
-        if pauses.insert(point, Arc::clone(&state)).is_some() {
-            return Err(StorageError::Internal(
-                "Fjall graph pause point is already armed".into(),
-            ));
+        match pauses.entry(point) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&state));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(StorageError::Internal(
+                    "Fjall graph pause point is already armed".into(),
+                ));
+            }
         }
         Ok(FjallGraphPause { state })
     }
