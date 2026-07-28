@@ -145,15 +145,22 @@ impl PointHistoryReader {
         let expected_applied_log_index = read.applied_log_index();
         let mut outcomes = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
         while ranges.iter().any(|range| !range.complete) {
-            let (range_ordinals, scans, max_total_bytes) = self.build_batch(&ranges)?;
-            let request = CanonicalBatchScanRequest::new(scans, max_total_bytes)
-                .map_err(query_primitive_error)?;
-            let page = match read.scan_canonical_batch(&request).await {
-                Ok(page) => page,
-                Err(AdapterError::ScanByteLimit { .. }) => {
-                    return Err(TemporalStoreError::HistoryRecordByteLimit);
+            let mut max_ranges = MAX_CANONICAL_BATCH_RANGES;
+            let (range_ordinals, page) = loop {
+                let (range_ordinals, scans, max_total_bytes) =
+                    self.build_batch(&ranges, max_ranges)?;
+                let request = CanonicalBatchScanRequest::new(scans, max_total_bytes)
+                    .map_err(query_primitive_error)?;
+                match read.scan_canonical_batch(&request).await {
+                    Ok(page) => break (range_ordinals, page),
+                    Err(AdapterError::ScanByteLimit { .. }) if range_ordinals.len() > 1 => {
+                        max_ranges = range_ordinals.len().div_ceil(2);
+                    }
+                    Err(AdapterError::ScanByteLimit { .. }) => {
+                        return Err(TemporalStoreError::HistoryRecordByteLimit);
+                    }
+                    Err(error) => return Err(TemporalStoreError::Adapter(error)),
                 }
-                Err(error) => return Err(TemporalStoreError::Adapter(error)),
             };
             if page.applied_log_index() != expected_applied_log_index {
                 return Err(TemporalStoreError::HistoryAppliedIndexMismatch {
@@ -176,15 +183,25 @@ impl PointHistoryReader {
     fn build_batch(
         &self,
         ranges: &[RangeReplay],
+        max_ranges: usize,
     ) -> Result<(Vec<usize>, Vec<CanonicalScanRequest>, u64), TemporalStoreError> {
-        let mut range_ordinals = Vec::new();
-        let mut scans = Vec::new();
+        let range_ordinals = ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, range)| (!range.complete).then_some(ordinal))
+            .take(max_ranges.min(MAX_CANONICAL_BATCH_RANGES))
+            .collect::<Vec<_>>();
+        let per_range_bytes = MAX_QUERY_PAGE_BYTES
+            .checked_div(
+                u64::try_from(range_ordinals.len())
+                    .map_err(|_| TemporalStoreError::HistoryTotalByteLimit)?,
+            )
+            .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
+        let mut scans = Vec::with_capacity(range_ordinals.len());
         let mut aggregate_bytes = 0_u64;
 
-        for (range_ordinal, range) in ranges.iter().enumerate() {
-            if range.complete || range_ordinals.len() == MAX_CANONICAL_BATCH_RANGES {
-                continue;
-            }
+        for &range_ordinal in &range_ordinals {
+            let range = &ranges[range_ordinal];
             let remaining_records = self
                 .budget
                 .max_records
@@ -204,13 +221,11 @@ impl PointHistoryReader {
                 .max_record_bytes
                 .checked_add(key_bytes)
                 .ok_or(TemporalStoreError::HistoryTotalByteLimit)?
+                .min(per_range_bytes)
                 .min(MAX_QUERY_PAGE_BYTES);
             let next_aggregate = aggregate_bytes
                 .checked_add(requested_bytes)
                 .ok_or(TemporalStoreError::HistoryTotalByteLimit)?;
-            if next_aggregate > MAX_QUERY_PAGE_BYTES && !scans.is_empty() {
-                break;
-            }
 
             let span =
                 KeySpan::prefix_from(Keyspace::History, range.prefix.clone(), range.start.clone())
@@ -220,8 +235,7 @@ impl PointHistoryReader {
             let bounds = QueryPageBounds::new(remaining_records, requested_bytes)
                 .map_err(query_primitive_error)?;
             scans.push(CanonicalScanRequest::new(span, bounds).map_err(query_primitive_error)?);
-            range_ordinals.push(range_ordinal);
-            aggregate_bytes = next_aggregate.min(MAX_QUERY_PAGE_BYTES);
+            aggregate_bytes = next_aggregate;
         }
 
         Ok((range_ordinals, scans, aggregate_bytes))

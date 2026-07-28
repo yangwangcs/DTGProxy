@@ -533,9 +533,16 @@ fn nine_distinct_one_page_requests_use_one_batch_call() {
         })
         .collect();
 
+    let key_bytes =
+        u64::try_from(history_anchor_key(vertex(100), tx(100), 0).as_bytes().len()).unwrap();
     let outcomes = block_on(
         PointHistoryReader::new(
-            HistoryReadBudget::new(16, storage_api::MAX_QUERY_PAGE_BYTES, 1024 * 1024).unwrap(),
+            HistoryReadBudget::new(
+                16,
+                storage_api::MAX_QUERY_PAGE_BYTES,
+                storage_api::MAX_QUERY_PAGE_BYTES - key_bytes,
+            )
+            .unwrap(),
         )
         .read_batch(&snapshot, &requests, PropertyDemand::All),
     )
