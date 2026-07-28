@@ -24,6 +24,8 @@ use dtg_storage::{
 
 pub use artifact::FjallArtifactStore;
 pub use consensus::FjallConsensusStore;
+#[cfg(feature = "tck")]
+pub use graph::FjallGraphPause;
 pub use graph::FjallReplicaStore;
 
 pub const CLEAN_BREAK_ARCHITECTURE_VERSION: u32 = 1;

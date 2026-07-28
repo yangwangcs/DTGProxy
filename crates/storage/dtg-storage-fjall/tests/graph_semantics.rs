@@ -5,13 +5,20 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+#[cfg(feature = "tck")]
+use std::thread;
+
+#[cfg(feature = "tck")]
+use dtg_storage::SnapshotReplayRecord;
+
 use dtg_storage::{
     ArtifactChunk, ArtifactKey, ArtifactKind, ArtifactManifest, ArtifactStore, BackendClass,
     BindingRole, CapabilityManifest, CommandId, CommittedShardBatch, ConsensusCommandEnvelope,
     ConsensusEntry, ConsensusStore, EdgeId, EdgeTombstone, EdgeVersion, LogicalMutation,
     LogicalSnapshotSink, LogicalSnapshotSource, ProviderKind, ReadFence, ReplicaBinding,
     ReplicaStateStore, SnapshotChunk, SnapshotManifest, SnapshotRecord, SnapshotRequest,
-    TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion,
+    StorageError, TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead,
+    VertexVersion,
 };
 use dtg_storage_fjall::{FjallArtifactStore, FjallConsensusStore, FjallReplicaStore};
 use fjall::{Database, KeyspaceCreateOptions};
@@ -306,6 +313,559 @@ fn native_adjacency_partitions_drop_stale_rows_for_batch_updates_and_deletes() {
     .unwrap();
     drop(reopened);
     assert_adjacency_counts(dir.path(), 0, 0);
+}
+
+#[test]
+fn stale_snapshot_fence_is_rejected_instead_of_labeling_newer_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_binding = binding("stale-snapshot-fence", 1);
+    let store = FjallReplicaStore::open(dir.path(), store_binding.clone()).unwrap();
+    block_on(
+        store.apply(
+            CommittedShardBatch::new(
+                store_binding.clone(),
+                1,
+                1,
+                CommandId::new(1).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(1, 1))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let error = match block_on(store.begin_snapshot(
+        ReadFence::new(store_binding, 0),
+        SnapshotRequest::new(100, 16).unwrap(),
+    )) {
+        Ok(_) => panic!("stale snapshot fence was accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        StorageError::ReadFenceUnavailable {
+            requested: 0,
+            applied: 1,
+        }
+    );
+}
+
+#[cfg(feature = "tck")]
+#[test]
+fn snapshot_capture_blocks_apply_at_the_post_fence_materialization_boundary() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("export-race-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(11).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(11, 1))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let apply_handle = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    let export_handle = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    let capture_pause = export_handle.arm_tck_snapshot_after_fence_pause().unwrap();
+    let export_binding = source_binding.clone();
+    let export_thread = thread::spawn(move || {
+        let mut reader = block_on(export_handle.begin_snapshot(
+            ReadFence::new(export_binding, 1),
+            SnapshotRequest::new(111, 32).unwrap(),
+        ))
+        .unwrap();
+        let header = reader.header().clone();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = block_on(reader.next_chunk()).unwrap() {
+            chunks.push(chunk);
+        }
+        let manifest = block_on(reader.finish()).unwrap();
+        (header, chunks, manifest)
+    });
+
+    capture_pause.wait_until_reached().unwrap();
+    let apply_binding = source_binding.clone();
+    let apply_thread = thread::spawn(move || {
+        block_on(
+            apply_handle.apply(
+                CommittedShardBatch::new(
+                    apply_binding,
+                    1,
+                    2,
+                    CommandId::new(12).unwrap(),
+                    vec![LogicalMutation::PutVertex(vertex(12, 2))],
+                )
+                .unwrap(),
+            ),
+        )
+    });
+    source.wait_for_tck_graph_waiter().unwrap();
+    assert_eq!(block_on(source.applied_index()).unwrap(), 1);
+
+    capture_pause.release().unwrap();
+    let (header, chunks, manifest) = export_thread.join().unwrap();
+    assert_eq!(header.applied_index(), 1);
+    assert!(apply_thread.join().unwrap().is_ok());
+    assert_eq!(block_on(source.applied_index()).unwrap(), 2);
+
+    let target_binding = binding("export-race-target", 2);
+    let target = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    let mut writer = block_on(target.begin_restore(target_binding.clone(), header)).unwrap();
+    for chunk in chunks {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    block_on(writer.commit(manifest)).unwrap();
+    assert_eq!(block_on(target.applied_index()).unwrap(), 1);
+    let restored =
+        block_on(target.begin_read_view(ReadFence::new(target_binding.clone(), 1))).unwrap();
+    assert_eq!(
+        block_on(restored.get_vertex(VertexRead::new(
+            VertexId::new(11).unwrap(),
+            10,
+            TransactionTime::new(10).unwrap(),
+        )))
+        .unwrap(),
+        Some(vertex(11, 1))
+    );
+    assert!(
+        block_on(restored.get_vertex(VertexRead::new(
+            VertexId::new(12).unwrap(),
+            10,
+            TransactionTime::new(10).unwrap(),
+        )))
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[cfg(feature = "tck")]
+#[test]
+fn concurrent_handles_publish_exactly_one_divergent_next_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_binding = binding("concurrent-apply", 1);
+    let first = FjallReplicaStore::open(dir.path(), store_binding.clone()).unwrap();
+    let second = FjallReplicaStore::open(dir.path(), store_binding.clone()).unwrap();
+    let first_vertices = [vertex(1, 1), vertex(2, 1)];
+    let second_vertices = [vertex(101, 1), vertex(102, 1)];
+    let first_mutations = first_vertices
+        .iter()
+        .cloned()
+        .map(LogicalMutation::PutVertex)
+        .collect::<Vec<_>>();
+    let second_mutations = second_vertices
+        .iter()
+        .cloned()
+        .map(LogicalMutation::PutVertex)
+        .collect::<Vec<_>>();
+    let first_batch = CommittedShardBatch::new(
+        store_binding.clone(),
+        7,
+        1,
+        CommandId::new(101).unwrap(),
+        first_mutations.clone(),
+    )
+    .unwrap();
+    let second_batch = CommittedShardBatch::new(
+        store_binding.clone(),
+        8,
+        1,
+        CommandId::new(202).unwrap(),
+        second_mutations.clone(),
+    )
+    .unwrap();
+    let expected_replay = SnapshotReplayRecord::new(
+        first_batch.raft_index(),
+        first_batch.raft_term(),
+        first_batch.command_id(),
+        first_batch.mutation_digest(),
+    )
+    .unwrap();
+    let commit_pause = first.arm_tck_apply_before_commit_pause().unwrap();
+    let first_thread = thread::spawn(move || block_on(first.apply(first_batch)));
+    commit_pause.wait_until_reached().unwrap();
+    let second_thread = thread::spawn(move || block_on(second.apply(second_batch)));
+    let observer = FjallReplicaStore::open(dir.path(), store_binding.clone()).unwrap();
+    observer.wait_for_tck_graph_waiter().unwrap();
+    assert_eq!(block_on(observer.applied_index()).unwrap(), 0);
+
+    commit_pause.release().unwrap();
+    let first_result = first_thread.join().unwrap();
+    let second_result = second_thread.join().unwrap();
+    assert!(first_result.is_ok());
+    assert_eq!(
+        second_result.unwrap_err(),
+        StorageError::ReplayMismatch { raft_index: 1 }
+    );
+
+    let reopened = FjallReplicaStore::open(dir.path(), store_binding.clone()).unwrap();
+    assert_eq!(block_on(reopened.applied_index()).unwrap(), 1);
+    let view =
+        block_on(reopened.begin_read_view(ReadFence::new(store_binding.clone(), 1))).unwrap();
+    for winner in &first_vertices {
+        assert_eq!(
+            block_on(view.get_vertex(VertexRead::new(
+                winner.id(),
+                10,
+                TransactionTime::new(10).unwrap(),
+            )))
+            .unwrap(),
+            Some(winner.clone())
+        );
+    }
+    for loser in &second_vertices {
+        assert!(
+            block_on(view.get_vertex(VertexRead::new(
+                loser.id(),
+                10,
+                TransactionTime::new(10).unwrap(),
+            )))
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    let (_, _, _, records) = export(&reopened, &store_binding, 1, 101);
+    let history = records
+        .iter()
+        .filter_map(|record| match record {
+            SnapshotRecord::Vertex(vertex) => Some(vertex.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(history, first_vertices);
+    let changes = records
+        .iter()
+        .filter_map(|record| match record {
+            SnapshotRecord::Change(change) => Some(change.mutation().clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(changes, first_mutations);
+    let replay = records
+        .iter()
+        .filter_map(|record| match record {
+            SnapshotRecord::Replay(replay) => Some(replay.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replay, vec![expected_replay]);
+    assert!(records.iter().all(|record| match record {
+        SnapshotRecord::Vertex(vertex) => !second_vertices.contains(vertex),
+        SnapshotRecord::Change(change) => !second_mutations.contains(change.mutation()),
+        _ => true,
+    }));
+}
+
+#[cfg(feature = "tck")]
+#[test]
+fn apply_racing_restore_finishes_as_one_complete_serial_outcome() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("restore-race-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(301).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(1, 1))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                2,
+                2,
+                CommandId::new(302).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(2, 2))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (header, chunks, manifest, source_records) = export(&source, &source_binding, 2, 301);
+
+    let target_binding = binding("restore-race-target", 2);
+    let restore_handle =
+        FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    let apply_handle = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    block_on(
+        apply_handle.apply(
+            CommittedShardBatch::new(
+                target_binding.clone(),
+                1,
+                1,
+                CommandId::new(401).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(20_001, 1))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    block_on(
+        apply_handle.apply(
+            CommittedShardBatch::new(
+                target_binding.clone(),
+                2,
+                2,
+                CommandId::new(402).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(20_002, 2))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let raced_vertex = vertex(99_999, 2);
+    let raced_batch = CommittedShardBatch::new(
+        target_binding.clone(),
+        3,
+        3,
+        CommandId::new(403).unwrap(),
+        vec![LogicalMutation::PutVertex(raced_vertex.clone())],
+    )
+    .unwrap();
+    let mut writer =
+        block_on(restore_handle.begin_restore(target_binding.clone(), header)).unwrap();
+    for chunk in chunks {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    let commit_pause = restore_handle
+        .arm_tck_restore_before_commit_pause()
+        .unwrap();
+    let restore_thread = thread::spawn(move || block_on(writer.commit(manifest)));
+    commit_pause.wait_until_reached().unwrap();
+    let apply_thread = thread::spawn(move || block_on(apply_handle.apply(raced_batch)));
+    restore_handle.wait_for_tck_graph_waiter().unwrap();
+    assert_eq!(block_on(restore_handle.applied_index()).unwrap(), 2);
+
+    commit_pause.release().unwrap();
+    let restore_result = restore_thread.join().unwrap();
+    assert!(restore_result.is_ok());
+    assert!(apply_thread.join().unwrap().is_ok());
+
+    let final_store = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    assert_eq!(block_on(final_store.applied_index()).unwrap(), 3);
+    let (_, _, _, final_records) = export(&final_store, &target_binding, 3, 302);
+    let base_records = final_records
+        .iter()
+        .filter(|record| match record {
+            SnapshotRecord::Vertex(vertex) => vertex.id() != raced_vertex.id(),
+            SnapshotRecord::Replay(replay) => replay.raft_index() != 3,
+            SnapshotRecord::Change(change) => change.raft_index() != 3,
+            _ => true,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(base_records, source_records);
+    assert_eq!(
+        final_records
+            .iter()
+            .filter(
+                |record| matches!(record, SnapshotRecord::Vertex(vertex) if vertex == &raced_vertex)
+            )
+            .count(),
+        1
+    );
+    assert_eq!(
+        final_records
+            .iter()
+            .filter(|record| matches!(record, SnapshotRecord::Replay(replay) if replay.raft_index() == 3))
+            .count(),
+        1
+    );
+    assert_eq!(
+        final_records
+            .iter()
+            .filter(|record| matches!(record, SnapshotRecord::Change(change) if change.raft_index() == 3 && change.mutation() == &LogicalMutation::PutVertex(raced_vertex.clone())))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn restore_rejects_semantically_corrupt_change_sequences_without_publication() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("digest-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(501).unwrap(),
+                vec![
+                    LogicalMutation::PutVertex(vertex(1, 1)),
+                    LogicalMutation::PutVertex(vertex(2, 1)),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                2,
+                2,
+                CommandId::new(502).unwrap(),
+                vec![
+                    LogicalMutation::PutVertex(vertex(3, 2)),
+                    LogicalMutation::PutVertex(vertex(4, 2)),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (header, _, _, records) = export(&source, &source_binding, 2, 501);
+    let change_positions = records
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| match record {
+            SnapshotRecord::Change(change) => Some((change.cursor(), position)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(change_positions.len(), 4);
+    let position = |raft_index, mutation_ordinal| {
+        change_positions[&dtg_storage::ChangeCursor::new(raft_index, mutation_ordinal)]
+    };
+
+    let mut corruptions = Vec::new();
+    let mut missing = records.clone();
+    missing.remove(position(2, 1));
+    corruptions.push(("missing", missing));
+
+    let mut extra = records.clone();
+    extra.push(SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+        dtg_storage::ChangeCursor::new(2, 2),
+        LogicalMutation::PutVertex(vertex(5, 2)),
+    )));
+    corruptions.push(("extra", extra));
+
+    let mut reordered = records.clone();
+    let first_change = match &records[position(1, 0)] {
+        SnapshotRecord::Change(change) => change.clone(),
+        _ => unreachable!(),
+    };
+    let second_change = match &records[position(1, 1)] {
+        SnapshotRecord::Change(change) => change.clone(),
+        _ => unreachable!(),
+    };
+    reordered[position(1, 0)] = SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+        first_change.cursor(),
+        second_change.mutation().clone(),
+    ));
+    reordered[position(1, 1)] = SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+        second_change.cursor(),
+        first_change.mutation().clone(),
+    ));
+    corruptions.push(("reordered", reordered));
+
+    let mut cursor_swapped = records.clone();
+    cursor_swapped[position(1, 0)] = SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+        second_change.cursor(),
+        first_change.mutation().clone(),
+    ));
+    cursor_swapped[position(1, 1)] = SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+        first_change.cursor(),
+        second_change.mutation().clone(),
+    ));
+    corruptions.push(("cursor-swapped", cursor_swapped));
+
+    let mut altered = records.clone();
+    let altered_change = match &records[position(2, 0)] {
+        SnapshotRecord::Change(change) => change.clone(),
+        _ => unreachable!(),
+    };
+    altered[position(2, 0)] = SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+        altered_change.cursor(),
+        LogicalMutation::PutVertex(vertex(6, 2)),
+    ));
+    corruptions.push(("altered", altered));
+
+    let mut cross_index_reassociated = records;
+    let first_index_change = match &cross_index_reassociated[position(1, 1)] {
+        SnapshotRecord::Change(change) => change.clone(),
+        _ => unreachable!(),
+    };
+    let second_index_change = match &cross_index_reassociated[position(2, 0)] {
+        SnapshotRecord::Change(change) => change.clone(),
+        _ => unreachable!(),
+    };
+    cross_index_reassociated[position(1, 1)] =
+        SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+            first_index_change.cursor(),
+            second_index_change.mutation().clone(),
+        ));
+    cross_index_reassociated[position(2, 0)] =
+        SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+            second_index_change.cursor(),
+            first_index_change.mutation().clone(),
+        ));
+    corruptions.push(("cross-index-reassociated", cross_index_reassociated));
+
+    for (ordinal, (name, corrupted_records)) in corruptions.into_iter().enumerate() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_binding = binding(&format!("digest-target-{name}"), 2);
+        let target = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+        let dirty = vertex(90 + ordinal as u128, 1);
+        block_on(
+            target.apply(
+                CommittedShardBatch::new(
+                    target_binding.clone(),
+                    9,
+                    1,
+                    CommandId::new(900 + ordinal as u128).unwrap(),
+                    vec![LogicalMutation::PutVertex(dirty.clone())],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let chunks = corrupted_records
+            .chunks(3)
+            .enumerate()
+            .map(|(chunk_ordinal, records)| {
+                SnapshotChunk::new(header.snapshot_id(), chunk_ordinal as u64, records.to_vec())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let manifest = SnapshotManifest::new(&header, &chunks).unwrap();
+        let mut writer =
+            block_on(target.begin_restore(target_binding.clone(), header.clone())).unwrap();
+        for chunk in chunks {
+            block_on(writer.write_chunk(chunk)).unwrap();
+        }
+        let error = block_on(writer.commit(manifest)).unwrap_err();
+        assert_eq!(error.code(), "DTG-STORAGE-SNAPSHOT-CORRUPT", "{name}");
+        assert_eq!(block_on(target.applied_index()).unwrap(), 1, "{name}");
+        let view = block_on(target.begin_read_view(ReadFence::new(target_binding, 1))).unwrap();
+        assert_eq!(
+            block_on(view.get_vertex(VertexRead::new(
+                dirty.id(),
+                10,
+                TransactionTime::new(10).unwrap(),
+            )))
+            .unwrap(),
+            Some(dirty),
+            "{name}"
+        );
+    }
 }
 
 fn assert_adjacency_counts(path: &std::path::Path, outgoing: usize, incoming: usize) {

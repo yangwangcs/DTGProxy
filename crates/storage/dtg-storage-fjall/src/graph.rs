@@ -2,8 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, MutexGuard},
 };
+
+#[cfg(feature = "tck")]
+use std::sync::{Condvar, Mutex};
 
 use dtg_storage::{
     ApplyReceipt, CapabilityManifest, ChangeRecord, CommittedShardBatch, EdgeId, EdgeTombstone,
@@ -25,9 +28,91 @@ struct ReplicaInner {
     namespace: NamespaceDb,
     binding: ReplicaBinding,
     capabilities: CapabilityManifest,
-    apply_guard: Mutex<()>,
     #[cfg(feature = "tck")]
     injected_failure_after: Mutex<Option<usize>>,
+    #[cfg(feature = "tck")]
+    graph_pauses: Mutex<BTreeMap<GraphPausePoint, Arc<GraphPauseState>>>,
+}
+
+#[cfg(feature = "tck")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum GraphPausePoint {
+    ApplyBeforeCommit,
+    RestoreBeforeCommit,
+    SnapshotAfterFence,
+}
+
+#[cfg(feature = "tck")]
+#[derive(Default)]
+struct GraphPauseStatus {
+    reached: bool,
+    released: bool,
+}
+
+#[cfg(feature = "tck")]
+struct GraphPauseState {
+    status: Mutex<GraphPauseStatus>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "tck")]
+impl GraphPauseState {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(GraphPauseStatus::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn pause(&self) -> Result<(), StorageError> {
+        let mut status = lock(&self.status)?;
+        status.reached = true;
+        self.changed.notify_all();
+        while !status.released {
+            status = self
+                .changed
+                .wait(status)
+                .map_err(|_| StorageError::Internal("Fjall graph pause is poisoned".into()))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tck")]
+pub struct FjallGraphPause {
+    state: Arc<GraphPauseState>,
+}
+
+#[cfg(feature = "tck")]
+impl FjallGraphPause {
+    pub fn wait_until_reached(&self) -> Result<(), StorageError> {
+        let mut status = lock(&self.state.status)?;
+        while !status.reached {
+            status = self
+                .state
+                .changed
+                .wait(status)
+                .map_err(|_| StorageError::Internal("Fjall graph pause is poisoned".into()))?;
+        }
+        Ok(())
+    }
+
+    pub fn release(&self) -> Result<(), StorageError> {
+        let mut status = lock(&self.state.status)?;
+        status.released = true;
+        self.state.changed.notify_all();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tck")]
+impl Drop for FjallGraphPause {
+    fn drop(&mut self) {
+        if let Ok(mut status) = self.state.status.lock() {
+            status.released = true;
+            self.state.changed.notify_all();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -53,9 +138,10 @@ impl FjallReplicaStore {
                 namespace,
                 binding,
                 capabilities,
-                apply_guard: Mutex::new(()),
                 #[cfg(feature = "tck")]
                 injected_failure_after: Mutex::new(None),
+                #[cfg(feature = "tck")]
+                graph_pauses: Mutex::new(BTreeMap::new()),
             }),
         })
     }
@@ -85,7 +171,7 @@ impl FjallReplicaStore {
             return Err(StorageError::CapabilityDrift);
         }
         let applied = self.applied_index_sync()?;
-        if fence.applied_index() > applied {
+        if fence.applied_index() != applied {
             return Err(StorageError::ReadFenceUnavailable {
                 requested: fence.applied_index(),
                 applied,
@@ -114,10 +200,60 @@ impl FjallReplicaStore {
             .map(Option::unwrap_or_default)
     }
 
+    pub(crate) fn lock_graph(&self) -> Result<MutexGuard<'_, ()>, StorageError> {
+        self.inner.namespace.graph_guard.lock()
+    }
+
+    #[cfg(feature = "tck")]
+    pub fn arm_tck_apply_before_commit_pause(&self) -> Result<FjallGraphPause, StorageError> {
+        self.arm_graph_pause(GraphPausePoint::ApplyBeforeCommit)
+    }
+
+    #[cfg(feature = "tck")]
+    pub fn arm_tck_restore_before_commit_pause(&self) -> Result<FjallGraphPause, StorageError> {
+        self.arm_graph_pause(GraphPausePoint::RestoreBeforeCommit)
+    }
+
+    #[cfg(feature = "tck")]
+    pub fn arm_tck_snapshot_after_fence_pause(&self) -> Result<FjallGraphPause, StorageError> {
+        self.arm_graph_pause(GraphPausePoint::SnapshotAfterFence)
+    }
+
+    #[cfg(feature = "tck")]
+    pub fn wait_for_tck_graph_waiter(&self) -> Result<(), StorageError> {
+        self.inner.namespace.graph_guard.wait_for_waiter()
+    }
+
+    #[cfg(feature = "tck")]
+    fn arm_graph_pause(&self, point: GraphPausePoint) -> Result<FjallGraphPause, StorageError> {
+        let state = Arc::new(GraphPauseState::new());
+        let mut pauses = lock(&self.inner.graph_pauses)?;
+        if pauses.insert(point, Arc::clone(&state)).is_some() {
+            return Err(StorageError::Internal(
+                "Fjall graph pause point is already armed".into(),
+            ));
+        }
+        Ok(FjallGraphPause { state })
+    }
+
+    #[cfg(feature = "tck")]
+    pub(crate) fn pause_tck_snapshot_after_fence(&self) -> Result<(), StorageError> {
+        self.pause_graph_at(GraphPausePoint::SnapshotAfterFence)
+    }
+
+    #[cfg(feature = "tck")]
+    fn pause_graph_at(&self, point: GraphPausePoint) -> Result<(), StorageError> {
+        let pause = lock(&self.inner.graph_pauses)?.remove(&point);
+        match pause {
+            Some(pause) => pause.pause(),
+            None => Ok(()),
+        }
+    }
+
     fn apply_sync(&self, batch: CommittedShardBatch) -> Result<ApplyReceipt, StorageError> {
         batch.validate()?;
         self.verify_binding(batch.binding())?;
-        let _guard = lock(&self.inner.apply_guard)?;
+        let _guard = self.lock_graph()?;
         let applied = self.applied_index_sync()?;
         if batch.raft_index() <= applied {
             let replay = self
@@ -186,6 +322,8 @@ impl FjallReplicaStore {
             APPLIED_INDEX_KEY,
             batch.raft_index().to_be_bytes(),
         );
+        #[cfg(feature = "tck")]
+        self.pause_graph_at(GraphPausePoint::ApplyBeforeCommit)?;
         write.commit().map_err(fjall_error)?;
         Ok(ApplyReceipt::new(&batch, false))
     }
@@ -196,7 +334,7 @@ impl FjallReplicaStore {
         applied_index: u64,
         stage_keys: &[Vec<u8>],
     ) -> Result<(), StorageError> {
-        let _guard = lock(&self.inner.apply_guard)?;
+        let _guard = self.lock_graph()?;
         let mut history = Vec::new();
         let mut transactions = Vec::new();
         let mut metadata = Vec::new();
@@ -224,8 +362,8 @@ impl FjallReplicaStore {
                 SnapshotRecord::Change(record) => changes.push(record.clone()),
             }
         }
-        validate_restored_state(applied_index, &replay, &changes)?;
         changes.sort_by_key(ChangeRecord::cursor);
+        validate_restored_state(&self.inner.binding, applied_index, &replay, &changes)?;
 
         let mut write = self
             .inner
@@ -299,6 +437,8 @@ impl FjallReplicaStore {
             APPLIED_INDEX_KEY,
             applied_index.to_be_bytes(),
         );
+        #[cfg(feature = "tck")]
+        self.pause_graph_at(GraphPausePoint::RestoreBeforeCommit)?;
         write.commit().map_err(fjall_error)
     }
 }
@@ -318,6 +458,7 @@ impl ReplicaStateStore for FjallReplicaStore {
 
     fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
         Box::pin(async move {
+            let _guard = self.lock_graph()?;
             self.verify_fence(&fence)?;
             Ok(Box::new(FjallReadView::load(self, fence)?) as Box<dyn TemporalReadView>)
         })
@@ -452,6 +593,7 @@ fn stage_current_mutation(
 }
 
 fn validate_restored_state(
+    binding: &ReplicaBinding,
     applied_index: u64,
     replay: &[SnapshotReplayRecord],
     changes: &[ChangeRecord],
@@ -489,6 +631,42 @@ fn validate_restored_state(
             ));
         }
         *ordinal += 1;
+    }
+    let replay_by_index = replay
+        .iter()
+        .map(|record| (record.raft_index(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut mutations_by_index = BTreeMap::<u64, Vec<LogicalMutation>>::new();
+    for change in changes {
+        mutations_by_index
+            .entry(change.raft_index())
+            .or_default()
+            .push(change.mutation().clone());
+    }
+    for index in 1..=applied_index {
+        let replay = replay_by_index.get(&index).ok_or_else(|| {
+            StorageError::CorruptSnapshot("snapshot replay identity is missing".into())
+        })?;
+        let mutations = mutations_by_index.get(&index).ok_or_else(|| {
+            StorageError::CorruptSnapshot("snapshot committed batch has no changes".into())
+        })?;
+        let batch = CommittedShardBatch::new(
+            binding.clone(),
+            replay.raft_term(),
+            index,
+            replay.command_id(),
+            mutations.clone(),
+        )
+        .map_err(|error| {
+            StorageError::CorruptSnapshot(format!(
+                "snapshot committed batch cannot be reconstructed: {error}"
+            ))
+        })?;
+        if batch.mutation_digest() != replay.mutation_digest() {
+            return Err(StorageError::CorruptSnapshot(format!(
+                "snapshot change digest does not match replay identity at Raft index {index}"
+            )));
+        }
     }
     Ok(())
 }
@@ -637,6 +815,7 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, StorageError> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+#[cfg(feature = "tck")]
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, StorageError> {
     mutex
         .lock()

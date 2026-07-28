@@ -3,8 +3,11 @@ use std::{
     fs,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
 };
+
+#[cfg(feature = "tck")]
+use std::sync::Condvar;
 
 use dtg_storage::{BackendClass, CapabilityManifest, ProviderKind, ReplicaBinding, StorageError};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
@@ -35,6 +38,7 @@ pub(crate) struct NamespaceInner {
     pub(crate) raft_log: Keyspace,
     pub(crate) raft_state: Keyspace,
     pub(crate) raft_snapshot: Keyspace,
+    pub(crate) graph_guard: GraphGuard,
     pub(crate) consensus_guard: Mutex<()>,
     pub(crate) artifact_guard: Mutex<()>,
 }
@@ -127,11 +131,70 @@ impl NamespaceDb {
             raft_log,
             raft_state,
             raft_snapshot,
+            graph_guard: GraphGuard::new(),
             consensus_guard: Mutex::new(()),
             artifact_guard: Mutex::new(()),
         });
         registry.insert(path, Arc::downgrade(&shared));
         Ok(Self(shared))
+    }
+}
+
+pub(crate) struct GraphGuard {
+    mutex: Mutex<()>,
+    #[cfg(feature = "tck")]
+    waiters: Mutex<usize>,
+    #[cfg(feature = "tck")]
+    waiters_changed: Condvar,
+}
+
+impl GraphGuard {
+    fn new() -> Self {
+        Self {
+            mutex: Mutex::new(()),
+            #[cfg(feature = "tck")]
+            waiters: Mutex::new(0),
+            #[cfg(feature = "tck")]
+            waiters_changed: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, ()>, StorageError> {
+        #[cfg(feature = "tck")]
+        {
+            let mut waiters = self.waiters.lock().map_err(|_| {
+                StorageError::Internal("Fjall graph waiter state is poisoned".into())
+            })?;
+            *waiters += 1;
+            self.waiters_changed.notify_all();
+        }
+
+        let guard = self.mutex.lock();
+
+        #[cfg(feature = "tck")]
+        {
+            let mut waiters = self.waiters.lock().map_err(|_| {
+                StorageError::Internal("Fjall graph waiter state is poisoned".into())
+            })?;
+            *waiters -= 1;
+            self.waiters_changed.notify_all();
+        }
+
+        guard.map_err(|_| StorageError::Internal("Fjall graph lock is poisoned".into()))
+    }
+
+    #[cfg(feature = "tck")]
+    pub(crate) fn wait_for_waiter(&self) -> Result<(), StorageError> {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .map_err(|_| StorageError::Internal("Fjall graph waiter state is poisoned".into()))?;
+        while *waiters == 0 {
+            waiters = self.waiters_changed.wait(waiters).map_err(|_| {
+                StorageError::Internal("Fjall graph waiter state is poisoned".into())
+            })?;
+        }
+        Ok(())
     }
 }
 

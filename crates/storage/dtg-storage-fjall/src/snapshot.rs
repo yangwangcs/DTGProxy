@@ -15,6 +15,7 @@ impl LogicalSnapshotSource for FjallReplicaStore {
         request: SnapshotRequest,
     ) -> StoreFuture<'_, Box<dyn LogicalSnapshotReader>> {
         Box::pin(async move {
+            let _guard = self.lock_graph()?;
             self.verify_fence(&fence)?;
             request.validate()?;
             let header = SnapshotHeader::new(
@@ -23,6 +24,8 @@ impl LogicalSnapshotSource for FjallReplicaStore {
                 fence.applied_index(),
                 SUPPORTED_SNAPSHOT_FORMAT_VERSION,
             )?;
+            #[cfg(feature = "tck")]
+            self.pause_tck_snapshot_after_fence()?;
             let records = FjallReadView::load(self, fence)?.snapshot_records();
             let chunks = records
                 .chunks(request.max_records_per_chunk() as usize)
