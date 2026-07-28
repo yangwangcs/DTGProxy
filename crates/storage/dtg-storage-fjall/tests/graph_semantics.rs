@@ -265,6 +265,51 @@ fn snapshot_restore_replaces_dirty_state_preserves_deletes_and_survives_restart(
 }
 
 #[test]
+fn snapshot_history_authentication_preserves_duplicate_graph_mutations() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("snapshot-duplicate-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    let duplicate = vertex(30, 1);
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(30).unwrap(),
+                vec![
+                    LogicalMutation::PutVertex(duplicate.clone()),
+                    LogicalMutation::PutVertex(duplicate.clone()),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (header, chunks, manifest, source_records) = export(&source, &source_binding, 1, 30);
+    assert_eq!(
+        source_records
+            .iter()
+            .filter(
+                |record| matches!(record, SnapshotRecord::Vertex(vertex) if vertex == &duplicate)
+            )
+            .count(),
+        2
+    );
+
+    let target_binding = binding("snapshot-duplicate-target", 2);
+    let target = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    let mut writer = block_on(target.begin_restore(target_binding.clone(), header)).unwrap();
+    for chunk in chunks {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    block_on(writer.commit(manifest)).unwrap();
+    let (_, _, _, restored_records) = export(&target, &target_binding, 1, 31);
+    assert_eq!(restored_records, source_records);
+}
+
+#[test]
 fn native_adjacency_partitions_drop_stale_rows_for_batch_updates_and_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let store_binding = binding("adjacency-native", 1);
@@ -744,6 +789,104 @@ fn apply_racing_restore_finishes_as_one_complete_serial_outcome() {
             .filter(|record| matches!(record, SnapshotRecord::Change(change) if change.raft_index() == 3 && change.mutation() == &LogicalMutation::PutVertex(raced_vertex.clone())))
             .count(),
         1
+    );
+}
+
+#[test]
+fn restore_rejects_missing_graph_history_without_publication() {
+    assert_graph_history_corruption_rejected("missing-history", |records| {
+        let position = records
+            .iter()
+            .position(|record| {
+                matches!(record, SnapshotRecord::Vertex(vertex) if vertex.id() == VertexId::new(1).unwrap())
+            })
+            .unwrap();
+        records.remove(position);
+    });
+}
+
+#[test]
+fn restore_rejects_altered_graph_history_without_publication() {
+    assert_graph_history_corruption_rejected("altered-history", |records| {
+        let position = records
+            .iter()
+            .position(|record| {
+                matches!(record, SnapshotRecord::Vertex(vertex) if vertex.id() == VertexId::new(2).unwrap())
+            })
+            .unwrap();
+        records[position] = SnapshotRecord::Vertex(vertex(20, 1));
+    });
+}
+
+fn assert_graph_history_corruption_rejected(
+    name: &str,
+    corrupt: impl FnOnce(&mut Vec<SnapshotRecord>),
+) {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("history-digest-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(450).unwrap(),
+                vec![
+                    LogicalMutation::PutVertex(vertex(1, 1)),
+                    LogicalMutation::PutVertex(vertex(2, 1)),
+                ],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (header, _, _, mut corrupted_records) = export(&source, &source_binding, 1, 450);
+    corrupt(&mut corrupted_records);
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_binding = binding(&format!("history-digest-target-{name}"), 2);
+    let target = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    let dirty = vertex(80, 1);
+    block_on(
+        target.apply(
+            CommittedShardBatch::new(
+                target_binding.clone(),
+                9,
+                1,
+                CommandId::new(800).unwrap(),
+                vec![LogicalMutation::PutVertex(dirty.clone())],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let chunks = corrupted_records
+        .chunks(3)
+        .enumerate()
+        .map(|(chunk_ordinal, records)| {
+            SnapshotChunk::new(header.snapshot_id(), chunk_ordinal as u64, records.to_vec())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let manifest = SnapshotManifest::new(&header, &chunks).unwrap();
+    let mut writer = block_on(target.begin_restore(target_binding.clone(), header)).unwrap();
+    for chunk in chunks {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    let error = block_on(writer.commit(manifest)).unwrap_err();
+    assert_eq!(error.code(), "DTG-STORAGE-SNAPSHOT-CORRUPT", "{name}");
+    assert_eq!(block_on(target.applied_index()).unwrap(), 1, "{name}");
+    let view = block_on(target.begin_read_view(ReadFence::new(target_binding, 1))).unwrap();
+    assert_eq!(
+        block_on(view.get_vertex(VertexRead::new(
+            dirty.id(),
+            10,
+            TransactionTime::new(10).unwrap(),
+        )))
+        .unwrap(),
+        Some(dirty),
+        "{name}"
     );
 }
 

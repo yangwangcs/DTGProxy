@@ -368,7 +368,13 @@ impl FjallReplicaStore {
             }
         }
         changes.sort_by_key(ChangeRecord::cursor);
-        validate_restored_state(&self.inner.binding, applied_index, &replay, &changes)?;
+        validate_restored_state(
+            &self.inner.binding,
+            applied_index,
+            &history,
+            &replay,
+            &changes,
+        )?;
 
         let mut write = self
             .inner
@@ -377,8 +383,16 @@ impl FjallReplicaStore {
             .batch()
             .durability(Some(PersistMode::SyncAll));
         clear_logical_state(&self.inner.namespace, &mut write)?;
-        for mutation in &history {
-            stage_history_mutation(&self.inner.namespace, &mut write, mutation)?;
+        for change in &changes {
+            if is_graph_mutation(change.mutation()) {
+                stage_history_mutation(
+                    &self.inner.namespace,
+                    &mut write,
+                    change.raft_index(),
+                    change.mutation_ordinal(),
+                    change.mutation(),
+                )?;
+            }
         }
         for transaction in &transactions {
             let mutation = LogicalMutation::PutTransaction(transaction.clone());
@@ -410,22 +424,13 @@ impl FjallReplicaStore {
             );
         }
         let mut adjacency = EdgeAdjacencyState::default();
-        if changes.is_empty() {
-            for mutation in &history {
-                stage_current_mutation(
-                    &self.inner.namespace,
-                    &mut write,
-                    mutation,
-                    &mut adjacency,
-                )?;
-            }
-        } else {
-            for change in &changes {
-                write.insert(
-                    &self.inner.namespace.temporal_index,
-                    change_key(change.raft_index(), change.mutation_ordinal()),
-                    encode_mutation(change.mutation())?,
-                );
+        for change in &changes {
+            write.insert(
+                &self.inner.namespace.temporal_index,
+                change_key(change.raft_index(), change.mutation_ordinal()),
+                encode_mutation(change.mutation())?,
+            );
+            if is_graph_mutation(change.mutation()) {
                 stage_current_mutation(
                     &self.inner.namespace,
                     &mut write,
@@ -479,7 +484,7 @@ pub(crate) fn stage_mutation(
     adjacency: &mut EdgeAdjacencyState,
 ) -> Result<(), StorageError> {
     let value = encode_mutation(mutation)?;
-    stage_history_mutation(namespace, write, mutation)?;
+    stage_history_mutation(namespace, write, raft_index, ordinal, mutation)?;
     stage_current_mutation(namespace, write, mutation, adjacency)?;
     write.insert(
         &namespace.temporal_index,
@@ -492,6 +497,8 @@ pub(crate) fn stage_mutation(
 fn stage_history_mutation(
     namespace: &NamespaceDb,
     write: &mut OwnedWriteBatch,
+    raft_index: u64,
+    ordinal: u64,
     mutation: &LogicalMutation,
 ) -> Result<(), StorageError> {
     let value = encode_mutation(mutation)?;
@@ -499,28 +506,28 @@ fn stage_history_mutation(
         LogicalMutation::PutVertex(vertex) => {
             write.insert(
                 &namespace.history,
-                vertex_history_key(vertex, false),
+                history_occurrence_key(vertex_history_key(vertex, false), raft_index, ordinal),
                 value.clone(),
             );
         }
         LogicalMutation::DeleteVertex(tombstone) => {
             write.insert(
                 &namespace.history,
-                vertex_tombstone_key(tombstone),
+                history_occurrence_key(vertex_tombstone_key(tombstone), raft_index, ordinal),
                 value.clone(),
             );
         }
         LogicalMutation::PutEdge(edge) => {
             write.insert(
                 &namespace.history,
-                edge_history_key(edge, false),
+                history_occurrence_key(edge_history_key(edge, false), raft_index, ordinal),
                 value.clone(),
             );
         }
         LogicalMutation::DeleteEdge(tombstone) => {
             write.insert(
                 &namespace.history,
-                edge_tombstone_key(tombstone),
+                history_occurrence_key(edge_tombstone_key(tombstone), raft_index, ordinal),
                 value.clone(),
             );
         }
@@ -600,6 +607,7 @@ fn stage_current_mutation(
 fn validate_restored_state(
     binding: &ReplicaBinding,
     applied_index: u64,
+    history: &[LogicalMutation],
     replay: &[SnapshotReplayRecord],
     changes: &[ChangeRecord],
 ) -> Result<(), StorageError> {
@@ -673,7 +681,34 @@ fn validate_restored_state(
             )));
         }
     }
+    let supplied_history = graph_history_multiset(history.iter())?;
+    let authenticated_history = graph_history_multiset(changes.iter().map(ChangeRecord::mutation))?;
+    if supplied_history != authenticated_history {
+        return Err(StorageError::CorruptSnapshot(
+            "snapshot graph history does not match authenticated changes".into(),
+        ));
+    }
     Ok(())
+}
+
+fn graph_history_multiset<'a>(
+    mutations: impl Iterator<Item = &'a LogicalMutation>,
+) -> Result<BTreeMap<Vec<u8>, usize>, StorageError> {
+    let mut multiset = BTreeMap::new();
+    for mutation in mutations.filter(|mutation| is_graph_mutation(mutation)) {
+        *multiset.entry(encode_mutation(mutation)?).or_default() += 1;
+    }
+    Ok(multiset)
+}
+
+fn is_graph_mutation(mutation: &LogicalMutation) -> bool {
+    matches!(
+        mutation,
+        LogicalMutation::PutVertex(_)
+            | LogicalMutation::DeleteVertex(_)
+            | LogicalMutation::PutEdge(_)
+            | LogicalMutation::DeleteEdge(_)
+    )
 }
 
 fn clear_logical_state(
@@ -801,6 +836,12 @@ fn history_key(
     key.extend_from_slice(&transaction_time.to_be_bytes());
     key.extend_from_slice(&version.to_be_bytes());
     key.push(u8::from(tombstone));
+    key
+}
+
+fn history_occurrence_key(mut key: Vec<u8>, raft_index: u64, ordinal: u64) -> Vec<u8> {
+    key.extend_from_slice(&raft_index.to_be_bytes());
+    key.extend_from_slice(&ordinal.to_be_bytes());
     key
 }
 
