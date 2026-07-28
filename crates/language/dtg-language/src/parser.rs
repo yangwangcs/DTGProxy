@@ -12,12 +12,20 @@ use crate::{
 const MAX_NESTING: usize = 128;
 
 pub(crate) fn parse(tokens: &[Token]) -> Result<Program, LanguageError> {
-    Parser { tokens, cursor: 0 }.program()
+    Parser {
+        tokens,
+        cursor: 0,
+        anonymous_nodes: 0,
+        anonymous_relationships: 0,
+    }
+    .program()
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
     cursor: usize,
+    anonymous_nodes: usize,
+    anonymous_relationships: usize,
 }
 impl Parser<'_> {
     fn program(&mut self) -> Result<Program, LanguageError> {
@@ -276,7 +284,9 @@ impl Parser<'_> {
     fn node_pattern(&mut self) -> Result<NodePattern, LanguageError> {
         self.expect_symbol('(')?;
         let variable = if self.at_symbol(':') || self.at_symbol(')') {
-            format!("_node_{}", self.cursor)
+            let variable = format!("@anonymous_node:{}", self.anonymous_nodes);
+            self.anonymous_nodes += 1;
+            variable
         } else {
             self.identifier()?
         };
@@ -298,7 +308,9 @@ impl Parser<'_> {
     }
     fn relationship_pattern(&mut self) -> Result<RelationshipPattern, LanguageError> {
         let variable = if self.at_symbol(':') || self.at_symbol(']') {
-            format!("_rel_{}", self.cursor)
+            let variable = format!("@anonymous_relationship:{}", self.anonymous_relationships);
+            self.anonymous_relationships += 1;
+            variable
         } else {
             self.identifier()?
         };

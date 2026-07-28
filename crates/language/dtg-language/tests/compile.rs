@@ -205,6 +205,44 @@ fn match_constrained_write_preserves_relationship_expansion_and_properties() {
 }
 
 #[test]
+fn expanded_destination_labels_are_preserved_for_queries_and_writes() {
+    let query = compile(
+        "MATCH (a)-[r:KNOWS]->(b:Person:Employee) RETURN b",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = query.statement else {
+        panic!("expected query");
+    };
+    assert!(plan.nodes.iter().any(|node| matches!(
+        &node.kind,
+        LogicalNodeKind::Expand(expand)
+            if expand.destination == "b"
+                && expand.destination_labels == ["Person", "Employee"]
+    )));
+
+    for source in [
+        "MATCH (a)-[r:KNOWS]->(b:Person:Employee) SET b.name = 'Wang' VALID FROM 1",
+        "MATCH (a)-[r:KNOWS]->(b:Person:Employee) DELETE b VALID FROM 1",
+    ] {
+        let program = compile(source, &EmptySchemaCatalog).unwrap();
+        let LogicalStatement::Write(write) = program.statement else {
+            panic!("expected write");
+        };
+        let input = write.input.expect("MATCH write must carry its selection");
+        assert!(
+            input.nodes.iter().any(|node| matches!(
+                &node.kind,
+                LogicalNodeKind::Expand(expand)
+                    if expand.destination == "b"
+                        && expand.destination_labels == ["Person", "Employee"]
+            )),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn match_constrained_set_and_delete_preserve_their_selection_plan() {
     for source in [
         "MATCH (n:Person {id: $id}) SET n.name = 'Wang' VALID FROM $t",
@@ -356,6 +394,113 @@ fn repeated_match_variables_reuse_the_binding_while_independent_matches_join() {
             .iter()
             .any(|node| matches!(node.kind, LogicalNodeKind::Join(_)))
     );
+}
+
+#[test]
+fn unsupported_relationship_and_multi_anchor_correlations_fail_closed() {
+    for source in [
+        "MATCH (a)-[r:KNOWS]->(b) MATCH (c)-[r:KNOWS]->(d) RETURN r",
+        "MATCH (a) MATCH (b) MATCH (a)-[r:KNOWS]->(b) RETURN r",
+    ] {
+        let error = compile(source, &EmptySchemaCatalog).unwrap_err();
+        assert_eq!(error.code(), "DTG-LANG-UNSUPPORTED-CORRELATION", "{source}");
+    }
+}
+
+#[test]
+fn reused_bindings_require_compatible_effective_read_scopes() {
+    for source in [
+        "MATCH (a) FOR SYSTEM_TIME AS OF 1 MATCH (a) FOR SYSTEM_TIME AS OF 2 RETURN a",
+        "MATCH (a) FOR VALID_TIME AS OF 1 MATCH (a)-[r]->(b) FOR VALID_TIME AS OF 2 RETURN b",
+    ] {
+        let error = compile(source, &EmptySchemaCatalog).unwrap_err();
+        assert_eq!(error.code(), "DTG-LANG-INCOMPATIBLE-SCOPE", "{source}");
+    }
+}
+
+#[test]
+fn valid_and_system_time_changes_cannot_be_combined() {
+    let error = compile(
+        "CHANGES FOR VALID_TIME BETWEEN 1 AND 2 \
+         CHANGES FOR SYSTEM_TIME BETWEEN 3 AND 4 MATCH (n) RETURN n",
+        &EmptySchemaCatalog,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "DTG-LANG-UNSUPPORTED-CHANGES");
+}
+
+#[test]
+fn historical_system_time_is_rejected_for_write_selection_matches() {
+    for source in [
+        "MATCH (n) FOR SYSTEM_TIME AS OF 1 SET n.name = 'Wang' VALID FROM 2",
+        "MATCH (n) FOR SYSTEM_TIME AS OF 1 DELETE n VALID FROM 2",
+    ] {
+        let error = compile(source, &EmptySchemaCatalog).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "DTG-LANG-HISTORICAL-WRITE-SELECTION",
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn anonymous_node_bindings_are_hygienic_and_not_returnable() {
+    let program = compile(
+        "MATCH (_node_6) MATCH () RETURN _node_6",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = program.statement else {
+        panic!("expected query");
+    };
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .filter(|node| matches!(node.kind, LogicalNodeKind::NodeScan(_)))
+            .count(),
+        2
+    );
+    assert!(
+        plan.nodes
+            .iter()
+            .any(|node| matches!(node.kind, LogicalNodeKind::Join(_)))
+    );
+
+    let error = compile("MATCH () RETURN _node_2", &EmptySchemaCatalog).unwrap_err();
+    assert_eq!(error.code(), "DTG-LANG-UNBOUND-VARIABLE");
+}
+
+#[test]
+fn anonymous_relationship_bindings_are_hygienic_and_not_returnable() {
+    let program = compile(
+        "MATCH (a)-[_rel_18]->(b) MATCH (c)-[]->(d) RETURN _rel_18",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = program.statement else {
+        panic!("expected query");
+    };
+    let relationship_variables = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            LogicalNodeKind::Expand(expand) => Some(expand.relationship.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(relationship_variables.len(), 2);
+    assert!(relationship_variables.contains(&"_rel_18"));
+    assert_eq!(
+        relationship_variables
+            .iter()
+            .filter(|variable| variable.starts_with("@anonymous_relationship:"))
+            .count(),
+        1
+    );
+
+    let error = compile("MATCH (a)-[]->(b) RETURN _rel_6", &EmptySchemaCatalog).unwrap_err();
+    assert_eq!(error.code(), "DTG-LANG-UNBOUND-VARIABLE");
 }
 
 #[test]

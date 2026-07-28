@@ -222,6 +222,7 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
                     source: "v".into(),
                     relationship: "expanded_r".into(),
                     destination: "other".into(),
+                    destination_labels: vec!["Person".into()],
                     direction: ExpandDirection::Outgoing,
                     relationship_types: Vec::new(),
                     read_scope: ReadScope {
@@ -259,6 +260,28 @@ fn logical_plans_find_transaction_scopes_in_reads_and_subqueries() {
     assert!(plan.contains_scope(expand_scope));
     assert!(plan.contains_scope(nested_scope));
     assert!(!plan.contains_scope(TemporalScope::AsOf(TimeExpr::Parameter("missing".into(),))));
+}
+
+#[test]
+fn expand_exposes_destination_label_constraints_in_logical_ir() {
+    let expand = Expand {
+        input: LogicalNodeId::new(1),
+        source: "source".into(),
+        relationship: "relationship".into(),
+        destination: "destination".into(),
+        destination_labels: vec!["Person".into(), "Employee".into()],
+        direction: ExpandDirection::Outgoing,
+        relationship_types: vec!["KNOWS".into()],
+        read_scope: ReadScope::current(),
+    };
+
+    assert_eq!(expand.destination_labels, ["Person", "Employee"]);
+    assert_eq!(
+        validate_program(&program(LogicalStatement::Query(plan(
+            LogicalNodeKind::Expand(expand),
+        )))),
+        Ok(())
+    );
 }
 
 #[test]
@@ -488,6 +511,7 @@ fn validation_recursively_rejects_unknown_expression_parameters_everywhere() {
             source: "v".into(),
             relationship: "r".into(),
             destination: "other".into(),
+            destination_labels: Vec::new(),
             direction: ExpandDirection::Outgoing,
             relationship_types: Vec::new(),
             read_scope: ReadScope {

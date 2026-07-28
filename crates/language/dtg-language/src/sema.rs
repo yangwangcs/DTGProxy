@@ -25,9 +25,16 @@ enum BindingKind {
 struct Binding {
     kind: BindingKind,
     constraints: BTreeSet<String>,
+    read_scope: EffectiveReadScope,
 }
 
 type Bindings = BTreeMap<String, Binding>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EffectiveReadScope {
+    valid: Option<Scope>,
+    system: Option<Scope>,
+}
 
 pub(crate) fn analyze(
     program: Program,
@@ -74,7 +81,7 @@ fn validate_statement(statement: &Statement) -> Result<(), LanguageError> {
         Statement::Query(query) => {
             validate_scopes(&query.scopes)?;
             let mut bindings = Bindings::new();
-            validate_matches(&query.matches, &mut bindings)?;
+            validate_matches(&query.matches, &query.scopes, &mut bindings)?;
             if let Some((left, right)) = &query.where_clause {
                 validate_expr(left, &bindings)?;
                 validate_expr(right, &bindings)?;
@@ -104,7 +111,8 @@ fn validate_write(write: &Write) -> Result<(), LanguageError> {
             valid_from,
         } => {
             let mut bindings = Bindings::new();
-            validate_matches(matches, &mut bindings)?;
+            reject_historical_write_selection(matches)?;
+            validate_matches(matches, &[], &mut bindings)?;
             validate_relationship_create(pattern, &bindings)?;
             valid_from
         }
@@ -115,7 +123,8 @@ fn validate_write(write: &Write) -> Result<(), LanguageError> {
             valid_from,
         } => {
             let mut bindings = Bindings::new();
-            validate_matches(matches, &mut bindings)?;
+            reject_historical_write_selection(matches)?;
+            validate_matches(matches, &[], &mut bindings)?;
             require_binding(variable, &bindings)?;
             for expression in properties.values() {
                 validate_expr(expression, &bindings)?;
@@ -128,7 +137,8 @@ fn validate_write(write: &Write) -> Result<(), LanguageError> {
             valid_from,
         } => {
             let mut bindings = Bindings::new();
-            validate_matches(matches, &mut bindings)?;
+            reject_historical_write_selection(matches)?;
+            validate_matches(matches, &[], &mut bindings)?;
             require_binding(variable, &bindings)?;
             valid_from
         }
@@ -143,19 +153,98 @@ fn validate_write(write: &Write) -> Result<(), LanguageError> {
     }
 }
 
-fn validate_matches(matches: &[Match], bindings: &mut Bindings) -> Result<(), LanguageError> {
-    for matching in matches {
-        validate_scopes(&matching.scopes)?;
-        validate_pattern(&matching.pattern, bindings)?;
+fn reject_historical_write_selection(matches: &[Match]) -> Result<(), LanguageError> {
+    if matches
+        .iter()
+        .flat_map(|matching| &matching.scopes)
+        .any(|scope| scope.axis == Axis::System)
+    {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-HISTORICAL-WRITE-SELECTION",
+            "write-selection MATCH clauses cannot override SYSTEM_TIME",
+        ));
     }
     Ok(())
 }
 
-fn validate_pattern(pattern: &Pattern, bindings: &mut Bindings) -> Result<(), LanguageError> {
+fn validate_matches(
+    matches: &[Match],
+    defaults: &[Scope],
+    bindings: &mut Bindings,
+) -> Result<(), LanguageError> {
+    for matching in matches {
+        validate_scopes(&matching.scopes)?;
+        let (valid, system) = effective_scope(defaults, &matching.scopes)?;
+        let read_scope = EffectiveReadScope { valid, system };
+        validate_correlation(&matching.pattern, bindings, &read_scope)?;
+        validate_pattern(&matching.pattern, bindings, &read_scope)?;
+    }
+    Ok(())
+}
+
+fn validate_correlation(
+    pattern: &Pattern,
+    bindings: &Bindings,
+    read_scope: &EffectiveReadScope,
+) -> Result<(), LanguageError> {
+    let mut prebound = BTreeSet::new();
+    for variable in pattern
+        .nodes
+        .iter()
+        .map(|node| node.variable.as_str())
+        .chain(
+            pattern
+                .relationships
+                .iter()
+                .map(|relationship| relationship.variable.as_str()),
+        )
+    {
+        if bindings.contains_key(variable) {
+            prebound.insert(variable);
+        }
+    }
+
+    if prebound.len() > 1
+        || prebound.iter().any(|variable| {
+            bindings
+                .get(*variable)
+                .is_some_and(|binding| binding.kind == BindingKind::Relationship)
+        })
+    {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-UNSUPPORTED-CORRELATION",
+            "logical IR cannot faithfully express this MATCH correlation",
+        ));
+    }
+
+    if let Some(variable) = prebound.first()
+        && bindings
+            .get(*variable)
+            .is_some_and(|binding| binding.read_scope != *read_scope)
+    {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-INCOMPATIBLE-SCOPE",
+            format!("incompatible temporal scope for reused binding '{variable}'"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pattern(
+    pattern: &Pattern,
+    bindings: &mut Bindings,
+    read_scope: &EffectiveReadScope,
+) -> Result<(), LanguageError> {
     let first = pattern.nodes.first().ok_or_else(|| {
         LanguageError::semantic("DTG-LANG-PATTERN", "MATCH pattern requires a node")
     })?;
-    bind(bindings, &first.variable, BindingKind::Node, &first.labels)?;
+    bind(
+        bindings,
+        &first.variable,
+        BindingKind::Node,
+        &first.labels,
+        read_scope,
+    )?;
     validate_properties(&first.properties, bindings)?;
 
     for (index, relationship) in pattern.relationships.iter().enumerate() {
@@ -164,6 +253,7 @@ fn validate_pattern(pattern: &Pattern, bindings: &mut Bindings) -> Result<(), La
             &relationship.variable,
             BindingKind::Relationship,
             &relationship.types,
+            read_scope,
         )?;
         validate_properties(&relationship.properties, bindings)?;
         let destination = &pattern.nodes[index + 1];
@@ -172,6 +262,7 @@ fn validate_pattern(pattern: &Pattern, bindings: &mut Bindings) -> Result<(), La
             &destination.variable,
             BindingKind::Node,
             &destination.labels,
+            read_scope,
         )?;
         validate_properties(&destination.properties, bindings)?;
     }
@@ -183,6 +274,7 @@ fn bind(
     variable: &str,
     kind: BindingKind,
     constraints: &[String],
+    read_scope: &EffectiveReadScope,
 ) -> Result<(), LanguageError> {
     if let Some(existing) = bindings.get(variable) {
         let adds_constraints = constraints
@@ -201,6 +293,7 @@ fn bind(
         Binding {
             kind,
             constraints: constraints.iter().cloned().collect(),
+            read_scope: read_scope.clone(),
         },
     );
     Ok(())
@@ -423,6 +516,17 @@ pub(crate) fn effective_scope(
             Axis::Valid => valid = Some(scope.clone()),
             Axis::System => system = Some(scope.clone()),
         }
+    }
+    let changes_axes = [valid.as_ref(), system.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|scope| matches!(scope.mode, Mode::Changes(_, _)))
+        .count();
+    if changes_axes > 1 {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-UNSUPPORTED-CHANGES",
+            "at most one effective temporal axis may use CHANGES",
+        ));
     }
     Ok((valid, system))
 }

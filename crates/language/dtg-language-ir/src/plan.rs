@@ -195,6 +195,7 @@ pub struct Expand {
     pub source: String,
     pub relationship: String,
     pub destination: String,
+    pub destination_labels: Vec<String>,
     pub direction: ExpandDirection,
     pub relationship_types: Vec<String>,
     pub read_scope: ReadScope,

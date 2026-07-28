@@ -78,7 +78,7 @@ pub(crate) enum Write {
         valid_from: Expr,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Scope {
     pub(crate) axis: Axis,
     pub(crate) mode: Mode,
@@ -88,13 +88,13 @@ pub(crate) enum Axis {
     Valid,
     System,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
     AsOf(Expr),
     Between(Expr, Expr),
     Changes(Expr, Expr),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Expr {
     Parameter(String),
     Integer(i64),

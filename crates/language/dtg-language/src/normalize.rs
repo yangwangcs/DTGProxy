@@ -280,6 +280,7 @@ fn expand_edge(
             source: source.variable.clone(),
             relationship: relationship.variable.clone(),
             destination: destination.variable.clone(),
+            destination_labels: destination.labels.clone(),
             direction: match direction {
                 RelationshipDirection::Outgoing => ExpandDirection::Outgoing,
                 RelationshipDirection::Incoming => ExpandDirection::Incoming,
