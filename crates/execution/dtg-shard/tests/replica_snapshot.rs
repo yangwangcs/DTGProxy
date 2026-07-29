@@ -1,0 +1,437 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use dtg_shard::{
+    CommitSingleShard, RaftReplica, ReplicaSnapshot, ReplicaSnapshotInstallState,
+    ReplicaSnapshotManifest, SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION, ShardCommand,
+    create_replica_snapshot, install_replica_snapshot,
+};
+use dtg_storage::{
+    BackendClass, BindingRole, CapabilityManifest, CommandId, ConsensusCommandEnvelope,
+    ConsensusEntry, ConsensusStore, LogicalMutation, LogicalReplicaActivation,
+    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotSink,
+    Properties, ProviderKind, RaftHardState, RaftMembership, ReplicaBinding, ReplicaStateStore,
+    SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION,
+    StorageError, StoreFuture, ValidInterval, Version, VertexId, VertexVersion,
+};
+use dtg_storage_fjall::{FjallConsensusStore, FjallReplicaStore};
+
+#[test]
+fn created_snapshot_manifest_binds_the_exact_applied_prefix_and_totals() {
+    assert_eq!(SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION, 1);
+    let root = tempfile::tempdir().unwrap();
+    let source_binding = binding(4, BindingRole::Active, "source");
+    let snapshot = create_source_snapshot(root.path());
+    let manifest: &ReplicaSnapshotManifest = snapshot.manifest();
+
+    assert_eq!(manifest.format(), Version::new(1));
+    assert_eq!(manifest.binding(), &source_binding);
+    assert_eq!(manifest.last_included_term(), 1);
+    assert_eq!(manifest.last_included_index(), 2);
+    assert_eq!(manifest.chunks() as usize, snapshot.chunks().len());
+    assert!(manifest.records() >= 3);
+    assert!(manifest.bytes() > 0);
+    assert_eq!(
+        manifest.bytes(),
+        snapshot
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.encoded_len().unwrap())
+            .sum()
+    );
+    assert_ne!(manifest.logical_digest().get(), [0; 32]);
+}
+
+#[test]
+fn corrupted_install_remains_candidate_and_the_exact_retry_activates_last() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot(root.path());
+    let candidate_binding = binding(5, BindingRole::Candidate, "target");
+    let active_binding = binding(5, BindingRole::Active, "target");
+    let candidate_path = root.path().join("target-business");
+    let candidate =
+        Arc::new(FjallReplicaStore::open(&candidate_path, candidate_binding.clone()).unwrap());
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("target-consensus"), active_binding.clone())
+            .unwrap(),
+    );
+    let mut corrupted = snapshot.clone();
+    corrupted.chunks_mut()[0].digest = dtg_storage::Digest32::new([0; 32]);
+
+    assert!(
+        install_replica_snapshot(
+            &corrupted,
+            candidate.as_ref(),
+            candidate.as_ref(),
+            consensus.as_ref(),
+            candidate_binding.clone(),
+            active_binding.clone(),
+        )
+        .is_err()
+    );
+    assert_eq!(candidate.binding().role(), BindingRole::Candidate);
+    assert_eq!(block_on(candidate.applied_index()).unwrap(), 0);
+    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_none());
+
+    let installed = install_replica_snapshot(
+        &snapshot,
+        candidate.as_ref(),
+        candidate.as_ref(),
+        consensus.as_ref(),
+        candidate_binding,
+        active_binding.clone(),
+    )
+    .unwrap();
+    assert_eq!(installed.state(), ReplicaSnapshotInstallState::Active);
+    assert_eq!(installed.active_binding(), &active_binding);
+    let retried = block_on(candidate.activate_candidate(
+        installed.candidate_receipt().clone(),
+        active_binding.clone(),
+    ))
+    .unwrap();
+    assert_eq!(retried.active_binding(), &active_binding);
+    assert!(block_on(candidate.applied_index()).is_err());
+
+    let metadata = block_on(consensus.snapshot_metadata()).unwrap().unwrap();
+    assert_eq!(metadata.last_included_index, 2);
+    assert_eq!(block_on(consensus.hard_state()).unwrap().committed_index, 2);
+    assert_eq!(block_on(consensus.membership()).unwrap().voters.len(), 1);
+
+    drop(candidate);
+    let active = Arc::new(FjallReplicaStore::open(candidate_path, active_binding).unwrap());
+    assert_eq!(block_on(active.applied_index()).unwrap(), 2);
+    let mut recovered = RaftReplica::open(consensus, active).unwrap();
+    assert!(recovered.recover().unwrap().is_empty());
+}
+
+#[test]
+fn interrupted_activation_stays_non_serving_and_full_install_is_retryable() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot(root.path());
+    let candidate_binding = binding(5, BindingRole::Candidate, "interrupted-target");
+    let active_binding = binding(5, BindingRole::Active, "interrupted-target");
+    let candidate = Arc::new(
+        FjallReplicaStore::open(
+            root.path().join("interrupted-business"),
+            candidate_binding.clone(),
+        )
+        .unwrap(),
+    );
+    let consensus = Arc::new(
+        FjallConsensusStore::open(
+            root.path().join("interrupted-consensus"),
+            active_binding.clone(),
+        )
+        .unwrap(),
+    );
+    let fail_once = FailOnceActivation {
+        inner: Arc::clone(&candidate),
+        failing: AtomicBool::new(true),
+    };
+
+    assert!(
+        install_replica_snapshot(
+            &snapshot,
+            candidate.as_ref(),
+            &fail_once,
+            consensus.as_ref(),
+            candidate_binding.clone(),
+            active_binding.clone(),
+        )
+        .is_err()
+    );
+    assert_eq!(block_on(candidate.applied_index()).unwrap(), 2);
+    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_some());
+    assert!(RaftReplica::open(consensus.clone(), candidate.clone()).is_err());
+
+    let installed = install_replica_snapshot(
+        &snapshot,
+        candidate.as_ref(),
+        candidate.as_ref(),
+        consensus.as_ref(),
+        candidate_binding,
+        active_binding,
+    )
+    .unwrap();
+    assert_eq!(installed.state(), ReplicaSnapshotInstallState::Active);
+}
+
+#[test]
+fn recovery_replays_the_retained_wal_suffix_after_snapshot_activation() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot(root.path());
+    let candidate_binding = binding(5, BindingRole::Candidate, "suffix-target");
+    let active_binding = binding(5, BindingRole::Active, "suffix-target");
+    let candidate_path = root.path().join("suffix-business");
+    let candidate =
+        Arc::new(FjallReplicaStore::open(&candidate_path, candidate_binding.clone()).unwrap());
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("suffix-consensus"), active_binding.clone())
+            .unwrap(),
+    );
+    block_on(consensus.append(vec![consensus_entry(vertex_command(11), 1, 3)])).unwrap();
+    block_on(consensus.set_hard_state(RaftHardState {
+        current_term: 1,
+        voted_for: None,
+        committed_index: 3,
+    }))
+    .unwrap();
+
+    install_replica_snapshot(
+        &snapshot,
+        candidate.as_ref(),
+        candidate.as_ref(),
+        consensus.as_ref(),
+        candidate_binding,
+        active_binding.clone(),
+    )
+    .unwrap();
+    drop(candidate);
+
+    let active = Arc::new(FjallReplicaStore::open(candidate_path, active_binding).unwrap());
+    let mut recovered = RaftReplica::open(consensus, active.clone()).unwrap();
+    let outcomes = recovered.recover().unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].applied_index(), 3);
+    assert_eq!(block_on(active.applied_index()).unwrap(), 3);
+}
+
+#[test]
+fn activation_rejects_any_binding_change_beyond_candidate_to_active_role() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot(root.path());
+    let candidate_binding = binding(5, BindingRole::Candidate, "mismatch-target");
+    let active_binding = binding(5, BindingRole::Active, "mismatch-target");
+    let mismatched_active = active_binding
+        .to_builder()
+        .endpoint_profile_ref("different-endpoint")
+        .build()
+        .unwrap();
+    let candidate = Arc::new(
+        FjallReplicaStore::open(
+            root.path().join("mismatch-business"),
+            candidate_binding.clone(),
+        )
+        .unwrap(),
+    );
+    let mut writer =
+        block_on(candidate.begin_restore(candidate_binding.clone(), snapshot.header().clone()))
+            .unwrap();
+    for chunk in snapshot.chunks().iter().cloned() {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    let restore_receipt = block_on(writer.commit(snapshot.logical_manifest().clone())).unwrap();
+    let candidate_receipt = LogicalSnapshotCandidateReceipt::new(
+        candidate_binding,
+        snapshot.header().clone(),
+        restore_receipt.manifest().clone(),
+    )
+    .unwrap();
+
+    assert!(block_on(candidate.activate_candidate(candidate_receipt, mismatched_active)).is_err());
+    assert_eq!(candidate.binding().role(), BindingRole::Candidate);
+    assert_eq!(block_on(candidate.applied_index()).unwrap(), 2);
+}
+
+#[test]
+fn missing_retained_wal_suffix_is_rejected_before_candidate_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot(root.path());
+    let candidate_binding = binding(5, BindingRole::Candidate, "missing-suffix-target");
+    let active_binding = binding(5, BindingRole::Active, "missing-suffix-target");
+    let candidate = Arc::new(
+        FjallReplicaStore::open(
+            root.path().join("missing-suffix-business"),
+            candidate_binding.clone(),
+        )
+        .unwrap(),
+    );
+    let consensus = Arc::new(
+        FjallConsensusStore::open(
+            root.path().join("missing-suffix-consensus"),
+            active_binding.clone(),
+        )
+        .unwrap(),
+    );
+    block_on(consensus.append(vec![consensus_entry(vertex_command(11), 1, 3)])).unwrap();
+    block_on(consensus.set_hard_state(RaftHardState {
+        current_term: 1,
+        voted_for: None,
+        committed_index: 4,
+    }))
+    .unwrap();
+
+    assert!(
+        install_replica_snapshot(
+            &snapshot,
+            candidate.as_ref(),
+            candidate.as_ref(),
+            consensus.as_ref(),
+            candidate_binding,
+            active_binding,
+        )
+        .is_err()
+    );
+    assert_eq!(block_on(candidate.applied_index()).unwrap(), 0);
+    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_none());
+}
+
+struct FailOnceActivation {
+    inner: Arc<FjallReplicaStore>,
+    failing: AtomicBool,
+}
+
+impl LogicalReplicaActivation for FailOnceActivation {
+    fn activate_candidate(
+        &self,
+        candidate: LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+    ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
+        Box::pin(async move {
+            if self.failing.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Internal(
+                    "injected activation interruption".into(),
+                ));
+            }
+            self.inner
+                .activate_candidate(candidate, active_binding)
+                .await
+        })
+    }
+}
+
+fn create_source_snapshot(root: &std::path::Path) -> ReplicaSnapshot {
+    let source_binding = binding(4, BindingRole::Active, "source");
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.join("consensus"), source_binding.clone()).unwrap(),
+    );
+    block_on(consensus.set_membership(RaftMembership {
+        voters: vec![source_binding.replica_id()],
+        learners: vec![],
+        configuration_index: 0,
+    }))
+    .unwrap();
+    let state = Arc::new(FjallReplicaStore::open(root.join("business"), source_binding).unwrap());
+    let mut replica = RaftReplica::open(consensus.clone(), state.clone()).unwrap();
+    replica.start().unwrap();
+    replica.campaign().unwrap();
+    replica.drive_ready().unwrap();
+    replica.propose(vertex_command(10)).unwrap();
+    replica.drive_ready().unwrap();
+    let permit = replica.snapshot_read_permit(2).unwrap();
+
+    create_replica_snapshot(state.as_ref(), consensus.as_ref(), &permit, 77, 1).unwrap()
+}
+
+#[test]
+fn candidate_binding_cannot_open_a_serving_raft_replica() {
+    let root = tempfile::tempdir().unwrap();
+    let candidate = binding(5, BindingRole::Candidate, "candidate-non-serving");
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("consensus"), candidate.clone()).unwrap(),
+    );
+    let state = Arc::new(FjallReplicaStore::open(root.path().join("business"), candidate).unwrap());
+
+    assert!(RaftReplica::open(consensus, state).is_err());
+}
+
+fn vertex_command(command_id: u128) -> ShardCommand {
+    let vertex = VertexVersion::new(
+        VertexId::new(command_id).unwrap(),
+        Version::new(1),
+        ValidInterval::new(0, 100).unwrap(),
+        dtg_storage::TransactionTime::new(10).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(command_id).unwrap(),
+            7,
+            8,
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .unwrap(),
+    )
+}
+
+fn consensus_entry(command: ShardCommand, term: u64, index: u64) -> ConsensusEntry {
+    let command_id = command.header().command_id();
+    let context = command_id.get().to_be_bytes();
+    let data = command.encode_current().unwrap();
+    let mut payload = Vec::with_capacity(13 + context.len() + data.len());
+    payload.extend_from_slice(&1_u32.to_be_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&(context.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&context);
+    payload.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&data);
+    ConsensusEntry::new(
+        SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION,
+        term,
+        index,
+        command_id,
+        ConsensusCommandEnvelope::new(SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, payload).unwrap(),
+    )
+    .unwrap()
+}
+
+fn binding(replica_id: u64, role: BindingRole, namespace: &str) -> ReplicaBinding {
+    let capabilities = CapabilityManifest::from_names([
+        "adjacency",
+        "immutable-read-view",
+        "logical-snapshot",
+        "point",
+    ])
+    .unwrap();
+    let class = BackendClass::new(
+        ProviderKind::Fjall,
+        1,
+        1,
+        capabilities.names().map(str::to_owned),
+    )
+    .unwrap();
+    ReplicaBinding::builder()
+        .cluster_id(1)
+        .graph_id(2)
+        .shard_id(3)
+        .placement_epoch(7)
+        .replica_id(replica_id)
+        .backend_generation(8)
+        .backend_class_digest(class.digest())
+        .provider_kind(ProviderKind::Fjall)
+        .contract_version(1)
+        .layout_version(1)
+        .capability_digest(capabilities.digest())
+        .namespace_id(namespace)
+        .endpoint_profile_ref("local")
+        .credential_ref("none")
+        .role(role)
+        .build()
+        .unwrap()
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    struct ThreadWaker(std::thread::Thread);
+
+    impl std::task::Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = std::task::Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => return output,
+            std::task::Poll::Pending => std::thread::park(),
+        }
+    }
+}

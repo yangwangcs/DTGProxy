@@ -155,6 +155,7 @@ impl FjallReplicaStore {
     }
 
     pub(crate) fn verify_binding(&self, binding: &ReplicaBinding) -> Result<(), StorageError> {
+        self.inner.namespace.ensure_binding(&self.inner.binding)?;
         if binding == &self.inner.binding {
             Ok(())
         } else {
@@ -190,6 +191,7 @@ impl FjallReplicaStore {
     }
 
     pub(crate) fn applied_index_sync(&self) -> Result<u64, StorageError> {
+        self.inner.namespace.ensure_binding(&self.inner.binding)?;
         self.inner
             .namespace
             .replica_meta
@@ -338,7 +340,9 @@ impl FjallReplicaStore {
         records: &[SnapshotRecord],
         applied_index: u64,
         stage_keys: &[Vec<u8>],
+        install_marker: Option<&[u8]>,
     ) -> Result<(), StorageError> {
+        self.inner.namespace.ensure_binding(&self.inner.binding)?;
         let _guard = self.lock_graph()?;
         let mut history = Vec::new();
         let mut transactions = Vec::new();
@@ -449,6 +453,13 @@ impl FjallReplicaStore {
             APPLIED_INDEX_KEY,
             applied_index.to_be_bytes(),
         );
+        if let Some(marker) = install_marker {
+            write.insert(
+                &self.inner.namespace.owner,
+                crate::namespace::SNAPSHOT_INSTALL_KEY,
+                marker,
+            );
+        }
         #[cfg(feature = "tck")]
         self.pause_graph_at(GraphPausePoint::RestoreBeforeCommit)?;
         write.commit().map_err(fjall_error)
@@ -466,6 +477,7 @@ impl ReplicaStateStore for FjallReplicaStore {
 
     fn replica_metadata<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
         Box::pin(async move {
+            self.inner.namespace.ensure_binding(&self.inner.binding)?;
             let _guard = self.lock_graph()?;
             let mut key = b"user/".to_vec();
             key.extend_from_slice(name.as_bytes());

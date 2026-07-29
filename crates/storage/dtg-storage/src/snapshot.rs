@@ -1,8 +1,9 @@
 use dtg_kernel::Digest32;
 
 use crate::{
-    ChangeRecord, CommandId, EdgeTombstone, EdgeVersion, ReadFence, ReplicaBinding,
-    ReplicaMetadata, StorageError, StoreFuture, TransactionRecord, VertexTombstone, VertexVersion,
+    BindingRole, ChangeRecord, CommandId, EdgeTombstone, EdgeVersion, LogicalMutation, Properties,
+    ReadFence, ReplicaBinding, ReplicaMetadata, StorageError, StoreFuture, TransactionRecord,
+    Value, VertexTombstone, VertexVersion,
     mutation::{encode_edge, encode_metadata, encode_mutation, encode_transaction, encode_vertex},
 };
 
@@ -213,6 +214,12 @@ impl SnapshotChunk {
     pub fn into_records(self) -> std::vec::IntoIter<SnapshotRecord> {
         self.records.into_iter()
     }
+
+    pub fn encoded_len(&self) -> Result<u64, StorageError> {
+        self.records.iter().try_fold(64_u64, |bytes, record| {
+            checked_add(bytes, snapshot_record_len(record)?)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,6 +298,102 @@ impl SnapshotRestoreReceipt {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalSnapshotCandidateReceipt {
+    candidate_binding: ReplicaBinding,
+    header: SnapshotHeader,
+    manifest: SnapshotManifest,
+}
+
+impl LogicalSnapshotCandidateReceipt {
+    pub fn new(
+        candidate_binding: ReplicaBinding,
+        header: SnapshotHeader,
+        manifest: SnapshotManifest,
+    ) -> Result<Self, StorageError> {
+        if candidate_binding.role() != BindingRole::Candidate
+            || manifest.snapshot_id() != header.snapshot_id()
+            || manifest.content_digest().get() == [0; 32]
+            || header.format_version() != SUPPORTED_SNAPSHOT_FORMAT_VERSION
+        {
+            return Err(StorageError::CorruptSnapshot(
+                "logical snapshot candidate receipt is invalid".into(),
+            ));
+        }
+        Ok(Self {
+            candidate_binding,
+            header,
+            manifest,
+        })
+    }
+
+    pub const fn candidate_binding(&self) -> &ReplicaBinding {
+        &self.candidate_binding
+    }
+
+    pub const fn binding(&self) -> &ReplicaBinding {
+        &self.candidate_binding
+    }
+
+    pub const fn header(&self) -> &SnapshotHeader {
+        &self.header
+    }
+
+    pub const fn manifest(&self) -> &SnapshotManifest {
+        &self.manifest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicalReplicaActivationReceipt {
+    active_binding: ReplicaBinding,
+    snapshot_id: SnapshotId,
+    applied_index: u64,
+    content_digest: Digest32,
+    format_version: u32,
+}
+
+impl LogicalReplicaActivationReceipt {
+    pub fn new(
+        candidate: &LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+    ) -> Result<Self, StorageError> {
+        if candidate.candidate_binding.role() != BindingRole::Candidate
+            || active_binding.role() != BindingRole::Active
+            || !same_binding_except_role(&candidate.candidate_binding, &active_binding)
+        {
+            return Err(StorageError::SnapshotIdentityMismatch);
+        }
+        Ok(Self {
+            active_binding,
+            snapshot_id: candidate.header.snapshot_id(),
+            applied_index: candidate.header.applied_index(),
+            content_digest: candidate.manifest.content_digest(),
+            format_version: candidate.header.format_version(),
+        })
+    }
+
+    pub const fn active_binding(&self) -> &ReplicaBinding {
+        &self.active_binding
+    }
+
+    pub const fn snapshot_id(&self) -> SnapshotId {
+        self.snapshot_id
+    }
+
+    pub const fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    pub const fn content_digest(&self) -> Digest32 {
+        self.content_digest
+    }
+
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
+}
+
 pub trait LogicalSnapshotSource: Send + Sync {
     fn begin_snapshot(
         &self,
@@ -311,6 +414,14 @@ pub trait LogicalSnapshotSink: Send + Sync {
         binding: ReplicaBinding,
         header: SnapshotHeader,
     ) -> StoreFuture<'_, Box<dyn LogicalSnapshotWriter>>;
+}
+
+pub trait LogicalReplicaActivation: Send + Sync {
+    fn activate_candidate(
+        &self,
+        candidate: LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+    ) -> StoreFuture<'_, LogicalReplicaActivationReceipt>;
 }
 
 pub trait LogicalSnapshotWriter: Send {
@@ -334,6 +445,95 @@ fn validate_chunks(header: &SnapshotHeader, chunks: &[SnapshotChunk]) -> Result<
         }
     }
     Ok(())
+}
+
+fn same_binding_except_role(left: &ReplicaBinding, right: &ReplicaBinding) -> bool {
+    left.to_builder()
+        .role(right.role())
+        .build()
+        .is_ok_and(|normalized| normalized == *right)
+}
+
+fn snapshot_record_len(record: &SnapshotRecord) -> Result<u64, StorageError> {
+    checked_add(
+        1,
+        match record {
+            SnapshotRecord::Vertex(vertex) => vertex_len(vertex)?,
+            SnapshotRecord::VertexTombstone(_) => 32,
+            SnapshotRecord::Edge(edge) => edge_len(edge)?,
+            SnapshotRecord::EdgeTombstone(_) => 32,
+            SnapshotRecord::Transaction(_) => 57,
+            SnapshotRecord::ReplicaMetadata(metadata) => metadata_len(metadata)?,
+            SnapshotRecord::Replay(_) => 64,
+            SnapshotRecord::Change(change) => checked_add(16, mutation_len(change.mutation())?)?,
+        },
+    )
+}
+
+fn mutation_len(mutation: &LogicalMutation) -> Result<u64, StorageError> {
+    checked_add(
+        1,
+        match mutation {
+            LogicalMutation::PutVertex(vertex) => vertex_len(vertex)?,
+            LogicalMutation::DeleteVertex(_) => 32,
+            LogicalMutation::PutEdge(edge) => edge_len(edge)?,
+            LogicalMutation::DeleteEdge(_) => 32,
+            LogicalMutation::PutTransaction(_) => 57,
+            LogicalMutation::PutReplicaMetadata(metadata) => metadata_len(metadata)?,
+        },
+    )
+}
+
+fn vertex_len(vertex: &VertexVersion) -> Result<u64, StorageError> {
+    checked_add(48, properties_len(vertex.properties())?)
+}
+
+fn edge_len(edge: &EdgeVersion) -> Result<u64, StorageError> {
+    checked_add(
+        checked_add(72, string_len(edge.edge_type())?)?,
+        properties_len(edge.properties())?,
+    )
+}
+
+fn metadata_len(metadata: &ReplicaMetadata) -> Result<u64, StorageError> {
+    checked_add(string_len(metadata.name())?, value_len(metadata.value())?)
+}
+
+fn properties_len(properties: &Properties) -> Result<u64, StorageError> {
+    properties.iter().try_fold(8_u64, |bytes, (name, value)| {
+        checked_add(checked_add(bytes, string_len(name)?)?, value_len(value)?)
+    })
+}
+
+fn value_len(value: &Value) -> Result<u64, StorageError> {
+    match value {
+        Value::Null => Ok(1),
+        Value::Boolean(_) => Ok(2),
+        Value::Integer(_) | Value::FloatBits(_) => Ok(9),
+        Value::Bytes(bytes) => checked_add(9, length(bytes.len())?),
+        Value::String(value) => checked_add(1, string_len(value)?),
+        Value::List(values) => values
+            .iter()
+            .try_fold(9_u64, |bytes, value| checked_add(bytes, value_len(value)?)),
+        Value::Map(values) => values.iter().try_fold(9_u64, |bytes, (name, value)| {
+            checked_add(checked_add(bytes, string_len(name)?)?, value_len(value)?)
+        }),
+    }
+}
+
+fn string_len(value: &str) -> Result<u64, StorageError> {
+    checked_add(8, length(value.len())?)
+}
+
+fn length(value: usize) -> Result<u64, StorageError> {
+    value
+        .try_into()
+        .map_err(|_| StorageError::CorruptSnapshot("snapshot byte count overflow".into()))
+}
+
+fn checked_add(left: u64, right: u64) -> Result<u64, StorageError> {
+    left.checked_add(right)
+        .ok_or_else(|| StorageError::CorruptSnapshot("snapshot byte count overflow".into()))
 }
 
 fn digest_chunk(snapshot_id: SnapshotId, ordinal: u64, records: &[SnapshotRecord]) -> Digest32 {

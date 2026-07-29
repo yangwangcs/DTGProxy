@@ -1,12 +1,17 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use dtg_kernel::{Digest32, ReplicaId, TransactionTime};
-use dtg_storage::{ConsensusStore, ProviderKind, ReplicaBinding, ReplicaStateStore};
+use dtg_storage::{BindingRole, ConsensusStore, ProviderKind, ReplicaBinding, ReplicaStateStore};
 use raft::eraftpb::{Entry, EntryType, Message};
-use raft::{Config, RawNode};
+use raft::{Config, RawNode, StateRole, Storage};
 use slog::{Logger, o};
 
-use crate::{ApplyOutcome, RaftStore, ShardCommand, ShardError, ShardStateMachine};
+use crate::{
+    ApplyOutcome, FollowerReadProof, FollowerReadProofAuthority, RaftStore, ReadError, ReadFailure,
+    ReadPermit, ShardCommand, ShardError, ShardStateMachine,
+};
+
+const MAX_PENDING_READ_INDEX_REQUESTS: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplicaLifecycle {
@@ -60,6 +65,8 @@ pub struct ReplicaObservation {
 pub struct RaftProgress {
     messages: Vec<Message>,
     receipts: Vec<ProposalReceipt>,
+    read_permits: Vec<ReadPermit>,
+    read_failures: Vec<ReadFailure>,
 }
 
 impl RaftProgress {
@@ -74,6 +81,26 @@ impl RaftProgress {
     pub fn receipts(&self) -> &[ProposalReceipt] {
         &self.receipts
     }
+
+    pub fn read_permits(&self) -> &[ReadPermit] {
+        &self.read_permits
+    }
+
+    pub fn read_failures(&self) -> &[ReadFailure] {
+        &self.read_failures
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingReadIndex {
+    request_id: u128,
+    leader_id: u64,
+    leader_term: u64,
+    binding_digest: Digest32,
+    placement_epoch: u64,
+    backend_generation: u64,
+    read_index: Option<u64>,
+    active: bool,
 }
 
 impl ReplicaObservation {
@@ -114,6 +141,7 @@ pub struct RaftReplica {
     lifecycle: ReplicaLifecycle,
     pending_apply: Vec<Entry>,
     pending_messages: Vec<Message>,
+    pending_reads: HashMap<Vec<u8>, PendingReadIndex>,
 }
 
 impl RaftReplica {
@@ -121,7 +149,10 @@ impl RaftReplica {
         consensus_store: Arc<dyn ConsensusStore>,
         state_store: Arc<dyn ReplicaStateStore>,
     ) -> Result<Self, ShardError> {
-        if !same_replica_identity(consensus_store.binding(), state_store.binding()) {
+        if consensus_store.binding().role() != BindingRole::Active
+            || state_store.binding().role() != BindingRole::Active
+            || !same_replica_identity(consensus_store.binding(), state_store.binding())
+        {
             return Err(ShardError::BindingMismatch);
         }
         let binding = state_store.binding().clone();
@@ -135,6 +166,7 @@ impl RaftReplica {
             lifecycle: ReplicaLifecycle::Added,
             pending_apply: Vec::new(),
             pending_messages: Vec::new(),
+            pending_reads: HashMap::new(),
         })
     }
 
@@ -177,6 +209,59 @@ impl RaftReplica {
         self.running_node()?
             .propose(context, data)
             .map_err(ShardError::Raft)
+    }
+
+    pub fn request_linearizable_read(&mut self, request_id: u128) -> Result<(), ReadError> {
+        if request_id == 0 {
+            return Err(ReadError::InvalidRequest);
+        }
+        if self.lifecycle != ReplicaLifecycle::Running {
+            return Err(ReadError::NotReady);
+        }
+        let node = self.node.as_mut().ok_or(ReadError::NotReady)?;
+        let status = node.status();
+        if status.ss.raft_state != StateRole::Leader
+            || status.ss.leader_id != self.binding.replica_id().get()
+        {
+            return Err(ReadError::NotLeader);
+        }
+        if !node.raft.commit_to_current_term() {
+            return Err(ReadError::NotReady);
+        }
+        let context = read_index_context(request_id);
+        if self.pending_reads.contains_key(&context) {
+            return Err(ReadError::DuplicateRequest);
+        }
+        if self.pending_reads.len() >= MAX_PENDING_READ_INDEX_REQUESTS {
+            return Err(ReadError::Overloaded);
+        }
+        self.pending_reads.insert(
+            context.clone(),
+            PendingReadIndex {
+                request_id,
+                leader_id: status.ss.leader_id,
+                leader_term: status.hs.term,
+                binding_digest: self.binding.identity_digest(),
+                placement_epoch: self.binding.placement_epoch().get(),
+                backend_generation: self.binding.backend_generation().get(),
+                read_index: None,
+                active: true,
+            },
+        );
+        node.read_index(context);
+        Ok(())
+    }
+
+    pub fn cancel_linearizable_read(&mut self, request_id: u128) -> bool {
+        let Some(pending) = self
+            .pending_reads
+            .values_mut()
+            .find(|pending| pending.request_id == request_id)
+        else {
+            return false;
+        };
+        pending.active = false;
+        true
     }
 
     pub fn drive_ready(&mut self) -> Result<RaftProgress, ShardError> {
@@ -231,6 +316,86 @@ impl RaftReplica {
         })?;
         node.transfer_leader(target.get());
         Ok(())
+    }
+
+    pub fn follower_read_permit(
+        &self,
+        authority: &FollowerReadProofAuthority,
+        proof: &FollowerReadProof,
+        requested_time: TransactionTime,
+    ) -> Result<ReadPermit, ReadError> {
+        authority.verify(proof)?;
+        let leader = proof.leader_binding();
+        if leader.cluster_id() != self.binding.cluster_id()
+            || leader.graph_id() != self.binding.graph_id()
+            || leader.shard_id() != self.binding.shard_id()
+            || leader.backend_class_digest() != self.binding.backend_class_digest()
+            || leader.provider_kind() != self.binding.provider_kind()
+            || leader.contract_version() != self.binding.contract_version()
+            || leader.layout_version() != self.binding.layout_version()
+            || leader.capability_digest() != self.binding.capability_digest()
+        {
+            return Err(ReadError::UnsafeFollowerRead);
+        }
+        if proof.placement_epoch() != self.binding.placement_epoch().get() {
+            return Err(ReadError::StalePlacementEpoch);
+        }
+        if proof.backend_generation() != self.binding.backend_generation().get() {
+            return Err(ReadError::StaleBackendGeneration);
+        }
+        if self.lifecycle != ReplicaLifecycle::Running {
+            return Err(ReadError::NotReady);
+        }
+        let node = self.node.as_ref().ok_or(ReadError::NotReady)?;
+        let status = node.status();
+        if status.ss.raft_state == StateRole::Leader
+            || status.ss.leader_id != proof.leader_replica().get()
+            || status.hs.term != proof.leader_term()
+        {
+            return Err(ReadError::NotReady);
+        }
+        if self.machine.applied_index() < proof.applied_index() {
+            return Err(ReadError::AdapterLagging);
+        }
+        let closed_timestamp = self.machine.closed_timestamp().ok_or(ReadError::NotReady)?;
+        if closed_timestamp < proof.closed_timestamp() {
+            return Err(ReadError::NotReady);
+        }
+        if requested_time > proof.closed_timestamp() || requested_time > closed_timestamp {
+            return Err(ReadError::UnsafeFollowerRead);
+        }
+        Ok(ReadPermit::new(
+            None,
+            crate::ReadMode::Follower { requested_time },
+            dtg_storage::ReadFence::new(self.binding.clone(), self.machine.applied_index()),
+            Some(proof.leader_replica()),
+            proof.leader_term(),
+            Some(closed_timestamp),
+        ))
+    }
+
+    pub fn snapshot_read_permit(&self, applied_index: u64) -> Result<ReadPermit, ReadError> {
+        if self.lifecycle != ReplicaLifecycle::Running {
+            return Err(ReadError::NotReady);
+        }
+        let local_applied = self.machine.applied_index();
+        if local_applied < applied_index {
+            return Err(ReadError::AdapterLagging);
+        }
+        if local_applied > applied_index {
+            return Err(ReadError::SnapshotTooOld);
+        }
+        let node = self.node.as_ref().ok_or(ReadError::NotReady)?;
+        let status = node.status();
+        let leader_replica = ReplicaId::new(status.ss.leader_id).ok();
+        Ok(ReadPermit::new(
+            None,
+            crate::ReadMode::Snapshot,
+            dtg_storage::ReadFence::new(self.binding.clone(), applied_index),
+            leader_replica,
+            status.hs.term,
+            self.machine.closed_timestamp(),
+        ))
     }
 
     pub fn seal(&mut self) -> Result<(), ShardError> {
@@ -300,6 +465,11 @@ impl RaftReplica {
                 self.wal.persist_hard_state(hard_state)?;
             }
             let mut committed = ready.take_committed_entries();
+            for read_state in ready.take_read_states() {
+                if let Some(pending) = self.pending_reads.get_mut(&read_state.request_ctx) {
+                    pending.read_index = Some(read_state.index);
+                }
+            }
             self.pending_messages.extend(ready.take_messages());
             self.pending_messages
                 .extend(ready.take_persisted_messages());
@@ -329,7 +499,79 @@ impl RaftReplica {
             self.pending_apply.clear();
             progress.receipts.append(&mut receipts);
         }
+        self.resolve_pending_reads(node, progress)?;
         progress.messages.append(&mut self.pending_messages);
+        Ok(())
+    }
+
+    fn resolve_pending_reads(
+        &mut self,
+        node: &RawNode<RaftStore>,
+        progress: &mut RaftProgress,
+    ) -> Result<(), ShardError> {
+        let status = node.status();
+        let applied_index = self.machine.applied_index();
+        let binding_digest = self.binding.identity_digest();
+        let placement_epoch = self.binding.placement_epoch().get();
+        let backend_generation = self.binding.backend_generation().get();
+        let mut completed = Vec::new();
+        for (context, pending) in &self.pending_reads {
+            let leadership_error = if status.ss.raft_state != StateRole::Leader
+                || status.ss.leader_id != pending.leader_id
+            {
+                Some(ReadError::NotLeader)
+            } else if status.hs.term != pending.leader_term
+                || !node.raft.commit_to_current_term()
+                || binding_digest != pending.binding_digest
+                || placement_epoch != pending.placement_epoch
+                || backend_generation != pending.backend_generation
+            {
+                Some(ReadError::NotReady)
+            } else {
+                None
+            };
+            if let Some(error) = leadership_error {
+                if pending.active {
+                    progress
+                        .read_failures
+                        .push(ReadFailure::new(pending.request_id, error));
+                }
+                completed.push(context.clone());
+                continue;
+            }
+            let Some(read_index) = pending.read_index else {
+                continue;
+            };
+            if !pending.active {
+                completed.push(context.clone());
+                continue;
+            }
+            if applied_index < read_index {
+                continue;
+            }
+            if node.store().term(read_index).map_err(ShardError::Raft)? != pending.leader_term {
+                progress
+                    .read_failures
+                    .push(ReadFailure::new(pending.request_id, ReadError::NotReady));
+                completed.push(context.clone());
+                continue;
+            }
+            let leader_replica = ReplicaId::new(pending.leader_id).map_err(|error| {
+                ShardError::InvalidRaftState(format!("invalid ReadIndex leader: {error}"))
+            })?;
+            progress.read_permits.push(ReadPermit::new(
+                Some(pending.request_id),
+                crate::ReadMode::Linearizable,
+                dtg_storage::ReadFence::new(self.binding.clone(), read_index),
+                Some(leader_replica),
+                pending.leader_term,
+                self.machine.closed_timestamp(),
+            ));
+            completed.push(context.clone());
+        }
+        for context in completed {
+            self.pending_reads.remove(&context);
+        }
         Ok(())
     }
 
@@ -370,6 +612,13 @@ impl RaftReplica {
         }
         Ok((receipts, outcomes))
     }
+}
+
+fn read_index_context(request_id: u128) -> Vec<u8> {
+    let mut context = Vec::with_capacity(20);
+    context.extend_from_slice(&1_u32.to_be_bytes());
+    context.extend_from_slice(&request_id.to_be_bytes());
+    context
 }
 
 fn same_replica_identity(consensus: &ReplicaBinding, business: &ReplicaBinding) -> bool {

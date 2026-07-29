@@ -40,6 +40,7 @@ pub use read::{
     TemporalReadView, VertexHistoryRead, VertexRead, VertexScan,
 };
 pub use snapshot::{
+    LogicalReplicaActivation, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,
     LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
     SUPPORTED_SNAPSHOT_FORMAT_VERSION, SnapshotChunk, SnapshotHeader, SnapshotId, SnapshotManifest,
     SnapshotRecord, SnapshotReplayRecord, SnapshotRequest, SnapshotRestoreReceipt,

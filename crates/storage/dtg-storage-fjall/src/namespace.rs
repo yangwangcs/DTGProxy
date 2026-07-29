@@ -14,7 +14,9 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 
 use crate::codec::{decode_binding, encode_binding};
 
-const OWNER_KEY: &[u8] = b"binding";
+pub(crate) const OWNER_KEY: &[u8] = b"binding";
+pub(crate) const SNAPSHOT_ACTIVATION_KEY: &[u8] = b"snapshot_activation";
+pub(crate) const SNAPSHOT_INSTALL_KEY: &[u8] = b"snapshot_install";
 pub(crate) const FJALL_CONTRACT_VERSION: u32 = 1;
 pub(crate) const FJALL_LAYOUT_VERSION: u32 = 1;
 
@@ -137,6 +139,23 @@ impl NamespaceDb {
         });
         registry.insert(path, Arc::downgrade(&shared));
         Ok(Self(shared))
+    }
+
+    pub(crate) fn ensure_binding(&self, expected: &ReplicaBinding) -> Result<(), StorageError> {
+        let actual = self
+            .owner
+            .get(OWNER_KEY)
+            .map_err(fjall_error)?
+            .ok_or_else(|| StorageError::Internal("missing namespace owner".into()))
+            .and_then(|bytes| decode_binding(&bytes))?;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(StorageError::NamespaceOwnerMismatch {
+                expected: Box::new(actual),
+                actual: Box::new(expected.clone()),
+            })
+        }
     }
 }
 

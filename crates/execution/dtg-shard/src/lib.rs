@@ -3,7 +3,9 @@
 mod command;
 mod host;
 mod raft_store;
+mod read;
 mod replica;
+mod snapshot;
 mod state_machine;
 
 pub use command::{
@@ -14,8 +16,17 @@ pub use command::{
 };
 pub use host::{ReplicaKey, ShardHost};
 pub use raft_store::RaftStore;
+pub use read::{
+    FollowerReadProof, FollowerReadProofAuthority, ReadError, ReadFailure, ReadMode, ReadPermit,
+    SUPPORTED_FOLLOWER_READ_PROOF_VERSION,
+};
 pub use replica::{
     ProposalReceipt, RaftProgress, RaftReplica, ReplicaLifecycle, ReplicaObservation,
+};
+pub use snapshot::{
+    ReplicaSnapshot, ReplicaSnapshotError, ReplicaSnapshotInstallReceipt,
+    ReplicaSnapshotInstallState, ReplicaSnapshotManifest,
+    SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION, create_replica_snapshot, install_replica_snapshot,
 };
 pub use state_machine::{
     ACTIVE_TRANSACTION_INTENTS_METADATA_NAME, ApplyOutcome, SINGLE_SHARD_TRANSACTION_METADATA_NAME,
