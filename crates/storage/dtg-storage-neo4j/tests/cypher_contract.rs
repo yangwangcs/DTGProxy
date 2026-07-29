@@ -25,3 +25,36 @@ fn apply_uses_one_explicit_transaction_and_never_a_mirror() {
     assert!(!source.contains("Sidecar"));
     assert!(!source.contains("adapter_neo4j"));
 }
+
+#[test]
+fn candidate_restore_and_activation_are_owner_fenced_atomic_and_exact() {
+    let source = include_str!("../src/snapshot.rs");
+
+    for marker_field in [
+        "candidate_binding_digest",
+        "snapshot_format_version",
+        "snapshot_id",
+        "snapshot_applied_index",
+        "snapshot_chunk_count",
+        "snapshot_record_count",
+        "snapshot_content_digest",
+    ] {
+        assert!(
+            source.contains(marker_field),
+            "missing durable candidate marker field {marker_field}"
+        );
+    }
+    assert!(source.contains("BindingRole::Candidate"));
+    assert!(source.contains("CANDIDATE_SNAPSHOT_PUBLISH_QUERY"));
+    assert!(source.contains("ACTIVE_SNAPSHOT_PUBLISH_QUERY"));
+    assert!(source.contains("MATCH (install:DtgSnapshotInstall"));
+    assert!(source.contains("DELETE install"));
+    assert!(source.contains("SET owner.binding_role = $active_binding_role"));
+    assert!(source.contains("owner.binding_digest = $active_binding_digest"));
+    assert!(source.contains("DtgSnapshotActivation"));
+    assert!(source.contains("LogicalReplicaActivationReceipt::new"));
+    assert!(source.contains("read_applied_index(&client, store.binding_ref()).await?"));
+    assert!(source.contains("Neo4j snapshot abort lost its owner fence"));
+    assert!(!source.contains("CanonicalKv"));
+    assert!(!source.contains("Sidecar"));
+}

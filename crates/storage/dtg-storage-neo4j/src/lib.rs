@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dtg_storage::{
     ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommittedShardBatch,
+    LogicalReplicaActivation, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,
     LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
     ProviderKind, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence,
     ReplicaBinding, ReplicaMetadata, ReplicaStateStore, SnapshotHeader, SnapshotRecord,
@@ -187,6 +188,16 @@ impl LogicalSnapshotSink for Neo4jReplicaStore {
         header: SnapshotHeader,
     ) -> StoreFuture<'_, Box<dyn LogicalSnapshotWriter>> {
         Box::pin(async move { snapshot::snapshot_writer(self, binding, header).await })
+    }
+}
+
+impl LogicalReplicaActivation for Neo4jReplicaStore {
+    fn activate_candidate(
+        &self,
+        candidate: LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+    ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
+        Box::pin(async move { snapshot::activate_candidate(self, candidate, active_binding).await })
     }
 }
 

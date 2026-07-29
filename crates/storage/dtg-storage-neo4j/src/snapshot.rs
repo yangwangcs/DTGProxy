@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dtg_storage::{
-    ChangeRecord, CommittedShardBatch, LogicalMutation, LogicalSnapshotReader,
+    BindingRole, ChangeRecord, CommittedShardBatch, LogicalMutation,
+    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotReader,
     LogicalSnapshotWriter, ReadFence, ReplicaBinding, ReplicaMetadata, SnapshotChunk,
     SnapshotHeader, SnapshotManifest, SnapshotRecord, SnapshotReplayRecord, SnapshotRequest,
     SnapshotRestoreReceipt, StorageError, StoreFuture, TransactionId, TransactionRecord,
@@ -12,8 +13,157 @@ use crate::{
     Neo4jReplicaStore,
     apply::{insert_replay, stage_mutation},
     codec::encode_mutation,
-    schema::{begin_fenced_transaction, fenced_parameters, u64_hex, u128_hex},
+    schema::{
+        begin_fenced_transaction, digest_text, fenced_parameters, owner_parameters,
+        read_applied_index, u64_hex, u128_hex,
+    },
 };
+
+const CANDIDATE_SNAPSHOT_PUBLISH_QUERY: &str = "MATCH (owner:DtgOwner {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation,
+       binding_digest: $binding_digest
+     })
+     SET owner.applied_index = $snapshot_applied_index
+     WITH owner
+     OPTIONAL MATCH (stage:DtgSnapshotStage {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation,
+       restore_id: $snapshot_id
+     })
+     DETACH DELETE stage
+     WITH DISTINCT owner
+     MERGE (install:DtgSnapshotInstall {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation
+     })
+     SET install.candidate_binding_digest = $candidate_binding_digest,
+       install.snapshot_format_version = $snapshot_format_version,
+       install.snapshot_id = $snapshot_id,
+       install.snapshot_applied_index = $snapshot_applied_index,
+       install.snapshot_chunk_count = $snapshot_chunk_count,
+       install.snapshot_record_count = $snapshot_record_count,
+       install.snapshot_content_digest = $snapshot_content_digest
+     RETURN owner.applied_index";
+
+const ACTIVE_SNAPSHOT_PUBLISH_QUERY: &str = "MATCH (owner:DtgOwner {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation,
+       binding_digest: $binding_digest
+     })
+     SET owner.applied_index = $snapshot_applied_index
+     WITH owner
+     OPTIONAL MATCH (stage:DtgSnapshotStage {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation,
+       restore_id: $snapshot_id
+     })
+     DETACH DELETE stage
+     WITH DISTINCT owner
+     OPTIONAL MATCH (install:DtgSnapshotInstall {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation
+     })
+     DETACH DELETE install
+     WITH DISTINCT owner
+     RETURN owner.applied_index";
+
+const ACTIVATE_CANDIDATE_QUERY: &str = "MATCH (owner:DtgOwner {namespace_id: $namespace_id})
+     CALL {
+       WITH owner
+       WHERE owner.backend_generation = $backend_generation
+         AND owner.cluster_id = $cluster_id
+         AND owner.graph_id = $graph_id
+         AND owner.shard_id = $shard_id
+         AND owner.placement_epoch = $placement_epoch
+         AND owner.replica_id = $replica_id
+         AND owner.backend_class_digest = $backend_class_digest
+         AND owner.provider_kind = $provider_kind
+         AND owner.contract_version = $contract_version
+         AND owner.layout_version = $layout_version
+         AND owner.capability_digest = $capability_digest
+         AND owner.endpoint_profile_ref = $endpoint_profile_ref
+         AND owner.credential_ref = $credential_ref
+         AND owner.binding_role = $binding_role
+         AND owner.binding_digest = $binding_digest
+       MATCH (install:DtgSnapshotInstall {
+         namespace_id: $namespace_id,
+         backend_generation: $backend_generation,
+         candidate_binding_digest: $candidate_binding_digest,
+         snapshot_format_version: $snapshot_format_version,
+         snapshot_id: $snapshot_id,
+         snapshot_applied_index: $snapshot_applied_index,
+         snapshot_chunk_count: $snapshot_chunk_count,
+         snapshot_record_count: $snapshot_record_count,
+         snapshot_content_digest: $snapshot_content_digest
+       })
+       OPTIONAL MATCH (existing:DtgSnapshotActivation {
+         namespace_id: $namespace_id,
+         backend_generation: $backend_generation
+       })
+       WITH owner, install, existing
+       WHERE existing IS NULL OR (
+         existing.candidate_binding_digest = $candidate_binding_digest
+         AND existing.active_binding_digest = $active_binding_digest
+         AND existing.snapshot_format_version = $snapshot_format_version
+         AND existing.snapshot_id = $snapshot_id
+         AND existing.snapshot_applied_index = $snapshot_applied_index
+         AND existing.snapshot_content_digest = $snapshot_content_digest
+       )
+       SET owner.binding_role = $active_binding_role,
+         owner.binding_digest = $active_binding_digest
+       DELETE install
+       MERGE (activation:DtgSnapshotActivation {
+         namespace_id: $namespace_id,
+         backend_generation: $backend_generation
+       })
+       ON CREATE SET
+         activation.candidate_binding_digest = $candidate_binding_digest,
+         activation.active_binding_digest = $active_binding_digest,
+         activation.snapshot_format_version = $snapshot_format_version,
+         activation.snapshot_id = $snapshot_id,
+         activation.snapshot_applied_index = $snapshot_applied_index,
+         activation.snapshot_content_digest = $snapshot_content_digest
+       RETURN activation.active_binding_digest AS active_binding_digest,
+         activation.snapshot_id AS snapshot_id,
+         activation.snapshot_applied_index AS snapshot_applied_index,
+         activation.snapshot_content_digest AS snapshot_content_digest,
+         activation.snapshot_format_version AS snapshot_format_version
+       UNION
+       WITH owner
+       WHERE owner.backend_generation = $backend_generation
+         AND owner.cluster_id = $cluster_id
+         AND owner.graph_id = $graph_id
+         AND owner.shard_id = $shard_id
+         AND owner.placement_epoch = $placement_epoch
+         AND owner.replica_id = $replica_id
+         AND owner.backend_class_digest = $backend_class_digest
+         AND owner.provider_kind = $provider_kind
+         AND owner.contract_version = $contract_version
+         AND owner.layout_version = $layout_version
+         AND owner.capability_digest = $capability_digest
+         AND owner.endpoint_profile_ref = $endpoint_profile_ref
+         AND owner.credential_ref = $credential_ref
+         AND owner.binding_role = $active_binding_role
+         AND owner.binding_digest = $active_binding_digest
+       MATCH (activation:DtgSnapshotActivation {
+         namespace_id: $namespace_id,
+         backend_generation: $backend_generation,
+         candidate_binding_digest: $candidate_binding_digest,
+         active_binding_digest: $active_binding_digest,
+         snapshot_format_version: $snapshot_format_version,
+         snapshot_id: $snapshot_id,
+         snapshot_applied_index: $snapshot_applied_index,
+         snapshot_content_digest: $snapshot_content_digest
+       })
+       RETURN activation.active_binding_digest AS active_binding_digest,
+         activation.snapshot_id AS snapshot_id,
+         activation.snapshot_applied_index AS snapshot_applied_index,
+         activation.snapshot_content_digest AS snapshot_content_digest,
+         activation.snapshot_format_version AS snapshot_format_version
+     }
+     RETURN active_binding_digest, snapshot_id, snapshot_applied_index,
+       snapshot_content_digest, snapshot_format_version";
 
 pub(crate) async fn snapshot_reader(
     store: &Neo4jReplicaStore,
@@ -88,6 +238,8 @@ pub(crate) async fn snapshot_writer(
     if !same_logical_identity(store.binding_ref(), header.source_binding()) {
         return Err(StorageError::SnapshotIdentityMismatch);
     }
+    let client = store.client()?;
+    read_applied_index(&client, store.binding_ref()).await?;
     Ok(Box::new(Neo4jSnapshotWriter {
         store: store.clone(),
         target_binding: store.binding_ref().clone(),
@@ -204,33 +356,17 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
                     }
                     insert_replay(&transaction, batch).await?;
                 }
-                let mut parameters = fenced_parameters(self.store.binding_ref());
-                parameters.insert(
-                    "applied_index".into(),
-                    Value::String(u64_hex(self.header.applied_index())),
-                );
-                parameters.insert(
-                    "restore_id".into(),
-                    Value::String(u128_hex(self.header.snapshot_id().get())),
-                );
+                let parameters =
+                    snapshot_publish_parameters(self.store.binding_ref(), &self.header, &manifest);
+                let publish_query = match self.target_binding.role() {
+                    BindingRole::Candidate => CANDIDATE_SNAPSHOT_PUBLISH_QUERY,
+                    BindingRole::Active => ACTIVE_SNAPSHOT_PUBLISH_QUERY,
+                    BindingRole::Retiring => {
+                        return Err(StorageError::SnapshotIdentityMismatch);
+                    }
+                };
                 let rows = transaction
-                    .execute(
-                        "MATCH (owner:DtgOwner {
-                          namespace_id: $namespace_id,
-                          backend_generation: $backend_generation,
-                          binding_digest: $binding_digest
-                        })
-                        SET owner.applied_index = $applied_index
-                        WITH owner
-                        OPTIONAL MATCH (stage:DtgSnapshotStage {
-                          namespace_id: $namespace_id,
-                          backend_generation: $backend_generation,
-                          restore_id: $restore_id
-                        })
-                        DETACH DELETE stage
-                        RETURN owner.applied_index",
-                        Value::Object(parameters),
-                    )
+                    .execute(publish_query, Value::Object(parameters))
                     .await?;
                 if rows.len() != 1 {
                     return Err(StorageError::Internal(
@@ -262,7 +398,7 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
                 "restore_id".into(),
                 Value::String(u128_hex(self.header.snapshot_id().get())),
             );
-            client
+            let rows = client
                 .execute(
                     "MATCH (owner:DtgOwner {
                       namespace_id: $namespace_id,
@@ -274,13 +410,129 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
                       backend_generation: $backend_generation,
                       restore_id: $restore_id
                     })
-                    DETACH DELETE stage RETURN owner.namespace_id",
+                    DETACH DELETE stage
+                    WITH DISTINCT owner
+                    RETURN owner.namespace_id",
                     Value::Object(parameters),
                 )
                 .await?;
+            if rows.len() != 1 {
+                return Err(StorageError::Internal(
+                    "Neo4j snapshot abort lost its owner fence".into(),
+                ));
+            }
             Ok(())
         })
     }
+}
+
+pub(crate) async fn activate_candidate(
+    store: &Neo4jReplicaStore,
+    candidate: LogicalSnapshotCandidateReceipt,
+    active_binding: ReplicaBinding,
+) -> Result<LogicalReplicaActivationReceipt, StorageError> {
+    let receipt = LogicalReplicaActivationReceipt::new(&candidate, active_binding.clone())?;
+    if candidate.candidate_binding() != store.binding_ref() {
+        return Err(StorageError::SnapshotIdentityMismatch);
+    }
+    let _guard = store.inner.apply_guard.lock().await;
+    let client = store.client()?;
+    let parameters = activation_parameters(&candidate, &active_binding);
+    let expected = vec![
+        Value::String(digest_text(active_binding.identity_digest())),
+        Value::String(u128_hex(candidate.header().snapshot_id().get())),
+        Value::String(u64_hex(candidate.header().applied_index())),
+        Value::String(digest_text(candidate.manifest().content_digest())),
+        Value::from(candidate.header().format_version()),
+    ];
+    let rows = client
+        .execute(ACTIVATE_CANDIDATE_QUERY, Value::Object(parameters))
+        .await?;
+    if rows.as_slice() != [expected] {
+        return Err(StorageError::SnapshotIdentityMismatch);
+    }
+    Ok(receipt)
+}
+
+fn snapshot_publish_parameters(
+    binding: &ReplicaBinding,
+    header: &SnapshotHeader,
+    manifest: &SnapshotManifest,
+) -> serde_json::Map<String, Value> {
+    let mut parameters = fenced_parameters(binding);
+    parameters.insert(
+        "candidate_binding_digest".into(),
+        Value::String(digest_text(binding.identity_digest())),
+    );
+    parameters.insert(
+        "snapshot_format_version".into(),
+        Value::from(header.format_version()),
+    );
+    parameters.insert(
+        "snapshot_id".into(),
+        Value::String(u128_hex(header.snapshot_id().get())),
+    );
+    parameters.insert(
+        "snapshot_applied_index".into(),
+        Value::String(u64_hex(header.applied_index())),
+    );
+    parameters.insert(
+        "snapshot_chunk_count".into(),
+        Value::String(u64_hex(manifest.chunk_count())),
+    );
+    parameters.insert(
+        "snapshot_record_count".into(),
+        Value::String(u64_hex(manifest.record_count())),
+    );
+    parameters.insert(
+        "snapshot_content_digest".into(),
+        Value::String(digest_text(manifest.content_digest())),
+    );
+    parameters
+}
+
+fn activation_parameters(
+    candidate: &LogicalSnapshotCandidateReceipt,
+    active_binding: &ReplicaBinding,
+) -> serde_json::Map<String, Value> {
+    let mut parameters = owner_parameters(candidate.candidate_binding())
+        .as_object()
+        .cloned()
+        .expect("owner parameters are always a JSON object");
+    parameters.insert(
+        "candidate_binding_digest".into(),
+        Value::String(digest_text(candidate.candidate_binding().identity_digest())),
+    );
+    parameters.insert("active_binding_role".into(), Value::String("active".into()));
+    parameters.insert(
+        "active_binding_digest".into(),
+        Value::String(digest_text(active_binding.identity_digest())),
+    );
+    parameters.insert(
+        "snapshot_format_version".into(),
+        Value::from(candidate.header().format_version()),
+    );
+    parameters.insert(
+        "snapshot_id".into(),
+        Value::String(u128_hex(candidate.header().snapshot_id().get())),
+    );
+    parameters.insert(
+        "snapshot_applied_index".into(),
+        Value::String(u64_hex(candidate.header().applied_index())),
+    );
+    parameters.insert(
+        "snapshot_chunk_count".into(),
+        Value::String(u64_hex(candidate.manifest().chunk_count())),
+    );
+    parameters.insert(
+        "snapshot_record_count".into(),
+        Value::String(u64_hex(candidate.manifest().record_count())),
+    );
+    parameters.insert(
+        "snapshot_content_digest".into(),
+        Value::String(digest_text(candidate.manifest().content_digest())),
+    );
+    parameters
 }
 
 async fn clear_logical_state(

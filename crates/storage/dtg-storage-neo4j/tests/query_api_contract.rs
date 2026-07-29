@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use dtg_storage_neo4j::QueryApiContract;
+use dtg_storage::LogicalReplicaActivation;
+use dtg_storage_neo4j::{Neo4jReplicaStore, QueryApiContract};
+
+fn assert_activation_contract<T: LogicalReplicaActivation>() {}
 
 #[test]
 fn query_api_v2_transaction_routes_and_affinity_are_explicit() {
@@ -27,4 +30,15 @@ fn query_api_requests_are_single_statement_and_parameterized() {
     assert_eq!(body["statement"], "RETURN $value");
     assert_eq!(body["parameters"]["value"], 7);
     assert_eq!(body.as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn activation_uses_the_exact_provider_neutral_signature_and_one_query_api_statement() {
+    assert_activation_contract::<Neo4jReplicaStore>();
+
+    let source = include_str!("../src/snapshot.rs");
+    assert!(source.contains("const ACTIVATE_CANDIDATE_QUERY"));
+    assert!(source.contains(".execute(ACTIVATE_CANDIDATE_QUERY"));
+    assert!(!source.contains("begin_transaction(ACTIVATE_CANDIDATE_QUERY"));
+    assert!(!source.contains("format!(ACTIVATE_CANDIDATE_QUERY"));
 }

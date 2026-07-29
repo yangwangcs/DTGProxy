@@ -14,6 +14,8 @@ fn native_model_uses_nodes_relationships_and_owner_fence() {
         "DtgReplay",
         "DtgChange",
         "DtgSnapshotStage",
+        "DtgSnapshotInstall",
+        "DtgSnapshotActivation",
     ] {
         assert!(
             model.labels().contains(&label),
@@ -38,6 +40,16 @@ fn native_model_uses_nodes_relationships_and_owner_fence() {
     );
     assert!(!model.labels().contains(&"CanonicalKv"));
     assert!(!model.relationships().contains(&"CANONICAL_ENTRY"));
+    assert!(model.constraints().iter().any(|constraint| {
+        constraint.contains("dtg_snapshot_install_identity")
+            && constraint.contains("stage.namespace_id")
+            && constraint.contains("stage.backend_generation")
+    }));
+    assert!(model.constraints().iter().any(|constraint| {
+        constraint.contains("dtg_snapshot_activation_identity")
+            && constraint.contains("activation.namespace_id")
+            && constraint.contains("activation.backend_generation")
+    }));
 }
 
 #[test]
