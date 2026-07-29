@@ -16,14 +16,52 @@ use crate::{
 pub trait TimestampAuthority: Send + Sync {
     fn allocate_start_time(&self, transaction_id: TransactionId) -> TxnFuture<'_, TransactionTime>;
 
-    fn allocate_commit_time(&self, transaction_id: TransactionId)
-    -> TxnFuture<'_, TransactionTime>;
+    /// Durably creates or returns the transaction's unique pending commit-time reservation.
+    fn reserve_commit_time(&self, transaction_id: TransactionId) -> TxnFuture<'_, TransactionTime>;
 
-    fn publish_commit_time(
+    /// Reads a durable reservation without creating one.
+    fn commit_time_reservation(
+        &self,
+        transaction_id: TransactionId,
+    ) -> TxnFuture<'_, Option<CommitTimeReservation>>;
+
+    /// Resolves one reservation. The authority may advance its published frontier only across the
+    /// contiguous prefix of reservations resolved as either committed or aborted.
+    fn resolve_commit_time(
         &self,
         transaction_id: TransactionId,
         commit_time: TransactionTime,
+        resolution: CommitResolution,
     ) -> TxnFuture<'_, ()>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitResolution {
+    Committed,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitTimeReservation {
+    commit_time: TransactionTime,
+    resolution: Option<CommitResolution>,
+}
+
+impl CommitTimeReservation {
+    pub const fn new(commit_time: TransactionTime, resolution: Option<CommitResolution>) -> Self {
+        Self {
+            commit_time,
+            resolution,
+        }
+    }
+
+    pub const fn commit_time(self) -> TransactionTime {
+        self.commit_time
+    }
+
+    pub const fn resolution(self) -> Option<CommitResolution> {
+        self.resolution
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,13 +152,17 @@ impl TemporalTxnCoordinator {
             validate_participants(context, &participants)?;
             participants.sort_by_key(ParticipantWrite::shard_id);
 
-            let commit_time = self
+            let existing_reservation = self
                 .timestamps
-                .allocate_commit_time(context.snapshot.transaction_id)
+                .commit_time_reservation(context.snapshot.transaction_id)
                 .await?;
-            if commit_time <= context.snapshot.start_time {
-                return Err(TxnError::InconsistentSnapshot);
+            if existing_reservation.is_some_and(|reservation| {
+                reservation.resolution() == Some(CommitResolution::Aborted)
+            }) {
+                return Ok(TransactionOutcome::Aborted);
             }
+            let existing_commit_time =
+                existing_reservation.map(|reservation| reservation.commit_time());
 
             for participant in &participants {
                 let fence = context
@@ -132,17 +174,46 @@ impl TemporalTxnCoordinator {
                     .participants
                     .changes_after(participant.shard_id(), fence.applied_index)
                     .await?;
-                let intended = stamp_mutations(participant.mutations(), commit_time)?;
+                let intended = match existing_commit_time {
+                    Some(commit_time) => stamp_mutations(participant.mutations(), commit_time)?,
+                    None => Vec::new(),
+                };
                 let committed: Vec<_> = changes
                     .iter()
                     .map(|change| change.mutation().clone())
                     .filter(|mutation| !intended.contains(mutation))
                     .collect();
-                detect_mutation_conflicts(
+                if let Err(error) = detect_mutation_conflicts(
                     participant.mutations(),
                     &committed,
                     context.snapshot.start_time,
-                )?;
+                ) {
+                    if let Some(existing_commit_time) = existing_commit_time {
+                        if participants.len() > 1 {
+                            return self.resolve_failed_prewrite(context).await;
+                        }
+                        self.timestamps
+                            .resolve_commit_time(
+                                context.snapshot.transaction_id,
+                                existing_commit_time,
+                                CommitResolution::Aborted,
+                            )
+                            .await?;
+                    }
+                    return Err(error);
+                }
+            }
+
+            let commit_time = match existing_commit_time {
+                Some(commit_time) => commit_time,
+                None => {
+                    self.timestamps
+                        .reserve_commit_time(context.snapshot.transaction_id)
+                        .await?
+                }
+            };
+            if commit_time <= context.snapshot.start_time {
+                return Err(TxnError::InconsistentSnapshot);
             }
 
             if participants.len() == 1 {
@@ -164,7 +235,11 @@ impl TemporalTxnCoordinator {
                     .submit(participant.shard_id(), request)
                     .await?;
                 self.timestamps
-                    .publish_commit_time(context.snapshot.transaction_id, commit_time)
+                    .resolve_commit_time(
+                        context.snapshot.transaction_id,
+                        commit_time,
+                        CommitResolution::Committed,
+                    )
                     .await?;
                 return Ok(TransactionOutcome::Committed(commit_time));
             }
@@ -187,11 +262,17 @@ impl TemporalTxnCoordinator {
                     start_time: context.snapshot.start_time,
                     mutations: mutations.clone(),
                 };
-                let receipt = self
+                let receipt = match self
                     .participants
                     .submit(participant.shard_id(), request)
-                    .await?;
-                let digest = receipt.intent_digest().ok_or(TxnError::CorruptRecovery)?;
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(_) => return self.resolve_failed_prewrite(context).await,
+                };
+                let Some(digest) = receipt.intent_digest() else {
+                    return self.resolve_failed_prewrite(context).await;
+                };
                 intents.push((participant, mutations, digest));
             }
 
@@ -233,6 +314,7 @@ impl TemporalTxnCoordinator {
                         fence.backend_generation,
                     ),
                     transaction_id: context.snapshot.transaction_id,
+                    start_time: context.snapshot.start_time,
                     commit_time,
                     intent_digest,
                     mutations,
@@ -243,7 +325,11 @@ impl TemporalTxnCoordinator {
             }
 
             self.timestamps
-                .publish_commit_time(context.snapshot.transaction_id, commit_time)
+                .resolve_commit_time(
+                    context.snapshot.transaction_id,
+                    commit_time,
+                    CommitResolution::Committed,
+                )
                 .await?;
             Ok(TransactionOutcome::Committed(commit_time))
         })
@@ -278,14 +364,18 @@ impl TemporalTxnCoordinator {
                     start_time: context.snapshot.start_time,
                     mutations,
                 };
-                let receipt = self
+                let receipt = match self
                     .participants
                     .submit(participant.shard_id(), request)
-                    .await?;
-                intents.push((
-                    participant.shard_id(),
-                    receipt.intent_digest().ok_or(TxnError::CorruptRecovery)?,
-                ));
+                    .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(_) => return self.resolve_failed_prewrite(context).await,
+                };
+                let Some(intent_digest) = receipt.intent_digest() else {
+                    return self.resolve_failed_prewrite(context).await;
+                };
+                intents.push((participant.shard_id(), intent_digest));
             }
 
             let home = participants[0].shard_id();

@@ -139,7 +139,7 @@ fn snapshot_rejects_stale_epoch_and_generation() {
 }
 
 #[test]
-fn snapshot_read_time_is_bounded_by_every_closed_time() {
+fn snapshot_read_time_is_pinned_to_the_published_start() {
     let token = SnapshotToken::new(
         TransactionId::new(9).unwrap(),
         transaction_time(40),
@@ -151,10 +151,10 @@ fn snapshot_read_time_is_bounded_by_every_closed_time() {
     )
     .unwrap();
 
-    assert_eq!(token.validate_read_time(transaction_time(45)), Ok(()));
+    assert_eq!(token.validate_read_time(transaction_time(40)), Ok(()));
     assert_eq!(
-        token.validate_read_time(transaction_time(46)),
-        Err(TxnError::ReadTimeExceedsClosedTime)
+        token.validate_read_time(transaction_time(45)),
+        Err(TxnError::InconsistentSnapshot)
     );
 }
 
@@ -172,13 +172,17 @@ fn vertex(id: u128, version: u64, start: i64, end: i64, label: &str) -> VertexVe
 }
 
 fn edge(id: u128, source: u128, target: u128) -> EdgeVersion {
+    edge_interval(id, source, target, 0, 100)
+}
+
+fn edge_interval(id: u128, source: u128, target: u128, start: i64, end: i64) -> EdgeVersion {
     EdgeVersion::new(
         EdgeId::new(id).unwrap(),
         VertexId::new(source).unwrap(),
         VertexId::new(target).unwrap(),
         "knows",
         Version::new(1),
-        ValidInterval::new(0, 100).unwrap(),
+        ValidInterval::new(start, end).unwrap(),
         transaction_time(40),
         Properties::new(),
     )
@@ -265,4 +269,62 @@ fn overlay_rejects_missing_references_and_overlapping_identity_versions() {
         duplicate_identity.validate(&BaseGraphSnapshot::default()),
         Err(TxnError::DuplicateIdentity)
     );
+}
+
+#[test]
+fn base_and_staged_histories_allow_disjoint_intervals_per_identity() {
+    let base = BaseGraphSnapshot::new(
+        vec![
+            vertex(1, 1, 0, 50, "source-first"),
+            vertex(1, 2, 50, 100, "source-second"),
+            vertex(2, 1, 0, 100, "target"),
+        ],
+        Vec::new(),
+    );
+    assert!(base.is_ok());
+
+    let mut staged = TransactionOverlay::new();
+    staged
+        .stage(LogicalMutation::PutVertex(vertex(
+            1,
+            1,
+            0,
+            50,
+            "source-first",
+        )))
+        .unwrap();
+    staged
+        .stage(LogicalMutation::PutVertex(vertex(
+            1,
+            2,
+            50,
+            100,
+            "source-second",
+        )))
+        .unwrap();
+    staged
+        .stage(LogicalMutation::PutVertex(vertex(2, 1, 0, 100, "target")))
+        .unwrap();
+    staged
+        .stage(LogicalMutation::PutEdge(edge_interval(9, 1, 2, 0, 100)))
+        .unwrap();
+    assert_eq!(staged.validate(&BaseGraphSnapshot::default()), Ok(()));
+}
+
+#[test]
+fn edge_endpoints_must_cover_the_complete_edge_interval() {
+    let base = BaseGraphSnapshot::new(
+        vec![
+            vertex(1, 1, 0, 50, "short-source"),
+            vertex(2, 1, 0, 100, "target"),
+        ],
+        Vec::new(),
+    )
+    .unwrap();
+    let mut overlay = TransactionOverlay::new();
+    overlay
+        .stage(LogicalMutation::PutEdge(edge_interval(9, 1, 2, 0, 100)))
+        .unwrap();
+
+    assert_eq!(overlay.validate(&base), Err(TxnError::ReferentialIntegrity));
 }

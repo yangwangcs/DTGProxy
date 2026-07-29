@@ -75,7 +75,7 @@ impl SnapshotToken {
     }
 
     pub fn validate_read_time(&self, read_time: TransactionTime) -> Result<(), TxnError> {
-        if read_time < self.start_time {
+        if read_time != self.start_time {
             return Err(TxnError::InconsistentSnapshot);
         }
         if self

@@ -9,7 +9,8 @@ mod snapshot;
 
 pub use conflict::{EntityIdentity, IntervalWrite, detect_conflict};
 pub use coordinator::{
-    TemporalTxnCoordinator, TimestampAuthority, TransactionContext, TransactionOutcome,
+    CommitResolution, CommitTimeReservation, TemporalTxnCoordinator, TimestampAuthority,
+    TransactionContext, TransactionOutcome,
 };
 pub use dtg_kernel::Value;
 pub use dtg_kernel::{

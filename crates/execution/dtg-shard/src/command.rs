@@ -12,9 +12,9 @@ use dtg_storage::{
 use crate::ShardError;
 
 pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 1;
-pub const SUPPORTED_TRANSACTION_INTENT_VERSION: u32 = 1;
+pub const SUPPORTED_TRANSACTION_INTENT_VERSION: u32 = 2;
 
-pub const TRANSACTION_INTENT_METADATA_NAME: &str = "dtg.transaction_intent.v1";
+pub const TRANSACTION_INTENT_METADATA_NAME: &str = "dtg.transaction_intent.v2";
 const MAX_TRANSACTION_INTENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRANSACTION_INTENT_ITEMS: usize = 4_096;
 
@@ -93,6 +93,7 @@ impl CommitSingleShard {
 pub struct ParticipantIntent {
     transaction_id: TransactionId,
     shard_id: ShardId,
+    start_time: TransactionTime,
     mutations: Vec<LogicalMutation>,
 }
 
@@ -100,12 +101,14 @@ impl ParticipantIntent {
     pub fn new(
         transaction_id: TransactionId,
         shard_id: ShardId,
+        start_time: TransactionTime,
         mutations: Vec<LogicalMutation>,
     ) -> Result<Self, ShardError> {
         validate_intent_mutations(&mutations)?;
         let intent = Self {
             transaction_id,
             shard_id,
+            start_time,
             mutations,
         };
         intent.encode_current()?;
@@ -120,6 +123,10 @@ impl ParticipantIntent {
         self.shard_id
     }
 
+    pub const fn start_time(&self) -> TransactionTime {
+        self.start_time
+    }
+
     pub fn mutations(&self) -> &[LogicalMutation] {
         &self.mutations
     }
@@ -129,7 +136,7 @@ impl ParticipantIntent {
             .encode_current()
             .expect("validated participant intent remains encodable");
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"dtg-transaction-participant-intent-v1");
+        hasher.update(b"dtg-transaction-participant-intent-v2");
         hasher.update(&encoded);
         Digest32::new(*hasher.finalize().as_bytes())
     }
@@ -140,6 +147,7 @@ impl ParticipantIntent {
         encoder.u32(SUPPORTED_TRANSACTION_INTENT_VERSION);
         encoder.u128(self.transaction_id.get());
         encoder.u64(self.shard_id.get());
+        encoder.i64(self.start_time.get());
         encoder.mutations(&self.mutations)?;
         let encoded = encoder.finish()?;
         if encoded.len() > MAX_TRANSACTION_INTENT_BYTES {
@@ -159,9 +167,13 @@ impl ParticipantIntent {
         }
         let transaction_id = TransactionId::new(decoder.u128()?)?;
         let shard_id = ShardId::new(decoder.u64()?)?;
-        let mutations = decoder.mutations()?;
+        let start_time = TransactionTime::new(decoder.i64()?)?;
+        let mutations = decoder.mutations_with_limit(
+            MAX_TRANSACTION_INTENT_ITEMS,
+            "transaction intent mutation count is outside the supported bounds",
+        )?;
         decoder.finish()?;
-        Self::new(transaction_id, shard_id, mutations)
+        Self::new(transaction_id, shard_id, start_time, mutations)
     }
 
     fn metadata(&self) -> Result<ReplicaMetadata, ShardError> {
@@ -211,6 +223,7 @@ impl PrewriteIntent {
     fn validate(&self) -> Result<(), ShardError> {
         if self.prepared.state() != TransactionState::Prepared
             || self.prepared.id() != self.intent.transaction_id()
+            || self.prepared.transaction_time() != self.intent.start_time()
             || self.prepared.record_digest() != self.intent.digest()
         {
             return Err(invalid_command_shape(
@@ -314,6 +327,7 @@ impl FinalizeParticipant {
                 })?;
                 if self.terminal.id() != intent.transaction_id()
                     || self.terminal.record_digest() != intent.digest()
+                    || self.terminal.transaction_time() <= intent.start_time()
                     || intent.mutations().iter().any(|mutation| {
                         mutation_transaction_time(mutation) != self.terminal.transaction_time()
                     })
@@ -1121,8 +1135,23 @@ impl<'a> Decoder<'a> {
     }
 
     fn mutations(&mut self) -> Result<Vec<LogicalMutation>, ShardError> {
-        let count = self.collection_count()?;
-        let mut mutations = Vec::new();
+        self.mutations_with_limit(
+            MAX_COLLECTION_ITEMS,
+            "command collection exceeds item limit",
+        )
+    }
+
+    fn mutations_with_limit(
+        &mut self,
+        limit: usize,
+        limit_message: &'static str,
+    ) -> Result<Vec<LogicalMutation>, ShardError> {
+        let count = self.count()?;
+        if count > limit {
+            return Err(invalid(limit_message));
+        }
+        self.allocation_budget.consume(count)?;
+        let mut mutations = Vec::with_capacity(count);
         for _ in 0..count {
             mutations.push(self.mutation()?);
         }

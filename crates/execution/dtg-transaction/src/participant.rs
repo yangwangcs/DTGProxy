@@ -63,6 +63,7 @@ pub enum ShardRequest {
     FinalizeParticipantCommit {
         header: ShardRequestHeader,
         transaction_id: TransactionId,
+        start_time: TransactionTime,
         commit_time: TransactionTime,
         intent_digest: Digest32,
         mutations: Vec<LogicalMutation>,
@@ -125,14 +126,21 @@ impl SubmissionReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredParticipantIntent {
     shard_id: ShardId,
+    start_time: TransactionTime,
     mutations: Vec<LogicalMutation>,
     digest: Digest32,
 }
 
 impl RecoveredParticipantIntent {
-    pub fn new(shard_id: ShardId, mutations: Vec<LogicalMutation>, digest: Digest32) -> Self {
+    pub fn new(
+        shard_id: ShardId,
+        start_time: TransactionTime,
+        mutations: Vec<LogicalMutation>,
+        digest: Digest32,
+    ) -> Self {
         Self {
             shard_id,
+            start_time,
             mutations,
             digest,
         }
@@ -140,6 +148,10 @@ impl RecoveredParticipantIntent {
 
     pub const fn shard_id(&self) -> ShardId {
         self.shard_id
+    }
+
+    pub const fn start_time(&self) -> TransactionTime {
+        self.start_time
     }
 
     pub fn mutations(&self) -> &[LogicalMutation] {

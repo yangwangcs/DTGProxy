@@ -157,13 +157,14 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
     let intent = ParticipantIntent::new(
         transaction_id,
         dtg_storage::ShardId::new(3).unwrap(),
+        TransactionTime::new(5).unwrap(),
         vec![committed_vertex_mutation(900)],
     )
     .unwrap();
     let prepared = TransactionRecord::new(
         transaction_id,
         TransactionState::Prepared,
-        TransactionTime::new(40).unwrap(),
+        TransactionTime::new(5).unwrap(),
         intent.digest(),
     )
     .unwrap();
@@ -190,7 +191,7 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
     assert!(mutations.iter().any(|mutation| matches!(
         mutation,
         LogicalMutation::PutReplicaMetadata(metadata)
-            if metadata.name() == "dtg.transaction_intent.v1"
+            if metadata.name() == dtg_shard::TRANSACTION_INTENT_METADATA_NAME
                 && matches!(metadata.value(), Value::Bytes(bytes) if ParticipantIntent::decode_current(bytes).is_ok())
     )));
     assert!(!mutations.iter().any(|mutation| matches!(
@@ -246,7 +247,7 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
     let aborted = TransactionRecord::new(
         transaction_id,
         TransactionState::Aborted,
-        TransactionTime::new(50).unwrap(),
+        TransactionTime::new(5).unwrap(),
         intent.digest(),
     )
     .unwrap();
@@ -274,6 +275,7 @@ fn participant_intent_is_current_only_bounded_and_digest_bound() {
     let original = ParticipantIntent::new(
         transaction_id,
         dtg_storage::ShardId::new(3).unwrap(),
+        TransactionTime::new(5).unwrap(),
         vec![committed_vertex_mutation(900)],
     )
     .unwrap();
@@ -284,7 +286,7 @@ fn participant_intent_is_current_only_bounded_and_digest_bound() {
     );
 
     let mut unknown = encoded.clone();
-    unknown[..4].copy_from_slice(&2_u32.to_be_bytes());
+    unknown[..4].copy_from_slice(&3_u32.to_be_bytes());
     assert!(ParticipantIntent::decode_current(&unknown).is_err());
 
     let mut trailing = encoded;
@@ -295,13 +297,14 @@ fn participant_intent_is_current_only_bounded_and_digest_bound() {
     let changed = ParticipantIntent::new(
         transaction_id,
         dtg_storage::ShardId::new(3).unwrap(),
+        TransactionTime::new(5).unwrap(),
         vec![committed_vertex_mutation(901)],
     )
     .unwrap();
     let prepared = TransactionRecord::new(
         transaction_id,
         TransactionState::Prepared,
-        TransactionTime::new(40).unwrap(),
+        TransactionTime::new(5).unwrap(),
         original.digest(),
     )
     .unwrap();
@@ -310,7 +313,7 @@ fn participant_intent_is_current_only_bounded_and_digest_bound() {
     let prepared = TransactionRecord::new(
         transaction_id,
         TransactionState::Prepared,
-        TransactionTime::new(40).unwrap(),
+        TransactionTime::new(5).unwrap(),
         original.digest(),
     )
     .unwrap();
@@ -327,6 +330,7 @@ fn commit_finalization_rejects_intent_timestamp_mismatch() {
     let intent = ParticipantIntent::new(
         transaction_id,
         dtg_storage::ShardId::new(3).unwrap(),
+        TransactionTime::new(5).unwrap(),
         vec![committed_vertex_mutation(900)],
     )
     .unwrap();
@@ -346,6 +350,7 @@ fn commit_finalization_rejects_intent_timestamp_mismatch() {
     let mixed = ParticipantIntent::new(
         TransactionId::new(92).unwrap(),
         dtg_storage::ShardId::new(3).unwrap(),
+        TransactionTime::new(5).unwrap(),
         vec![
             committed_vertex_mutation(901),
             LogicalMutation::PutVertex(
@@ -361,6 +366,62 @@ fn commit_finalization_rejects_intent_timestamp_mismatch() {
         ],
     );
     assert!(mixed.is_err());
+}
+
+#[test]
+fn participant_intent_binds_the_transaction_start_timestamp() {
+    let transaction_id = TransactionId::new(93).unwrap();
+    let shard_id = dtg_storage::ShardId::new(3).unwrap();
+    let at_five = ParticipantIntent::new(
+        transaction_id,
+        shard_id,
+        TransactionTime::new(5).unwrap(),
+        vec![committed_vertex_mutation(910)],
+    )
+    .unwrap();
+    let at_six = ParticipantIntent::new(
+        transaction_id,
+        shard_id,
+        TransactionTime::new(6).unwrap(),
+        vec![committed_vertex_mutation(910)],
+    )
+    .unwrap();
+    assert_ne!(at_five.digest(), at_six.digest());
+
+    let wrong_prepared_time = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Prepared,
+        TransactionTime::new(6).unwrap(),
+        at_five.digest(),
+    )
+    .unwrap();
+    assert!(
+        PrewriteIntent::new(
+            CommandId::new(911).unwrap(),
+            7,
+            10,
+            wrong_prepared_time,
+            at_five,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn participant_intent_decode_rejects_item_count_before_payload_decode() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&2_u32.to_be_bytes());
+    bytes.extend_from_slice(&93_u128.to_be_bytes());
+    bytes.extend_from_slice(&3_u64.to_be_bytes());
+    bytes.extend_from_slice(&5_i64.to_be_bytes());
+    bytes.extend_from_slice(&4_097_u32.to_be_bytes());
+
+    let error = ParticipantIntent::decode_current(&bytes).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("transaction intent mutation count")
+    );
 }
 
 fn fixture_machine() -> ShardStateMachine {
