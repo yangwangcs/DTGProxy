@@ -8,8 +8,9 @@ use dtg_storage::{
 };
 
 use crate::{
-    BaseGraphSnapshot, ParticipantService, ParticipantWrite, ShardRequest, ShardRequestHeader,
-    ShardSnapshotFence, SnapshotToken, SubmissionFailure, TransactionOverlay, TxnError, TxnFuture,
+    BaseGraphSnapshot, DurableParticipantManifest, DurableTransactionManifest, ParticipantService,
+    ParticipantWrite, ShardRequest, ShardRequestHeader, ShardSnapshotFence, SnapshotToken,
+    SubmissionFailure, TransactionOverlay, TxnError, TxnFuture,
     conflict::detect_mutation_conflicts, recovery::AbortPrevalidation,
 };
 
@@ -151,6 +152,9 @@ impl TemporalTxnCoordinator {
             context.overlay.validate(&context.base)?;
             validate_participants(context, &participants)?;
             participants.sort_by_key(ParticipantWrite::shard_id);
+            if participants.is_empty() {
+                return Ok(TransactionOutcome::Committed(context.snapshot.start_time));
+            }
 
             let existing_reservation = self
                 .timestamps
@@ -301,13 +305,14 @@ impl TemporalTxnCoordinator {
 
             let home = participants[0].shard_id();
             let home_fence = context.snapshot.shards[&home];
-            let decision_digest = decision_digest(
-                context.snapshot.transaction_id,
-                commit_time,
+            let manifest = transaction_manifest(
+                context,
                 intents
                     .iter()
                     .map(|(participant, _, digest)| (participant.shard_id(), *digest)),
-            );
+            )?;
+            let decision_digest =
+                manifest.decision_digest(TransactionState::Committed, commit_time)?;
             let decision = TransactionRecord::new(
                 context.snapshot.transaction_id,
                 TransactionState::Committed,
@@ -321,6 +326,7 @@ impl TemporalTxnCoordinator {
                     home_fence.backend_generation,
                 ),
                 decision,
+                manifest,
             };
             self.participants
                 .submit(home, request)
@@ -414,11 +420,9 @@ impl TemporalTxnCoordinator {
 
             let home = participants[0].shard_id();
             let home_fence = context.snapshot.shards[&home];
-            let digest = abort_decision_digest(
-                context.snapshot.transaction_id,
-                context.snapshot.start_time,
-                participants.iter().map(ParticipantWrite::shard_id),
-            );
+            let manifest = transaction_manifest(context, intents.iter().copied())?;
+            let digest =
+                manifest.decision_digest(TransactionState::Aborted, context.snapshot.start_time)?;
             let decision = TransactionRecord::new(
                 context.snapshot.transaction_id,
                 TransactionState::Aborted,
@@ -432,6 +436,7 @@ impl TemporalTxnCoordinator {
                     home_fence.backend_generation,
                 ),
                 decision,
+                manifest,
             };
             self.participants
                 .submit(home, request)
@@ -477,17 +482,38 @@ impl TemporalTxnCoordinator {
     }
 }
 
+pub(crate) fn transaction_manifest(
+    context: &TransactionContext,
+    participants: impl Iterator<Item = (ShardId, Digest32)>,
+) -> Result<DurableTransactionManifest, TxnError> {
+    DurableTransactionManifest::new(
+        context.snapshot.transaction_id,
+        context.snapshot.start_time,
+        context.snapshot.catalog_version,
+        participants
+            .map(|(shard_id, intent_digest)| {
+                let fence = context
+                    .snapshot
+                    .shards
+                    .get(&shard_id)
+                    .copied()
+                    .ok_or(TxnError::IncompleteSnapshot)?;
+                DurableParticipantManifest::new(shard_id, fence, intent_digest)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+}
+
 fn validate_participants(
     context: &TransactionContext,
     participants: &[ParticipantWrite],
 ) -> Result<(), TxnError> {
-    if participants.is_empty()
-        || participants
-            .iter()
-            .map(ParticipantWrite::mutations)
-            .map(<[LogicalMutation]>::len)
-            .sum::<usize>()
-            != context.overlay.mutations().len()
+    if participants
+        .iter()
+        .map(ParticipantWrite::mutations)
+        .map(<[LogicalMutation]>::len)
+        .sum::<usize>()
+        != context.overlay.mutations().len()
     {
         return Err(TxnError::ParticipantsMismatch);
     }
@@ -509,7 +535,10 @@ fn validate_participants(
         .map(ParticipantWrite::shard_id)
         .collect();
     if shard_ids.len() != participants.len()
-        || shard_ids != context.snapshot.shards.keys().copied().collect()
+        || !shard_ids
+            .iter()
+            .all(|shard_id| context.snapshot.shards.contains_key(shard_id))
+        || (participants.is_empty() != context.overlay.mutations().is_empty())
     {
         return Err(TxnError::ParticipantsMismatch);
     }

@@ -103,6 +103,44 @@ async fn timestamp_authority_rejects_conflicting_terminal_resolution() {
 }
 
 #[tokio::test]
+async fn pending_lower_commit_time_fences_the_published_start_frontier() {
+    let authority = DurableTimestampAuthority::open(Arc::new(MemoryTimestampLog::default()))
+        .await
+        .unwrap();
+    let first = TransactionId::new(31).unwrap();
+    let second = TransactionId::new(32).unwrap();
+    let later = TransactionId::new(33).unwrap();
+
+    assert_eq!(
+        authority.allocate_start_time(first).await.unwrap(),
+        TransactionTime::new(1).unwrap()
+    );
+    let lower = authority.reserve_commit_time(first).await.unwrap();
+    let higher = authority.reserve_commit_time(second).await.unwrap();
+    authority
+        .resolve_commit_time(second, higher, CommitResolution::Committed)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        authority.allocate_start_time(later).await.unwrap(),
+        TransactionTime::new(1).unwrap()
+    );
+
+    authority
+        .resolve_commit_time(first, lower, CommitResolution::Aborted)
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .allocate_start_time(TransactionId::new(34).unwrap())
+            .await
+            .unwrap(),
+        TransactionTime::new(4).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn timestamp_authority_fails_closed_on_malformed_replay() {
     let log = Arc::new(MemoryTimestampLog::default());
     log.entries.lock().unwrap().push(b"not-a-command".to_vec());

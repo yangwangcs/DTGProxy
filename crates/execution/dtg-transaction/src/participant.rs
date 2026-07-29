@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,6 +14,172 @@ use crate::TxnError;
 pub type TxnFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TxnError>> + Send + 'a>>;
 pub type SubmissionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SubmissionReceipt, SubmissionFailure>> + Send + 'a>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryLease {
+    transaction_id: TransactionId,
+    owner: u128,
+    epoch: u64,
+}
+
+impl RecoveryLease {
+    pub fn new(transaction_id: TransactionId, owner: u128, epoch: u64) -> Result<Self, TxnError> {
+        if owner == 0 || epoch == 0 {
+            return Err(TxnError::CorruptRecovery);
+        }
+        Ok(Self {
+            transaction_id,
+            owner,
+            epoch,
+        })
+    }
+
+    pub const fn transaction_id(self) -> TransactionId {
+        self.transaction_id
+    }
+
+    pub const fn owner(self) -> u128 {
+        self.owner
+    }
+
+    pub const fn epoch(self) -> u64 {
+        self.epoch
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableParticipantManifest {
+    shard_id: ShardId,
+    fence: crate::ShardSnapshotFence,
+    intent_digest: Digest32,
+}
+
+impl DurableParticipantManifest {
+    pub fn new(
+        shard_id: ShardId,
+        fence: crate::ShardSnapshotFence,
+        intent_digest: Digest32,
+    ) -> Result<Self, TxnError> {
+        if intent_digest.get() == [0; 32] {
+            return Err(TxnError::CorruptRecovery);
+        }
+        Ok(Self {
+            shard_id,
+            fence,
+            intent_digest,
+        })
+    }
+
+    pub const fn shard_id(self) -> ShardId {
+        self.shard_id
+    }
+
+    pub const fn fence(self) -> crate::ShardSnapshotFence {
+        self.fence
+    }
+
+    pub const fn intent_digest(self) -> Digest32 {
+        self.intent_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableTransactionManifest {
+    transaction_id: TransactionId,
+    start_time: TransactionTime,
+    catalog_version: dtg_kernel::Version,
+    participants: Vec<DurableParticipantManifest>,
+}
+
+impl DurableTransactionManifest {
+    pub fn new(
+        transaction_id: TransactionId,
+        start_time: TransactionTime,
+        catalog_version: dtg_kernel::Version,
+        mut participants: Vec<DurableParticipantManifest>,
+    ) -> Result<Self, TxnError> {
+        participants.sort_by_key(|participant| participant.shard_id());
+        let unique = participants
+            .iter()
+            .map(|participant| participant.shard_id())
+            .collect::<BTreeSet<_>>();
+        if catalog_version.get() == 0
+            || participants.is_empty()
+            || unique.len() != participants.len()
+        {
+            return Err(TxnError::CorruptRecovery);
+        }
+        Ok(Self {
+            transaction_id,
+            start_time,
+            catalog_version,
+            participants,
+        })
+    }
+
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    pub const fn start_time(&self) -> TransactionTime {
+        self.start_time
+    }
+
+    pub const fn catalog_version(&self) -> dtg_kernel::Version {
+        self.catalog_version
+    }
+
+    pub fn participants(&self) -> &[DurableParticipantManifest] {
+        &self.participants
+    }
+
+    pub fn decision_digest(
+        &self,
+        state: dtg_storage::TransactionState,
+        decision_time: TransactionTime,
+    ) -> Result<Digest32, TxnError> {
+        let mut hasher = blake3::Hasher::new();
+        match state {
+            dtg_storage::TransactionState::Committed if decision_time > self.start_time => {
+                hasher.update(b"dtg-transaction-home-decision-v1");
+                hasher.update(&self.transaction_id.get().to_be_bytes());
+                hasher.update(&decision_time.get().to_be_bytes());
+                for participant in &self.participants {
+                    hasher.update(&participant.shard_id().get().to_be_bytes());
+                    hasher.update(&participant.intent_digest().get());
+                }
+            }
+            dtg_storage::TransactionState::Aborted if decision_time == self.start_time => {
+                hasher.update(b"dtg-transaction-home-abort-v1");
+                hasher.update(&self.transaction_id.get().to_be_bytes());
+                hasher.update(&self.start_time.get().to_be_bytes());
+                for participant in &self.participants {
+                    hasher.update(&participant.shard_id().get().to_be_bytes());
+                }
+            }
+            dtg_storage::TransactionState::Prepared
+            | dtg_storage::TransactionState::Committed
+            | dtg_storage::TransactionState::Aborted => return Err(TxnError::CorruptRecovery),
+        }
+        Ok(Digest32::new(*hasher.finalize().as_bytes()))
+    }
+
+    pub fn snapshot_token(&self) -> Result<crate::SnapshotToken, TxnError> {
+        crate::SnapshotToken::new(
+            self.transaction_id,
+            self.start_time,
+            self.catalog_version,
+            self.participants
+                .iter()
+                .map(|participant| {
+                    let mut fence = participant.fence();
+                    fence.closed_time = self.start_time;
+                    (participant.shard_id(), fence)
+                })
+                .collect(),
+        )
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubmissionFailure {
@@ -86,6 +253,7 @@ pub enum ShardRequest {
     RecordHomeDecision {
         header: ShardRequestHeader,
         decision: TransactionRecord,
+        manifest: DurableTransactionManifest,
     },
     FinalizeParticipantCommit {
         header: ShardRequestHeader,
@@ -147,9 +315,12 @@ impl ShardRequest {
                 hasher.update(&snapshot_applied_index.to_be_bytes());
                 hash_mutations(&mut hasher, mutations);
             }
-            Self::RecordHomeDecision { decision, .. } => {
+            Self::RecordHomeDecision {
+                decision, manifest, ..
+            } => {
                 hasher.update(&[3]);
                 hash_transaction(&mut hasher, decision);
+                hash_manifest(&mut hasher, manifest);
             }
             Self::FinalizeParticipantCommit {
                 transaction_id,
@@ -294,6 +465,20 @@ fn hash_value(hasher: &mut blake3::Hasher, value: &Value) {
 fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
+}
+
+fn hash_manifest(hasher: &mut blake3::Hasher, manifest: &DurableTransactionManifest) {
+    hasher.update(&manifest.transaction_id().get().to_be_bytes());
+    hasher.update(&manifest.start_time().get().to_be_bytes());
+    hasher.update(&manifest.catalog_version().get().to_be_bytes());
+    hasher.update(&(manifest.participants().len() as u64).to_be_bytes());
+    for participant in manifest.participants() {
+        hasher.update(&participant.shard_id().get().to_be_bytes());
+        hasher.update(&participant.fence().placement_epoch.get().to_be_bytes());
+        hasher.update(&participant.fence().backend_generation.get().to_be_bytes());
+        hasher.update(&participant.fence().applied_index.to_be_bytes());
+        hasher.update(&participant.intent_digest().get());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -492,6 +677,26 @@ pub trait ShardCommandExecutor: Send + Sync {
         shard_id: ShardId,
         transaction_id: TransactionId,
     ) -> TxnFuture<'_, TransactionHistory>;
+
+    fn acquire_recovery_lease(
+        &self,
+        _transaction_id: TransactionId,
+        _owner: u128,
+    ) -> TxnFuture<'_, RecoveryLease> {
+        Box::pin(async { Err(TxnError::CorruptRecovery) })
+    }
+
+    fn recovery_manifest(
+        &self,
+        _transaction_id: TransactionId,
+        _lease: RecoveryLease,
+    ) -> TxnFuture<'_, Option<DurableTransactionManifest>> {
+        Box::pin(async { Err(TxnError::CorruptRecovery) })
+    }
+
+    fn release_recovery_lease(&self, _lease: RecoveryLease) -> TxnFuture<'_, ()> {
+        Box::pin(async { Err(TxnError::CorruptRecovery) })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -555,5 +760,25 @@ impl ParticipantService {
         transaction_id: TransactionId,
     ) -> TxnFuture<'_, TransactionHistory> {
         self.executor.transaction_history(shard_id, transaction_id)
+    }
+
+    pub fn acquire_recovery_lease(
+        &self,
+        transaction_id: TransactionId,
+        owner: u128,
+    ) -> TxnFuture<'_, RecoveryLease> {
+        self.executor.acquire_recovery_lease(transaction_id, owner)
+    }
+
+    pub fn recovery_manifest(
+        &self,
+        transaction_id: TransactionId,
+        lease: RecoveryLease,
+    ) -> TxnFuture<'_, Option<DurableTransactionManifest>> {
+        self.executor.recovery_manifest(transaction_id, lease)
+    }
+
+    pub fn release_recovery_lease(&self, lease: RecoveryLease) -> TxnFuture<'_, ()> {
+        self.executor.release_recovery_lease(lease)
     }
 }

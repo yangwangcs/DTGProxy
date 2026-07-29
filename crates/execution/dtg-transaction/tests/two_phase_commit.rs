@@ -6,7 +6,9 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use dtg_shard::{
-    CommitSingleShardTransaction, FinalizeParticipant, ParticipantIntent, PrewriteIntent,
+    ApplyRejection, CommitSingleShardTransaction, FinalizeParticipant,
+    HomeDecisionManifest as PhysicalHomeDecisionManifest,
+    HomeDecisionParticipant as PhysicalHomeDecisionParticipant, ParticipantIntent, PrewriteIntent,
     RecordHomeDecision, ShardCommand as PhysicalShardCommand, ShardError, ShardStateMachine,
     decode_single_shard_transaction_metadata,
 };
@@ -17,12 +19,13 @@ use dtg_storage::{
 use dtg_storage_fjall::FjallReplicaStore;
 use dtg_transaction::{
     BackendGeneration, ChangeCursor, ChangeRecord, CommitResolution, CommitTimeReservation,
-    LogicalMutation, ParticipantWrite, PlacementEpoch, RecoveredParticipantIntent,
-    RecoveredSingleShardCommit, ReplicaMetadata, ShardCommandExecutor, ShardId, ShardRequest,
-    ShardSnapshotFence, SnapshotToken, SubmissionFailure, SubmissionFuture, SubmissionReceipt,
-    TemporalTxnCoordinator, TimestampAuthority, TransactionContext, TransactionHistory,
-    TransactionId, TransactionOutcome, TransactionRecord, TransactionState, TransactionTime,
-    TxnError, TxnFuture, ValidInterval, Value, Version, VertexId, VertexVersion,
+    DurableParticipantManifest, DurableTransactionManifest, LogicalMutation, ParticipantWrite,
+    PlacementEpoch, RecoveredParticipantIntent, RecoveredSingleShardCommit, RecoveryLease,
+    ReplicaMetadata, ShardCommandExecutor, ShardId, ShardRequest, ShardSnapshotFence,
+    SnapshotToken, SubmissionFailure, SubmissionFuture, SubmissionReceipt, TemporalTxnCoordinator,
+    TimestampAuthority, TransactionContext, TransactionHistory, TransactionId, TransactionOutcome,
+    TransactionRecord, TransactionState, TransactionTime, TxnError, TxnFuture, ValidInterval,
+    Value, Version, VertexId, VertexVersion,
 };
 
 #[test]
@@ -57,6 +60,121 @@ fn single_shard_fast_path_uses_one_deterministic_command() {
         .collect();
     assert_eq!(command_ids.len(), 1);
     assert_eq!(timestamps.published.lock().unwrap().as_slice(), &[50]);
+}
+
+#[test]
+fn read_fence_shards_are_independent_from_write_participants() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(FakeShards::default());
+    let coordinator = TemporalTxnCoordinator::new(timestamps, shards.clone());
+    let mut context = context(&[3, 9]);
+    let mutation = vertex_mutation(1);
+    context.stage(mutation.clone()).unwrap();
+
+    assert_eq!(
+        block_on(coordinator.commit(
+            &context,
+            vec![ParticipantWrite::new(ShardId::new(9).unwrap(), vec![mutation]).unwrap()],
+        )),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    let commands = shards.commands.lock().unwrap();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, ShardId::new(9).unwrap());
+    assert!(matches!(
+        commands[0].1,
+        ShardRequest::CommitSingleShard { .. }
+    ));
+}
+
+#[test]
+fn asymmetric_single_write_recovery_finds_the_durable_write_shard() {
+    let root = tempfile::tempdir().unwrap();
+    let bindings = BTreeMap::from([
+        (ShardId::new(3).unwrap(), fixture_binding(3, 4)),
+        (ShardId::new(9).unwrap(), fixture_binding(9, 10)),
+    ]);
+    let paths = BTreeMap::from([
+        (ShardId::new(3).unwrap(), root.path().join("shard-3")),
+        (ShardId::new(9).unwrap(), root.path().join("shard-9")),
+    ]);
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let mut context = context_with_transaction(&[3, 9], TransactionId::new(502).unwrap());
+    let mutation = vertex_mutation(1);
+    context.stage(mutation.clone()).unwrap();
+    let participant = ParticipantWrite::new(ShardId::new(9).unwrap(), vec![mutation]).unwrap();
+
+    {
+        let shards = Arc::new(FjallShards::open(&paths, &bindings));
+        shards.crash_after(1);
+        let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+        assert_eq!(
+            block_on(coordinator.commit(&context, vec![participant])),
+            Err(TxnError::InjectedCrash)
+        );
+        assert_eq!(shards.applied_index(ShardId::new(9).unwrap()), 1);
+        assert_eq!(shards.graph_mutation_count(), 1);
+    }
+
+    let reopened = Arc::new(FjallShards::open(&paths, &bindings));
+    let recovery = TemporalTxnCoordinator::new(timestamps.clone(), reopened.clone());
+    assert_eq!(
+        block_on(recovery.recover(&context)),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    assert_eq!(reopened.applied_index(ShardId::new(9).unwrap()), 1);
+    assert_eq!(reopened.graph_mutation_count(), 1);
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(
+            transaction_time(50),
+            Some(CommitResolution::Committed)
+        )))
+    );
+}
+
+#[test]
+fn asymmetric_two_phase_recovery_uses_only_durable_write_participants() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(DurableShards::default());
+    shards.set_crash(CrashPoint::After(3));
+    let coordinator = TemporalTxnCoordinator::new(timestamps, shards.clone());
+    let mut context = context(&[3, 9, 11]);
+    let first = vertex_mutation(1);
+    let second = vertex_mutation(2);
+    context.stage(first.clone()).unwrap();
+    context.stage(second.clone()).unwrap();
+    let participants = vec![
+        ParticipantWrite::new(ShardId::new(9).unwrap(), vec![first]).unwrap(),
+        ParticipantWrite::new(ShardId::new(11).unwrap(), vec![second]).unwrap(),
+    ];
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, participants)),
+        Err(TxnError::InjectedCrash)
+    );
+    shards.clear_crash();
+    assert_eq!(
+        block_on(coordinator.recover(&context)),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    assert_eq!(shards.graph_mutation_count(), 2);
+}
+
+#[test]
+fn read_only_transaction_commits_without_timestamp_or_shard_writes() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(FakeShards::default());
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let context = context(&[3, 9]);
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, Vec::new())),
+        Ok(TransactionOutcome::Committed(context.snapshot().start_time))
+    );
+    assert!(shards.commands.lock().unwrap().is_empty());
+    assert!(timestamps.reserved.lock().unwrap().is_empty());
+    assert!(timestamps.published.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -453,6 +571,34 @@ fn recovery_requires_a_home_decision_and_finishes_commit_or_abort() {
 }
 
 #[test]
+fn replacement_coordinator_recovers_orphaned_prepares_from_transaction_id_under_lease() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(DurableShards::default());
+    let (context, participants) = two_shard_transaction();
+    let manifest = recovery_manifest(&context, &participants, transaction_time(50));
+    shards.install_recovery_manifest(manifest);
+    shards.set_history_unavailable(true);
+    shards.set_crash(CrashPoint::Before(3));
+    let original = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+
+    assert_eq!(
+        block_on(original.commit(&context, participants)),
+        Err(TxnError::InjectedCrash)
+    );
+    shards.clear_crash();
+    shards.set_history_unavailable(false);
+    drop(original);
+
+    let replacement = TemporalTxnCoordinator::new(timestamps, shards.clone());
+    assert_eq!(
+        block_on(replacement.recover_transaction(context.snapshot().transaction_id, 900,)),
+        Ok(TransactionOutcome::Aborted)
+    );
+    assert_eq!(shards.recovery_owners.lock().unwrap().as_slice(), &[900]);
+    assert!(shards.recovery_leases.lock().unwrap().is_empty());
+}
+
+#[test]
 fn recovery_rejects_contradictory_or_corrupt_terminal_history_before_publication() {
     for terminal_case in [
         TerminalCase::ContradictHome,
@@ -794,6 +940,34 @@ fn failed_prewrite_with_unavailable_authority_remains_unresolved() {
 }
 
 #[test]
+fn recovery_uses_resolved_abort_when_no_prewrite_was_durable() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(DurableShards::default());
+    shards.set_crash(CrashPoint::Before(1));
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let (context, participants) = two_shard_transaction();
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, participants)),
+        Ok(TransactionOutcome::Aborted)
+    );
+    assert_eq!(shards.home_abort_decision_count(), 0);
+    shards.clear_crash();
+    assert_eq!(
+        block_on(coordinator.recover(&context)),
+        Ok(TransactionOutcome::Aborted)
+    );
+    assert_eq!(shards.home_abort_decision_count(), 0);
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(
+            transaction_time(50),
+            Some(CommitResolution::Aborted)
+        )))
+    );
+}
+
+#[test]
 fn crash_matrix_and_visibility_publication_are_recoverable_and_idempotent() {
     for crash in [
         CrashPoint::Before(1),
@@ -815,7 +989,10 @@ fn crash_matrix_and_visibility_publication_are_recoverable_and_idempotent() {
             block_on(coordinator.recover(&context)),
             Ok(TransactionOutcome::Aborted)
         );
-        assert_eq!(shards.home_abort_decision_count(), 1);
+        assert_eq!(
+            shards.home_abort_decision_count(),
+            usize::from(crash != CrashPoint::Before(1))
+        );
         assert!(!shards.graph_is_visible());
         assert_eq!(timestamps.published.lock().unwrap().as_slice(), &[50]);
     }
@@ -1295,6 +1472,52 @@ fn two_shard_transaction_with(
     )
 }
 
+fn recovery_manifest(
+    context: &TransactionContext,
+    participants: &[ParticipantWrite],
+    commit_time: TransactionTime,
+) -> DurableTransactionManifest {
+    let entries = participants
+        .iter()
+        .map(|participant| {
+            let fence = context.snapshot().shards[&participant.shard_id()];
+            let mutations = participant
+                .mutations()
+                .iter()
+                .map(|mutation| match mutation {
+                    LogicalMutation::PutVertex(vertex) => LogicalMutation::PutVertex(
+                        VertexVersion::new(
+                            vertex.id(),
+                            vertex.version(),
+                            vertex.valid_time(),
+                            commit_time,
+                            vertex.properties().clone(),
+                        )
+                        .unwrap(),
+                    ),
+                    _ => panic!("fixture uses only vertex puts"),
+                })
+                .collect();
+            let intent = ParticipantIntent::new(
+                context.snapshot().transaction_id,
+                participant.shard_id(),
+                context.snapshot().start_time,
+                fence.applied_index,
+                mutations,
+            )
+            .unwrap();
+            DurableParticipantManifest::new(participant.shard_id(), fence, intent.digest()).unwrap()
+        })
+        .collect();
+    DurableTransactionManifest::new(
+        context.snapshot().transaction_id,
+        context.snapshot().start_time,
+        context.snapshot().catalog_version,
+        entries,
+    )
+    .unwrap()
+}
+
 fn context(shards: &[u64]) -> TransactionContext {
     context_with_transaction(shards, TransactionId::new(99).unwrap())
 }
@@ -1580,6 +1803,9 @@ struct DurableShards {
     applied_commands: Mutex<BTreeSet<u128>>,
     durable: Mutex<BTreeMap<ShardId, Vec<ChangeRecord>>>,
     history_unavailable: Mutex<bool>,
+    recovery_manifest: Mutex<Option<DurableTransactionManifest>>,
+    recovery_leases: Mutex<BTreeMap<u128, RecoveryLease>>,
+    recovery_owners: Mutex<Vec<u128>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1605,6 +1831,10 @@ enum TerminalCase {
 }
 
 impl DurableShards {
+    fn install_recovery_manifest(&self, manifest: DurableTransactionManifest) {
+        *self.recovery_manifest.lock().unwrap() = Some(manifest);
+    }
+
     fn crash_after(&self, boundary: usize) {
         self.set_crash(CrashPoint::After(boundary));
     }
@@ -1852,6 +2082,51 @@ impl ShardCommandExecutor for DurableShards {
             transaction_history_from_changes(shard_id, transaction_id, &changes)
         })
     }
+
+    fn acquire_recovery_lease(
+        &self,
+        transaction_id: TransactionId,
+        owner: u128,
+    ) -> TxnFuture<'_, RecoveryLease> {
+        Box::pin(async move {
+            let lease = RecoveryLease::new(transaction_id, owner, 1)?;
+            self.recovery_owners.lock().unwrap().push(owner);
+            self.recovery_leases
+                .lock()
+                .unwrap()
+                .insert(transaction_id.get(), lease);
+            Ok(lease)
+        })
+    }
+
+    fn recovery_manifest(
+        &self,
+        transaction_id: TransactionId,
+        lease: RecoveryLease,
+    ) -> TxnFuture<'_, Option<DurableTransactionManifest>> {
+        Box::pin(async move {
+            if self
+                .recovery_leases
+                .lock()
+                .unwrap()
+                .get(&transaction_id.get())
+                != Some(&lease)
+            {
+                return Err(TxnError::CorruptRecovery);
+            }
+            Ok(self.recovery_manifest.lock().unwrap().clone())
+        })
+    }
+
+    fn release_recovery_lease(&self, lease: RecoveryLease) -> TxnFuture<'_, ()> {
+        Box::pin(async move {
+            self.recovery_leases
+                .lock()
+                .unwrap()
+                .remove(&lease.transaction_id().get());
+            Ok(())
+        })
+    }
 }
 
 fn materialize_command(command: &PhysicalShardCommand) -> Result<Vec<LogicalMutation>, TxnError> {
@@ -1867,7 +2142,11 @@ fn materialize_command(command: &PhysicalShardCommand) -> Result<Vec<LogicalMuta
                 Value::Bytes(shard_result(command.intent().encode_current())?),
             )?),
         ]),
-        PhysicalShardCommand::RecordHomeDecision(command) => Ok(command.mutations().to_vec()),
+        PhysicalShardCommand::RecordHomeDecision(command) => {
+            Ok(vec![LogicalMutation::PutTransaction(
+                command.decision().clone(),
+            )])
+        }
         PhysicalShardCommand::FinalizeParticipant(command) => {
             let mut mutations = command
                 .intent()
@@ -1962,15 +2241,42 @@ fn map_request_to_shard(
                 Some(digest),
             ))
         }
-        ShardRequest::RecordHomeDecision { header, decision } => Ok((
-            PhysicalShardCommand::RecordHomeDecision(shard_result(RecordHomeDecision::new(
-                header.command_id(),
-                header.placement_epoch().get(),
-                header.backend_generation().get(),
-                vec![LogicalMutation::PutTransaction(decision.clone())],
-            ))?),
-            None,
-        )),
+        ShardRequest::RecordHomeDecision {
+            header,
+            decision,
+            manifest,
+        } => {
+            let participants = shard_result(
+                manifest
+                    .participants()
+                    .iter()
+                    .map(|participant| {
+                        PhysicalHomeDecisionParticipant::new(
+                            participant.shard_id(),
+                            participant.fence().placement_epoch,
+                            participant.fence().backend_generation,
+                            participant.fence().applied_index,
+                            participant.intent_digest(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>(),
+            )?;
+            let physical_manifest = shard_result(PhysicalHomeDecisionManifest::new(
+                manifest.start_time(),
+                manifest.catalog_version(),
+                participants,
+            ))?;
+            Ok((
+                PhysicalShardCommand::RecordHomeDecision(shard_result(RecordHomeDecision::new(
+                    header.command_id(),
+                    header.placement_epoch().get(),
+                    header.backend_generation().get(),
+                    decision.clone(),
+                    physical_manifest,
+                ))?),
+                None,
+            ))
+        }
         ShardRequest::FinalizeParticipantCommit {
             header,
             transaction_id,
@@ -2319,6 +2625,9 @@ impl ShardCommandExecutor for FjallShards {
                     .apply_committed(1, index, command)
                     .map_err(shard_submission_failure)?
             };
+            if let Some(rejection) = receipt.rejection() {
+                return Err(apply_rejection_failure(rejection));
+            }
             if *self.crash_after.lock().unwrap() == Some(boundary) {
                 *self.visibility_at_crash.lock().unwrap() = Some(
                     self.graph_mutations_are_durable()
@@ -2377,6 +2686,19 @@ impl ShardCommandExecutor for FjallShards {
             transaction_history_from_changes(shard_id, transaction_id, &changes)
         })
     }
+}
+
+fn apply_rejection_failure(rejection: ApplyRejection) -> SubmissionFailure {
+    let error = match rejection {
+        ApplyRejection::StalePlacementEpoch => TxnError::StalePlacementEpoch,
+        ApplyRejection::StaleBackendGeneration => TxnError::StaleBackendGeneration,
+        ApplyRejection::WriteConflict => TxnError::WriteConflict,
+        ApplyRejection::InvalidCommand | ApplyRejection::ClosedTimestampFenced => {
+            TxnError::InvalidMutation
+        }
+        ApplyRejection::HomeDecisionConflict => TxnError::Shard(rejection.code().to_owned()),
+    };
+    SubmissionFailure::Definitive(error)
 }
 
 fn fixture_binding(shard_id: u64, replica_id: u64) -> ReplicaBinding {

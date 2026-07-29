@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dtg_kernel::{
     BackendGeneration, Digest32, PlacementEpoch, ShardId, TransactionId, TransactionTime,
@@ -11,10 +11,11 @@ use dtg_storage::{
 
 use crate::{MigrationCommand, MigrationPhase, ShardError};
 
-pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 2;
+pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 3;
 pub const SUPPORTED_TRANSACTION_INTENT_VERSION: u32 = 3;
 
 pub const TRANSACTION_INTENT_METADATA_NAME: &str = "dtg.transaction_intent.v3";
+pub(crate) const CLOSED_TIMESTAMP_METADATA_NAME: &str = "dtg.closed_timestamp";
 const MAX_TRANSACTION_INTENT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_TRANSACTION_INTENT_ITEMS: usize = 4_096;
 
@@ -326,45 +327,200 @@ impl PrewriteIntent {
     }
 }
 
-macro_rules! mutation_command {
-    ($name:ident, $validator:ident) => {
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        pub struct $name {
-            header: CommandHeader,
-            mutations: Vec<LogicalMutation>,
-        }
-
-        impl $name {
-            pub fn new(
-                command_id: CommandId,
-                placement_epoch: u64,
-                backend_generation: u64,
-                mutations: Vec<LogicalMutation>,
-            ) -> Result<Self, ShardError> {
-                if mutations.is_empty() {
-                    return Err(ShardError::InvalidCommand(
-                        concat!(stringify!($name), " must contain mutations").into(),
-                    ));
-                }
-                $validator(&mutations)?;
-                Ok(Self {
-                    header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
-                    mutations,
-                })
-            }
-
-            pub const fn header(&self) -> CommandHeader {
-                self.header
-            }
-
-            pub fn mutations(&self) -> &[LogicalMutation] {
-                &self.mutations
-            }
-        }
-    };
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HomeDecisionParticipant {
+    shard_id: ShardId,
+    placement_epoch: PlacementEpoch,
+    backend_generation: BackendGeneration,
+    snapshot_applied_index: u64,
+    intent_digest: Digest32,
 }
 
-mutation_command!(RecordHomeDecision, validate_home_decision);
+impl HomeDecisionParticipant {
+    pub fn new(
+        shard_id: ShardId,
+        placement_epoch: PlacementEpoch,
+        backend_generation: BackendGeneration,
+        snapshot_applied_index: u64,
+        intent_digest: Digest32,
+    ) -> Result<Self, ShardError> {
+        if intent_digest.get() == [0; 32] {
+            return Err(invalid_command_shape(
+                "home decision participant digest must be nonzero",
+            ));
+        }
+        Ok(Self {
+            shard_id,
+            placement_epoch,
+            backend_generation,
+            snapshot_applied_index,
+            intent_digest,
+        })
+    }
+
+    pub const fn shard_id(self) -> ShardId {
+        self.shard_id
+    }
+
+    pub const fn placement_epoch(self) -> PlacementEpoch {
+        self.placement_epoch
+    }
+
+    pub const fn backend_generation(self) -> BackendGeneration {
+        self.backend_generation
+    }
+
+    pub const fn snapshot_applied_index(self) -> u64 {
+        self.snapshot_applied_index
+    }
+
+    pub const fn intent_digest(self) -> Digest32 {
+        self.intent_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HomeDecisionManifest {
+    start_time: TransactionTime,
+    catalog_version: Version,
+    participants: Vec<HomeDecisionParticipant>,
+}
+
+impl HomeDecisionManifest {
+    pub fn new(
+        start_time: TransactionTime,
+        catalog_version: Version,
+        mut participants: Vec<HomeDecisionParticipant>,
+    ) -> Result<Self, ShardError> {
+        participants.sort_by_key(|participant| participant.shard_id());
+        let unique = participants
+            .iter()
+            .map(|participant| participant.shard_id())
+            .collect::<BTreeSet<_>>();
+        if catalog_version.get() == 0
+            || participants.is_empty()
+            || participants.len() > MAX_TRANSACTION_INTENT_ITEMS
+            || unique.len() != participants.len()
+        {
+            return Err(invalid_command_shape(
+                "home decision manifest must contain unique durable participants",
+            ));
+        }
+        Ok(Self {
+            start_time,
+            catalog_version,
+            participants,
+        })
+    }
+
+    pub const fn start_time(&self) -> TransactionTime {
+        self.start_time
+    }
+
+    pub const fn catalog_version(&self) -> Version {
+        self.catalog_version
+    }
+
+    pub fn participants(&self) -> &[HomeDecisionParticipant] {
+        &self.participants
+    }
+
+    pub fn decision_digest(
+        &self,
+        transaction_id: TransactionId,
+        state: TransactionState,
+        decision_time: TransactionTime,
+    ) -> Result<Digest32, ShardError> {
+        let mut hasher = blake3::Hasher::new();
+        match state {
+            TransactionState::Committed if decision_time > self.start_time => {
+                hasher.update(b"dtg-transaction-home-decision-v1");
+                hasher.update(&transaction_id.get().to_be_bytes());
+                hasher.update(&decision_time.get().to_be_bytes());
+                for participant in &self.participants {
+                    hasher.update(&participant.shard_id().get().to_be_bytes());
+                    hasher.update(&participant.intent_digest().get());
+                }
+            }
+            TransactionState::Aborted if decision_time == self.start_time => {
+                hasher.update(b"dtg-transaction-home-abort-v1");
+                hasher.update(&transaction_id.get().to_be_bytes());
+                hasher.update(&self.start_time.get().to_be_bytes());
+                for participant in &self.participants {
+                    hasher.update(&participant.shard_id().get().to_be_bytes());
+                }
+            }
+            TransactionState::Prepared
+            | TransactionState::Committed
+            | TransactionState::Aborted => {
+                return Err(invalid_command_shape(
+                    "home decision time does not match its terminal state",
+                ));
+            }
+        }
+        Ok(Digest32::new(*hasher.finalize().as_bytes()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordHomeDecision {
+    header: CommandHeader,
+    decision: TransactionRecord,
+    manifest: HomeDecisionManifest,
+}
+
+impl RecordHomeDecision {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        decision: TransactionRecord,
+        manifest: HomeDecisionManifest,
+    ) -> Result<Self, ShardError> {
+        let command = Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            decision,
+            manifest,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub const fn decision(&self) -> &TransactionRecord {
+        &self.decision
+    }
+
+    pub const fn manifest(&self) -> &HomeDecisionManifest {
+        &self.manifest
+    }
+
+    fn validate(&self) -> Result<(), ShardError> {
+        if !matches!(
+            self.decision.state(),
+            TransactionState::Committed | TransactionState::Aborted
+        ) || self.decision.record_digest()
+            != self.manifest.decision_digest(
+                self.decision.id(),
+                self.decision.state(),
+                self.decision.transaction_time(),
+            )?
+        {
+            return Err(invalid_command_shape(
+                "home decision must match its durable participant manifest",
+            ));
+        }
+        Ok(())
+    }
+
+    fn mutations(&self) -> Result<Vec<LogicalMutation>, ShardError> {
+        self.validate()?;
+        Ok(vec![LogicalMutation::PutTransaction(self.decision.clone())])
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FinalizeParticipant {
@@ -548,14 +704,11 @@ impl ShardCommand {
                 Ok(command.mutations.clone())
             }
             Self::PrewriteIntent(command) => command.mutations(),
-            Self::RecordHomeDecision(command) => {
-                validate_home_decision(&command.mutations)?;
-                Ok(command.mutations.clone())
-            }
+            Self::RecordHomeDecision(command) => command.mutations(),
             Self::FinalizeParticipant(command) => command.mutations(),
             Self::AdvanceClosedTimestamp(command) => Ok(vec![LogicalMutation::PutReplicaMetadata(
                 ReplicaMetadata::new(
-                    "dtg.closed_timestamp",
+                    CLOSED_TIMESTAMP_METADATA_NAME,
                     Value::Integer(command.closed_timestamp().get()),
                 )?,
             )]),
@@ -586,7 +739,7 @@ impl ShardCommand {
             }
             Self::CommitSingleShardTransaction(command) => command.validate()?,
             Self::PrewriteIntent(command) => command.validate()?,
-            Self::RecordHomeDecision(command) => validate_home_decision(command.mutations())?,
+            Self::RecordHomeDecision(command) => command.validate()?,
             Self::FinalizeParticipant(command) => command.validate()?,
             Self::AdvanceClosedTimestamp(_) | Self::InstallSnapshot(_) | Self::Migration(_) => {}
         }
@@ -616,7 +769,24 @@ impl ShardCommand {
             Self::RecordHomeDecision(command) => {
                 encoder.u8(3);
                 encoder.header(command.header());
-                encoder.mutations(command.mutations())?;
+                encoder.transaction(command.decision());
+                encoder.i64(command.manifest().start_time().get());
+                encoder.u64(command.manifest().catalog_version().get());
+                encoder.u32(
+                    command
+                        .manifest()
+                        .participants()
+                        .len()
+                        .try_into()
+                        .map_err(|_| invalid("too many home decision participants"))?,
+                );
+                for participant in command.manifest().participants() {
+                    encoder.u64(participant.shard_id().get());
+                    encoder.u64(participant.placement_epoch().get());
+                    encoder.u64(participant.backend_generation().get());
+                    encoder.u64(participant.snapshot_applied_index());
+                    encoder.bytes(&participant.intent_digest().get())?;
+                }
             }
             Self::FinalizeParticipant(command) => {
                 encoder.u8(4);
@@ -688,10 +858,29 @@ impl ShardCommand {
                 prepared: decoder.transaction()?,
                 intent: ParticipantIntent::decode_current(decoder.bytes()?)?,
             }),
-            3 => Self::RecordHomeDecision(RecordHomeDecision {
-                header,
-                mutations: decoder.mutations()?,
-            }),
+            3 => {
+                let decision = decoder.transaction()?;
+                let start_time = TransactionTime::new(decoder.i64()?)?;
+                let catalog_version = Version::new(decoder.u64()?);
+                let count = decoder.collection_count()?;
+                let mut participants = Vec::with_capacity(count);
+                for _ in 0..count {
+                    participants.push(HomeDecisionParticipant::new(
+                        ShardId::new(decoder.u64()?)?,
+                        PlacementEpoch::new(decoder.u64()?)?,
+                        BackendGeneration::new(decoder.u64()?)?,
+                        decoder.u64()?,
+                        Digest32::new(decoder.fixed_32()?),
+                    )?);
+                }
+                Self::RecordHomeDecision(RecordHomeDecision::new(
+                    header.command_id(),
+                    header.placement_epoch().get(),
+                    header.backend_generation().get(),
+                    decision,
+                    HomeDecisionManifest::new(start_time, catalog_version, participants)?,
+                )?)
+            }
             4 => Self::FinalizeParticipant(FinalizeParticipant {
                 header,
                 terminal: decoder.transaction()?,
@@ -756,7 +945,6 @@ impl ShardCommand {
                     mutations,
                     ..
                 })
-                | Self::RecordHomeDecision(RecordHomeDecision { mutations, .. })
                 if mutations.is_empty()
         ) {
             return Err(invalid("mutation command must not be empty"));
@@ -952,25 +1140,6 @@ fn mutation_transaction_time(mutation: &LogicalMutation) -> TransactionTime {
         LogicalMutation::PutTransaction(_) | LogicalMutation::PutReplicaMetadata(_) => {
             unreachable!("transaction intents reject non-graph mutations before timestamp checks")
         }
-    }
-}
-
-fn validate_home_decision(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
-    if mutations.len() == 1
-        && matches!(
-            &mutations[0],
-            LogicalMutation::PutTransaction(transaction)
-                if matches!(
-                    transaction.state(),
-                    TransactionState::Committed | TransactionState::Aborted
-                )
-        )
-    {
-        Ok(())
-    } else {
-        Err(invalid_command_shape(
-            "home decision requires one terminal transaction record",
-        ))
     }
 }
 

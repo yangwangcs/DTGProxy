@@ -5,7 +5,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_kernel::{Digest32, KernelError, TransactionId, TransactionTime, ValidInterval};
 use dtg_storage::{
-    ChangeCursor, ChangeRecord, ChangesRead, CommandId, CommittedShardBatch, EdgeId,
+    BindingRole, ChangeCursor, ChangeRecord, ChangesRead, CommandId, CommittedShardBatch, EdgeId,
     LogicalMutation, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError,
     TransactionRecord, TransactionState, Value, VertexId,
 };
@@ -16,7 +16,7 @@ use crate::{ParticipantIntent, ShardCommand};
 const HISTORY_PAGE_LIMIT: u32 = 256;
 const HISTORY_PAGE_BUDGET: usize = 256;
 const HISTORY_RECORD_BUDGET: usize = HISTORY_PAGE_LIMIT as usize * HISTORY_PAGE_BUDGET;
-const HOME_DECISION_METADATA_NAME: &str = "dtg.transaction_home_decision.v1";
+const HOME_DECISION_METADATA_PREFIX: &str = "dtg.transaction_home_decision.v2/";
 pub const SINGLE_SHARD_TRANSACTION_METADATA_NAME: &str = "dtg.single_shard_transaction.v1/";
 pub const ACTIVE_TRANSACTION_INTENTS_METADATA_NAME: &str = "dtg.transaction_active_intents.v1";
 pub const TRANSACTION_STATE_METADATA_PREFIX: &str = "dtg.transaction_state.v1/";
@@ -68,6 +68,7 @@ pub enum ShardError {
         actual: u64,
     },
     WriteConflict,
+    HomeDecisionConflict,
     CorruptIntentHistory(String),
     BindingMismatch,
     Storage(StorageError),
@@ -88,6 +89,7 @@ impl ShardError {
             Self::StalePlacementEpoch { .. } => "DTG-SHARD-STALE-EPOCH",
             Self::StaleBackendGeneration { .. } => "DTG-SHARD-STALE-GENERATION",
             Self::WriteConflict => "DTG-SHARD-WRITE-CONFLICT",
+            Self::HomeDecisionConflict => "DTG-SHARD-HOME-DECISION-CONFLICT",
             Self::CorruptIntentHistory(_) => "DTG-SHARD-INTENT-HISTORY",
             Self::BindingMismatch => "DTG-SHARD-BINDING",
             Self::Storage(error) => error.code(),
@@ -125,6 +127,9 @@ impl core::fmt::Display for ShardError {
                 "stale backend generation: expected {expected}, got {actual}"
             ),
             Self::WriteConflict => formatter.write_str("temporal write conflict"),
+            Self::HomeDecisionConflict => {
+                formatter.write_str("Home decision is already durably resolved differently")
+            }
             Self::CorruptIntentHistory(message) => formatter.write_str(message),
             Self::BindingMismatch => {
                 formatter.write_str("state store binding does not match replica binding")
@@ -148,11 +153,36 @@ impl From<KernelError> for ShardError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplyRejection {
+    InvalidCommand,
+    StalePlacementEpoch,
+    StaleBackendGeneration,
+    WriteConflict,
+    ClosedTimestampFenced,
+    HomeDecisionConflict,
+}
+
+impl ApplyRejection {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidCommand => "DTG-SHARD-REJECTED-COMMAND",
+            Self::StalePlacementEpoch => "DTG-SHARD-REJECTED-STALE-EPOCH",
+            Self::StaleBackendGeneration => "DTG-SHARD-REJECTED-STALE-GENERATION",
+            Self::WriteConflict => "DTG-SHARD-REJECTED-WRITE-CONFLICT",
+            Self::ClosedTimestampFenced => "DTG-SHARD-REJECTED-CLOSED-TIME",
+            Self::HomeDecisionConflict => "DTG-SHARD-REJECTED-HOME-DECISION",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyOutcome {
     digest: Digest32,
     applied_index: u64,
     replayed: bool,
+    rejection: Option<ApplyRejection>,
+    active_binding: ReplicaBinding,
 }
 
 impl ApplyOutcome {
@@ -167,6 +197,14 @@ impl ApplyOutcome {
     pub const fn replayed(&self) -> bool {
         self.replayed
     }
+
+    pub const fn rejection(&self) -> Option<ApplyRejection> {
+        self.rejection
+    }
+
+    pub const fn active_binding(&self) -> &ReplicaBinding {
+        &self.active_binding
+    }
 }
 
 pub struct ShardStateMachine {
@@ -175,6 +213,7 @@ pub struct ShardStateMachine {
     applied_index: u64,
     closed_timestamp: Option<TransactionTime>,
     active_intents: BTreeMap<TransactionId, ParticipantIntent>,
+    migration_state_stores: BTreeMap<dtg_kernel::BackendGeneration, Arc<dyn ReplicaStateStore>>,
 }
 
 impl ShardStateMachine {
@@ -187,13 +226,42 @@ impl ShardStateMachine {
         }
         let applied_index = block_on(state_store.applied_index())?;
         let active_intents = rebuild_active_intents(&binding, &state_store, applied_index)?;
+        let closed_timestamp = load_closed_timestamp(&state_store)?;
         Ok(Self {
             binding,
             state_store,
             applied_index,
-            closed_timestamp: None,
+            closed_timestamp,
             active_intents,
+            migration_state_stores: BTreeMap::new(),
         })
+    }
+
+    pub fn stage_migration_state_store(
+        &mut self,
+        state_store: Arc<dyn ReplicaStateStore>,
+    ) -> Result<(), ShardError> {
+        let binding = state_store.binding();
+        if binding.role() != BindingRole::Active
+            || binding.cluster_id() != self.binding.cluster_id()
+            || binding.graph_id() != self.binding.graph_id()
+            || binding.shard_id() != self.binding.shard_id()
+            || binding.replica_id() != self.binding.replica_id()
+            || binding.backend_generation() <= self.binding.backend_generation()
+            || block_on(state_store.applied_index())? != self.applied_index
+        {
+            return Err(ShardError::BindingMismatch);
+        }
+        if self
+            .migration_state_stores
+            .insert(binding.backend_generation(), state_store)
+            .is_some()
+        {
+            return Err(ShardError::InvalidLifecycle(
+                "migration state store generation is already staged".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn apply_committed(
@@ -202,7 +270,22 @@ impl ShardStateMachine {
         index: u64,
         command: ShardCommand,
     ) -> Result<ApplyOutcome, ShardError> {
-        self.validate_command(&command)?;
+        if let Err(error) = self.validate_command(&command) {
+            return match committed_rejection(&error) {
+                Some(rejection) => {
+                    self.apply_rejected(term, index, command.header().command_id(), rejection)
+                }
+                None => Err(error),
+            };
+        }
+        if let ShardCommand::Migration(migration) = &command
+            && migration.cuts_over_from(
+                self.binding.placement_epoch(),
+                self.binding.backend_generation(),
+            )
+        {
+            return self.apply_migration_cutover(term, index, migration);
+        }
         if index < self.applied_index
             && matches!(
                 command,
@@ -212,7 +295,17 @@ impl ShardStateMachine {
             return self.replay_old_transaction_command(term, index, &command);
         }
         let new_index = index > self.applied_index;
-        let intent_transition = self.validate_transaction_acceptance(&command)?;
+        let intent_transition = match self.validate_transaction_acceptance(&command) {
+            Ok(transition) => transition,
+            Err(error) => {
+                return match committed_rejection(&error) {
+                    Some(rejection) => {
+                        self.apply_rejected(term, index, command.header().command_id(), rejection)
+                    }
+                    None => Err(error),
+                };
+            }
+        };
         let logical_replay = new_index && matches!(intent_transition, IntentTransition::Replay);
         let header = command.header();
 
@@ -238,11 +331,8 @@ impl ShardStateMachine {
             command.mutations()?
         };
         if let ShardCommand::RecordHomeDecision(command) = &command {
-            let LogicalMutation::PutTransaction(decision) = &command.mutations()[0] else {
-                unreachable!("validated Home decision contains one transaction record");
-            };
             mutations.push(LogicalMutation::PutReplicaMetadata(home_decision_metadata(
-                decision,
+                command,
             )?));
         }
         if let ShardCommand::CommitSingleShardTransaction(command) = &command {
@@ -324,6 +414,8 @@ impl ShardStateMachine {
             digest: receipt.mutation_digest(),
             applied_index: receipt.raft_index(),
             replayed: receipt.replayed() || logical_replay,
+            rejection: None,
+            active_binding: self.binding.clone(),
         })
     }
 
@@ -353,6 +445,8 @@ impl ShardStateMachine {
             digest: receipt.mutation_digest(),
             applied_index: receipt.raft_index(),
             replayed: true,
+            rejection: None,
+            active_binding: self.binding.clone(),
         })
     }
 
@@ -429,6 +523,17 @@ impl ShardStateMachine {
             {
                 return Err(ShardError::InvalidCommand(
                     "closed timestamp cannot move backwards".into(),
+                ));
+            }
+            if self.active_intents.values().any(|intent| {
+                intent
+                    .mutations()
+                    .iter()
+                    .filter_map(graph_mutation_time)
+                    .any(|pending| proposed >= pending)
+            }) {
+                return Err(ShardError::InvalidCommand(
+                    "closed timestamp is fenced by a pending prepared intent".into(),
                 ));
             }
         }
@@ -515,8 +620,14 @@ impl ShardStateMachine {
                     ))
                 }
             }
-            ShardCommand::RecordHomeDecision(_)
-            | ShardCommand::AdvanceClosedTimestamp(_)
+            ShardCommand::RecordHomeDecision(command) => {
+                if self.home_decision_is_durable(command)? {
+                    Ok(IntentTransition::Replay)
+                } else {
+                    Ok(IntentTransition::None)
+                }
+            }
+            ShardCommand::AdvanceClosedTimestamp(_)
             | ShardCommand::InstallSnapshot(_)
             | ShardCommand::Migration(_) => Ok(IntentTransition::None),
         }
@@ -584,6 +695,21 @@ impl ShardStateMachine {
             .transpose()
     }
 
+    fn home_decision_is_durable(
+        &self,
+        command: &crate::RecordHomeDecision,
+    ) -> Result<bool, ShardError> {
+        let expected = home_decision_metadata(command)?;
+        match block_on(self.state_store.replica_metadata(expected.name()))? {
+            None => Ok(false),
+            Some(metadata) if metadata == expected => Ok(true),
+            Some(metadata) => {
+                decode_home_decision_metadata(&metadata)?;
+                Err(ShardError::HomeDecisionConflict)
+            }
+        }
+    }
+
     pub(crate) fn apply_raft_noop(
         &mut self,
         term: u64,
@@ -606,6 +732,97 @@ impl ShardStateMachine {
             digest: receipt.mutation_digest(),
             applied_index: receipt.raft_index(),
             replayed: receipt.replayed(),
+            rejection: None,
+            active_binding: self.binding.clone(),
+        })
+    }
+
+    fn apply_rejected(
+        &mut self,
+        term: u64,
+        index: u64,
+        command_id: CommandId,
+        rejection: ApplyRejection,
+    ) -> Result<ApplyOutcome, ShardError> {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "command_id".into(),
+            Value::Bytes(command_id.get().to_be_bytes().to_vec()),
+        );
+        fields.insert("reason".into(), Value::String(rejection.code().into()));
+        let batch = CommittedShardBatch::new(
+            self.binding.clone(),
+            term,
+            index,
+            command_id,
+            vec![LogicalMutation::PutReplicaMetadata(ReplicaMetadata::new(
+                "dtg.raft_rejection",
+                Value::Map(fields),
+            )?)],
+        )?;
+        let receipt = block_on(self.state_store.apply(batch))?;
+        self.applied_index = self.applied_index.max(receipt.raft_index());
+        Ok(ApplyOutcome {
+            digest: receipt.mutation_digest(),
+            applied_index: receipt.raft_index(),
+            replayed: receipt.replayed(),
+            rejection: Some(rejection),
+            active_binding: self.binding.clone(),
+        })
+    }
+
+    fn apply_migration_cutover(
+        &mut self,
+        term: u64,
+        index: u64,
+        command: &crate::MigrationCommand,
+    ) -> Result<ApplyOutcome, ShardError> {
+        let target_generation = command
+            .target_generation()
+            .ok_or_else(|| ShardError::InvalidCommand("migration cutover lacks a target".into()))?;
+        let target = self
+            .migration_state_stores
+            .get(&target_generation)
+            .cloned()
+            .ok_or_else(|| {
+                ShardError::InvalidLifecycle(
+                    "migration cutover target state store is not staged".into(),
+                )
+            })?;
+        let target_binding = target.binding().clone();
+        if target_binding.placement_epoch() != command.header().placement_epoch()
+            || target_binding.backend_generation() != target_generation
+            || target_binding.backend_class_digest()
+                != command.target_backend_class_digest().ok_or_else(|| {
+                    ShardError::InvalidCommand(
+                        "migration cutover lacks a target backend class".into(),
+                    )
+                })?
+            || command.verified_index() != Some(self.applied_index)
+        {
+            return Err(ShardError::BindingMismatch);
+        }
+        let batch = CommittedShardBatch::new(
+            target_binding.clone(),
+            term,
+            index,
+            command.header().command_id(),
+            ShardCommand::Migration(command.clone()).mutations()?,
+        )?;
+        let receipt = block_on(target.apply(batch))?;
+        let active_intents =
+            rebuild_active_intents(&target_binding, &target, receipt.raft_index())?;
+        self.migration_state_stores.remove(&target_generation);
+        self.binding = target_binding.clone();
+        self.state_store = target;
+        self.applied_index = receipt.raft_index();
+        self.active_intents = active_intents;
+        Ok(ApplyOutcome {
+            digest: receipt.mutation_digest(),
+            applied_index: receipt.raft_index(),
+            replayed: receipt.replayed(),
+            rejection: None,
+            active_binding: target_binding,
         })
     }
 
@@ -622,6 +839,32 @@ impl ShardStateMachine {
     }
 }
 
+fn committed_rejection(error: &ShardError) -> Option<ApplyRejection> {
+    match error {
+        ShardError::InvalidCommand(message)
+            if message == "closed timestamp is fenced by a pending prepared intent" =>
+        {
+            Some(ApplyRejection::ClosedTimestampFenced)
+        }
+        ShardError::InvalidCommand(_) => Some(ApplyRejection::InvalidCommand),
+        ShardError::StalePlacementEpoch { .. } => Some(ApplyRejection::StalePlacementEpoch),
+        ShardError::StaleBackendGeneration { .. } => Some(ApplyRejection::StaleBackendGeneration),
+        ShardError::WriteConflict => Some(ApplyRejection::WriteConflict),
+        ShardError::HomeDecisionConflict => Some(ApplyRejection::HomeDecisionConflict),
+        ShardError::UnsupportedCommandVersion(_)
+        | ShardError::InvalidRaftState(_)
+        | ShardError::SnapshotStateMissing { .. }
+        | ShardError::InvalidLifecycle(_)
+        | ShardError::DuplicateReplica
+        | ShardError::HeterogeneousGeneration
+        | ShardError::ReplicaNotFound
+        | ShardError::Raft(_)
+        | ShardError::CorruptIntentHistory(_)
+        | ShardError::BindingMismatch
+        | ShardError::Storage(_) => None,
+    }
+}
+
 enum IntentTransition {
     None,
     Prepare(ParticipantIntent),
@@ -630,6 +873,26 @@ enum IntentTransition {
         intent: ParticipantIntent,
     },
     Replay,
+}
+
+fn load_closed_timestamp(
+    state_store: &Arc<dyn ReplicaStateStore>,
+) -> Result<Option<TransactionTime>, ShardError> {
+    let Some(metadata) =
+        block_on(state_store.replica_metadata(crate::command::CLOSED_TIMESTAMP_METADATA_NAME))?
+    else {
+        return Ok(None);
+    };
+    let Value::Integer(value) = metadata.value() else {
+        return Err(ShardError::Storage(StorageError::Internal(
+            "closed timestamp metadata has an invalid value".into(),
+        )));
+    };
+    TransactionTime::new(*value).map(Some).map_err(|_| {
+        ShardError::Storage(StorageError::Internal(
+            "closed timestamp metadata is outside the valid range".into(),
+        ))
+    })
 }
 
 fn rebuild_active_intents(
@@ -1101,25 +1364,43 @@ pub fn decode_single_shard_transaction_metadata(
     Ok(receipt)
 }
 
-fn home_decision_metadata(decision: &TransactionRecord) -> Result<ReplicaMetadata, ShardError> {
-    let mut bytes = Vec::with_capacity(61);
-    bytes.extend_from_slice(&1_u32.to_be_bytes());
-    bytes.extend_from_slice(&decision.id().get().to_be_bytes());
-    bytes.push(match decision.state() {
-        TransactionState::Committed => 1,
-        TransactionState::Aborted => 2,
-        TransactionState::Prepared => {
-            return Err(corrupt_intent_history(
-                "Prepared is not a terminal Home decision",
-            ));
-        }
-    });
-    bytes.extend_from_slice(&decision.transaction_time().get().to_be_bytes());
-    bytes.extend_from_slice(&decision.record_digest().get());
+fn home_decision_metadata(
+    command: &crate::RecordHomeDecision,
+) -> Result<ReplicaMetadata, ShardError> {
+    let bytes = ShardCommand::RecordHomeDecision(command.clone()).encode_current()?;
     Ok(ReplicaMetadata::new(
-        HOME_DECISION_METADATA_NAME,
+        format!(
+            "{HOME_DECISION_METADATA_PREFIX}{:032x}",
+            command.decision().id().get()
+        ),
         Value::Bytes(bytes),
     )?)
+}
+
+fn decode_home_decision_metadata(
+    metadata: &ReplicaMetadata,
+) -> Result<crate::RecordHomeDecision, ShardError> {
+    let transaction_id = transaction_id_from_metadata_name(
+        metadata.name(),
+        HOME_DECISION_METADATA_PREFIX,
+        "Home decision",
+    )?;
+    let Value::Bytes(bytes) = metadata.value() else {
+        return Err(corrupt_intent_history(
+            "Home decision metadata is not bytes",
+        ));
+    };
+    let ShardCommand::RecordHomeDecision(command) = ShardCommand::decode(bytes)? else {
+        return Err(corrupt_intent_history(
+            "Home decision metadata contains another command type",
+        ));
+    };
+    if command.decision().id() != transaction_id {
+        return Err(corrupt_intent_history(
+            "Home decision metadata name contradicts its transaction ID",
+        ));
+    }
+    Ok(command)
 }
 
 fn for_each_change(

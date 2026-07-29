@@ -24,9 +24,10 @@ pub use dtg_storage::{
 };
 pub use overlay::{BaseGraphSnapshot, TransactionOverlay};
 pub use participant::{
-    ParticipantService, ParticipantWrite, RecoveredParticipantIntent, RecoveredSingleShardCommit,
-    ShardCommandExecutor, ShardRequest, ShardRequestHeader, SubmissionFailure, SubmissionFuture,
-    SubmissionReceipt, TransactionHistory, TxnFuture,
+    DurableParticipantManifest, DurableTransactionManifest, ParticipantService, ParticipantWrite,
+    RecoveredParticipantIntent, RecoveredSingleShardCommit, RecoveryLease, ShardCommandExecutor,
+    ShardRequest, ShardRequestHeader, SubmissionFailure, SubmissionFuture, SubmissionReceipt,
+    TransactionHistory, TxnFuture,
 };
 pub use snapshot::{ShardSnapshotFence, SnapshotToken};
 pub use timestamp::{DurableTimestampAuthority, TimestampCommandLog, TimestampLogFuture};

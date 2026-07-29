@@ -7,8 +7,8 @@ use raft::{Config, RawNode, StateRole, Storage};
 use slog::{Logger, o};
 
 use crate::{
-    ApplyOutcome, FollowerReadProof, FollowerReadProofAuthority, RaftStore, ReadError, ReadFailure,
-    ReadPermit, ShardCommand, ShardError, ShardStateMachine,
+    ApplyOutcome, ApplyRejection, FollowerReadProof, FollowerReadProofAuthority, RaftStore,
+    ReadError, ReadFailure, ReadPermit, ShardCommand, ShardError, ShardStateMachine,
 };
 
 const MAX_PENDING_READ_INDEX_REQUESTS: usize = 1_024;
@@ -28,6 +28,8 @@ pub struct ProposalReceipt {
     command_id: u128,
     digest: Digest32,
     replayed: bool,
+    rejection: Option<ApplyRejection>,
+    active_binding: ReplicaBinding,
 }
 
 impl ProposalReceipt {
@@ -49,6 +51,14 @@ impl ProposalReceipt {
 
     pub const fn replayed(&self) -> bool {
         self.replayed
+    }
+
+    pub const fn rejection(&self) -> Option<ApplyRejection> {
+        self.rejection
+    }
+
+    pub const fn active_binding(&self) -> &ReplicaBinding {
+        &self.active_binding
     }
 }
 
@@ -168,6 +178,13 @@ impl RaftReplica {
             pending_messages: Vec::new(),
             pending_reads: HashMap::new(),
         })
+    }
+
+    pub fn stage_migration_state_store(
+        &mut self,
+        state_store: Arc<dyn ReplicaStateStore>,
+    ) -> Result<(), ShardError> {
+        self.machine.stage_migration_state_store(state_store)
     }
 
     pub fn recover(&mut self) -> Result<Vec<ApplyOutcome>, ShardError> {
@@ -601,12 +618,15 @@ impl RaftReplica {
             let outcome = self
                 .machine
                 .apply_committed(entry.term, entry.index, command)?;
+            self.binding = outcome.active_binding().clone();
             receipts.push(ProposalReceipt {
                 term: entry.term,
                 index: entry.index,
                 command_id,
                 digest: outcome.digest(),
                 replayed: outcome.replayed(),
+                rejection: outcome.rejection(),
+                active_binding: outcome.active_binding().clone(),
             });
             outcomes.push(outcome);
         }
@@ -625,7 +645,5 @@ fn same_replica_identity(consensus: &ReplicaBinding, business: &ReplicaBinding) 
     consensus.cluster_id() == business.cluster_id()
         && consensus.graph_id() == business.graph_id()
         && consensus.shard_id() == business.shard_id()
-        && consensus.placement_epoch() == business.placement_epoch()
         && consensus.replica_id() == business.replica_id()
-        && consensus.backend_generation() == business.backend_generation()
 }

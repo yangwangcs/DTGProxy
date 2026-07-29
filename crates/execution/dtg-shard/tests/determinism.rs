@@ -4,16 +4,18 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_shard::{
-    AdvanceClosedTimestamp, CommitSingleShard, CommitSingleShardTransaction, FinalizeParticipant,
-    ParticipantIntent, PrewriteIntent, RecordHomeDecision, SINGLE_SHARD_TRANSACTION_METADATA_NAME,
-    ShardCommand, ShardStateMachine, decode_single_shard_transaction_metadata,
+    AdvanceClosedTimestamp, ApplyRejection, CommitSingleShard, CommitSingleShardTransaction,
+    FinalizeParticipant, HomeDecisionManifest, HomeDecisionParticipant, ParticipantIntent,
+    PrewriteIntent, RecordHomeDecision, SINGLE_SHARD_TRANSACTION_METADATA_NAME,
+    SUPPORTED_SHARD_COMMAND_FORMAT_VERSION, ShardCommand, ShardStateMachine,
+    decode_single_shard_transaction_metadata,
 };
 use dtg_storage::{
-    ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, ChangesRead, CommandId,
-    CommittedShardBatch, Digest32, LogicalMutation, Properties, ProviderKind, ReadFence,
-    ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError, StoreFuture,
-    TemporalReadView, TransactionId, TransactionRecord, TransactionState, TransactionTime,
-    ValidInterval, Value, Version, VertexId, VertexVersion,
+    ApplyReceipt, BackendClass, BackendGeneration, BindingRole, CapabilityManifest, ChangesRead,
+    CommandId, CommittedShardBatch, Digest32, LogicalMutation, PlacementEpoch, Properties,
+    ProviderKind, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError,
+    StoreFuture, TemporalReadView, TransactionId, TransactionRecord, TransactionState,
+    TransactionTime, ValidInterval, Value, Version, VertexId, VertexVersion,
 };
 use dtg_storage_fjall::FjallReplicaStore;
 
@@ -71,12 +73,17 @@ fn exact_single_shard_transaction_replay_at_a_new_index_is_metadata_only() {
 }
 
 #[test]
-fn stale_backend_generation_is_rejected_before_apply() {
+fn stale_backend_generation_is_rejected_as_a_committed_noop() {
     let mut machine = fixture_machine();
-    let error = machine
+    let outcome = machine
         .apply_committed(11, 1, command_for_generation(9))
-        .unwrap_err();
-    assert_eq!(error.code(), "DTG-SHARD-STALE-GENERATION");
+        .unwrap();
+    assert_eq!(
+        outcome.rejection(),
+        Some(ApplyRejection::StaleBackendGeneration)
+    );
+    assert_eq!(outcome.applied_index(), 1);
+    assert_eq!(machine.applied_index(), 1);
 }
 
 #[test]
@@ -94,6 +101,127 @@ fn closed_timestamp_is_recorded_through_the_state_store() {
     assert_eq!(machine.closed_timestamp(), Some(timestamp));
     let state = store.state.lock().unwrap();
     assert_eq!(state.batch.as_ref().unwrap().mutations().len(), 1);
+}
+
+#[test]
+fn pending_prepared_intent_rejects_unsafe_closed_time_as_an_applied_noop() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let path = root.path().join("closed-time-fence");
+    let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding.clone(), store).unwrap();
+    let intent = ParticipantIntent::new(
+        TransactionId::new(90).unwrap(),
+        binding.shard_id(),
+        TransactionTime::new(40).unwrap(),
+        0,
+        vec![vertex_mutation_at(90, 1, 0, 100, 50)],
+    )
+    .unwrap();
+    let prepared = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Prepared,
+        intent.start_time(),
+        intent.digest(),
+    )
+    .unwrap();
+    machine
+        .apply_committed(
+            11,
+            1,
+            ShardCommand::PrewriteIntent(
+                PrewriteIntent::new(CommandId::new(90).unwrap(), 7, 10, prepared, intent).unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let rejected = machine
+        .apply_committed(
+            11,
+            2,
+            ShardCommand::AdvanceClosedTimestamp(
+                AdvanceClosedTimestamp::new(
+                    CommandId::new(91).unwrap(),
+                    7,
+                    10,
+                    TransactionTime::new(50).unwrap(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(
+        rejected.rejection(),
+        Some(ApplyRejection::ClosedTimestampFenced)
+    );
+    assert_eq!(machine.applied_index(), 2);
+    assert_eq!(machine.closed_timestamp(), None);
+    drop(machine);
+
+    let reopened = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding, reopened).unwrap();
+    let later = machine
+        .apply_committed(11, 3, committed_vertex_command(92))
+        .unwrap();
+    assert_eq!(later.rejection(), None);
+    assert_eq!(machine.applied_index(), 3);
+}
+
+#[test]
+fn committed_write_conflict_is_rejected_without_stalling_later_entries_or_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let path = root.path().join("committed-rejection");
+    let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding.clone(), store).unwrap();
+    machine
+        .apply_committed(
+            11,
+            1,
+            ShardCommand::CommitSingleShardTransaction(
+                CommitSingleShardTransaction::new(
+                    CommandId::new(101).unwrap(),
+                    7,
+                    10,
+                    TransactionId::new(101).unwrap(),
+                    TransactionTime::new(40).unwrap(),
+                    0,
+                    Digest32::new([1; 32]),
+                    vec![vertex_mutation_at(101, 1, 0, 100, 50)],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let conflict = machine
+        .apply_committed(
+            11,
+            2,
+            ShardCommand::CommitSingleShardTransaction(
+                CommitSingleShardTransaction::new(
+                    CommandId::new(102).unwrap(),
+                    7,
+                    10,
+                    TransactionId::new(102).unwrap(),
+                    TransactionTime::new(40).unwrap(),
+                    0,
+                    Digest32::new([2; 32]),
+                    vec![vertex_mutation_at(101, 2, 50, 150, 60)],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(conflict.rejection(), Some(ApplyRejection::WriteConflict));
+    machine
+        .apply_committed(11, 3, committed_vertex_command(103))
+        .unwrap();
+    drop(machine);
+
+    let reopened = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let machine = ShardStateMachine::new(binding, reopened).unwrap();
+    assert_eq!(machine.applied_index(), 3);
 }
 
 #[test]
@@ -151,20 +279,102 @@ fn transaction_encodings_reject_commit_times_at_or_before_start() {
 }
 
 #[test]
-fn home_decision_rejects_non_transaction_mutations() {
-    let command = committed_vertex_command(7);
-    let ShardCommand::CommitSingleShard(commit) = command else {
-        unreachable!();
-    };
-    let error = RecordHomeDecision::new(
-        CommandId::new(8).unwrap(),
-        7,
-        10,
-        commit.mutations().to_vec(),
+fn home_decision_manifest_binds_the_terminal_digest() {
+    let manifest = home_manifest(TransactionTime::new(40).unwrap());
+    let decision = TransactionRecord::new(
+        TransactionId::new(7).unwrap(),
+        TransactionState::Committed,
+        TransactionTime::new(50).unwrap(),
+        Digest32::new([7; 32]),
     )
-    .unwrap_err();
+    .unwrap();
+    let error =
+        RecordHomeDecision::new(CommandId::new(8).unwrap(), 7, 10, decision, manifest).unwrap_err();
 
     assert_eq!(error.code(), "DTG-SHARD-COMMAND");
+}
+
+#[test]
+fn home_decision_is_write_once_and_opposite_replay_advances_as_rejected_noop() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let path = root.path().join("home-decision-cas");
+    let transaction_id = TransactionId::new(700).unwrap();
+    let manifest = home_manifest(TransactionTime::new(40).unwrap());
+    let committed = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Committed,
+        TransactionTime::new(50).unwrap(),
+        manifest
+            .decision_digest(
+                transaction_id,
+                TransactionState::Committed,
+                TransactionTime::new(50).unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let aborted = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Aborted,
+        TransactionTime::new(40).unwrap(),
+        manifest
+            .decision_digest(
+                transaction_id,
+                TransactionState::Aborted,
+                TransactionTime::new(40).unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let commit_command = ShardCommand::RecordHomeDecision(
+        RecordHomeDecision::new(
+            CommandId::new(701).unwrap(),
+            7,
+            10,
+            committed,
+            manifest.clone(),
+        )
+        .unwrap(),
+    );
+    let abort_command = ShardCommand::RecordHomeDecision(
+        RecordHomeDecision::new(CommandId::new(701).unwrap(), 7, 10, aborted, manifest).unwrap(),
+    );
+
+    let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding.clone(), store).unwrap();
+    assert_eq!(
+        machine
+            .apply_committed(11, 1, commit_command.clone())
+            .unwrap()
+            .rejection(),
+        None
+    );
+    assert!(
+        machine
+            .apply_committed(11, 2, commit_command)
+            .unwrap()
+            .replayed()
+    );
+    assert_eq!(
+        machine
+            .apply_committed(11, 3, abort_command.clone())
+            .unwrap()
+            .rejection(),
+        Some(ApplyRejection::HomeDecisionConflict)
+    );
+    drop(machine);
+
+    let reopened = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding, reopened).unwrap();
+    assert_eq!(
+        machine
+            .apply_committed(11, 4, abort_command)
+            .unwrap()
+            .rejection(),
+        Some(ApplyRejection::HomeDecisionConflict)
+    );
+    assert_eq!(machine.applied_index(), 4);
 }
 
 #[test]
@@ -231,7 +441,7 @@ fn command_value_nesting_and_allocation_budgets_fail_closed() {
     assert!(nested_command.encode_current().is_err());
 
     let mut truncated = Vec::new();
-    truncated.extend_from_slice(&2_u32.to_be_bytes());
+    truncated.extend_from_slice(&SUPPORTED_SHARD_COMMAND_FORMAT_VERSION.to_be_bytes());
     truncated.push(1);
     truncated.extend_from_slice(&101_u128.to_be_bytes());
     truncated.extend_from_slice(&7_u64.to_be_bytes());
@@ -780,13 +990,14 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
         )
         .unwrap(),
     );
+    let committed_conflict = committed_machine
+        .apply_committed(11, 2, overlapping)
+        .unwrap();
     assert_eq!(
-        committed_machine
-            .apply_committed(11, 2, overlapping)
-            .unwrap_err()
-            .code(),
-        "DTG-SHARD-WRITE-CONFLICT"
+        committed_conflict.rejection(),
+        Some(ApplyRejection::WriteConflict)
     );
+    assert_eq!(committed_machine.applied_index(), 2);
 
     let prepared_path = root.path().join("prepared");
     let prepared_store =
@@ -853,13 +1064,14 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
         )
         .unwrap(),
     );
+    let prepared_conflict = reopened
+        .apply_committed(11, 2, competing_command.clone())
+        .unwrap();
     assert_eq!(
-        reopened
-            .apply_committed(11, 2, competing_command.clone())
-            .unwrap_err()
-            .code(),
-        "DTG-SHARD-WRITE-CONFLICT"
+        prepared_conflict.rejection(),
+        Some(ApplyRejection::WriteConflict)
     );
+    assert_eq!(reopened.applied_index(), 2);
 
     let committed = TransactionRecord::new(
         winning_intent.transaction_id(),
@@ -871,7 +1083,7 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
     reopened
         .apply_committed(
             11,
-            2,
+            3,
             ShardCommand::FinalizeParticipant(
                 FinalizeParticipant::new(
                     CommandId::new(2_003).unwrap(),
@@ -888,7 +1100,7 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
         TransactionId::new(202).unwrap(),
         binding.shard_id(),
         TransactionTime::new(60).unwrap(),
-        2,
+        3,
         vec![vertex_mutation_at(2, 2, 50, 150, 70)],
     )
     .unwrap();
@@ -902,7 +1114,7 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
     reopened
         .apply_committed(
             11,
-            3,
+            4,
             ShardCommand::PrewriteIntent(
                 PrewriteIntent::new(
                     CommandId::new(2_006).unwrap(),
@@ -926,7 +1138,7 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
     reopened
         .apply_committed(
             11,
-            4,
+            5,
             ShardCommand::FinalizeParticipant(
                 FinalizeParticipant::new(CommandId::new(2_004).unwrap(), 7, 10, aborted, None)
                     .unwrap(),
@@ -937,7 +1149,7 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
         TransactionId::new(203).unwrap(),
         binding.shard_id(),
         TransactionTime::new(60).unwrap(),
-        4,
+        5,
         vec![vertex_mutation_at(2, 3, 25, 75, 70)],
     )
     .unwrap();
@@ -951,7 +1163,7 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
     reopened
         .apply_committed(
             11,
-            5,
+            6,
             ShardCommand::PrewriteIntent(
                 PrewriteIntent::new(
                     CommandId::new(2_005).unwrap(),
@@ -1188,26 +1400,19 @@ fn live_prewrite_enforces_the_reopen_active_intent_bound() {
         competing.digest(),
     )
     .unwrap();
-    assert_eq!(
-        machine
-            .apply_committed(
-                11,
-                1,
-                ShardCommand::PrewriteIntent(
-                    PrewriteIntent::new(
-                        CommandId::new(4_097).unwrap(),
-                        7,
-                        10,
-                        prepared,
-                        competing,
-                    )
+    let outcome = machine
+        .apply_committed(
+            11,
+            1,
+            ShardCommand::PrewriteIntent(
+                PrewriteIntent::new(CommandId::new(4_097).unwrap(), 7, 10, prepared, competing)
                     .unwrap(),
-                ),
-            )
-            .unwrap_err()
-            .code(),
-        "DTG-SHARD-COMMAND"
-    );
+            ),
+        )
+        .unwrap();
+    assert_eq!(outcome.rejection(), Some(ApplyRejection::InvalidCommand));
+    assert_eq!(outcome.applied_index(), 1);
+    assert_eq!(machine.applied_index(), 1);
 }
 
 fn transaction_state_metadata_for_test(intent: &ParticipantIntent) -> ReplicaMetadata {
@@ -1460,4 +1665,30 @@ fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Pending => std::thread::park(),
         }
     }
+}
+
+fn home_manifest(start_time: TransactionTime) -> HomeDecisionManifest {
+    HomeDecisionManifest::new(
+        start_time,
+        Version::new(12),
+        vec![
+            HomeDecisionParticipant::new(
+                dtg_storage::ShardId::new(3).unwrap(),
+                PlacementEpoch::new(7).unwrap(),
+                BackendGeneration::new(10).unwrap(),
+                0,
+                Digest32::new([3; 32]),
+            )
+            .unwrap(),
+            HomeDecisionParticipant::new(
+                dtg_storage::ShardId::new(9).unwrap(),
+                PlacementEpoch::new(7).unwrap(),
+                BackendGeneration::new(10).unwrap(),
+                0,
+                Digest32::new([9; 32]),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
 }

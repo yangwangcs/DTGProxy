@@ -56,7 +56,7 @@ impl TimestampAuthority for DurableTimestampAuthority {
             if let Some(timestamp) = state.start_times.get(&transaction_id) {
                 return Ok(*timestamp);
             }
-            let timestamp = state.next_timestamp()?;
+            let timestamp = state.next_start_time()?;
             self.append_and_apply(
                 &mut state,
                 TimestampCommand::AllocateStart {
@@ -175,11 +175,24 @@ impl TimestampCommand {
 #[derive(Default)]
 struct TimestampState {
     last_issued: i64,
+    published_frontier: i64,
     start_times: BTreeMap<TransactionId, TransactionTime>,
     reservations: BTreeMap<TransactionId, CommitTimeReservation>,
 }
 
 impl TimestampState {
+    fn next_start_time(&self) -> Result<TransactionTime, TxnError> {
+        if self
+            .reservations
+            .values()
+            .any(|reservation| reservation.resolution().is_none())
+        {
+            return TransactionTime::new(self.published_frontier)
+                .map_err(|_| TxnError::CorruptRecovery);
+        }
+        self.next_timestamp()
+    }
+
     fn next_timestamp(&self) -> Result<TransactionTime, TxnError> {
         self.last_issued
             .checked_add(1)
@@ -198,7 +211,20 @@ impl TimestampState {
                         .then_some(())
                         .ok_or(TxnError::CorruptRecovery);
                 }
-                self.apply_new_timestamp(timestamp)?;
+                if timestamp.get()
+                    == self
+                        .last_issued
+                        .checked_add(1)
+                        .ok_or(TxnError::CorruptRecovery)?
+                {
+                    if self.published_frontier != self.last_issued {
+                        return Err(TxnError::CorruptRecovery);
+                    }
+                    self.apply_new_timestamp(timestamp)?;
+                    self.published_frontier = timestamp.get();
+                } else if timestamp.get() != self.published_frontier {
+                    return Err(TxnError::CorruptRecovery);
+                }
                 self.start_times.insert(transaction_id, timestamp);
             }
             TimestampCommand::ReserveCommit {
@@ -231,6 +257,7 @@ impl TimestampState {
                     Some(_) => return Err(TxnError::CorruptRecovery),
                     None => {
                         *reservation = CommitTimeReservation::new(timestamp, Some(resolution));
+                        self.advance_published_frontier()?;
                     }
                 }
             }
@@ -248,6 +275,23 @@ impl TimestampState {
             return Err(TxnError::CorruptRecovery);
         }
         self.last_issued = timestamp.get();
+        Ok(())
+    }
+
+    fn advance_published_frontier(&mut self) -> Result<(), TxnError> {
+        while self.published_frontier < self.last_issued {
+            let next = self
+                .published_frontier
+                .checked_add(1)
+                .ok_or(TxnError::CorruptRecovery)?;
+            let resolved = self.reservations.values().any(|reservation| {
+                reservation.commit_time().get() == next && reservation.resolution().is_some()
+            });
+            if !resolved {
+                break;
+            }
+            self.published_frontier = next;
+        }
         Ok(())
     }
 }

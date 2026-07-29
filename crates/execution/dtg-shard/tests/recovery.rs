@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_shard::{
-    AdvanceClosedTimestamp, CommitSingleShard, RaftReplica, RaftStore, ShardCommand, ShardHost,
+    AdvanceClosedTimestamp, ApplyRejection, CommitSingleShard, MigrationCommand, MigrationPhase,
+    RaftReplica, RaftStore, SUPPORTED_SHARD_COMMAND_FORMAT_VERSION, ShardCommand, ShardHost,
     ShardStateMachine,
 };
 use dtg_storage::{
@@ -15,7 +16,7 @@ use dtg_storage::{
     EdgeScan, EdgeVersion, LogicalMutation, Properties, ProviderKind, RaftHardState,
     RaftMembership, ReadFence, ReplicaBinding, ReplicaId, ReplicaMetadata, ReplicaStateStore,
     SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, ScanPage,
-    StorageError, StoreFuture, TemporalReadView, TransactionTime, ValidInterval, Version,
+    StorageError, StoreFuture, TemporalReadView, TransactionTime, ValidInterval, Value, Version,
     VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexVersion,
 };
 use dtg_storage_fjall::{FjallConsensusStore, FjallReplicaStore};
@@ -75,6 +76,49 @@ fn committed_wal_is_replayed_after_restart() {
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].applied_index(), 2);
     assert_eq!(block_on(state.applied_index()).unwrap(), 2);
+}
+
+#[test]
+fn committed_rejection_recovery_advances_to_the_following_wal_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = fixture_binding(3, 4, ProviderKind::Fjall, "rejected-restart");
+    let consensus_path = dir.path().join("consensus");
+    let business_path = dir.path().join("business");
+    let consensus = Arc::new(FjallConsensusStore::open(&consensus_path, binding.clone()).unwrap());
+    let stale = committed_vertex_command(1, 6, 10);
+    let following = committed_vertex_command(2, 7, 10);
+    block_on(consensus.append(vec![
+        committed_command_entry(1, 1, &stale),
+        committed_command_entry(1, 2, &following),
+    ]))
+    .unwrap();
+    block_on(consensus.set_hard_state(RaftHardState {
+        current_term: 1,
+        voted_for: None,
+        committed_index: 2,
+    }))
+    .unwrap();
+    let state = Arc::new(FjallReplicaStore::open(&business_path, binding.clone()).unwrap());
+    let mut replica = RaftReplica::open(consensus, state.clone()).unwrap();
+
+    let recovered = replica.recover().unwrap();
+
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(
+        recovered[0].rejection(),
+        Some(ApplyRejection::StalePlacementEpoch)
+    );
+    assert_eq!(recovered[0].applied_index(), 1);
+    assert_eq!(recovered[1].rejection(), None);
+    assert_eq!(recovered[1].applied_index(), 2);
+    assert_eq!(block_on(state.applied_index()).unwrap(), 2);
+    drop(replica);
+
+    let consensus = Arc::new(FjallConsensusStore::open(consensus_path, binding.clone()).unwrap());
+    let state = Arc::new(FjallReplicaStore::open(business_path, binding).unwrap());
+    let mut reopened = RaftReplica::open(consensus, state).unwrap();
+    assert!(reopened.recover().unwrap().is_empty());
+    assert_eq!(reopened.observe().applied_index(), 2);
 }
 
 #[test]
@@ -164,7 +208,7 @@ fn snapshot_recovery_replays_only_the_committed_suffix() {
 }
 
 #[test]
-fn stale_epoch_and_generation_are_fenced_before_state_store_apply() {
+fn stale_epoch_and_generation_advance_as_committed_rejected_noops() {
     let binding = fixture_binding(3, 4, ProviderKind::Fjall, "fences");
     let state = Arc::new(RecordingStateStore::with_applied(binding.clone(), 0));
     let mut machine = ShardStateMachine::new(binding, state.clone()).unwrap();
@@ -172,18 +216,267 @@ fn stale_epoch_and_generation_are_fenced_before_state_store_apply() {
     assert_eq!(
         machine
             .apply_committed(1, 1, committed_vertex_command(1, 6, 10))
-            .unwrap_err()
-            .code(),
-        "DTG-SHARD-STALE-EPOCH"
+            .unwrap()
+            .rejection(),
+        Some(ApplyRejection::StalePlacementEpoch)
     );
     assert_eq!(
         machine
-            .apply_committed(1, 1, committed_vertex_command(1, 7, 9))
-            .unwrap_err()
-            .code(),
-        "DTG-SHARD-STALE-GENERATION"
+            .apply_committed(1, 2, committed_vertex_command(2, 7, 9))
+            .unwrap()
+            .rejection(),
+        Some(ApplyRejection::StaleBackendGeneration)
     );
-    assert_eq!(state.apply_calls(), 0);
+    assert_eq!(machine.applied_index(), 2);
+    assert_eq!(state.apply_calls(), 2);
+}
+
+#[test]
+fn activate_switches_the_authoritative_store_and_following_phases_survive_restart() {
+    let source_binding = fixture_binding(3, 10, ProviderKind::Fjall, "migration-source");
+    let target_binding = source_binding
+        .to_builder()
+        .placement_epoch(8)
+        .backend_generation(11)
+        .backend_class_digest(Digest32::new([11; 32]))
+        .provider_kind(ProviderKind::PostgreSql)
+        .namespace_id("migration-target")
+        .role(BindingRole::Active)
+        .build()
+        .unwrap();
+    let source = Arc::new(RecordingStateStore::with_applied(source_binding.clone(), 1));
+    let target = Arc::new(RecordingStateStore::with_applied(target_binding.clone(), 1));
+    let mut machine = ShardStateMachine::new(source_binding, source.clone()).unwrap();
+    machine.stage_migration_state_store(target.clone()).unwrap();
+
+    let activate = ShardCommand::Migration(
+        MigrationCommand::online(
+            CommandId::new(8_001).unwrap(),
+            77,
+            7,
+            10,
+            10,
+            11,
+            target_binding.backend_class_digest(),
+            Version::new(12),
+            1,
+            Digest32::new([9; 32]),
+            MigrationPhase::Activate,
+        )
+        .unwrap(),
+    );
+    let activated = machine.apply_committed(11, 2, activate).unwrap();
+    assert_eq!(activated.active_binding(), &target_binding);
+    assert_eq!(machine.binding(), &target_binding);
+    assert_eq!(source.apply_calls(), 0);
+    assert_eq!(target.apply_calls(), 1);
+
+    let grace = ShardCommand::Migration(
+        MigrationCommand::online(
+            CommandId::new(8_002).unwrap(),
+            77,
+            7,
+            10,
+            10,
+            11,
+            target_binding.backend_class_digest(),
+            Version::new(12),
+            1,
+            Digest32::new([9; 32]),
+            MigrationPhase::Grace,
+        )
+        .unwrap(),
+    );
+    machine.apply_committed(11, 3, grace).unwrap();
+    drop(machine);
+
+    let mut reopened = ShardStateMachine::new(target_binding.clone(), target.clone()).unwrap();
+    let retire = ShardCommand::Migration(
+        MigrationCommand::online(
+            CommandId::new(8_003).unwrap(),
+            77,
+            7,
+            10,
+            10,
+            11,
+            target_binding.backend_class_digest(),
+            Version::new(12),
+            1,
+            Digest32::new([9; 32]),
+            MigrationPhase::Retire,
+        )
+        .unwrap(),
+    );
+    reopened.apply_committed(11, 4, retire).unwrap();
+    assert_eq!(reopened.binding(), &target_binding);
+    assert_eq!(target.apply_calls(), 3);
+}
+
+#[test]
+fn migration_cutover_retains_the_staged_target_after_transient_apply_failure() {
+    let source_binding = fixture_binding(3, 10, ProviderKind::Fjall, "migration-retry-source");
+    let target_binding = source_binding
+        .to_builder()
+        .placement_epoch(8)
+        .backend_generation(11)
+        .backend_class_digest(Digest32::new([11; 32]))
+        .provider_kind(ProviderKind::PostgreSql)
+        .namespace_id("migration-retry-target")
+        .build()
+        .unwrap();
+    let source = Arc::new(RecordingStateStore::with_applied(source_binding.clone(), 1));
+    let target = Arc::new(RecordingStateStore::with_applied(target_binding.clone(), 1));
+    let toggled = Arc::new(ToggleStateStore::new(target.clone()));
+    let mut machine = ShardStateMachine::new(source_binding.clone(), source).unwrap();
+    machine
+        .stage_migration_state_store(toggled.clone())
+        .unwrap();
+    let activate = ShardCommand::Migration(
+        MigrationCommand::online(
+            CommandId::new(8_010).unwrap(),
+            78,
+            7,
+            10,
+            10,
+            11,
+            target_binding.backend_class_digest(),
+            Version::new(12),
+            1,
+            Digest32::new([10; 32]),
+            MigrationPhase::Activate,
+        )
+        .unwrap(),
+    );
+    toggled.set_failing(true);
+
+    assert!(machine.apply_committed(11, 2, activate.clone()).is_err());
+    assert_eq!(machine.binding(), &source_binding);
+    toggled.set_failing(false);
+    let retried = machine.apply_committed(11, 2, activate).unwrap();
+
+    assert_eq!(retried.active_binding(), &target_binding);
+    assert_eq!(machine.binding(), &target_binding);
+    assert_eq!(target.apply_calls(), 1);
+}
+
+#[test]
+fn rollback_switches_the_raft_replica_binding_and_survives_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let consensus_path = root.path().join("rollback-consensus");
+    let target_path = root.path().join("rollback-target");
+    let consensus_binding = fixture_binding(3, 4, ProviderKind::Fjall, "rollback-consensus")
+        .to_builder()
+        .placement_epoch(8)
+        .backend_generation(11)
+        .build()
+        .unwrap();
+    let source_binding = consensus_binding
+        .to_builder()
+        .backend_class_digest(Digest32::new([11; 32]))
+        .provider_kind(ProviderKind::PostgreSql)
+        .namespace_id("rollback-source")
+        .build()
+        .unwrap();
+    let target_binding = fixture_binding(3, 4, ProviderKind::Fjall, "rollback-target")
+        .to_builder()
+        .placement_epoch(9)
+        .backend_generation(12)
+        .build()
+        .unwrap();
+    let consensus =
+        Arc::new(FjallConsensusStore::open(&consensus_path, consensus_binding.clone()).unwrap());
+    initialize_membership(&*consensus, consensus_binding.replica_id());
+    let source = Arc::new(RecordingStateStore::with_applied(source_binding, 0));
+    let mut replica = RaftReplica::open(consensus, source).unwrap();
+    replica.start().unwrap();
+    replica.campaign().unwrap();
+    replica.drive_ready().unwrap();
+    assert_eq!(replica.observe().applied_index(), 1);
+    let source_command = committed_vertex_command(8_000, 8, 11);
+    replica.propose(source_command.clone()).unwrap();
+    let source_progress = replica.drive_ready().unwrap();
+    let source_receipt = source_progress.receipts().last().unwrap();
+    assert_eq!(source_receipt.index(), 2);
+
+    let target = Arc::new(FjallReplicaStore::open(&target_path, target_binding.clone()).unwrap());
+    block_on(
+        target.apply(
+            CommittedShardBatch::new(
+                target_binding.clone(),
+                1,
+                1,
+                CommandId::new((u128::from(1_u64) << 64) | 1).unwrap(),
+                vec![LogicalMutation::PutReplicaMetadata(
+                    ReplicaMetadata::new(
+                        "dtg.raft_noop",
+                        Value::Bytes(1_u64.to_be_bytes().to_vec()),
+                    )
+                    .unwrap(),
+                )],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let ShardCommand::CommitSingleShard(source_commit) = source_command else {
+        unreachable!();
+    };
+    block_on(
+        target.apply(
+            CommittedShardBatch::new(
+                target_binding.clone(),
+                source_receipt.term(),
+                source_receipt.index(),
+                CommandId::new(source_receipt.command_id()).unwrap(),
+                source_commit.mutations().to_vec(),
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    replica.stage_migration_state_store(target.clone()).unwrap();
+    let rollback = ShardCommand::Migration(
+        MigrationCommand::online(
+            CommandId::new(8_001).unwrap(),
+            77,
+            8,
+            11,
+            10,
+            12,
+            target_binding.backend_class_digest(),
+            Version::new(12),
+            2,
+            Digest32::new([9; 32]),
+            MigrationPhase::Rollback,
+        )
+        .unwrap(),
+    );
+    replica.propose(rollback).unwrap();
+    let progress = replica.drive_ready().unwrap();
+    let receipt = progress.receipts().last().unwrap();
+    assert_eq!(receipt.rejection(), None);
+    assert_eq!(receipt.active_binding(), &target_binding);
+    assert_eq!(replica.observe().binding(), &target_binding);
+    drop(replica);
+
+    let consensus =
+        Arc::new(FjallConsensusStore::open(&consensus_path, consensus_binding.clone()).unwrap());
+    let target = Arc::new(FjallReplicaStore::open(&target_path, target_binding.clone()).unwrap());
+    let mut reopened = RaftReplica::open(consensus, target.clone()).unwrap();
+    assert!(reopened.recover().unwrap().is_empty());
+    assert_eq!(reopened.observe().binding(), &target_binding);
+    reopened.start().unwrap();
+    reopened.campaign().unwrap();
+    reopened.drive_ready().unwrap();
+    reopened
+        .propose(committed_vertex_command(8_002, 9, 12))
+        .unwrap();
+    let progress = reopened.drive_ready().unwrap();
+    assert_eq!(
+        progress.receipts().last().unwrap().active_binding(),
+        &target_binding
+    );
+    assert_eq!(block_on(target.applied_index()).unwrap(), 5);
 }
 
 #[test]
@@ -471,7 +764,7 @@ fn host_rejects_heterogeneous_replicas_in_one_generation() {
 fn unknown_command_versions_fail_closed() {
     let command = committed_vertex_command(1, 7, 10);
     let mut encoded = command.encode_current().unwrap();
-    encoded[..4].copy_from_slice(&3_u32.to_be_bytes());
+    encoded[..4].copy_from_slice(&(SUPPORTED_SHARD_COMMAND_FORMAT_VERSION + 1).to_be_bytes());
     let error = ShardCommand::decode(&encoded).unwrap_err();
     assert_eq!(error.code(), "DTG-SHARD-COMMAND-VERSION");
 }
@@ -520,6 +813,26 @@ fn internal_noop_entry(term: u64, index: u64, context_len: usize) -> ConsensusEn
         term,
         index,
         CommandId::new((u128::from(term) << 64) | u128::from(index)).unwrap(),
+        ConsensusCommandEnvelope::new(SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, payload).unwrap(),
+    )
+    .unwrap()
+}
+
+fn committed_command_entry(term: u64, index: u64, command: &ShardCommand) -> ConsensusEntry {
+    let context = command.header().command_id().get().to_be_bytes();
+    let data = command.encode_current().unwrap();
+    let mut payload = Vec::with_capacity(13 + context.len() + data.len());
+    payload.extend_from_slice(&1_u32.to_be_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&(context.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&context);
+    payload.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&data);
+    ConsensusEntry::new(
+        SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION,
+        term,
+        index,
+        command.header().command_id(),
         ConsensusCommandEnvelope::new(SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, payload).unwrap(),
     )
     .unwrap()

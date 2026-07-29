@@ -41,15 +41,20 @@ impl RaftStore {
                 applied_index,
             });
         }
-        if hard_state.committed_index <= snapshot_index {
+        if applied_index > hard_state.committed_index {
+            return Err(ShardError::InvalidRaftState(
+                "state machine applied index exceeds the committed WAL".into(),
+            ));
+        }
+        if hard_state.committed_index == applied_index {
             return Ok(Vec::new());
         }
-        let low = snapshot_index.saturating_add(1);
+        let low = applied_index.saturating_add(1);
         let high = hard_state.committed_index.checked_add(1).ok_or_else(|| {
             ShardError::InvalidRaftState("committed index cannot be represented as a range".into())
         })?;
         let entries = block_on(self.store.entries(low, high, u64::MAX))?;
-        let expected = hard_state.committed_index - snapshot_index;
+        let expected = hard_state.committed_index - applied_index;
         if entries.len() as u64 != expected
             || entries
                 .iter()

@@ -11,9 +11,9 @@ mod state_machine;
 
 pub use command::{
     AdvanceClosedTimestamp, CommandHeader, CommitSingleShard, CommitSingleShardTransaction,
-    FinalizeParticipant, InstallSnapshot, ParticipantIntent, PrewriteIntent, RecordHomeDecision,
-    SUPPORTED_SHARD_COMMAND_FORMAT_VERSION, SUPPORTED_TRANSACTION_INTENT_VERSION, ShardCommand,
-    TRANSACTION_INTENT_METADATA_NAME,
+    FinalizeParticipant, HomeDecisionManifest, HomeDecisionParticipant, InstallSnapshot,
+    ParticipantIntent, PrewriteIntent, RecordHomeDecision, SUPPORTED_SHARD_COMMAND_FORMAT_VERSION,
+    SUPPORTED_TRANSACTION_INTENT_VERSION, ShardCommand, TRANSACTION_INTENT_METADATA_NAME,
 };
 pub use host::{ReplicaKey, ShardHost};
 pub use migration::{MigrationCommand, MigrationPhase};
@@ -32,9 +32,10 @@ pub use snapshot::{
     recover_replica_snapshot_install,
 };
 pub use state_machine::{
-    ACTIVE_TRANSACTION_INTENTS_METADATA_NAME, ApplyOutcome, SINGLE_SHARD_TRANSACTION_METADATA_NAME,
-    ShardError, ShardStateMachine, SingleShardTransactionReceipt,
-    TRANSACTION_STATE_METADATA_PREFIX, decode_single_shard_transaction_metadata,
+    ACTIVE_TRANSACTION_INTENTS_METADATA_NAME, ApplyOutcome, ApplyRejection,
+    SINGLE_SHARD_TRANSACTION_METADATA_NAME, ShardError, ShardStateMachine,
+    SingleShardTransactionReceipt, TRANSACTION_STATE_METADATA_PREFIX,
+    decode_single_shard_transaction_metadata,
 };
 
 pub const CLEAN_BREAK_ARCHITECTURE_VERSION: u32 = 1;

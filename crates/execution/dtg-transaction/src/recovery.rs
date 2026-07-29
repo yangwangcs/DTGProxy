@@ -4,10 +4,13 @@ use dtg_kernel::{ShardId, TransactionTime};
 use dtg_storage::{TransactionRecord, TransactionState};
 
 use crate::{
-    CommitResolution, CommitTimeReservation, RecoveredParticipantIntent, ShardRequest,
-    ShardRequestHeader, SubmissionFailure, TemporalTxnCoordinator, TransactionContext,
-    TransactionHistory, TransactionOutcome, TxnError, TxnFuture,
-    coordinator::{abort_decision_digest, command_id, decision_digest, stamp_mutations},
+    CommitResolution, CommitTimeReservation, RecoveredParticipantIntent,
+    RecoveredSingleShardCommit, ShardRequest, ShardRequestHeader, SubmissionFailure,
+    TemporalTxnCoordinator, TransactionContext, TransactionHistory, TransactionOutcome, TxnError,
+    TxnFuture,
+    coordinator::{
+        abort_decision_digest, command_id, decision_digest, stamp_mutations, transaction_manifest,
+    },
 };
 
 struct RecoveryState {
@@ -21,27 +24,91 @@ pub(crate) enum AbortPrevalidation {
 }
 
 impl TemporalTxnCoordinator {
+    pub fn recover_transaction(
+        &self,
+        transaction_id: dtg_kernel::TransactionId,
+        recovery_owner: u128,
+    ) -> TxnFuture<'_, TransactionOutcome> {
+        Box::pin(async move {
+            let lease = self
+                .participants
+                .acquire_recovery_lease(transaction_id, recovery_owner)
+                .await?;
+            let result = async {
+                let manifest = self
+                    .participants
+                    .recovery_manifest(transaction_id, lease)
+                    .await?
+                    .ok_or(TxnError::CorruptRecovery)?;
+                if manifest.transaction_id() != transaction_id {
+                    return Err(TxnError::CorruptRecovery);
+                }
+                let context = TransactionContext::new(manifest.snapshot_token()?);
+                let state = self.load_recovery_state(&context).await?;
+                for participant in manifest.participants() {
+                    if state
+                        .intents
+                        .get(&participant.shard_id())
+                        .map(RecoveredParticipantIntent::digest)
+                        != Some(participant.intent_digest())
+                    {
+                        return Err(TxnError::CorruptRecovery);
+                    }
+                }
+                match self.recover(&context).await? {
+                    TransactionOutcome::Unresolved => self.resolve_failed_prewrite(&context).await,
+                    outcome => Ok(outcome),
+                }
+            }
+            .await;
+            let release = self.participants.release_recovery_lease(lease).await;
+            match (result, release) {
+                (Ok(outcome), Ok(())) => Ok(outcome),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+            }
+        })
+    }
+
     pub fn recover<'a>(
         &'a self,
         context: &'a TransactionContext,
     ) -> TxnFuture<'a, TransactionOutcome> {
         Box::pin(async move {
             let state = self.load_recovery_state(context).await?;
-            if context.snapshot().shards.len() == 1 {
-                let history = state
-                    .histories
-                    .values()
-                    .next()
-                    .ok_or(TxnError::IncompleteSnapshot)?;
-                if let Some(commit) = history.single_shard_commit() {
-                    return self.recover_durable_single_shard(context, commit).await;
+            if let Some((shard_id, commit)) = recovered_single_shard_commit(&state)? {
+                return self
+                    .recover_durable_single_shard(context, shard_id, commit)
+                    .await;
+            }
+            if context.snapshot().shards.len() == 1
+                && state.histories.values().all(history_is_empty)
+            {
+                return self.recover_single_shard(context).await;
+            }
+            if state.intents.is_empty() {
+                validate_terminal_history_without_decision(context, &state)?;
+                if !state.histories.values().all(history_is_empty) {
+                    return Ok(TransactionOutcome::Unresolved);
                 }
-                if state.histories.values().all(history_is_empty) {
-                    return self.recover_single_shard(context).await;
+                let Some(reservation) = self
+                    .timestamps
+                    .commit_time_reservation(context.snapshot().transaction_id)
+                    .await?
+                else {
+                    return Ok(TransactionOutcome::Unresolved);
+                };
+                if reservation.commit_time() <= context.snapshot().start_time {
+                    return Err(TxnError::CorruptRecovery);
                 }
+                return match reservation.resolution() {
+                    Some(CommitResolution::Aborted) => Ok(TransactionOutcome::Aborted),
+                    Some(CommitResolution::Committed) => Err(TxnError::CorruptRecovery),
+                    None => Ok(TransactionOutcome::Unresolved),
+                };
             }
 
-            let home = home_shard(context)?;
+            let home = recovery_home_shard(&state)?;
             let decision = recover_home_decision(context, home, &state)?;
             let Some(decision) = decision else {
                 validate_terminal_history_without_decision(context, &state)?;
@@ -57,12 +124,10 @@ impl TemporalTxnCoordinator {
                             .await?,
                         decision.transaction_time(),
                     )?;
-                    if state.intents.len() != context.snapshot().shards.len() {
-                        return Err(TxnError::CorruptRecovery);
-                    }
-                    for (shard_id, fence) in &context.snapshot().shards {
-                        let intent = state
-                            .intents
+                    for (shard_id, intent) in &state.intents {
+                        let fence = context
+                            .snapshot()
+                            .shards
                             .get(shard_id)
                             .ok_or(TxnError::CorruptRecovery)?;
                         let request = ShardRequest::FinalizeParticipantCommit {
@@ -165,7 +230,31 @@ impl TemporalTxnCoordinator {
                 Err(TxnError::CorruptRecovery) => return Err(TxnError::CorruptRecovery),
                 Err(_) => return Ok(TransactionOutcome::Unresolved),
             };
-            let home = home_shard(context)?;
+            if state.intents.is_empty() {
+                if state
+                    .histories
+                    .values()
+                    .any(|history| !history.terminal().is_empty())
+                {
+                    validate_terminal_history_without_decision(context, &state)?;
+                    return Ok(TransactionOutcome::Unresolved);
+                }
+                if let Some(reservation) = self
+                    .timestamps
+                    .commit_time_reservation(context.snapshot().transaction_id)
+                    .await?
+                {
+                    self.timestamps
+                        .resolve_commit_time(
+                            context.snapshot().transaction_id,
+                            reservation.commit_time(),
+                            CommitResolution::Aborted,
+                        )
+                        .await?;
+                }
+                return Ok(TransactionOutcome::Aborted);
+            }
+            let home = recovery_home_shard(&state)?;
             if recover_home_decision(context, home, &state)?.is_some() {
                 return self.recover(context).await;
             }
@@ -183,15 +272,19 @@ impl TemporalTxnCoordinator {
                 .shards
                 .get(&home)
                 .ok_or(TxnError::IncompleteSnapshot)?;
+            let manifest = transaction_manifest(
+                context,
+                state
+                    .intents
+                    .iter()
+                    .map(|(shard_id, intent)| (*shard_id, intent.digest())),
+            )?;
             let decision = TransactionRecord::new(
                 context.snapshot().transaction_id,
                 TransactionState::Aborted,
                 context.snapshot().start_time,
-                abort_decision_digest(
-                    context.snapshot().transaction_id,
-                    context.snapshot().start_time,
-                    context.snapshot().shards.keys().copied(),
-                ),
+                manifest
+                    .decision_digest(TransactionState::Aborted, context.snapshot().start_time)?,
             )?;
             let request = ShardRequest::RecordHomeDecision {
                 header: ShardRequestHeader::new(
@@ -200,6 +293,7 @@ impl TemporalTxnCoordinator {
                     fence.backend_generation,
                 ),
                 decision,
+                manifest,
             };
             if self.participants.submit(home, request).await.is_err() {
                 return match self.recover(context).await {
@@ -235,26 +329,21 @@ impl TemporalTxnCoordinator {
                 }
             };
 
-            if context.snapshot().shards.len() == 1 {
-                let history = state
-                    .histories
-                    .values()
-                    .next()
-                    .ok_or(TxnError::IncompleteSnapshot)?;
-                if let Some(commit) = history.single_shard_commit() {
+            if let Some((shard_id, commit)) = recovered_single_shard_commit(&state)? {
+                return self
+                    .recover_durable_single_shard(context, shard_id, commit)
+                    .await
+                    .map(AbortPrevalidation::Terminal);
+            }
+
+            if !state.intents.is_empty() {
+                let home = recovery_home_shard(&state)?;
+                if recover_home_decision(context, home, &state)?.is_some() {
                     return self
-                        .recover_durable_single_shard(context, commit)
+                        .recover(context)
                         .await
                         .map(AbortPrevalidation::Terminal);
                 }
-            }
-
-            let home = home_shard(context)?;
-            if recover_home_decision(context, home, &state)?.is_some() {
-                return self
-                    .recover(context)
-                    .await
-                    .map(AbortPrevalidation::Terminal);
             }
             if state
                 .histories
@@ -309,15 +398,16 @@ impl TemporalTxnCoordinator {
                 Err(TxnError::CorruptRecovery) => return Err(TxnError::CorruptRecovery),
                 Err(_) => return Ok(TransactionOutcome::Unresolved),
             };
-            let history = state
+            if let Some((shard_id, commit)) = recovered_single_shard_commit(&state)? {
+                return self
+                    .recover_durable_single_shard(context, shard_id, commit)
+                    .await;
+            }
+            if state
                 .histories
                 .values()
-                .next()
-                .ok_or(TxnError::IncompleteSnapshot)?;
-            if let Some(commit) = history.single_shard_commit() {
-                return self.recover_durable_single_shard(context, commit).await;
-            }
-            if !history_is_empty(history) {
+                .any(|history| !history_is_empty(history))
+            {
                 return Err(TxnError::CorruptRecovery);
             }
 
@@ -427,7 +517,8 @@ impl TemporalTxnCoordinator {
     fn recover_durable_single_shard<'a>(
         &'a self,
         context: &'a TransactionContext,
-        commit: crate::RecoveredSingleShardCommit,
+        shard_id: ShardId,
+        commit: RecoveredSingleShardCommit,
     ) -> TxnFuture<'a, TransactionOutcome> {
         Box::pin(async move {
             let transaction_id = context.snapshot().transaction_id;
@@ -444,11 +535,10 @@ impl TemporalTxnCoordinator {
             {
                 return Err(TxnError::CorruptRecovery);
             }
-            let (&shard_id, fence) = context
+            let fence = context
                 .snapshot()
                 .shards
-                .iter()
-                .next()
+                .get(&shard_id)
                 .ok_or(TxnError::IncompleteSnapshot)?;
             let request = single_shard_request(context, shard_id, fence, commit.commit_time())?;
             if commit.transaction_id() != transaction_id
@@ -501,14 +591,27 @@ fn single_shard_request(
     })
 }
 
-fn home_shard(context: &TransactionContext) -> Result<ShardId, TxnError> {
-    context
-        .snapshot()
-        .shards
+fn recovered_single_shard_commit(
+    state: &RecoveryState,
+) -> Result<Option<(ShardId, RecoveredSingleShardCommit)>, TxnError> {
+    let mut recovered = None;
+    for (shard_id, history) in &state.histories {
+        if let Some(commit) = history.single_shard_commit()
+            && recovered.replace((*shard_id, commit)).is_some()
+        {
+            return Err(TxnError::CorruptRecovery);
+        }
+    }
+    Ok(recovered)
+}
+
+fn recovery_home_shard(state: &RecoveryState) -> Result<ShardId, TxnError> {
+    state
+        .intents
         .keys()
         .next()
         .copied()
-        .ok_or(TxnError::IncompleteSnapshot)
+        .ok_or(TxnError::CorruptRecovery)
 }
 
 fn validate_commit_reservation(
@@ -591,7 +694,7 @@ fn recover_home_decision(
         let valid = match record.state() {
             TransactionState::Committed
                 if record.transaction_time() > context.snapshot().start_time
-                    && state.intents.len() == context.snapshot().shards.len() =>
+                    && !state.intents.is_empty() =>
             {
                 decision_digest(
                     transaction_id,
@@ -608,7 +711,7 @@ fn recover_home_decision(
                 abort_decision_digest(
                     transaction_id,
                     context.snapshot().start_time,
-                    context.snapshot().shards.keys().copied(),
+                    state.intents.keys().copied(),
                 ) == record.record_digest()
             }
             TransactionState::Prepared
