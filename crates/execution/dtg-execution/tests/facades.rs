@@ -801,11 +801,13 @@ fn gateway_exposes_transaction_commit_and_abort_boundaries() {
 
     assert_eq!(
         block_on(gateway.commit_transaction(&context, Vec::new())),
-        Err(TxnError::ParticipantsMismatch)
+        Ok(dtg_transaction::TransactionOutcome::Committed(
+            context.snapshot().start_time,
+        ))
     );
     assert_eq!(
         block_on(gateway.abort_transaction(&context, Vec::new())),
-        Err(TxnError::ParticipantsMismatch)
+        Ok(dtg_transaction::TransactionOutcome::Aborted)
     );
 }
 

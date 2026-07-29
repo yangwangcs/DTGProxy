@@ -178,6 +178,22 @@ fn read_only_transaction_commits_without_timestamp_or_shard_writes() {
 }
 
 #[test]
+fn read_only_transaction_aborts_without_timestamp_or_shard_recovery() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(FakeShards::default());
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let context = context(&[3, 9]);
+
+    assert_eq!(
+        block_on(coordinator.abort(&context, Vec::new())),
+        Ok(TransactionOutcome::Aborted)
+    );
+    assert!(shards.commands.lock().unwrap().is_empty());
+    assert!(timestamps.reserved.lock().unwrap().is_empty());
+    assert!(timestamps.published.lock().unwrap().is_empty());
+}
+
+#[test]
 fn resolved_single_shard_commit_is_terminal_before_new_conflict_checks() {
     let timestamps = Arc::new(FakeTimestamps::default());
     let shards = Arc::new(FakeShards::default());

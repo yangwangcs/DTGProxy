@@ -378,6 +378,9 @@ impl TemporalTxnCoordinator {
             context.overlay.validate(&context.base)?;
             validate_participants(context, &participants)?;
             participants.sort_by_key(ParticipantWrite::shard_id);
+            if participants.is_empty() {
+                return Ok(TransactionOutcome::Aborted);
+            }
 
             let pending_commit_time = match self.prevalidate_abort_authority(context).await? {
                 AbortPrevalidation::Proceed(pending_commit_time) => pending_commit_time,
