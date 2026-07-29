@@ -815,6 +815,14 @@ dependencies = [
 [[package]]
 name = "dtg-storage-neo4j"
 version = "1.0.0"
+dependencies = [
+ "base64",
+ "dtg-kernel",
+ "dtg-storage",
+ "serde_json",
+ "tokio",
+ "ureq",
+]
 
 [[package]]
 name = "dtg-storage-postgres"
