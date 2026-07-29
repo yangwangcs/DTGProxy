@@ -1,9 +1,9 @@
 use dtg_kernel::{Digest32, Version};
 use dtg_storage::{
-    BindingRole, ConsensusSnapshotMetadata, ConsensusStore, LogicalReplicaActivation,
-    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotSink,
-    LogicalSnapshotSource, RaftHardState, RaftMembership, ReplicaBinding, SnapshotChunk,
-    SnapshotHeader, SnapshotManifest, SnapshotRequest, StorageError,
+    BindingRole, ConsensusSnapshotInstall, ConsensusSnapshotMetadata, ConsensusStore,
+    LogicalReplicaActivation, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,
+    LogicalSnapshotSink, LogicalSnapshotSource, RaftHardState, RaftMembership, ReplicaBinding,
+    SnapshotChunk, SnapshotHeader, SnapshotManifest, SnapshotRequest, StorageError,
 };
 
 use crate::{ReadMode, ReadPermit, state_machine::block_on};
@@ -283,15 +283,19 @@ pub fn install_replica_snapshot(
             .committed_index
             .max(snapshot.manifest.last_included_index),
     };
-    block_on(consensus.set_membership(snapshot.membership.clone()))?;
-    block_on(consensus.set_snapshot_metadata(ConsensusSnapshotMetadata {
-        snapshot_id: snapshot.header.snapshot_id().get(),
-        last_included_term: snapshot.manifest.last_included_term,
-        last_included_index: snapshot.manifest.last_included_index,
-        content_digest: snapshot.manifest.logical_digest,
-    }))?;
-    block_on(consensus.set_hard_state(installed_hard_state))?;
-    verify_consensus_install(consensus, snapshot, installed_hard_state)?;
+    let install = ConsensusSnapshotInstall::new(
+        candidate_receipt.clone(),
+        active_binding.clone(),
+        installed_hard_state,
+        snapshot.membership.clone(),
+        ConsensusSnapshotMetadata {
+            snapshot_id: snapshot.header.snapshot_id().get(),
+            last_included_term: snapshot.manifest.last_included_term,
+            last_included_index: snapshot.manifest.last_included_index,
+            content_digest: snapshot.manifest.logical_digest,
+        },
+    )?;
+    block_on(consensus.stage_snapshot_install(install.clone()))?;
 
     let activation_receipt =
         block_on(activation.activate_candidate(candidate_receipt.clone(), active_binding.clone()))?;
@@ -306,12 +310,49 @@ pub fn install_replica_snapshot(
             "snapshot activation receipt is invalid",
         ));
     }
+    block_on(consensus.commit_snapshot_install(install))?;
+    verify_consensus_install(consensus, snapshot, installed_hard_state)?;
     Ok(ReplicaSnapshotInstallReceipt {
         state: ReplicaSnapshotInstallState::Active,
         active_binding,
         candidate_receipt,
         activation_receipt,
     })
+}
+
+pub fn recover_replica_snapshot_install(
+    activation: &dyn LogicalReplicaActivation,
+    consensus: &dyn ConsensusStore,
+) -> Result<Option<ReplicaSnapshotInstallReceipt>, ReplicaSnapshotError> {
+    let Some(install) = block_on(consensus.snapshot_install())? else {
+        return Ok(None);
+    };
+    if consensus.binding() != install.active_binding() {
+        return Err(ReplicaSnapshotError::InvalidRequest(
+            "snapshot install journal and consensus bindings differ",
+        ));
+    }
+    let candidate_receipt = install.candidate().clone();
+    let active_binding = install.active_binding().clone();
+    let activation_receipt =
+        block_on(activation.activate_candidate(candidate_receipt.clone(), active_binding.clone()))?;
+    if activation_receipt.active_binding() != &active_binding
+        || activation_receipt.snapshot_id() != candidate_receipt.header().snapshot_id()
+        || activation_receipt.applied_index() != candidate_receipt.header().applied_index()
+        || activation_receipt.content_digest() != candidate_receipt.manifest().content_digest()
+        || activation_receipt.format_version() != candidate_receipt.header().format_version()
+    {
+        return Err(ReplicaSnapshotError::InvalidRequest(
+            "recovered snapshot activation receipt is invalid",
+        ));
+    }
+    block_on(consensus.commit_snapshot_install(install))?;
+    Ok(Some(ReplicaSnapshotInstallReceipt {
+        state: ReplicaSnapshotInstallState::Active,
+        active_binding,
+        candidate_receipt,
+        activation_receipt,
+    }))
 }
 
 fn validate_snapshot(snapshot: &ReplicaSnapshot) -> Result<(), ReplicaSnapshotError> {

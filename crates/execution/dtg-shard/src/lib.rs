@@ -29,6 +29,7 @@ pub use snapshot::{
     ReplicaSnapshot, ReplicaSnapshotError, ReplicaSnapshotInstallReceipt,
     ReplicaSnapshotInstallState, ReplicaSnapshotManifest,
     SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION, create_replica_snapshot, install_replica_snapshot,
+    recover_replica_snapshot_install,
 };
 pub use state_machine::{
     ACTIVE_TRANSACTION_INTENTS_METADATA_NAME, ApplyOutcome, SINGLE_SHARD_TRANSACTION_METADATA_NAME,

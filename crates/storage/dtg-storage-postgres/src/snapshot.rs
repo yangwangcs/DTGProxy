@@ -274,7 +274,9 @@ pub(crate) async fn activate_candidate(
     active_binding: ReplicaBinding,
 ) -> Result<LogicalReplicaActivationReceipt, StorageError> {
     let receipt = LogicalReplicaActivationReceipt::new(&candidate, active_binding.clone())?;
-    if candidate.candidate_binding() != store.binding_ref() {
+    if store.binding_ref() != candidate.candidate_binding()
+        && store.binding_ref() != &active_binding
+    {
         return Err(StorageError::SnapshotIdentityMismatch);
     }
     let expected_install = SnapshotInstallMarker::new(

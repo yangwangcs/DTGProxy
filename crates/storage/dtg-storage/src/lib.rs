@@ -20,8 +20,8 @@ pub use capability::{
     SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
 };
 pub use consensus::{
-    ConsensusCommandEnvelope, ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore,
-    RaftHardState, RaftMembership, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
+    ConsensusCommandEnvelope, ConsensusEntry, ConsensusSnapshotInstall, ConsensusSnapshotMetadata,
+    ConsensusStore, RaftHardState, RaftMembership, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
     SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION,
 };
 pub use dtg_kernel::{

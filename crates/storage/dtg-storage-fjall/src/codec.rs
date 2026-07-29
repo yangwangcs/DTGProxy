@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use bincode::{Decode, Encode};
 use dtg_storage::{
     ArtifactChunk, ArtifactKey, ArtifactKind, BindingRole, CommandId, ConsensusCommandEnvelope,
-    ConsensusEntry, ConsensusSnapshotMetadata, Digest32, EdgeId, EdgeTombstone, EdgeVersion,
-    LogicalMutation, ProviderKind, RaftHardState, RaftMembership, ReplicaBinding, ReplicaMetadata,
-    StorageError, TransactionId, TransactionRecord, TransactionState, TransactionTime,
-    ValidInterval, Value, Version, VertexId, VertexTombstone, VertexVersion,
+    ConsensusEntry, ConsensusSnapshotInstall, ConsensusSnapshotMetadata, Digest32, EdgeId,
+    EdgeTombstone, EdgeVersion, LogicalMutation, LogicalSnapshotCandidateReceipt, ProviderKind,
+    RaftHardState, RaftMembership, ReplicaBinding, ReplicaMetadata, SnapshotHeader, SnapshotId,
+    SnapshotManifest, StorageError, TransactionId, TransactionRecord, TransactionState,
+    TransactionTime, ValidInterval, Value, Version, VertexId, VertexTombstone, VertexVersion,
 };
 
 const CODEC_VERSION: u32 = 1;
@@ -592,6 +593,79 @@ pub(crate) fn decode_consensus_snapshot(
         last_included_index: wire.last_included_index,
         content_digest: Digest32::new(wire.content_digest),
     })
+}
+
+#[derive(Encode, Decode)]
+struct WireConsensusSnapshotInstall {
+    version: u32,
+    candidate_binding: Vec<u8>,
+    active_binding: Vec<u8>,
+    source_binding: Vec<u8>,
+    snapshot_id: u128,
+    applied_index: u64,
+    format_version: u32,
+    chunk_count: u64,
+    record_count: u64,
+    content_digest: [u8; 32],
+    hard_state: Vec<u8>,
+    membership: Vec<u8>,
+    last_included_term: u64,
+}
+
+pub(crate) fn encode_consensus_snapshot_install(
+    install: &ConsensusSnapshotInstall,
+) -> Result<Vec<u8>, StorageError> {
+    encode(&WireConsensusSnapshotInstall {
+        version: CODEC_VERSION,
+        candidate_binding: encode_binding(install.candidate().candidate_binding())?,
+        active_binding: encode_binding(install.active_binding())?,
+        source_binding: encode_binding(install.candidate().header().source_binding())?,
+        snapshot_id: install.candidate().header().snapshot_id().get(),
+        applied_index: install.candidate().header().applied_index(),
+        format_version: install.candidate().header().format_version(),
+        chunk_count: install.candidate().manifest().chunk_count(),
+        record_count: install.candidate().manifest().record_count(),
+        content_digest: install.candidate().manifest().content_digest().get(),
+        hard_state: encode_hard_state(install.hard_state())?,
+        membership: encode_membership(install.membership())?,
+        last_included_term: install.metadata().last_included_term,
+    })
+}
+
+pub(crate) fn decode_consensus_snapshot_install(
+    bytes: &[u8],
+) -> Result<ConsensusSnapshotInstall, StorageError> {
+    let wire: WireConsensusSnapshotInstall = decode(bytes)?;
+    require_version(wire.version, "consensus snapshot install")?;
+    let header = SnapshotHeader::new(
+        SnapshotId::new(wire.snapshot_id)?,
+        decode_binding(&wire.source_binding)?,
+        wire.applied_index,
+        wire.format_version,
+    )?;
+    let manifest = SnapshotManifest {
+        snapshot_id: header.snapshot_id(),
+        chunk_count: wire.chunk_count,
+        record_count: wire.record_count,
+        content_digest: Digest32::new(wire.content_digest),
+    };
+    let candidate = LogicalSnapshotCandidateReceipt::new(
+        decode_binding(&wire.candidate_binding)?,
+        header,
+        manifest,
+    )?;
+    ConsensusSnapshotInstall::new(
+        candidate,
+        decode_binding(&wire.active_binding)?,
+        decode_hard_state(&wire.hard_state)?,
+        decode_membership(&wire.membership)?,
+        ConsensusSnapshotMetadata {
+            snapshot_id: wire.snapshot_id,
+            last_included_term: wire.last_included_term,
+            last_included_index: wire.applied_index,
+            content_digest: Digest32::new(wire.content_digest),
+        },
+    )
 }
 
 #[derive(Encode, Decode)]

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use dtg_shard::{
     CommitSingleShard, RaftReplica, ReplicaSnapshot, ReplicaSnapshotInstallState,
     ReplicaSnapshotManifest, SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION, ShardCommand,
-    create_replica_snapshot, install_replica_snapshot,
+    create_replica_snapshot, install_replica_snapshot, recover_replica_snapshot_install,
 };
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, CommandId, ConsensusCommandEnvelope,
@@ -141,7 +141,12 @@ fn interrupted_activation_stays_non_serving_and_full_install_is_retryable() {
         .is_err()
     );
     assert_eq!(block_on(candidate.applied_index()).unwrap(), 2);
-    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_some());
+    assert!(block_on(consensus.snapshot_install()).unwrap().is_some());
+    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_none());
+    assert_eq!(
+        block_on(consensus.hard_state()).unwrap(),
+        RaftHardState::default()
+    );
     assert!(RaftReplica::open(consensus.clone(), candidate.clone()).is_err());
 
     let installed = install_replica_snapshot(
@@ -154,6 +159,53 @@ fn interrupted_activation_stays_non_serving_and_full_install_is_retryable() {
     )
     .unwrap();
     assert_eq!(installed.state(), ReplicaSnapshotInstallState::Active);
+}
+
+#[test]
+fn startup_recovery_finishes_an_activation_whose_response_was_lost() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot(root.path());
+    let candidate_binding = binding(5, BindingRole::Candidate, "activation-loss-target");
+    let active_binding = binding(5, BindingRole::Active, "activation-loss-target");
+    let business_path = root.path().join("activation-loss-business");
+    let candidate =
+        Arc::new(FjallReplicaStore::open(&business_path, candidate_binding.clone()).unwrap());
+    let consensus = Arc::new(
+        FjallConsensusStore::open(
+            root.path().join("activation-loss-consensus"),
+            active_binding.clone(),
+        )
+        .unwrap(),
+    );
+    let activation = LoseOnceActivationResponse {
+        inner: Arc::clone(&candidate),
+        failing: AtomicBool::new(true),
+    };
+
+    assert!(
+        install_replica_snapshot(
+            &snapshot,
+            candidate.as_ref(),
+            &activation,
+            consensus.as_ref(),
+            candidate_binding,
+            active_binding.clone(),
+        )
+        .is_err()
+    );
+    assert!(block_on(consensus.snapshot_install()).unwrap().is_some());
+    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_none());
+    drop(activation);
+    drop(candidate);
+
+    let active = Arc::new(FjallReplicaStore::open(&business_path, active_binding).unwrap());
+    let recovered = recover_replica_snapshot_install(active.as_ref(), consensus.as_ref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state(), ReplicaSnapshotInstallState::Active);
+    assert!(block_on(consensus.snapshot_install()).unwrap().is_none());
+    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_some());
+    assert!(RaftReplica::open(consensus, active).is_ok());
 }
 
 #[test]
@@ -362,6 +414,32 @@ fn snapshot_term_increase_clears_a_vote_from_the_old_term() {
 struct FailOnceActivation {
     inner: Arc<FjallReplicaStore>,
     failing: AtomicBool,
+}
+
+struct LoseOnceActivationResponse {
+    inner: Arc<FjallReplicaStore>,
+    failing: AtomicBool,
+}
+
+impl LogicalReplicaActivation for LoseOnceActivationResponse {
+    fn activate_candidate(
+        &self,
+        candidate: LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+    ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
+        Box::pin(async move {
+            let receipt = self
+                .inner
+                .activate_candidate(candidate, active_binding)
+                .await?;
+            if self.failing.swap(false, Ordering::SeqCst) {
+                return Err(StorageError::Internal(
+                    "injected activation response loss".into(),
+                ));
+            }
+            Ok(receipt)
+        })
+    }
 }
 
 impl LogicalReplicaActivation for FailOnceActivation {

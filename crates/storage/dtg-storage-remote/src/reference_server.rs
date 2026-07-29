@@ -859,7 +859,7 @@ impl Storage for ReferenceService {
                 Ok(receipt) => receipt,
                 Err(error) => return Ok(Response::new(activation_error_response(error))),
             };
-        if context_binding != candidate_binding {
+        if context_binding != candidate_binding && context_binding != active_binding {
             return Ok(Response::new(activation_error_response(
                 StorageError::SnapshotIdentityMismatch,
             )));

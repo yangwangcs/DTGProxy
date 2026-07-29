@@ -341,7 +341,9 @@ impl LogicalReplicaActivation for StorageRemoteClient {
         active_binding: ReplicaBinding,
     ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
         Box::pin(async move {
-            if candidate.candidate_binding() != self.binding_ref() {
+            if self.binding_ref() != candidate.candidate_binding()
+                && self.binding_ref() != &active_binding
+            {
                 return Err(StorageError::SnapshotIdentityMismatch);
             }
             let expected =

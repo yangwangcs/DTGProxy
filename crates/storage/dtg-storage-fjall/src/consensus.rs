@@ -1,15 +1,16 @@
 use std::{collections::BTreeMap, fmt, path::Path, sync::MutexGuard};
 
 use dtg_storage::{
-    ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, RaftHardState, RaftMembership,
-    ReplicaBinding, StorageError, StoreFuture,
+    ConsensusEntry, ConsensusSnapshotInstall, ConsensusSnapshotMetadata, ConsensusStore,
+    RaftHardState, RaftMembership, ReplicaBinding, StorageError, StoreFuture,
 };
 use fjall::PersistMode;
 
 use crate::{
     codec::{
-        decode_consensus_entry, decode_consensus_snapshot, decode_hard_state, decode_membership,
-        encode_consensus_entry, encode_consensus_snapshot, encode_hard_state, encode_membership,
+        decode_consensus_entry, decode_consensus_snapshot, decode_consensus_snapshot_install,
+        decode_hard_state, decode_membership, encode_consensus_entry, encode_consensus_snapshot,
+        encode_consensus_snapshot_install, encode_hard_state, encode_membership,
     },
     namespace::{NamespaceDb, fjall_error},
 };
@@ -17,6 +18,7 @@ use crate::{
 const HARD_STATE_KEY: &[u8] = b"hard_state";
 const MEMBERSHIP_KEY: &[u8] = b"membership";
 const SNAPSHOT_KEY: &[u8] = b"snapshot";
+const SNAPSHOT_INSTALL_KEY: &[u8] = b"snapshot_install";
 
 pub struct FjallConsensusStore {
     namespace: NamespaceDb,
@@ -273,6 +275,103 @@ impl ConsensusStore for FjallConsensusStore {
                 .db
                 .persist(PersistMode::SyncAll)
                 .map_err(fjall_error)
+        })
+    }
+
+    fn snapshot_install(&self) -> StoreFuture<'_, Option<ConsensusSnapshotInstall>> {
+        Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
+            self.namespace
+                .raft_snapshot
+                .get(SNAPSHOT_INSTALL_KEY)
+                .map_err(fjall_error)?
+                .map(|bytes| decode_consensus_snapshot_install(&bytes))
+                .transpose()
+        })
+    }
+
+    fn stage_snapshot_install(&self, install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
+            if install.active_binding() != &self.binding {
+                return Err(StorageError::InvalidConsensus(
+                    "snapshot install journal binding differs from consensus owner".into(),
+                ));
+            }
+            let encoded = encode_consensus_snapshot_install(&install)?;
+            if let Some(existing) = self
+                .namespace
+                .raft_snapshot
+                .get(SNAPSHOT_INSTALL_KEY)
+                .map_err(fjall_error)?
+            {
+                if existing.as_ref() == encoded.as_slice() {
+                    return Ok(());
+                }
+                return Err(StorageError::InvalidConsensus(
+                    "a different snapshot install is already staged".into(),
+                ));
+            }
+            self.namespace
+                .raft_snapshot
+                .insert(SNAPSHOT_INSTALL_KEY, encoded)
+                .map_err(fjall_error)?;
+            self.namespace
+                .db
+                .persist(PersistMode::SyncAll)
+                .map_err(fjall_error)
+        })
+    }
+
+    fn commit_snapshot_install(&self, install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let _guard = self.lock()?;
+            self.ensure_binding()?;
+            if install.active_binding() != &self.binding {
+                return Err(StorageError::InvalidConsensus(
+                    "snapshot install commit binding differs from consensus owner".into(),
+                ));
+            }
+            let expected = encode_consensus_snapshot_install(&install)?;
+            let staged = self
+                .namespace
+                .raft_snapshot
+                .get(SNAPSHOT_INSTALL_KEY)
+                .map_err(fjall_error)?
+                .ok_or_else(|| {
+                    StorageError::InvalidConsensus(
+                        "snapshot install commit has no staged journal".into(),
+                    )
+                })?;
+            if staged.as_ref() != expected.as_slice() {
+                return Err(StorageError::InvalidConsensus(
+                    "snapshot install commit differs from staged journal".into(),
+                ));
+            }
+            let mut batch = self
+                .namespace
+                .db
+                .batch()
+                .durability(Some(PersistMode::SyncAll));
+            batch.insert(
+                &self.namespace.raft_state,
+                MEMBERSHIP_KEY,
+                encode_membership(install.membership())?,
+            );
+            batch.insert(
+                &self.namespace.raft_snapshot,
+                SNAPSHOT_KEY,
+                encode_consensus_snapshot(install.metadata())?,
+            );
+            batch.insert(
+                &self.namespace.raft_state,
+                HARD_STATE_KEY,
+                encode_hard_state(install.hard_state())?,
+            );
+            batch.remove(&self.namespace.raft_snapshot, SNAPSHOT_INSTALL_KEY);
+            batch.commit().map_err(fjall_error)
         })
     }
 }

@@ -1,6 +1,9 @@
 use dtg_kernel::{Digest32, ReplicaId};
 
-use crate::{CommandId, ReplicaBinding, StorageError, StoreFuture};
+use crate::{
+    BindingRole, CommandId, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,
+    ReplicaBinding, StorageError, StoreFuture,
+};
 
 pub const SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION: u32 = 1;
 pub const SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION: u32 = 1;
@@ -126,6 +129,74 @@ pub struct ConsensusSnapshotMetadata {
     pub content_digest: Digest32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsensusSnapshotInstall {
+    candidate: LogicalSnapshotCandidateReceipt,
+    active_binding: ReplicaBinding,
+    hard_state: RaftHardState,
+    membership: RaftMembership,
+    metadata: ConsensusSnapshotMetadata,
+}
+
+impl ConsensusSnapshotInstall {
+    pub fn new(
+        candidate: LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+        hard_state: RaftHardState,
+        membership: RaftMembership,
+        metadata: ConsensusSnapshotMetadata,
+    ) -> Result<Self, StorageError> {
+        LogicalReplicaActivationReceipt::new(&candidate, active_binding.clone())?;
+        let target_count = membership
+            .voters
+            .iter()
+            .chain(&membership.learners)
+            .filter(|replica| **replica == active_binding.replica_id())
+            .count();
+        if candidate.candidate_binding().role() != BindingRole::Candidate
+            || active_binding.role() != BindingRole::Active
+            || metadata.snapshot_id != candidate.header().snapshot_id().get()
+            || metadata.last_included_index != candidate.header().applied_index()
+            || metadata.content_digest != candidate.manifest().content_digest()
+            || metadata.last_included_term == 0
+            || hard_state.current_term < metadata.last_included_term
+            || hard_state.committed_index < metadata.last_included_index
+            || target_count != 1
+        {
+            return Err(StorageError::InvalidConsensus(
+                "snapshot install journal is inconsistent".into(),
+            ));
+        }
+        Ok(Self {
+            candidate,
+            active_binding,
+            hard_state,
+            membership,
+            metadata,
+        })
+    }
+
+    pub const fn candidate(&self) -> &LogicalSnapshotCandidateReceipt {
+        &self.candidate
+    }
+
+    pub const fn active_binding(&self) -> &ReplicaBinding {
+        &self.active_binding
+    }
+
+    pub const fn hard_state(&self) -> RaftHardState {
+        self.hard_state
+    }
+
+    pub const fn membership(&self) -> &RaftMembership {
+        &self.membership
+    }
+
+    pub const fn metadata(&self) -> &ConsensusSnapshotMetadata {
+        &self.metadata
+    }
+}
+
 pub trait ConsensusStore: Send + Sync {
     fn binding(&self) -> &ReplicaBinding;
     /// Appends one contiguous sequence. Exact overlap is idempotent. The first
@@ -140,4 +211,7 @@ pub trait ConsensusStore: Send + Sync {
     fn set_membership(&self, membership: RaftMembership) -> StoreFuture<'_, ()>;
     fn snapshot_metadata(&self) -> StoreFuture<'_, Option<ConsensusSnapshotMetadata>>;
     fn set_snapshot_metadata(&self, metadata: ConsensusSnapshotMetadata) -> StoreFuture<'_, ()>;
+    fn snapshot_install(&self) -> StoreFuture<'_, Option<ConsensusSnapshotInstall>>;
+    fn stage_snapshot_install(&self, install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()>;
+    fn commit_snapshot_install(&self, install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()>;
 }

@@ -31,9 +31,9 @@ use dtg_query::{
 use dtg_shard::ShardError;
 use dtg_storage::{
     ApplyReceipt, BackendClass, BackendGeneration, BindingRole, CapabilityManifest, ChangeRecord,
-    CommittedShardBatch, ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, PlacementEpoch,
-    RaftHardState, RaftMembership, ReadFence, ReplicaMetadata, ShardId, StorageError,
-    TemporalReadView, TransactionId, TransactionTime, Version,
+    CommittedShardBatch, ConsensusEntry, ConsensusSnapshotInstall, ConsensusSnapshotMetadata,
+    ConsensusStore, PlacementEpoch, RaftHardState, RaftMembership, ReadFence, ReplicaMetadata,
+    ShardId, StorageError, TemporalReadView, TransactionId, TransactionTime, Version,
 };
 use dtg_transaction::{
     CommitResolution, CommitTimeReservation, ShardCommandExecutor, ShardRequest,
@@ -126,6 +126,18 @@ impl ConsensusStore for BindingConsensus {
     }
 
     fn set_snapshot_metadata(&self, _metadata: ConsensusSnapshotMetadata) -> StoreFuture<'_, ()> {
+        Box::pin(async { Err(StorageError::Unsupported) })
+    }
+
+    fn snapshot_install(&self) -> StoreFuture<'_, Option<ConsensusSnapshotInstall>> {
+        Box::pin(async { Err(StorageError::Unsupported) })
+    }
+
+    fn stage_snapshot_install(&self, _install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()> {
+        Box::pin(async { Err(StorageError::Unsupported) })
+    }
+
+    fn commit_snapshot_install(&self, _install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()> {
         Box::pin(async { Err(StorageError::Unsupported) })
     }
 }

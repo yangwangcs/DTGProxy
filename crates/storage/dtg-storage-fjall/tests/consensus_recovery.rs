@@ -6,8 +6,9 @@ use std::{
 
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, CommandId, ConsensusCommandEnvelope,
-    ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, Digest32, ProviderKind,
-    RaftHardState, RaftMembership, ReplicaBinding, ReplicaId, StorageError,
+    ConsensusEntry, ConsensusSnapshotInstall, ConsensusSnapshotMetadata, ConsensusStore, Digest32,
+    LogicalSnapshotCandidateReceipt, ProviderKind, RaftHardState, RaftMembership, ReplicaBinding,
+    ReplicaId, SnapshotHeader, SnapshotId, SnapshotManifest, StorageError,
 };
 use dtg_storage_fjall::FjallConsensusStore;
 use fjall::{Database, KeyspaceCreateOptions, PersistMode};
@@ -79,6 +80,42 @@ fn divergent_entry(index: u64) -> ConsensusEntry {
     .unwrap()
 }
 
+fn snapshot_install(active: &ReplicaBinding) -> ConsensusSnapshotInstall {
+    let candidate = active
+        .to_builder()
+        .role(BindingRole::Candidate)
+        .build()
+        .unwrap();
+    let header = SnapshotHeader::new(SnapshotId::new(91).unwrap(), active.clone(), 10, 1).unwrap();
+    let manifest = SnapshotManifest {
+        snapshot_id: header.snapshot_id(),
+        chunk_count: 2,
+        record_count: 7,
+        content_digest: Digest32::new([0x91; 32]),
+    };
+    ConsensusSnapshotInstall::new(
+        LogicalSnapshotCandidateReceipt::new(candidate, header, manifest).unwrap(),
+        active.clone(),
+        RaftHardState {
+            current_term: 3,
+            voted_for: None,
+            committed_index: 10,
+        },
+        RaftMembership {
+            voters: vec![active.replica_id()],
+            learners: vec![],
+            configuration_index: 10,
+        },
+        ConsensusSnapshotMetadata {
+            snapshot_id: 91,
+            last_included_term: 3,
+            last_included_index: 10,
+            content_digest: Digest32::new([0x91; 32]),
+        },
+    )
+    .unwrap()
+}
+
 #[test]
 fn consensus_entries_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -111,6 +148,45 @@ fn consensus_entries_survive_reopen() {
     assert_eq!(
         block_on(reopened.snapshot_metadata()).unwrap(),
         Some(snapshot)
+    );
+}
+
+#[test]
+fn snapshot_install_journal_survives_restart_and_commits_consensus_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = fixture_replica();
+    let install = snapshot_install(&binding);
+    let store = FjallConsensusStore::open(dir.path(), binding.clone()).unwrap();
+    block_on(store.stage_snapshot_install(install.clone())).unwrap();
+    assert_eq!(
+        block_on(store.snapshot_install()).unwrap(),
+        Some(install.clone())
+    );
+    assert_eq!(
+        block_on(store.hard_state()).unwrap(),
+        RaftHardState::default()
+    );
+    assert!(block_on(store.snapshot_metadata()).unwrap().is_none());
+    drop(store);
+
+    let reopened = FjallConsensusStore::open(dir.path(), binding).unwrap();
+    assert_eq!(
+        block_on(reopened.snapshot_install()).unwrap(),
+        Some(install.clone())
+    );
+    block_on(reopened.commit_snapshot_install(install.clone())).unwrap();
+    assert!(block_on(reopened.snapshot_install()).unwrap().is_none());
+    assert_eq!(
+        block_on(reopened.hard_state()).unwrap(),
+        install.hard_state()
+    );
+    assert_eq!(
+        block_on(reopened.membership()).unwrap(),
+        *install.membership()
+    );
+    assert_eq!(
+        block_on(reopened.snapshot_metadata()).unwrap(),
+        Some(install.metadata().clone())
     );
 }
 

@@ -202,7 +202,8 @@ impl LogicalReplicaActivation for FjallReplicaStore {
     ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
         Box::pin(async move {
             let receipt = LogicalReplicaActivationReceipt::new(&candidate, active_binding.clone())?;
-            if candidate.candidate_binding() != self.binding() {
+            if self.binding() != candidate.candidate_binding() && self.binding() != &active_binding
+            {
                 return Err(StorageError::SnapshotIdentityMismatch);
             }
             let _guard = self.lock_graph()?;
