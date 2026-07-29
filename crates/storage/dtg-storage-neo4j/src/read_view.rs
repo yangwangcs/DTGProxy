@@ -1,15 +1,15 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::collections::BTreeMap;
+
 use dtg_storage::{
     AdjacencyDirection, AdjacencyRead, ChangeCursor, ChangePage, ChangeRecord, ChangesRead,
-    EdgeHistoryRead, EdgeId, EdgeRead, EdgeScan, EdgeVersion, LogicalMutation, ReadFence,
-    ReplicaMetadata, ScanPage, SnapshotRecord, SnapshotReplayRecord, StorageError, StoreFuture,
-    TemporalReadView, VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexVersion,
+    EdgeHistoryRead, EdgeId, EdgeRead, EdgeScan, EdgeVersion, LogicalMutation, ReadFence, ScanPage,
+    SnapshotRecord, SnapshotReplayRecord, StorageError, StoreFuture, TemporalReadView,
+    VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexVersion,
 };
 use serde_json::{Map, Value};
 
 use crate::{
     apply::decode_payload,
-    codec::decode_value,
     config::QueryApiTransaction,
     schema::{
         decode_digest, decode_u64_hex, decode_u128_hex, fenced_parameters, text, u64_hex, u128_hex,
@@ -30,7 +30,12 @@ impl Neo4jReadView {
     }
 
     fn parameters(&self) -> Map<String, Value> {
-        fenced_parameters(self.fence.binding())
+        let mut parameters = fenced_parameters(self.fence.binding());
+        parameters.insert(
+            "fence_index".into(),
+            Value::String(u64_hex(self.fence.applied_index())),
+        );
+        parameters
     }
 
     pub(crate) async fn snapshot_records(&self) -> Result<Vec<SnapshotRecord>, StorageError> {
@@ -49,6 +54,7 @@ impl Neo4jReadView {
                    namespace_id: $namespace_id,
                    backend_generation: $backend_generation
                  })
+                 WHERE history.raft_index <= $fence_index
                  RETURN history.payload
                  ORDER BY history.raft_index, history.ordinal
                  LIMIT $limit",
@@ -72,6 +78,7 @@ impl Neo4jReadView {
                 },
             );
         }
+        let mut transactions = BTreeMap::new();
         for row in self
             .transaction
             .execute(
@@ -80,11 +87,13 @@ impl Neo4jReadView {
                    backend_generation: $backend_generation,
                    binding_digest: $binding_digest
                  })
-                 MATCH (record:DtgTransaction {
+                 MATCH (change:DtgChange {
                    namespace_id: $namespace_id,
                    backend_generation: $backend_generation
                  })
-                 RETURN record.payload ORDER BY record.transaction_id LIMIT $limit",
+                 WHERE change.raft_index <= $fence_index AND change.mutation_kind = 5
+                 RETURN change.payload
+                 ORDER BY change.raft_index, change.ordinal LIMIT $limit",
                 Value::Object(parameters.clone()),
             )
             .await?
@@ -93,7 +102,7 @@ impl Neo4jReadView {
                 StorageError::Internal("Neo4j transaction row omitted payload".into())
             })?)? {
                 LogicalMutation::PutTransaction(value) => {
-                    records.push(SnapshotRecord::Transaction(value));
+                    transactions.insert(value.id(), value);
                 }
                 _ => {
                     return Err(StorageError::Internal(
@@ -102,6 +111,9 @@ impl Neo4jReadView {
                 }
             }
         }
+        records.extend(transactions.into_values().map(SnapshotRecord::Transaction));
+
+        let mut metadata_records = BTreeMap::new();
         for row in self
             .transaction
             .execute(
@@ -110,35 +122,35 @@ impl Neo4jReadView {
                    backend_generation: $backend_generation,
                    binding_digest: $binding_digest
                  })
-                 MATCH (metadata:DtgMetadata {
+                 MATCH (change:DtgChange {
                    namespace_id: $namespace_id,
                    backend_generation: $backend_generation
                  })
-                 RETURN metadata.key, metadata.value ORDER BY metadata.key LIMIT $limit",
+                 WHERE change.raft_index <= $fence_index AND change.mutation_kind = 6
+                 RETURN change.payload
+                 ORDER BY change.raft_index, change.ordinal LIMIT $limit",
                 Value::Object(parameters.clone()),
             )
             .await?
         {
-            let bytes = STANDARD
-                .decode(text(
-                    row.get(1).ok_or_else(|| {
-                        StorageError::Internal("Neo4j metadata row omitted value".into())
-                    })?,
-                    "metadata value",
-                )?)
-                .map_err(|_| {
-                    StorageError::Internal("invalid Neo4j metadata value encoding".into())
-                })?;
-            records.push(SnapshotRecord::ReplicaMetadata(ReplicaMetadata::new(
-                text(
-                    row.first().ok_or_else(|| {
-                        StorageError::Internal("Neo4j metadata row omitted key".into())
-                    })?,
-                    "metadata key",
-                )?,
-                decode_value(&bytes)?,
-            )?));
+            match decode_payload(row.first().ok_or_else(|| {
+                StorageError::Internal("Neo4j metadata change omitted payload".into())
+            })?)? {
+                LogicalMutation::PutReplicaMetadata(value) => {
+                    metadata_records.insert(value.name().to_owned(), value);
+                }
+                _ => {
+                    return Err(StorageError::Internal(
+                        "Neo4j metadata change contained an invalid payload".into(),
+                    ));
+                }
+            }
         }
+        records.extend(
+            metadata_records
+                .into_values()
+                .map(SnapshotRecord::ReplicaMetadata),
+        );
         for row in self
             .transaction
             .execute(
@@ -151,6 +163,7 @@ impl Neo4jReadView {
                    namespace_id: $namespace_id,
                    backend_generation: $backend_generation
                  })
+                 WHERE replay.raft_index <= $fence_index
                  RETURN replay.raft_index, replay.raft_term,
                    replay.command_id, replay.mutation_digest
                  ORDER BY replay.raft_index LIMIT $limit",
@@ -177,6 +190,7 @@ impl Neo4jReadView {
                    namespace_id: $namespace_id,
                    backend_generation: $backend_generation
                  })
+                 WHERE change.raft_index <= $fence_index
                  RETURN change.raft_index, change.ordinal, change.payload
                  ORDER BY change.raft_index, change.ordinal LIMIT $limit",
                 Value::Object(parameters),
@@ -219,7 +233,8 @@ impl Neo4jReadView {
                    backend_generation: $backend_generation,
                    entity_kind: 'vertex', entity_id: $entity_id
                  })
-                 WHERE history.transaction_time <= $transaction_at
+                 WHERE history.raft_index <= $fence_index
+                   AND history.transaction_time <= $transaction_at
                    AND (history.tombstone OR
                      (history.valid_from <= $valid_at AND $valid_at < history.valid_to))
                  RETURN history.payload
@@ -256,7 +271,8 @@ impl Neo4jReadView {
                    backend_generation: $backend_generation,
                    entity_kind: 'edge', entity_id: $entity_id
                  })
-                 WHERE history.transaction_time <= $transaction_at
+                 WHERE history.raft_index <= $fence_index
+                   AND history.transaction_time <= $transaction_at
                    AND (history.tombstone OR
                      (history.valid_from <= $valid_at AND $valid_at < history.valid_to))
                  RETURN history.payload
@@ -311,7 +327,8 @@ impl TemporalReadView for Neo4jReadView {
                        entity_kind: 'vertex', entity_id: $entity_id,
                        tombstone: false
                      })
-                     WHERE $transaction_from <= history.transaction_time
+                     WHERE history.raft_index <= $fence_index
+                       AND $transaction_from <= history.transaction_time
                        AND history.transaction_time <= $transaction_through
                      RETURN history.payload
                      ORDER BY history.transaction_time, history.version LIMIT $limit",
@@ -353,7 +370,8 @@ impl TemporalReadView for Neo4jReadView {
                        entity_kind: 'edge', entity_id: $entity_id,
                        tombstone: false
                      })
-                     WHERE $transaction_from <= history.transaction_time
+                     WHERE history.raft_index <= $fence_index
+                       AND $transaction_from <= history.transaction_time
                        AND history.transaction_time <= $transaction_through
                      RETURN history.payload
                      ORDER BY history.transaction_time, history.version LIMIT $limit",
@@ -398,7 +416,7 @@ impl TemporalReadView for Neo4jReadView {
                    backend_generation: $backend_generation,
                    entity_kind: 'edge', tombstone: false
                  }})
-                 WHERE {direction}
+                 WHERE candidate.raft_index <= $fence_index AND {direction}
                  WITH DISTINCT candidate.entity_id AS entity_id
                  ORDER BY entity_id LIMIT $candidate_limit
                  MATCH (history:DtgVersion {{
@@ -407,6 +425,7 @@ impl TemporalReadView for Neo4jReadView {
                    entity_kind: 'edge'
                  }})
                  WHERE history.entity_id = entity_id
+                   AND history.raft_index <= $fence_index
                    AND history.transaction_time <= $transaction_at
                    AND (history.tombstone OR
                      (history.valid_from <= $valid_at AND $valid_at < history.valid_to))
@@ -456,7 +475,8 @@ impl TemporalReadView for Neo4jReadView {
                        namespace_id: $namespace_id,
                        backend_generation: $backend_generation
                      })
-                     WHERE change.raft_index <= $through_index
+                     WHERE change.raft_index <= $fence_index
+                       AND change.raft_index <= $through_index
                        AND (NOT $has_after OR change.raft_index > $after_index OR
                          (change.raft_index = $after_index AND change.ordinal > $after_ordinal))
                      RETURN change.raft_index, change.ordinal, change.payload
@@ -517,7 +537,8 @@ impl TemporalReadView for Neo4jReadView {
                        backend_generation: $backend_generation,
                        entity_kind: 'vertex'
                      })
-                     WHERE NOT $has_after OR candidate.entity_id > $after
+                     WHERE candidate.raft_index <= $fence_index
+                       AND (NOT $has_after OR candidate.entity_id > $after)
                      WITH DISTINCT candidate.entity_id AS entity_id
                      ORDER BY entity_id LIMIT $candidate_limit
                      MATCH (history:DtgVersion {
@@ -526,6 +547,7 @@ impl TemporalReadView for Neo4jReadView {
                        entity_kind: 'vertex'
                      })
                      WHERE history.entity_id = entity_id
+                       AND history.raft_index <= $fence_index
                        AND history.transaction_time <= $transaction_at
                        AND (history.tombstone OR
                          (history.valid_from <= $valid_at AND $valid_at < history.valid_to))
@@ -579,7 +601,8 @@ impl TemporalReadView for Neo4jReadView {
                        backend_generation: $backend_generation,
                        entity_kind: 'edge'
                      })
-                     WHERE NOT $has_after OR candidate.entity_id > $after
+                     WHERE candidate.raft_index <= $fence_index
+                       AND (NOT $has_after OR candidate.entity_id > $after)
                      WITH DISTINCT candidate.entity_id AS entity_id
                      ORDER BY entity_id LIMIT $candidate_limit
                      MATCH (history:DtgVersion {
@@ -588,6 +611,7 @@ impl TemporalReadView for Neo4jReadView {
                        entity_kind: 'edge'
                      })
                      WHERE history.entity_id = entity_id
+                       AND history.raft_index <= $fence_index
                        AND history.transaction_time <= $transaction_at
                        AND (history.tombstone OR
                          (history.valid_from <= $valid_at AND $valid_at < history.valid_to))

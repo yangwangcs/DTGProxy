@@ -226,6 +226,7 @@ run_certification() {
 
   run_gate format 'cargo fmt --all -- --check'
   run_gate architecture 'bash scripts/check-layered-architecture.sh'
+  run_gate legacy_removal 'bash scripts/check-clean-break-removal.sh'
   record_live_prerequisites
   run_gate process_contracts 'cargo test --locked -p dtg-language -p dtg-execution -p dtg-meta -p dtg-controller -p dtg-data -p dtg-gateway'
   run_gate raft_and_consistent_reads 'cargo test --locked -p dtg-shard'
@@ -233,6 +234,7 @@ run_certification() {
   run_gate snapshots_and_builtin_analytics 'cargo test --locked -p dtg-analytics'
   run_gate control_and_six_migrations 'cargo test --locked -p dtg-control'
   run_gate storage_and_remote_protocol 'cargo test --locked -p dtg-storage -p dtg-storage-fjall -p dtg-storage-remote'
+  run_gate official_provider_contracts 'cargo test --locked -p dtg-storage-fjall -p dtg-storage-postgres -p dtg-storage-neo4j'
   run_gate strict_clippy 'cargo clippy --locked -p dtg-language -p dtg-execution -p dtg-meta -p dtg-controller -p dtg-data -p dtg-gateway --all-targets -- -D warnings'
   run_gate process_binaries 'cargo build --locked -p dtg-meta -p dtg-controller -p dtg-data -p dtg-gateway --bins'
   start_processes
