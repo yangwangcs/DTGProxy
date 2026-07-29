@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod action;
 mod binding;
 mod catalog;
 mod migration;
@@ -10,9 +11,10 @@ mod reconcile;
 use core::fmt;
 
 pub use binding::{ReplicaBindingRecord, RetentionPin};
-pub use catalog::{CatalogCommand, CatalogState, LineageEntry};
+pub use catalog::{CatalogCommand, CatalogReplica, CatalogState, LineageEntry};
 pub use dtg_kernel::{
-    BackendGeneration, ClusterId, Digest32, GraphId, PlacementEpoch, ReplicaId, ShardId, Version,
+    BackendGeneration, ClusterId, Digest32, GraphId, PlacementEpoch, ReplicaId, ShardId,
+    TransactionTime, Version,
 };
 pub use dtg_storage::{BackendClass, BindingRole, NamespaceId, ProviderKind, ReplicaBinding};
 pub use migration::{
@@ -32,11 +34,31 @@ pub enum ControlError {
     InvalidPlacement(&'static str),
     MixedBackendClass,
     InvalidObservation(&'static str),
-    StaleCatalog { expected: Version, actual: Version },
+    StaleCatalog {
+        expected: Version,
+        actual: Version,
+    },
+    CatalogRevisionRegression {
+        current: Version,
+        received: Version,
+    },
+    CatalogRevisionConflict(Version),
+    CatalogEpochRegression {
+        graph_id: GraphId,
+        shard_id: ShardId,
+        current: PlacementEpoch,
+        received: PlacementEpoch,
+    },
+    InvalidAction(&'static str),
+    UnknownAction,
+    StaleActionLease,
     LineageConflict,
     RetentionPinned,
     UnknownGeneration,
-    StaleObservation { expected: Version, actual: Version },
+    StaleObservation {
+        expected: Version,
+        actual: Version,
+    },
     VersionOverflow,
     InvalidMigration(&'static str),
     IllegalMigrationTransition,
@@ -57,6 +79,12 @@ impl ControlError {
             Self::MixedBackendClass => "DTG-CONTROL-MIXED-BACKEND-CLASS",
             Self::InvalidObservation(_) => "DTG-CONTROL-INVALID-OBSERVATION",
             Self::StaleCatalog { .. } => "DTG-CONTROL-STALE-CATALOG",
+            Self::CatalogRevisionRegression { .. } => "DTG-CONTROL-CATALOG-REVISION-REGRESSION",
+            Self::CatalogRevisionConflict(_) => "DTG-CONTROL-CATALOG-REVISION-CONFLICT",
+            Self::CatalogEpochRegression { .. } => "DTG-CONTROL-CATALOG-EPOCH-REGRESSION",
+            Self::InvalidAction(_) => "DTG-CONTROL-ACTION-INVALID",
+            Self::UnknownAction => "DTG-CONTROL-ACTION-UNKNOWN",
+            Self::StaleActionLease => "DTG-CONTROL-ACTION-STALE-LEASE",
             Self::LineageConflict => "DTG-CONTROL-LINEAGE",
             Self::RetentionPinned => "DTG-CONTROL-RETENTION-PINNED",
             Self::UnknownGeneration => "DTG-CONTROL-UNKNOWN-GENERATION",
@@ -98,6 +126,33 @@ impl fmt::Display for ControlError {
                 expected.get(),
                 actual.get()
             ),
+            Self::CatalogRevisionRegression { current, received } => write!(
+                formatter,
+                "catalog revision regressed from {} to {}",
+                current.get(),
+                received.get()
+            ),
+            Self::CatalogRevisionConflict(revision) => write!(
+                formatter,
+                "catalog revision {} has conflicting snapshot contents",
+                revision.get()
+            ),
+            Self::CatalogEpochRegression {
+                graph_id,
+                shard_id,
+                current,
+                received,
+            } => write!(
+                formatter,
+                "catalog placement epoch regressed for graph {} shard {} from {} to {}",
+                graph_id.get(),
+                shard_id.get(),
+                current.get(),
+                received.get()
+            ),
+            Self::InvalidAction(reason) => write!(formatter, "invalid control action: {reason}"),
+            Self::UnknownAction => formatter.write_str("control action does not exist"),
+            Self::StaleActionLease => formatter.write_str("control action lease is stale"),
             Self::LineageConflict => formatter.write_str(
                 "a backend generation cannot be reassigned to a different backend class",
             ),
@@ -141,3 +196,7 @@ impl fmt::Display for ControlError {
 }
 
 impl std::error::Error for ControlError {}
+pub use action::{
+    ActionCommand, ActionFailure, ActionId, ActionLease, ActionRecord, ActionState,
+    ControlActionLedger,
+};

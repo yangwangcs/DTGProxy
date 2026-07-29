@@ -4,6 +4,7 @@ mod controller;
 mod data;
 mod gateway;
 mod meta;
+mod meta_raft;
 
 pub use dtg_analytics as analytics;
 pub use dtg_cluster_v2 as cluster_protocol;
@@ -12,7 +13,7 @@ pub use dtg_plan as planning;
 pub use dtg_storage as storage;
 pub use dtg_transaction as transaction;
 
-pub use controller::{ControllerExecution, ControllerExecutionBuilder};
+pub use controller::{ControlActionExecutor, ControllerExecution, ControllerExecutionBuilder};
 pub use data::{
     DataExecution, DataExecutionBuilder, ExecutionBuildError, ProviderResolver, ProviderResolverSet,
 };
@@ -25,5 +26,8 @@ pub use gateway::{
     GatewayTemporalMode, GatewayTime, GatewayValue, TonicGatewayProtocolV2TransportFactory,
 };
 pub use meta::{MetaExecution, MetaExecutionBuilder};
+pub use meta_raft::{
+    MetaCommittedEntry, MetaRaftError, MetaRaftHost, MetaRaftProgress, MetaRaftRole,
+};
 
 pub const CLEAN_BREAK_ARCHITECTURE_VERSION: u32 = 1;

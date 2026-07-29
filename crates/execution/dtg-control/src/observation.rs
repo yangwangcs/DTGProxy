@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    BackendGeneration, ControlError, Digest32, GraphId, ReplicaBinding, ReplicaId, ShardId, Version,
+    BackendGeneration, ControlError, Digest32, GraphId, ReplicaBinding, ReplicaId, ShardId,
+    TransactionTime, Version,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
@@ -19,7 +20,9 @@ pub struct ObservedReplicaState {
     binding: ReplicaBinding,
     backend_class_digest: Digest32,
     lifecycle: ObservedReplicaLifecycle,
-    leader: bool,
+    applied_index: u64,
+    leader_id: Option<ReplicaId>,
+    closed_timestamp: Option<TransactionTime>,
     caught_up: bool,
 }
 
@@ -45,7 +48,9 @@ impl ObservedReplicaState {
             binding,
             backend_class_digest,
             lifecycle,
-            leader: false,
+            applied_index: 0,
+            leader_id: None,
+            closed_timestamp: None,
             caught_up: false,
         })
     }
@@ -70,8 +75,20 @@ impl ObservedReplicaState {
         self.lifecycle
     }
 
-    pub const fn is_leader(&self) -> bool {
-        self.leader
+    pub fn is_leader(&self) -> bool {
+        self.leader_id == Some(self.binding.replica_id())
+    }
+
+    pub const fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    pub const fn leader_id(&self) -> Option<ReplicaId> {
+        self.leader_id
+    }
+
+    pub const fn closed_timestamp(&self) -> Option<TransactionTime> {
+        self.closed_timestamp
     }
 
     pub const fn is_caught_up(&self) -> bool {
@@ -80,7 +97,32 @@ impl ObservedReplicaState {
 
     #[must_use]
     pub const fn with_leader(mut self, leader: bool) -> Self {
-        self.leader = leader;
+        self.leader_id = if leader {
+            Some(self.binding.replica_id())
+        } else {
+            None
+        };
+        self
+    }
+
+    #[must_use]
+    pub const fn with_applied_index(mut self, applied_index: u64) -> Self {
+        self.applied_index = applied_index;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_leader_id(mut self, leader_id: Option<ReplicaId>) -> Self {
+        self.leader_id = leader_id;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_closed_timestamp(
+        mut self,
+        closed_timestamp: Option<TransactionTime>,
+    ) -> Self {
+        self.closed_timestamp = closed_timestamp;
         self
     }
 

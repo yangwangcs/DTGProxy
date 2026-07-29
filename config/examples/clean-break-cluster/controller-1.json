@@ -4,5 +4,6 @@
   "node_id": 2,
   "listen_addr": "127.0.0.1:55102",
   "data_directory": "target/clean-break-cluster/controller-1",
+  "meta_endpoints": ["http://127.0.0.1:55101"],
   "security": { "mode": "loopback_plaintext" }
 }

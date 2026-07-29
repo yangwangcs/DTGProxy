@@ -2,7 +2,6 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use dtg_controller::{ControllerConfig, ControllerProcess};
-use dtg_execution::control::CatalogState;
 
 #[tokio::main]
 async fn main() {
@@ -15,7 +14,7 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn Error>> {
     let config_path = config_path()?;
     let _ = tracing_subscriber::fmt().with_target(false).try_init();
-    ControllerProcess::open(ControllerConfig::load(config_path)?, CatalogState::new())
+    ControllerProcess::connect(ControllerConfig::load(config_path)?)
         .await?
         .serve()
         .await?;

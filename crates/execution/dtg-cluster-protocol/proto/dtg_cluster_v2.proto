@@ -101,6 +101,17 @@ message ControlObservation {
   BoundedPayload payload = 5;
 }
 
+message CatalogWatchRequest {
+  RequestContext request = 1;
+  uint64 after_revision = 2;
+}
+
+message CatalogSnapshot {
+  RequestContext request = 1;
+  uint64 revision = 2;
+  BoundedPayload payload = 3;
+}
+
 enum StatusCode {
   STATUS_CODE_UNSPECIFIED = 0;
   STATUS_CODE_OK = 1;
@@ -152,6 +163,7 @@ service DataService {
 service MetaService {
   rpc SubmitTransaction(TransactionRequest) returns (TypedStatus);
   rpc ReportObservation(ControlObservation) returns (TypedStatus);
+  rpc WatchCatalog(CatalogWatchRequest) returns (stream CatalogSnapshot);
 }
 
 service ControllerService {

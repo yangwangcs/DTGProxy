@@ -272,3 +272,51 @@ impl Default for CatalogState {
         Self::new()
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct CatalogReplica {
+    snapshot: CatalogState,
+}
+
+impl CatalogReplica {
+    pub fn new(snapshot: CatalogState) -> Result<Self, ControlError> {
+        for placement in snapshot.placements.values() {
+            placement.validate()?;
+        }
+        Ok(Self { snapshot })
+    }
+
+    pub const fn snapshot(&self) -> &CatalogState {
+        &self.snapshot
+    }
+
+    pub fn install(&mut self, snapshot: CatalogState) -> Result<bool, ControlError> {
+        if snapshot.version < self.snapshot.version {
+            return Err(ControlError::CatalogRevisionRegression {
+                current: self.snapshot.version,
+                received: snapshot.version,
+            });
+        }
+        if snapshot.version == self.snapshot.version {
+            if snapshot == self.snapshot {
+                return Ok(false);
+            }
+            return Err(ControlError::CatalogRevisionConflict(snapshot.version));
+        }
+        for (key, next) in &snapshot.placements {
+            next.validate()?;
+            if let Some(current) = self.snapshot.placements.get(key)
+                && next.placement_epoch < current.placement_epoch
+            {
+                return Err(ControlError::CatalogEpochRegression {
+                    graph_id: key.0,
+                    shard_id: key.1,
+                    current: current.placement_epoch,
+                    received: next.placement_epoch,
+                });
+            }
+        }
+        self.snapshot = snapshot;
+        Ok(true)
+    }
+}

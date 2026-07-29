@@ -361,6 +361,7 @@ dependencies = [
 name = "dtg-control"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "dtg-kernel",
  "dtg-storage",
 ]
@@ -372,7 +373,6 @@ dependencies = [
  "dtg-cluster-protocol",
  "dtg-control",
  "dtg-execution",
- "dtg-storage-fjall",
  "serde",
  "serde_json",
  "tempfile",
@@ -410,7 +410,12 @@ dependencies = [
  "dtg-query",
  "dtg-shard",
  "dtg-storage",
+ "dtg-storage-fjall",
  "dtg-transaction",
+ "raft",
+ "slog",
+ "tempfile",
+ "tokio",
  "tonic",
 ]
 
@@ -459,6 +464,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",

@@ -4,7 +4,10 @@ use dtg_analytics::{
     AnalyticsJobError, AnalyticsJobId, AnalyticsJobSpec, AnalyticsLedger, JobCas, JobLease,
     JobTimestamp, WorkerId,
 };
-use dtg_control::{CatalogCommand, CatalogState, ControlError};
+use dtg_control::{
+    ActionCommand, ActionId, ActionRecord, CatalogCommand, CatalogState, ControlActionLedger,
+    ControlError,
+};
 use dtg_storage::{TransactionId, TransactionTime, Version};
 use dtg_transaction::{CommitResolution, TimestampAuthority, TxnFuture};
 
@@ -14,6 +17,7 @@ pub struct MetaExecution {
     catalog: CatalogState,
     timestamps: Arc<dyn TimestampAuthority>,
     analytics: AnalyticsLedger,
+    actions: ControlActionLedger,
 }
 
 impl MetaExecution {
@@ -59,6 +63,17 @@ impl MetaExecution {
         Ok(version)
     }
 
+    pub fn apply_action_command(
+        &mut self,
+        command: ActionCommand,
+    ) -> Result<ActionRecord, ControlError> {
+        self.actions.apply(command)
+    }
+
+    pub fn action_record(&self, action_id: ActionId) -> Option<&ActionRecord> {
+        self.actions.record(action_id)
+    }
+
     pub fn submit_analytics_job(
         &mut self,
         spec: AnalyticsJobSpec,
@@ -95,6 +110,7 @@ pub struct MetaExecutionBuilder {
     catalog: Option<CatalogState>,
     timestamps: Option<Arc<dyn TimestampAuthority>>,
     analytics: Option<AnalyticsLedger>,
+    actions: Option<ControlActionLedger>,
 }
 
 impl MetaExecutionBuilder {
@@ -113,6 +129,11 @@ impl MetaExecutionBuilder {
         self
     }
 
+    pub fn with_action_ledger(mut self, actions: ControlActionLedger) -> Self {
+        self.actions = Some(actions);
+        self
+    }
+
     pub fn build(self) -> Result<MetaExecution, ExecutionBuildError> {
         Ok(MetaExecution {
             catalog: self
@@ -124,6 +145,7 @@ impl MetaExecutionBuilder {
             analytics: self
                 .analytics
                 .ok_or(ExecutionBuildError::MissingComponent("analytics ledger"))?,
+            actions: self.actions.unwrap_or_default(),
         })
     }
 }

@@ -5,5 +5,9 @@
   "listen_addr": "127.0.0.1:55101",
   "data_directory": "target/clean-break-cluster/meta-1",
   "analytics_lease_duration": 30,
+  "consensus_namespace": "meta-authority",
+  "peers": [
+    { "node_id": 1, "raft_addr": "127.0.0.1:56101", "rpc_addr": "127.0.0.1:55101" }
+  ],
   "security": { "mode": "loopback_plaintext" }
 }

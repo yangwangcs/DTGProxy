@@ -1,10 +1,16 @@
 use dtg_control::{
-    BackendClass, BindingRole, CatalogCommand, GraphId, PlacementEpoch, ProviderKind,
-    ReplicaBinding, ReplicaBindingRecord, RetentionPin, ShardId, ShardPlacement, Version,
+    ActionCommand, ActionState, BackendClass, BindingRole, CatalogCommand, GraphId, PlacementEpoch,
+    ProviderKind, ReconcileAction, ReplicaBinding, ReplicaBindingRecord, ReplicaId, RetentionPin,
+    ShardId, ShardPlacement, Version,
+};
+use dtg_execution::cluster_protocol::proto::{
+    CatalogWatchRequest, RequestContext, meta_service_server::MetaService,
 };
 use dtg_meta::{MetaConfig, MetaProcess};
 use dtg_storage::DurabilityPolicy;
 use dtg_transaction::{CommitResolution, TransactionId};
+use tokio_stream::StreamExt;
+use tonic::Request;
 
 #[tokio::test]
 async fn meta_process_replays_catalog_and_timestamps_from_fjall_consensus() {
@@ -61,6 +67,66 @@ async fn meta_process_replays_catalog_and_timestamps_from_fjall_consensus() {
             > first_commit
     );
     assert_eq!(restarted.rpc_service().protocol_major(), 2);
+}
+
+#[tokio::test]
+async fn meta_raft_recovers_authoritative_action_state_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let config = MetaConfig::for_test(root.path(), 7, 1).unwrap();
+    let action = ReconcileAction::TransferLeader {
+        graph_id: GraphId::new(1).unwrap(),
+        shard_id: ShardId::new(1).unwrap(),
+        placement_epoch: PlacementEpoch::new(1).unwrap(),
+        from: ReplicaId::new(1).unwrap(),
+        to: ReplicaId::new(2).unwrap(),
+    };
+    let process = MetaProcess::open(config.clone()).await.unwrap();
+    let queued = process
+        .apply_action_command(ActionCommand::enqueue(Version::new(0), action))
+        .await
+        .unwrap();
+    drop(process);
+
+    let restarted = MetaProcess::open(config).await.unwrap();
+    assert_eq!(
+        restarted
+            .action_record(queued.action_id())
+            .await
+            .unwrap()
+            .state(),
+        &ActionState::Pending { attempt: 0 }
+    );
+}
+
+#[tokio::test]
+async fn meta_streams_versioned_catalog_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let process = MetaProcess::open(MetaConfig::for_test(root.path(), 7, 1).unwrap())
+        .await
+        .unwrap();
+    let mut stream = process
+        .rpc_service()
+        .watch_catalog(Request::new(CatalogWatchRequest {
+            request: Some(RequestContext {
+                protocol_major: 2,
+                protocol_minor: 0,
+                cluster_id: 7_u64.to_be_bytes().to_vec(),
+                request_id: 77_u128.to_be_bytes().to_vec(),
+                deadline_unix_ms: 1_900_000_000_000,
+                trace_context: Vec::new(),
+            }),
+            after_revision: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let initial = stream.next().await.unwrap().unwrap();
+    assert_eq!(initial.revision, 0);
+    process.propose(put_placement()).await.unwrap();
+    let changed = stream.next().await.unwrap().unwrap();
+    assert_eq!(changed.revision, 1);
+    assert_eq!(changed.payload.unwrap().item_count, 1);
 }
 
 fn put_placement() -> CatalogCommand {

@@ -14,6 +14,8 @@ pub struct MetaConfig {
     listen_addr: SocketAddr,
     data_directory: PathBuf,
     analytics_lease_duration: u64,
+    consensus_namespace: String,
+    peers: Vec<MetaPeer>,
     security: TransportSecurity,
 }
 
@@ -34,14 +36,22 @@ impl MetaConfig {
         cluster_id: u64,
         node_id: u64,
     ) -> Result<Self, ProcessConfigError> {
+        let listen_addr = "127.0.0.1:0"
+            .parse()
+            .expect("static socket address is valid");
         validate_config(
-            cluster_id,
-            node_id,
-            "127.0.0.1:0"
-                .parse()
-                .expect("static socket address is valid"),
+            (cluster_id, node_id),
+            listen_addr,
             data_directory.as_ref().to_path_buf(),
             30,
+            (
+                "meta-authority".into(),
+                vec![MetaPeer {
+                    node_id,
+                    raft_addr: listen_addr,
+                    rpc_addr: listen_addr,
+                }],
+            ),
             TransportSecurity::LoopbackPlaintext,
         )
     }
@@ -68,6 +78,14 @@ impl MetaConfig {
 
     pub const fn security(&self) -> &TransportSecurity {
         &self.security
+    }
+
+    pub fn consensus_namespace(&self) -> &str {
+        &self.consensus_namespace
+    }
+
+    pub fn peers(&self) -> &[MetaPeer] {
+        &self.peers
     }
 
     pub fn catalog_consensus_path(&self) -> PathBuf {
@@ -116,6 +134,8 @@ struct RawMetaConfig {
     data_directory: PathBuf,
     analytics_lease_duration: u64,
     security: RawSecurity,
+    consensus_namespace: String,
+    peers: Vec<MetaPeer>,
 }
 
 impl RawMetaConfig {
@@ -124,13 +144,35 @@ impl RawMetaConfig {
             return Err(ProcessConfigError::UnsupportedVersion(self.version));
         }
         validate_config(
-            self.cluster_id,
-            self.node_id,
+            (self.cluster_id, self.node_id),
             self.listen_addr,
             self.data_directory,
             self.analytics_lease_duration,
+            (self.consensus_namespace, self.peers),
             self.security.try_into()?,
         )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MetaPeer {
+    node_id: u64,
+    raft_addr: SocketAddr,
+    rpc_addr: SocketAddr,
+}
+
+impl MetaPeer {
+    pub const fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    pub const fn raft_addr(&self) -> SocketAddr {
+        self.raft_addr
+    }
+
+    pub const fn rpc_addr(&self) -> SocketAddr {
+        self.rpc_addr
     }
 }
 
@@ -176,17 +218,31 @@ impl TryFrom<RawSecurity> for TransportSecurity {
 }
 
 fn validate_config(
-    cluster_id: u64,
-    node_id: u64,
+    identity: (u64, u64),
     listen_addr: SocketAddr,
     data_directory: PathBuf,
     analytics_lease_duration: u64,
+    authority: (String, Vec<MetaPeer>),
     security: TransportSecurity,
 ) -> Result<MetaConfig, ProcessConfigError> {
+    let (cluster_id, node_id) = identity;
+    let (consensus_namespace, peers) = authority;
     if cluster_id == 0 || node_id == 0 {
         return Err(ProcessConfigError::InvalidIdentity);
     }
-    if data_directory.as_os_str().is_empty() || analytics_lease_duration == 0 {
+    let unique_peers = peers
+        .iter()
+        .map(|peer| peer.node_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if data_directory.as_os_str().is_empty()
+        || analytics_lease_duration == 0
+        || consensus_namespace.is_empty()
+        || consensus_namespace.chars().any(char::is_whitespace)
+        || peers.is_empty()
+        || unique_peers.len() != peers.len()
+        || !unique_peers.contains(&node_id)
+        || peers.iter().any(|peer| peer.node_id == 0)
+    {
         return Err(ProcessConfigError::InvalidRuntime);
     }
     if matches!(security, TransportSecurity::LoopbackPlaintext) && !listen_addr.ip().is_loopback() {
@@ -198,6 +254,8 @@ fn validate_config(
         listen_addr,
         data_directory,
         analytics_lease_duration,
+        consensus_namespace,
+        peers,
         security,
     })
 }

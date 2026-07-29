@@ -13,6 +13,7 @@ pub struct ControllerConfig {
     node_id: u64,
     listen_addr: SocketAddr,
     data_directory: PathBuf,
+    meta_endpoints: Vec<String>,
     security: TransportSecurity,
 }
 
@@ -40,6 +41,7 @@ impl ControllerConfig {
                 .parse()
                 .expect("static socket address is valid"),
             data_directory.as_ref().to_path_buf(),
+            Vec::new(),
             TransportSecurity::LoopbackPlaintext,
         )
     }
@@ -62,6 +64,10 @@ impl ControllerConfig {
 
     pub const fn security(&self) -> &TransportSecurity {
         &self.security
+    }
+
+    pub fn meta_endpoints(&self) -> &[String] {
+        &self.meta_endpoints
     }
 
     pub fn consensus_path(&self) -> PathBuf {
@@ -104,6 +110,7 @@ struct RawControllerConfig {
     node_id: u64,
     listen_addr: SocketAddr,
     data_directory: PathBuf,
+    meta_endpoints: Vec<String>,
     security: RawSecurity,
 }
 
@@ -112,11 +119,19 @@ impl RawControllerConfig {
         if self.version != 1 {
             return Err(ProcessConfigError::UnsupportedVersion(self.version));
         }
+        if self.meta_endpoints.is_empty()
+            || self.meta_endpoints.iter().any(|endpoint| {
+                !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+            })
+        {
+            return Err(ProcessConfigError::InvalidRuntime);
+        }
         validate_config(
             self.cluster_id,
             self.node_id,
             self.listen_addr,
             self.data_directory,
+            self.meta_endpoints,
             self.security.try_into()?,
         )
     }
@@ -168,6 +183,7 @@ fn validate_config(
     node_id: u64,
     listen_addr: SocketAddr,
     data_directory: PathBuf,
+    meta_endpoints: Vec<String>,
     security: TransportSecurity,
 ) -> Result<ControllerConfig, ProcessConfigError> {
     if cluster_id == 0 || node_id == 0 {
@@ -184,6 +200,7 @@ fn validate_config(
         node_id,
         listen_addr,
         data_directory,
+        meta_endpoints,
         security,
     })
 }

@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use dtg_execution::analytics::{AnalyticsJobError, AnalyticsLedger};
@@ -11,29 +12,32 @@ use dtg_execution::cluster_protocol::{
     PROTOCOL_MAJOR, checksum_bytes, validate_control_observation, validate_transaction_request,
 };
 use dtg_execution::control::{
-    BackendClass, BackendGeneration, BindingRole, CatalogCommand, CatalogState, GraphId,
-    PlacementEpoch, ProviderKind, ReplicaBinding, ReplicaBindingRecord, RetentionPin, ShardId,
-    ShardPlacement, Version,
+    ActionCommand, ActionId, ActionRecord, BackendClass, BackendGeneration, BindingRole,
+    CatalogCommand, CatalogState, ControlActionLedger, GraphId, PlacementEpoch, ProviderKind,
+    ReplicaBinding, ReplicaBindingRecord, RetentionPin, ShardId, ShardPlacement, Version,
 };
 use dtg_execution::storage::{
     CommandId, ConsensusCommandEnvelope, ConsensusEntry, ConsensusStore, DurabilityPolicy,
-    StorageError,
+    RaftMembership, ReplicaId, StorageError,
 };
 use dtg_execution::transaction::{
     CommitResolution, DurableTimestampAuthority, TimestampAuthority, TimestampCommandLog,
     TimestampLogFuture, TransactionId, TxnError,
 };
-use dtg_execution::{ExecutionBuildError, MetaExecution};
+use dtg_execution::{
+    ExecutionBuildError, MetaExecution, MetaRaftError, MetaRaftHost, MetaRaftRole,
+};
 use dtg_storage_fjall::FjallConsensusStore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 use crate::{MetaConfig, TransportSecurity};
 
 const CONSENSUS_FORMAT_VERSION: u32 = 1;
-const CONSENSUS_TERM: u64 = 1;
+const TIMESTAMP_LOG_TERM: u64 = 1;
 const CATALOG_GRAPH_ID: u64 = u64::MAX - 1;
 const TIMESTAMP_GRAPH_ID: u64 = u64::MAX - 2;
 
@@ -45,7 +49,9 @@ pub struct MetaProcess {
 
 struct MetaCore {
     execution: Mutex<MetaExecution>,
-    catalog_log: CatalogLog,
+    raft: Mutex<MetaRaftHost>,
+    catalog_commands: Mutex<Vec<CatalogCommand>>,
+    catalog_revision: watch::Sender<Version>,
 }
 
 impl MetaProcess {
@@ -59,44 +65,151 @@ impl MetaProcess {
             config.timestamp_consensus_path(),
             consensus_binding(&config, TIMESTAMP_GRAPH_ID, "meta-timestamps")?,
         )?);
-        let catalog_log = CatalogLog::open(catalog_store).await?;
+        configure_meta_membership(&config, catalog_store.as_ref()).await?;
+        let committed_index = catalog_store.hard_state().await?.committed_index;
+        let mut raft = MetaRaftHost::open(
+            catalog_store,
+            ReplicaId::new(config.node_id())
+                .map_err(|error| MetaProcessError::Consensus(error.to_string()))?,
+            committed_index,
+        )
+        .await?;
         let timestamp_log = Arc::new(FjallTimestampLog::open(timestamp_store).await?);
         let timestamps = Arc::new(DurableTimestampAuthority::open(timestamp_log).await?);
 
+        let mut commands = Vec::new();
+        let mut actions = ControlActionLedger::new();
         let mut catalog = CatalogState::new();
-        for command in catalog_log.replay().await? {
-            catalog = catalog.apply(command)?;
+        for entry in raft.recovery_entries() {
+            match decode_authority_command(entry.payload())? {
+                AuthorityCommand::Catalog(command) => {
+                    catalog = catalog.apply(command.clone())?;
+                    commands.push(command);
+                }
+                AuthorityCommand::Action(command) => {
+                    actions.apply(command)?;
+                }
+            }
         }
+        if config.peers().len() == 1 && raft.role() != MetaRaftRole::Leader {
+            raft.campaign()?;
+            let progress = raft.drive_ready().await?;
+            if !progress.committed.is_empty() {
+                return Err(MetaProcessError::Consensus(
+                    "single-node Meta election committed an unexpected command".into(),
+                ));
+            }
+        }
+        let catalog_version = catalog.version();
         let execution = MetaExecution::builder()
             .with_catalog(catalog)
             .with_timestamps(timestamps.clone())
             .with_analytics_ledger(AnalyticsLedger::new(config.analytics_lease_duration())?)
+            .with_action_ledger(actions)
             .build()?;
+        let (catalog_revision, _) = watch::channel(catalog_version);
         Ok(Self {
             config,
             core: Arc::new(MetaCore {
                 execution: Mutex::new(execution),
-                catalog_log,
+                raft: Mutex::new(raft),
+                catalog_commands: Mutex::new(commands),
+                catalog_revision,
             }),
             timestamps,
         })
     }
 
     pub async fn propose(&self, command: CatalogCommand) -> Result<Version, MetaProcessError> {
-        let payload = encode_catalog_command(&command)?;
-        let mut execution = self.core.execution.lock().await;
-        let index = self.core.catalog_log.append(payload).await?;
-        match execution.apply_catalog_command(command) {
-            Ok(version) => Ok(version),
-            Err(error) => {
-                self.core.catalog_log.rollback(index).await?;
-                Err(error.into())
+        let payload = encode_authority_command(&AuthorityCommand::Catalog(command.clone()))?;
+        let proposal_id = catalog_proposal_id(&payload);
+        let mut raft = self.core.raft.lock().await;
+        raft.propose(proposal_id, payload)?;
+        let progress = raft.drive_ready().await?;
+        drop(raft);
+        let mut result = None;
+        for committed in progress.committed {
+            match decode_authority_command(committed.payload())? {
+                AuthorityCommand::Catalog(committed_command) => {
+                    let mut execution = self.core.execution.lock().await;
+                    let version = execution.apply_catalog_command(committed_command.clone())?;
+                    drop(execution);
+                    self.core
+                        .catalog_commands
+                        .lock()
+                        .await
+                        .push(committed_command);
+                    self.core.catalog_revision.send_replace(version);
+                    if committed.proposal_id() == proposal_id {
+                        result = Some(version);
+                    }
+                }
+                AuthorityCommand::Action(command) => {
+                    self.core
+                        .execution
+                        .lock()
+                        .await
+                        .apply_action_command(command)?;
+                }
             }
         }
+        result.ok_or(MetaProcessError::ProposalPending)
+    }
+
+    pub async fn apply_action_command(
+        &self,
+        command: ActionCommand,
+    ) -> Result<ActionRecord, MetaProcessError> {
+        let payload = encode_authority_command(&AuthorityCommand::Action(command))?;
+        let proposal_id = catalog_proposal_id(&payload);
+        let mut raft = self.core.raft.lock().await;
+        raft.propose(proposal_id, payload)?;
+        let progress = raft.drive_ready().await?;
+        drop(raft);
+        let mut result = None;
+        for committed in progress.committed {
+            match decode_authority_command(committed.payload())? {
+                AuthorityCommand::Catalog(command) => {
+                    let version = self
+                        .core
+                        .execution
+                        .lock()
+                        .await
+                        .apply_catalog_command(command.clone())?;
+                    self.core.catalog_commands.lock().await.push(command);
+                    self.core.catalog_revision.send_replace(version);
+                }
+                AuthorityCommand::Action(command) => {
+                    let record = self
+                        .core
+                        .execution
+                        .lock()
+                        .await
+                        .apply_action_command(command)?;
+                    if committed.proposal_id() == proposal_id {
+                        result = Some(record);
+                    }
+                }
+            }
+        }
+        result.ok_or(MetaProcessError::ProposalPending)
+    }
+
+    pub async fn action_record(&self, action_id: ActionId) -> Option<ActionRecord> {
+        self.core
+            .execution
+            .lock()
+            .await
+            .action_record(action_id)
+            .cloned()
     }
 
     pub async fn catalog_version(&self) -> Version {
         self.core.execution.lock().await.catalog_version()
+    }
+
+    pub async fn leader_id(&self) -> Option<ReplicaId> {
+        self.core.raft.lock().await.leader_id()
     }
 
     pub fn timestamps(&self) -> Arc<dyn TimestampAuthority> {
@@ -107,6 +220,7 @@ impl MetaProcess {
         MetaRpcService {
             timestamps: self.timestamps.clone(),
             cluster_id: self.config.cluster_id(),
+            core: self.core.clone(),
         }
     }
 
@@ -136,6 +250,7 @@ impl MetaProcess {
 pub struct MetaRpcService {
     timestamps: Arc<DurableTimestampAuthority>,
     cluster_id: u64,
+    core: Arc<MetaCore>,
 }
 
 impl MetaRpcService {
@@ -146,12 +261,24 @@ impl MetaRpcService {
 
 #[tonic::async_trait]
 impl MetaService for MetaRpcService {
+    type WatchCatalogStream =
+        Pin<Box<dyn Stream<Item = Result<proto::CatalogSnapshot, Status>> + Send + 'static>>;
+
     async fn submit_transaction(
         &self,
         request: Request<proto::TransactionRequest>,
     ) -> Result<Response<TypedStatus>, Status> {
         let wire = request.into_inner();
         let context = response_context_from_shard(wire.context.as_ref(), self.cluster_id);
+        if let Err(error) = self.core.raft.lock().await.leader_read_index() {
+            return Ok(Response::new(status(
+                context,
+                StatusCode::Unavailable,
+                RetryDisposition::Safe,
+                &error.to_string(),
+                Vec::new(),
+            )));
+        }
         if let Err(error) = validate_transaction_request(wire.clone()) {
             return Ok(Response::new(status(
                 context,
@@ -247,51 +374,72 @@ impl MetaService for MetaRpcService {
             ),
         }))
     }
+
+    async fn watch_catalog(
+        &self,
+        request: Request<proto::CatalogWatchRequest>,
+    ) -> Result<Response<Self::WatchCatalogStream>, Status> {
+        let request = request.into_inner();
+        let context = request
+            .request
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("DTG-PROTOCOL-MISSING-CONTEXT"))?;
+        dtg_execution::cluster_protocol::RequestContext::try_from(context.clone())
+            .map_err(|error| Status::invalid_argument(error.code()))?;
+        self.core
+            .raft
+            .lock()
+            .await
+            .leader_read_index()
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let mut revisions = self.core.catalog_revision.subscribe();
+        let core = self.core.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            loop {
+                let revision = *revisions.borrow_and_update();
+                if revision.get() >= request.after_revision {
+                    let snapshot = core.catalog_snapshot(context.clone(), revision).await;
+                    if sender.send(snapshot.map_err(Status::from)).await.is_err() {
+                        break;
+                    }
+                }
+                if revisions.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
 }
 
-struct CatalogLog {
-    store: Arc<FjallConsensusStore>,
-    next_index: Mutex<u64>,
-}
-
-impl CatalogLog {
-    async fn open(store: Arc<FjallConsensusStore>) -> Result<Self, MetaProcessError> {
-        let entries = store.entries(1, u64::MAX, u64::MAX).await?;
-        let next_index = entries
-            .last()
-            .map_or(1, |entry| entry.index().saturating_add(1));
-        Ok(Self {
-            store,
-            next_index: Mutex::new(next_index),
+impl MetaCore {
+    async fn catalog_snapshot(
+        &self,
+        request: proto::RequestContext,
+        revision: Version,
+    ) -> Result<proto::CatalogSnapshot, MetaProcessError> {
+        let commands = self.catalog_commands.lock().await;
+        if commands.len() as u64 != revision.get() {
+            return Err(MetaProcessError::ConsensusIndex);
+        }
+        let wire = commands
+            .iter()
+            .map(CatalogCommandWire::from_command)
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&wire)
+            .map_err(|error| MetaProcessError::Codec(error.to_string()))?;
+        Ok(proto::CatalogSnapshot {
+            request: Some(request),
+            revision: revision.get(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: wire.len() as u32,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
         })
-    }
-
-    async fn replay(&self) -> Result<Vec<CatalogCommand>, MetaProcessError> {
-        self.store
-            .entries(1, u64::MAX, u64::MAX)
-            .await?
-            .into_iter()
-            .map(|entry| decode_catalog_command(entry.command().payload()))
-            .collect()
-    }
-
-    async fn append(&self, payload: Vec<u8>) -> Result<u64, MetaProcessError> {
-        let mut next_index = self.next_index.lock().await;
-        let index = *next_index;
-        self.store
-            .append(vec![consensus_entry(index, payload)?])
-            .await?;
-        *next_index = index
-            .checked_add(1)
-            .ok_or(MetaProcessError::ConsensusIndex)?;
-        Ok(index)
-    }
-
-    async fn rollback(&self, index: u64) -> Result<(), MetaProcessError> {
-        let mut next_index = self.next_index.lock().await;
-        self.store.truncate_suffix(index).await?;
-        *next_index = index;
-        Ok(())
     }
 }
 
@@ -333,7 +481,7 @@ impl TimestampCommandLog for FjallTimestampLog {
         Box::pin(async move {
             let mut next_index = self.next_index.lock().await;
             let index = *next_index;
-            let entry = consensus_entry(index, command)
+            let entry = timestamp_consensus_entry(index, command)
                 .map_err(|error| TxnError::Storage(error.to_string()))?;
             self.store
                 .append(vec![entry])
@@ -345,14 +493,55 @@ impl TimestampCommandLog for FjallTimestampLog {
     }
 }
 
-fn consensus_entry(index: u64, payload: Vec<u8>) -> Result<ConsensusEntry, StorageError> {
+fn timestamp_consensus_entry(index: u64, payload: Vec<u8>) -> Result<ConsensusEntry, StorageError> {
     ConsensusEntry::new(
         CONSENSUS_FORMAT_VERSION,
-        CONSENSUS_TERM,
+        TIMESTAMP_LOG_TERM,
         index,
         CommandId::new(u128::from(index))?,
         ConsensusCommandEnvelope::new(CONSENSUS_FORMAT_VERSION, payload)?,
     )
+}
+
+async fn configure_meta_membership(
+    config: &MetaConfig,
+    store: &dyn ConsensusStore,
+) -> Result<(), MetaProcessError> {
+    let voters = config
+        .peers()
+        .iter()
+        .map(|peer| {
+            ReplicaId::new(peer.node_id())
+                .map_err(|error| MetaProcessError::Consensus(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    match store.membership().await {
+        Ok(existing)
+            if existing.voters == voters
+                && existing.learners.is_empty()
+                && existing.configuration_index == 1 => {}
+        Ok(_) => {
+            return Err(MetaProcessError::Consensus(
+                "configured Meta peers do not match durable membership".into(),
+            ));
+        }
+        Err(StorageError::NotFound) => {
+            store
+                .set_membership(RaftMembership {
+                    voters,
+                    learners: Vec::new(),
+                    configuration_index: 1,
+                })
+                .await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn catalog_proposal_id(payload: &[u8]) -> u128 {
+    let digest = checksum_bytes(payload);
+    u128::from_be_bytes(digest[..16].try_into().expect("digest prefix length")).max(1)
 }
 
 fn consensus_binding(
@@ -383,7 +572,11 @@ fn consensus_binding(
         .contract_version(1)
         .layout_version(1)
         .capability_digest(class.required_capabilities().digest())
-        .namespace_id(namespace)
+        .namespace_id(if graph_id == CATALOG_GRAPH_ID {
+            config.consensus_namespace()
+        } else {
+            namespace
+        })
         .endpoint_profile_ref("process://local-fjall")
         .credential_ref("process://local-fjall")
         .role(BindingRole::Active)
@@ -453,6 +646,7 @@ async fn shutdown_signal() {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum CatalogCommandWire {
     PutPlacement {
         expected_version: u64,
@@ -500,6 +694,7 @@ struct BackendClassWire {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum ProviderWire {
     Fjall,
     PostgreSql,
@@ -508,12 +703,14 @@ enum ProviderWire {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum DurabilityWire {
     DurableCommit,
     DurableCommitWithReplicaSync,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum BindingRoleWire {
     Candidate,
     Active,
@@ -538,42 +735,87 @@ struct ReplicaBindingWire {
 }
 
 fn encode_catalog_command(command: &CatalogCommand) -> Result<Vec<u8>, MetaProcessError> {
-    let wire = match command {
-        CatalogCommand::PutPlacement {
-            expected_version,
-            placement,
-        } => CatalogCommandWire::PutPlacement {
-            expected_version: expected_version.get(),
-            placement: PlacementWire::from(placement),
-        },
-        CatalogCommand::PinRetention {
-            expected_version,
-            graph_id,
-            shard_id,
-            generation,
-            pin,
-        } => CatalogCommandWire::PinRetention {
-            expected_version: expected_version.get(),
-            graph_id: graph_id.get(),
-            shard_id: shard_id.get(),
-            generation: generation.get(),
-            pin: pin.as_str().to_owned(),
-        },
-        CatalogCommand::UnpinRetention {
-            expected_version,
-            graph_id,
-            shard_id,
-            generation,
-            pin,
-        } => CatalogCommandWire::UnpinRetention {
-            expected_version: expected_version.get(),
-            graph_id: graph_id.get(),
-            shard_id: shard_id.get(),
-            generation: generation.get(),
-            pin: pin.as_str().to_owned(),
-        },
-    };
+    let wire = CatalogCommandWire::from_command(command);
     serde_json::to_vec(&wire).map_err(|error| MetaProcessError::Codec(error.to_string()))
+}
+
+enum AuthorityCommand {
+    Catalog(CatalogCommand),
+    Action(ActionCommand),
+}
+
+fn encode_authority_command(command: &AuthorityCommand) -> Result<Vec<u8>, MetaProcessError> {
+    let mut bytes = Vec::new();
+    match command {
+        AuthorityCommand::Catalog(command) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&encode_catalog_command(command)?);
+        }
+        AuthorityCommand::Action(command) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&command.encode_current()?);
+        }
+    }
+    Ok(bytes)
+}
+
+fn decode_authority_command(bytes: &[u8]) -> Result<AuthorityCommand, MetaProcessError> {
+    let (tag, payload) = bytes
+        .split_first()
+        .ok_or_else(|| MetaProcessError::Codec("empty Meta authority command".into()))?;
+    match tag {
+        1 => Ok(AuthorityCommand::Catalog(decode_catalog_command(payload)?)),
+        2 => Ok(AuthorityCommand::Action(ActionCommand::decode(payload)?)),
+        _ => Err(MetaProcessError::Codec(
+            "unknown Meta authority command tag".into(),
+        )),
+    }
+}
+
+impl CatalogCommandWire {
+    fn from_command(command: &CatalogCommand) -> Self {
+        match command {
+            CatalogCommand::PutPlacement {
+                expected_version,
+                placement,
+            } => Self::PutPlacement {
+                expected_version: expected_version.get(),
+                placement: PlacementWire::from(placement),
+            },
+            CatalogCommand::PinRetention {
+                expected_version,
+                graph_id,
+                shard_id,
+                generation,
+                pin,
+            } => Self::PinRetention {
+                expected_version: expected_version.get(),
+                graph_id: graph_id.get(),
+                shard_id: shard_id.get(),
+                generation: generation.get(),
+                pin: pin.as_str().to_owned(),
+            },
+            CatalogCommand::UnpinRetention {
+                expected_version,
+                graph_id,
+                shard_id,
+                generation,
+                pin,
+            } => Self::UnpinRetention {
+                expected_version: expected_version.get(),
+                graph_id: graph_id.get(),
+                shard_id: shard_id.get(),
+                generation: generation.get(),
+                pin: pin.as_str().to_owned(),
+            },
+        }
+    }
+}
+
+impl From<MetaProcessError> for Status {
+    fn from(error: MetaProcessError) -> Self {
+        Self::internal(error.to_string())
+    }
 }
 
 fn decode_catalog_command(bytes: &[u8]) -> Result<CatalogCommand, MetaProcessError> {
@@ -802,7 +1044,9 @@ pub enum MetaProcessError {
     Codec(String),
     Transport(String),
     Transaction(String),
+    Consensus(String),
     ConsensusIndex,
+    ProposalPending,
 }
 
 impl Display for MetaProcessError {
@@ -815,8 +1059,10 @@ impl Display for MetaProcessError {
             | Self::Execution(message)
             | Self::Codec(message)
             | Self::Transport(message)
-            | Self::Transaction(message) => formatter.write_str(message),
+            | Self::Transaction(message)
+            | Self::Consensus(message) => formatter.write_str(message),
             Self::ConsensusIndex => formatter.write_str("Meta consensus index overflow"),
+            Self::ProposalPending => formatter.write_str("Meta proposal is awaiting quorum commit"),
         }
     }
 }
@@ -862,5 +1108,11 @@ impl From<TxnError> for MetaProcessError {
 impl From<tonic::transport::Error> for MetaProcessError {
     fn from(error: tonic::transport::Error) -> Self {
         Self::Transport(error.to_string())
+    }
+}
+
+impl From<MetaRaftError> for MetaProcessError {
+    fn from(error: MetaRaftError) -> Self {
+        Self::Consensus(error.to_string())
     }
 }

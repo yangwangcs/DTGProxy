@@ -13,11 +13,13 @@ use dtg_analytics::{
     SchedulerFailure, ShardSnapshotProvenance, SnapshotProvenance, WorkerId,
 };
 use dtg_control::{
-    CatalogCommand, CatalogState, ControlError, GraphId, ObservedNodeState, RetentionPin,
+    ActionCommand, ActionState, CatalogCommand, CatalogState, ControlError, GraphId,
+    ObservedNodeState, PlacementEpoch as ControlPlacementEpoch, ReconcileAction, ReplicaId,
+    RetentionPin,
 };
 use dtg_execution::{
-    ControllerExecution, DataExecution, GatewayExecution, MetaExecution, ProviderKind,
-    ProviderResolver, ReplicaBinding, ReplicaStateStore, StoreFuture,
+    ControlActionExecutor, ControllerExecution, DataExecution, GatewayExecution, MetaExecution,
+    ProviderKind, ProviderResolver, ReplicaBinding, ReplicaStateStore, StoreFuture,
 };
 use dtg_language::{EmptySchemaCatalog, Language};
 use dtg_plan::{
@@ -880,6 +882,36 @@ fn meta_exposes_catalog_and_commit_time_mutations() {
 }
 
 #[test]
+fn meta_is_the_authority_for_reconciliation_action_state() {
+    let mut meta = MetaExecution::builder()
+        .with_catalog(CatalogState::new())
+        .with_timestamps(Arc::new(FixedTimestamps))
+        .with_analytics_ledger(AnalyticsLedger::new(5).unwrap())
+        .build()
+        .unwrap();
+    let action = ReconcileAction::TransferLeader {
+        graph_id: GraphId::new(2).unwrap(),
+        shard_id: ShardId::new(5).unwrap(),
+        placement_epoch: ControlPlacementEpoch::new(3).unwrap(),
+        from: ReplicaId::new(7).unwrap(),
+        to: ReplicaId::new(8).unwrap(),
+    };
+
+    let first = meta
+        .apply_action_command(ActionCommand::enqueue(Version::new(0), action.clone()))
+        .unwrap();
+    let duplicate = meta
+        .apply_action_command(ActionCommand::enqueue(Version::new(0), action))
+        .unwrap();
+
+    assert_eq!(first.action_id(), duplicate.action_id());
+    assert_eq!(
+        meta.action_record(first.action_id()).unwrap().state(),
+        &ActionState::Pending { attempt: 0 }
+    );
+}
+
+#[test]
 fn controller_composes_observations_and_fails_closed_on_catalog_drift() {
     let mut controller = ControllerExecution::builder()
         .with_catalog(CatalogState::new())
@@ -895,4 +927,101 @@ fn controller_composes_observations_and_fails_closed_on_catalog_drift() {
         Err(ControlError::StaleObservation { expected, actual })
             if expected == Version::new(0) && actual == Version::new(1)
     ));
+}
+
+#[test]
+fn controller_catalog_watch_rejects_revision_regression() {
+    let revision_one = CatalogState::new()
+        .apply(CatalogCommand::put_placement(
+            Version::new(0),
+            control_placement(1),
+        ))
+        .unwrap();
+    let mut controller = ControllerExecution::builder()
+        .with_catalog(revision_one)
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        controller.install_catalog(CatalogState::new()),
+        Err(ControlError::CatalogRevisionRegression { current, received })
+            if current == Version::new(1) && received == Version::new(0)
+    ));
+    assert_eq!(controller.catalog_version(), Version::new(1));
+}
+
+struct SuccessfulControlExecutor;
+
+impl ControlActionExecutor for SuccessfulControlExecutor {
+    fn execute(&self, _action: &ReconcileAction) -> Result<(), dtg_control::ActionFailure> {
+        Ok(())
+    }
+}
+
+#[test]
+fn controller_execution_returns_authoritative_completion_command() {
+    let mut meta = MetaExecution::builder()
+        .with_catalog(CatalogState::new())
+        .with_timestamps(Arc::new(FixedTimestamps))
+        .with_analytics_ledger(AnalyticsLedger::new(5).unwrap())
+        .build()
+        .unwrap();
+    let action = ReconcileAction::TransferLeader {
+        graph_id: GraphId::new(2).unwrap(),
+        shard_id: ShardId::new(5).unwrap(),
+        placement_epoch: ControlPlacementEpoch::new(3).unwrap(),
+        from: ReplicaId::new(7).unwrap(),
+        to: ReplicaId::new(8).unwrap(),
+    };
+    let queued = meta
+        .apply_action_command(ActionCommand::enqueue(Version::new(0), action))
+        .unwrap();
+    let claimed = meta
+        .apply_action_command(ActionCommand::claim(
+            queued.action_id(),
+            "controller-1",
+            10,
+            5,
+        ))
+        .unwrap();
+    let controller = ControllerExecution::builder()
+        .with_catalog(CatalogState::new())
+        .build()
+        .unwrap();
+
+    let completion = controller
+        .execute_claimed_action(&claimed, &SuccessfulControlExecutor)
+        .unwrap();
+    let completed = meta.apply_action_command(completion).unwrap();
+    assert!(matches!(completed.state(), ActionState::Completed { .. }));
+}
+
+fn control_placement(epoch: u64) -> dtg_control::ShardPlacement {
+    let backend_class = BackendClass::new(ProviderKind::Fjall, 1, 1, ["point"]).unwrap();
+    let binding = ReplicaBinding::builder()
+        .cluster_id(7)
+        .graph_id(2)
+        .shard_id(5)
+        .placement_epoch(epoch)
+        .replica_id(7)
+        .backend_generation(4)
+        .backend_class_digest(backend_class.digest())
+        .provider_kind(ProviderKind::Fjall)
+        .contract_version(1)
+        .layout_version(1)
+        .capability_digest(backend_class.required_capabilities().digest())
+        .namespace_id(format!("controller-watch-{epoch}"))
+        .endpoint_profile_ref("local-fjall")
+        .credential_ref("env://DTG_FJALL_ROOT")
+        .role(BindingRole::Active)
+        .build()
+        .unwrap();
+    dtg_control::ShardPlacement {
+        graph_id: GraphId::new(2).unwrap(),
+        shard_id: ShardId::new(5).unwrap(),
+        placement_epoch: ControlPlacementEpoch::new(epoch).unwrap(),
+        active_generation: BackendGeneration::new(4).unwrap(),
+        backend_class: backend_class.clone(),
+        replicas: vec![dtg_control::ReplicaBindingRecord::new(binding, backend_class).unwrap()],
+    }
 }
