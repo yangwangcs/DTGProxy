@@ -720,6 +720,10 @@ fn restore_staged_snapshot(
     }
     clear_keyspace_prefix(namespace, &namespace.replica_meta, b"user/".to_vec())?;
 
+    #[cfg(feature = "tck")]
+    let failure_after = store.take_tck_snapshot_restore_failure_after_batches()?;
+    #[cfg(feature = "tck")]
+    let mut restored_batches = 0_usize;
     for raft_index in 1..=header.applied_index() {
         let (replay, mutations) =
             load_staged_batch(namespace, header.snapshot_id().get(), raft_index)?;
@@ -747,6 +751,15 @@ fn restore_staged_snapshot(
             )?,
         );
         write.commit().map_err(fjall_error)?;
+        #[cfg(feature = "tck")]
+        {
+            restored_batches += 1;
+            if failure_after == Some(restored_batches) {
+                return Err(StorageError::Internal(
+                    "injected Fjall snapshot restore failure".into(),
+                ));
+            }
+        }
     }
 
     let mut publish = namespace.db.batch().durability(Some(PersistMode::SyncAll));

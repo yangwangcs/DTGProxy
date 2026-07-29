@@ -40,6 +40,8 @@ struct ReplicaInner {
     snapshot_writer_buffer_high_watermark: AtomicUsize,
     #[cfg(feature = "tck")]
     snapshot_commit_buffer_high_watermark: AtomicUsize,
+    #[cfg(feature = "tck")]
+    snapshot_restore_failure_after_batches: Mutex<Option<usize>>,
 }
 
 #[cfg(feature = "tck")]
@@ -157,6 +159,8 @@ impl FjallReplicaStore {
                 snapshot_writer_buffer_high_watermark: AtomicUsize::new(0),
                 #[cfg(feature = "tck")]
                 snapshot_commit_buffer_high_watermark: AtomicUsize::new(0),
+                #[cfg(feature = "tck")]
+                snapshot_restore_failure_after_batches: Mutex::new(None),
             }),
         })
     }
@@ -304,6 +308,27 @@ impl FjallReplicaStore {
         self.inner
             .snapshot_commit_buffer_high_watermark
             .fetch_max(records, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "tck")]
+    pub fn arm_tck_snapshot_restore_failure_after_batches(
+        &self,
+        restored_batches: usize,
+    ) -> Result<(), StorageError> {
+        if restored_batches == 0 {
+            return Err(StorageError::Internal(
+                "snapshot restore failure point must be nonzero".into(),
+            ));
+        }
+        *lock(&self.inner.snapshot_restore_failure_after_batches)? = Some(restored_batches);
+        Ok(())
+    }
+
+    #[cfg(feature = "tck")]
+    pub(crate) fn take_tck_snapshot_restore_failure_after_batches(
+        &self,
+    ) -> Result<Option<usize>, StorageError> {
+        Ok(lock(&self.inner.snapshot_restore_failure_after_batches)?.take())
     }
 
     #[cfg(feature = "tck")]

@@ -262,6 +262,92 @@ fn snapshot_restore_never_buffers_the_complete_snapshot() {
     assert_eq!(target.tck_snapshot_commit_buffer_high_watermark(), 1);
 }
 
+#[cfg(feature = "tck")]
+#[test]
+fn interrupted_streaming_restore_fails_closed_and_can_restart_from_staging() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("restartable-restore-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    for index in 1..=3 {
+        block_on(
+            source.apply(
+                CommittedShardBatch::new(
+                    source_binding.clone(),
+                    index,
+                    index,
+                    CommandId::new(3000 + u128::from(index)).unwrap(),
+                    vec![LogicalMutation::PutVertex(vertex(
+                        300 + u128::from(index),
+                        index,
+                    ))],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+    let (header, chunks, manifest, expected_records) = export(&source, &source_binding, 3, 1002);
+
+    let target_binding = binding("restartable-restore-target", 2);
+    let target = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    block_on(
+        target.apply(
+            CommittedShardBatch::new(
+                target_binding.clone(),
+                1,
+                1,
+                CommandId::new(4001).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(999, 1))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let mut writer =
+        block_on(target.begin_restore(target_binding.clone(), header.clone())).unwrap();
+    for chunk in chunks.iter().cloned() {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    target
+        .arm_tck_snapshot_restore_failure_after_batches(1)
+        .unwrap();
+    assert!(matches!(
+        block_on(writer.commit(manifest.clone())),
+        Err(StorageError::Internal(message)) if message.contains("injected Fjall snapshot restore failure")
+    ));
+    assert_eq!(block_on(target.applied_index()).unwrap(), 1);
+    assert!(matches!(
+        block_on(target.begin_read_view(ReadFence::new(target_binding.clone(), 1))),
+        Err(StorageError::CorruptSnapshot(_))
+    ));
+    assert!(matches!(
+        block_on(
+            target.apply(
+                CommittedShardBatch::new(
+                    target_binding.clone(),
+                    2,
+                    2,
+                    CommandId::new(4002).unwrap(),
+                    vec![LogicalMutation::PutVertex(vertex(1000, 2))],
+                )
+                .unwrap(),
+            )
+        ),
+        Err(StorageError::CorruptSnapshot(_))
+    ));
+
+    let mut retry = block_on(target.begin_restore(target_binding.clone(), header)).unwrap();
+    for chunk in chunks {
+        block_on(retry.write_chunk(chunk)).unwrap();
+    }
+    block_on(retry.commit(manifest)).unwrap();
+    assert_eq!(block_on(target.applied_index()).unwrap(), 3);
+    let (_, _, _, restored_records) = export(&target, &target_binding, 3, 1003);
+    assert_eq!(restored_records, expected_records);
+}
+
 #[test]
 fn snapshot_restore_replaces_dirty_state_preserves_deletes_and_survives_restart() {
     let source_dir = tempfile::tempdir().unwrap();
