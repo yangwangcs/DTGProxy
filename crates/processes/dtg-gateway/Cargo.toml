@@ -15,3 +15,10 @@ path = "src/main.rs"
 [dependencies]
 dtg-execution = { path = "../../execution/dtg-execution" }
 tokio = { version = "=1.53.0", features = ["macros", "rt", "signal"] }
+
+[dev-dependencies]
+dtg-controller = { path = "../dtg-controller" }
+dtg-data = { path = "../dtg-data" }
+dtg-meta = { path = "../dtg-meta" }
+serde_json = "=1.0.145"
+tempfile = "=3.27.0"

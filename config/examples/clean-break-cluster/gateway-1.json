@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "cluster_id": 9001,
+  "bind_addr": "127.0.0.1:55105",
+  "cluster_endpoint": "http://127.0.0.1:55103",
+  "request_timeout_ms": 30000
+}

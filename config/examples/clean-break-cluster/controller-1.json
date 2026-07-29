@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "cluster_id": 9001,
+  "node_id": 2,
+  "listen_addr": "127.0.0.1:55102",
+  "data_directory": "target/clean-break-cluster/controller-1",
+  "security": { "mode": "loopback_plaintext" }
+}

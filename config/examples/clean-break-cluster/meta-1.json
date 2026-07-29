@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "cluster_id": 9001,
+  "node_id": 1,
+  "listen_addr": "127.0.0.1:55101",
+  "data_directory": "target/clean-break-cluster/meta-1",
+  "analytics_lease_duration": 30,
+  "security": { "mode": "loopback_plaintext" }
+}
