@@ -739,6 +739,17 @@ version = "1.0.0"
 [[package]]
 name = "dtg-execution"
 version = "1.0.0"
+dependencies = [
+ "dtg-analytics",
+ "dtg-control",
+ "dtg-language",
+ "dtg-language-ir",
+ "dtg-plan",
+ "dtg-query",
+ "dtg-shard",
+ "dtg-storage",
+ "dtg-transaction",
+]
 
 [[package]]
 name = "dtg-gateway"

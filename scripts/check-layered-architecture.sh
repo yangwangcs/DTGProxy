@@ -80,6 +80,9 @@ allowed_new_dependencies = {
     "dtg-cluster-protocol": {"dtg-kernel"},
     "dtg-execution": {
         "dtg-kernel",
+        "dtg-language",
+        "dtg-language-ir",
+        "dtg-storage",
         "dtg-plan",
         "dtg-query",
         "dtg-transaction",

@@ -93,6 +93,9 @@ dtg-language-ir = { path = "../dtg-language-ir" }
 dtg-storage = { path = "../dtg-storage" }'
   write_crate dtg-cluster-protocol 'dtg-kernel = { path = "../dtg-kernel" }'
   write_crate dtg-execution 'dtg-kernel = { path = "../dtg-kernel" }
+dtg-language = { path = "../dtg-language" }
+dtg-language-ir = { path = "../dtg-language-ir" }
+dtg-storage = { path = "../dtg-storage" }
 dtg-plan = { path = "../dtg-plan" }
 dtg-query = { path = "../dtg-query" }
 dtg-transaction = { path = "../dtg-transaction" }

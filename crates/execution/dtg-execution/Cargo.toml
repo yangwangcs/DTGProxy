@@ -7,3 +7,14 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+dtg-analytics = { path = "../dtg-analytics" }
+dtg-control = { path = "../dtg-control" }
+dtg-language = { path = "../../language/dtg-language" }
+dtg-language-ir = { path = "../../language/dtg-language-ir" }
+dtg-plan = { path = "../dtg-plan" }
+dtg-query = { path = "../dtg-query" }
+dtg-shard = { path = "../dtg-shard" }
+dtg-storage = { path = "../../storage/dtg-storage" }
+dtg-transaction = { path = "../dtg-transaction" }
