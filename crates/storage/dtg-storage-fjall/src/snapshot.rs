@@ -260,6 +260,8 @@ impl LogicalReplicaActivation for FjallReplicaStore {
                 expected_activation,
             );
             write.commit().map_err(fjall_error)?;
+            self.namespace()
+                .rebind(candidate.candidate_binding(), &active_binding)?;
             Ok(receipt)
         })
     }

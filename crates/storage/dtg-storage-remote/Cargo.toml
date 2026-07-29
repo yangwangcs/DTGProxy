@@ -7,3 +7,16 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+dtg-storage = { path = "../dtg-storage" }
+dtg-storage-remote-protocol = { path = "../dtg-storage-remote-protocol" }
+prost = "=0.14.4"
+tokio = { version = "=1.53.0", features = ["rt", "sync", "time"] }
+tokio-stream = { version = "=0.1.18", features = ["net"] }
+tonic = { version = "=0.14.6", features = ["transport"] }
+
+[dev-dependencies]
+dtg-storage-fjall = { path = "../dtg-storage-fjall", features = ["tck"] }
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }

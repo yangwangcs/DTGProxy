@@ -1,0 +1,211 @@
+syntax = "proto3";
+
+package dtgproxy.storage.v1;
+
+message Binding {
+  uint64 cluster_id = 1;
+  uint64 graph_id = 2;
+  uint64 shard_id = 3;
+  uint64 placement_epoch = 4;
+  uint64 replica_id = 5;
+  uint64 backend_generation = 6;
+  bytes backend_class_digest = 7;
+  string provider_kind = 8;
+  uint32 contract_version = 9;
+  uint32 layout_version = 10;
+  bytes capability_digest = 11;
+  string namespace_id = 12;
+  string endpoint_profile_ref = 13;
+  string credential_ref = 14;
+  string role = 15;
+  bytes binding_digest = 16;
+}
+
+message RequestContext {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  uint32 contract_major = 3;
+  uint32 contract_minor = 4;
+  bytes request_id = 5;
+  uint64 deadline_unix_ms = 6;
+  Binding binding = 7;
+  bytes auth_context = 8;
+  uint64 max_response_bytes = 9;
+  uint32 max_response_items = 10;
+}
+
+message BoundedPayload {
+  uint32 format_version = 1;
+  uint64 declared_len = 2;
+  uint32 item_count = 3;
+  bytes checksum = 4;
+  bytes body = 5;
+}
+
+message CapabilityManifest {
+  repeated string names = 1;
+  bytes digest = 2;
+}
+
+message TypedStatus {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+  bytes idempotency_key = 4;
+  uint64 observed_applied_index = 5;
+  uint64 detail_u64_a = 6;
+  uint64 detail_u64_b = 7;
+  Binding expected_binding = 8;
+  Binding actual_binding = 9;
+}
+
+message HandshakeRequest { RequestContext context = 1; }
+message HandshakeResponse {
+  TypedStatus status = 1;
+  uint32 protocol_major = 2;
+  uint32 protocol_minor = 3;
+  uint32 contract_major = 4;
+  uint32 contract_minor = 5;
+  CapabilityManifest capabilities = 6;
+  uint64 observed_applied_index = 7;
+  uint64 max_message_bytes = 8;
+  uint32 max_message_items = 9;
+}
+
+message ApplyRequest {
+  RequestContext context = 1;
+  bytes idempotency_key = 2;
+  uint64 raft_term = 3;
+  uint64 raft_index = 4;
+  bytes command_id = 5;
+  bytes mutation_digest = 6;
+  BoundedPayload mutations = 7;
+}
+message ApplyResponse { TypedStatus status = 1; bool replayed = 2; }
+
+message BeginReadRequest {
+  RequestContext context = 1;
+  uint64 applied_index = 2;
+  bytes capability_digest = 3;
+}
+message BeginReadResponse {
+  TypedStatus status = 1;
+  bytes session_id = 2;
+  uint64 applied_index = 3;
+}
+
+enum ReadOperation {
+  READ_OPERATION_UNSPECIFIED = 0;
+  READ_OPERATION_GET_VERTEX = 1;
+  READ_OPERATION_GET_EDGE = 2;
+  READ_OPERATION_VERTEX_HISTORY = 3;
+  READ_OPERATION_EDGE_HISTORY = 4;
+  READ_OPERATION_EXPAND = 5;
+  READ_OPERATION_CHANGES = 6;
+  READ_OPERATION_SCAN_VERTICES = 7;
+  READ_OPERATION_SCAN_EDGES = 8;
+  READ_OPERATION_REPLICA_METADATA = 9;
+  READ_OPERATION_PUSHDOWN = 10;
+}
+
+message ReadRequest {
+  RequestContext context = 1;
+  bytes session_id = 2;
+  ReadOperation operation = 3;
+  BoundedPayload request = 4;
+}
+message ReadResponse { TypedStatus status = 1; BoundedPayload records = 2; }
+
+message EndReadRequest { RequestContext context = 1; bytes session_id = 2; }
+message EndReadResponse { TypedStatus status = 1; }
+
+message ExportSnapshotRequest {
+  RequestContext context = 1;
+  uint64 applied_index = 2;
+  bytes snapshot_id = 3;
+  uint32 max_records_per_chunk = 4;
+  bool has_resume_after = 5;
+  uint64 resume_after_ordinal = 6;
+}
+message SnapshotExportFrame {
+  TypedStatus status = 1;
+  uint32 kind = 2;
+  uint64 sequence = 3;
+  BoundedPayload payload = 4;
+}
+
+message SnapshotImportFrame {
+  RequestContext context = 1;
+  bytes stream_id = 2;
+  uint32 kind = 3;
+  uint64 sequence = 4;
+  BoundedPayload payload = 5;
+}
+message ImportSnapshotResponse { TypedStatus status = 1; BoundedPayload receipt = 2; }
+
+message SnapshotHeaderPayload {
+  bytes snapshot_id = 1;
+  Binding source_binding = 2;
+  uint64 applied_index = 3;
+  uint32 format_version = 4;
+}
+
+message SnapshotChunkPayload {
+  bytes snapshot_id = 1;
+  uint64 ordinal = 2;
+  bytes digest = 3;
+  BoundedPayload records = 4;
+}
+
+message SnapshotManifestPayload {
+  bytes snapshot_id = 1;
+  uint64 chunk_count = 2;
+  uint64 record_count = 3;
+  bytes content_digest = 4;
+}
+
+message SnapshotRestoreReceiptPayload {
+  Binding binding = 1;
+  SnapshotManifestPayload manifest = 2;
+}
+
+message SnapshotCandidatePayload {
+  Binding candidate_binding = 1;
+  SnapshotHeaderPayload header = 2;
+  SnapshotManifestPayload manifest = 3;
+}
+
+message ActivateRequest {
+  RequestContext context = 1;
+  SnapshotCandidatePayload candidate = 2;
+  Binding active_binding = 3;
+}
+
+message ActivateResponse {
+  TypedStatus status = 1;
+  Binding active_binding = 2;
+  bytes snapshot_id = 3;
+  uint64 applied_index = 4;
+  bytes content_digest = 5;
+  uint32 format_version = 6;
+}
+
+message HealthRequest { RequestContext context = 1; }
+message HealthResponse {
+  TypedStatus status = 1;
+  bool ready = 2;
+  bool draining = 3;
+  uint64 observed_applied_index = 4;
+}
+
+service Storage {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc BeginRead(BeginReadRequest) returns (BeginReadResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc EndRead(EndReadRequest) returns (EndReadResponse);
+  rpc ExportSnapshot(ExportSnapshotRequest) returns (stream SnapshotExportFrame);
+  rpc ImportSnapshot(stream SnapshotImportFrame) returns (ImportSnapshotResponse);
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}

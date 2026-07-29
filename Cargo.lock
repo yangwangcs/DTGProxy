@@ -841,10 +841,27 @@ dependencies = [
 [[package]]
 name = "dtg-storage-remote"
 version = "1.0.0"
+dependencies = [
+ "dtg-storage",
+ "dtg-storage-fjall",
+ "dtg-storage-remote-protocol",
+ "prost 0.14.4",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
 
 [[package]]
 name = "dtg-storage-remote-protocol"
 version = "1.0.0"
+dependencies = [
+ "blake3",
+ "prost 0.14.4",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
 
 [[package]]
 name = "dtg-transaction"

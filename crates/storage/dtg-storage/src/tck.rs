@@ -5,11 +5,12 @@ use dtg_kernel::{Digest32, TransactionId, TransactionTime, ValidInterval, Value,
 use crate::{
     AdjacencyDirection, AdjacencyRead, CapabilityManifest, ChangeCursor, CommandId,
     CommittedShardBatch, EdgeId, EdgeRead, EdgeScan, EdgeTombstone, EdgeVersion, LogicalMutation,
-    LogicalSnapshotSink, LogicalSnapshotSource, PushdownExecutor, PushdownOperation,
-    PushdownOutcome, PushdownRequest, ReadFence, ReplicaBinding, ReplicaMetadata,
-    ReplicaStateStore, SUPPORTED_PUSHDOWN_CONTRACT_VERSION, SnapshotRecord, SnapshotReplayRecord,
-    SnapshotRequest, SnapshotRestoreReceipt, StorageError, StoreFuture, TransactionRecord,
-    TransactionState, VertexId, VertexRead, VertexScan, VertexTombstone, VertexVersion,
+    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotSink,
+    LogicalSnapshotSource, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest,
+    ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore,
+    SUPPORTED_PUSHDOWN_CONTRACT_VERSION, SnapshotRecord, SnapshotReplayRecord, SnapshotRequest,
+    SnapshotRestoreReceipt, StorageError, StoreFuture, TransactionRecord, TransactionState,
+    VertexId, VertexRead, VertexScan, VertexTombstone, VertexVersion,
 };
 
 /// Certification-only adapter implemented by provider test harnesses.
@@ -22,6 +23,15 @@ pub trait StorageTckStore:
     /// TCK-only fault control. The next apply must fail after this many
     /// mutations have been staged privately and before any state is published.
     fn arm_apply_failure_after(&self, staged_mutations: usize) -> Result<(), StorageError>;
+
+    /// Certification-only bridge to the provider-neutral activation contract.
+    fn activate_candidate(
+        &self,
+        _candidate: LogicalSnapshotCandidateReceipt,
+        _active_binding: ReplicaBinding,
+    ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
+        Box::pin(async { Err(StorageError::Unsupported) })
+    }
 }
 
 pub trait StorageTckFactory: Send + Sync {

@@ -23,7 +23,7 @@ pub(crate) const FJALL_LAYOUT_VERSION: u32 = 1;
 static OPEN_NAMESPACES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<NamespaceInner>>>> = OnceLock::new();
 
 pub(crate) struct NamespaceInner {
-    binding: ReplicaBinding,
+    binding: Mutex<ReplicaBinding>,
     pub(crate) db: Database,
     pub(crate) owner: Keyspace,
     pub(crate) identity: Keyspace,
@@ -65,11 +65,16 @@ impl NamespaceDb {
             .lock()
             .map_err(|_| StorageError::Internal("Fjall namespace registry is poisoned".into()))?;
         if let Some(shared) = registry.get(&path).and_then(Weak::upgrade) {
-            if shared.binding == *binding {
+            let shared_binding = shared
+                .binding
+                .lock()
+                .map_err(|_| StorageError::Internal("Fjall namespace binding is poisoned".into()))?
+                .clone();
+            if shared_binding == *binding {
                 return Ok(Self(shared));
             }
             return Err(StorageError::NamespaceOwnerMismatch {
-                expected: Box::new(shared.binding.clone()),
+                expected: Box::new(shared_binding),
                 actual: Box::new(binding.clone()),
             });
         }
@@ -116,7 +121,7 @@ impl NamespaceDb {
         let raft_state = open("raft_state")?;
         let raft_snapshot = open("raft_snapshot")?;
         let shared = Arc::new(NamespaceInner {
-            binding: binding.clone(),
+            binding: Mutex::new(binding.clone()),
             db,
             owner,
             identity,
@@ -156,6 +161,25 @@ impl NamespaceDb {
                 actual: Box::new(expected.clone()),
             })
         }
+    }
+
+    pub(crate) fn rebind(
+        &self,
+        expected: &ReplicaBinding,
+        active: &ReplicaBinding,
+    ) -> Result<(), StorageError> {
+        let mut binding = self
+            .binding
+            .lock()
+            .map_err(|_| StorageError::Internal("Fjall namespace binding is poisoned".into()))?;
+        if *binding != *expected {
+            return Err(StorageError::NamespaceOwnerMismatch {
+                expected: Box::new(binding.clone()),
+                actual: Box::new(expected.clone()),
+            });
+        }
+        *binding = active.clone();
+        Ok(())
     }
 }
 

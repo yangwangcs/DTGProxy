@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "tck")]
 use dtg_storage::{
-    ApplyReceipt, BackendClass, BindingRole, CommittedShardBatch, LogicalSnapshotReader,
+    ApplyReceipt, BackendClass, BindingRole, CommittedShardBatch, LogicalReplicaActivation,
+    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotReader,
     LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter, ProviderKind, ReadFence,
     SnapshotRequest, StorageError, StorageTckFactory, StorageTckStore, TemporalReadView,
 };
@@ -222,5 +223,13 @@ impl PushdownExecutor for FjallStorageTckStore {
 impl StorageTckStore for FjallStorageTckStore {
     fn arm_apply_failure_after(&self, staged_mutations: usize) -> Result<(), StorageError> {
         self.store.arm_apply_failure_after(staged_mutations)
+    }
+
+    fn activate_candidate(
+        &self,
+        candidate: LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+    ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
+        LogicalReplicaActivation::activate_candidate(&self.store, candidate, active_binding)
     }
 }
