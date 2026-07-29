@@ -70,7 +70,7 @@ pub(crate) fn decode_chunk(
         .as_ref()
         .ok_or_else(|| corrupt("snapshot chunk omitted records"))?;
     validate_payload(records).map_err(protocol_storage_error)?;
-    let decoded = decode_snapshot_records(&records.body)?;
+    let decoded = decode_snapshot_records(&records.body, records.item_count as usize)?;
     if decoded.len() != records.item_count as usize {
         return Err(corrupt("snapshot chunk record count mismatch"));
     }

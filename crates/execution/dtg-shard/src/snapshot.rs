@@ -229,6 +229,18 @@ pub fn install_replica_snapshot(
             "snapshot target binding is invalid",
         ));
     }
+    let target_membership_count = snapshot
+        .membership
+        .voters
+        .iter()
+        .chain(&snapshot.membership.learners)
+        .filter(|replica| **replica == active_binding.replica_id())
+        .count();
+    if target_membership_count != 1 {
+        return Err(ReplicaSnapshotError::InvalidRequest(
+            "active snapshot target must occur exactly once in Raft membership",
+        ));
+    }
     validate_retained_suffix(
         consensus,
         snapshot.manifest.last_included_index,
@@ -258,12 +270,15 @@ pub fn install_replica_snapshot(
     )?;
 
     let existing = block_on(consensus.hard_state())?;
+    let installed_term = existing
+        .current_term
+        .max(snapshot.hard_state.current_term)
+        .max(snapshot.manifest.last_included_term);
     let installed_hard_state = RaftHardState {
-        current_term: existing
-            .current_term
-            .max(snapshot.hard_state.current_term)
-            .max(snapshot.manifest.last_included_term),
-        voted_for: existing.voted_for,
+        current_term: installed_term,
+        voted_for: (installed_term == existing.current_term)
+            .then_some(existing.voted_for)
+            .flatten(),
         committed_index: existing
             .committed_index
             .max(snapshot.manifest.last_included_index),

@@ -8,6 +8,7 @@ use dtg_storage::{
     TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead, VertexScan,
     VertexTombstone, VertexVersion,
 };
+use dtg_storage_remote_protocol::MAX_MESSAGE_ITEMS;
 
 const MAX_NESTING: usize = 64;
 
@@ -31,10 +32,13 @@ pub(crate) fn encode_mutations(mutations: &[LogicalMutation]) -> Result<Vec<u8>,
     Ok(encoder.finish())
 }
 
-pub(crate) fn decode_mutations(bytes: &[u8]) -> Result<Vec<LogicalMutation>, StorageError> {
+pub(crate) fn decode_mutations(
+    bytes: &[u8],
+    expected_count: usize,
+) -> Result<Vec<LogicalMutation>, StorageError> {
     let mut decoder = Decoder::new(bytes);
-    let count = decoder.u32()?;
-    let mut mutations = Vec::with_capacity(count as usize);
+    let count = decoder.collection_count_exact(1, "mutation", expected_count)?;
+    let mut mutations = Vec::with_capacity(count);
     for _ in 0..count {
         mutations.push(decoder.mutation()?);
     }
@@ -208,10 +212,13 @@ pub(crate) fn encode_change_page(page: &ChangePage) -> Result<Vec<u8>, StorageEr
     Ok(encoder.finish())
 }
 
-pub(crate) fn decode_change_page(bytes: &[u8]) -> Result<ChangePage, StorageError> {
+pub(crate) fn decode_change_page(
+    bytes: &[u8],
+    expected_count: usize,
+) -> Result<ChangePage, StorageError> {
     let mut decoder = Decoder::new(bytes);
-    let count = decoder.u32()?;
-    let mut rows = Vec::with_capacity(count as usize);
+    let count = decoder.collection_count_exact(17, "change page", expected_count)?;
+    let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         rows.push(ChangeRecord::new(
             ChangeCursor::new(decoder.u64()?, decoder.u64()?),
@@ -237,8 +244,9 @@ pub(crate) fn encode_vertex_page(
 
 pub(crate) fn decode_vertex_page(
     bytes: &[u8],
+    expected_count: usize,
 ) -> Result<ScanPage<VertexVersion, VertexId>, StorageError> {
-    let (mutations, next) = decode_page(bytes)?;
+    let (mutations, next) = decode_page(bytes, expected_count)?;
     let rows = mutations
         .into_iter()
         .map(|mutation| match mutation {
@@ -265,8 +273,9 @@ pub(crate) fn encode_edge_page(
 
 pub(crate) fn decode_edge_page(
     bytes: &[u8],
+    expected_count: usize,
 ) -> Result<ScanPage<EdgeVersion, EdgeId>, StorageError> {
-    let (mutations, next) = decode_page(bytes)?;
+    let (mutations, next) = decode_page(bytes, expected_count)?;
     let rows = mutations
         .into_iter()
         .map(|mutation| match mutation {
@@ -329,10 +338,13 @@ pub(crate) fn encode_snapshot_records(records: &[SnapshotRecord]) -> Result<Vec<
     Ok(encoder.finish())
 }
 
-pub(crate) fn decode_snapshot_records(bytes: &[u8]) -> Result<Vec<SnapshotRecord>, StorageError> {
+pub(crate) fn decode_snapshot_records(
+    bytes: &[u8],
+    expected_count: usize,
+) -> Result<Vec<SnapshotRecord>, StorageError> {
     let mut decoder = Decoder::new(bytes);
-    let count = decoder.u32()?;
-    let mut records = Vec::with_capacity(count as usize);
+    let count = decoder.collection_count_exact(1, "snapshot record", expected_count)?;
+    let mut records = Vec::with_capacity(count);
     for _ in 0..count {
         records.push(match decoder.u8()? {
             1 => SnapshotRecord::Vertex(decoder.vertex()?),
@@ -404,8 +416,8 @@ pub(crate) fn decode_pushdown_request(
 ) -> Result<PushdownRequest, StorageError> {
     let mut decoder = Decoder::new(bytes);
     let contract_version = decoder.u32()?;
-    let capability_count = decoder.u32()?;
-    let mut names = Vec::with_capacity(capability_count as usize);
+    let capability_count = decoder.collection_count(4, "pushdown capability")?;
+    let mut names = Vec::with_capacity(capability_count);
     for _ in 0..capability_count {
         names.push(decoder.string()?);
     }
@@ -467,15 +479,18 @@ pub(crate) fn encode_pushdown_outcome(outcome: &PushdownOutcome) -> Result<Vec<u
     Ok(encoder.finish())
 }
 
-pub(crate) fn decode_pushdown_outcome(bytes: &[u8]) -> Result<PushdownOutcome, StorageError> {
+pub(crate) fn decode_pushdown_outcome(
+    bytes: &[u8],
+    expected_rows: usize,
+) -> Result<PushdownOutcome, StorageError> {
     let mut decoder = Decoder::new(bytes);
     let kind = decoder.u8()?;
-    let guarantee_count = decoder.u32()?;
-    let mut guarantees = Vec::with_capacity(guarantee_count as usize);
+    let guarantee_count = decoder.collection_count(4, "pushdown guarantee")?;
+    let mut guarantees = Vec::with_capacity(guarantee_count);
     for _ in 0..guarantee_count {
         guarantees.push(decoder.string()?);
     }
-    let rows = decode_snapshot_records(&decoder.bytes()?)?;
+    let rows = decode_snapshot_records(&decoder.bytes()?, expected_rows)?;
     decoder.finish()?;
     match kind {
         1 if guarantees.is_empty() => Ok(PushdownOutcome::Exact(rows)),
@@ -501,10 +516,13 @@ fn encode_page(mutations: &[LogicalMutation], next: Option<u128>) -> Result<Vec<
     Ok(encoder.finish())
 }
 
-fn decode_page(bytes: &[u8]) -> Result<(Vec<LogicalMutation>, Option<u128>), StorageError> {
+fn decode_page(
+    bytes: &[u8],
+    expected_count: usize,
+) -> Result<(Vec<LogicalMutation>, Option<u128>), StorageError> {
     let mut decoder = Decoder::new(bytes);
-    let count = decoder.u32()?;
-    let mut mutations = Vec::with_capacity(count as usize);
+    let count = decoder.collection_count_exact(1, "scan page", expected_count)?;
+    let mut mutations = Vec::with_capacity(count);
     for _ in 0..count {
         mutations.push(decoder.mutation()?);
     }
@@ -720,6 +738,39 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    fn collection_count(
+        &mut self,
+        minimum_item_bytes: usize,
+        name: &str,
+    ) -> Result<usize, StorageError> {
+        let count =
+            usize::try_from(self.u32()?).map_err(|_| corrupt("invalid remote collection count"))?;
+        let minimum_bytes = count
+            .checked_mul(minimum_item_bytes)
+            .ok_or_else(|| corrupt("remote collection count overflows"))?;
+        if count > MAX_MESSAGE_ITEMS || minimum_bytes > self.bytes.len() - self.offset {
+            return Err(corrupt(&format!(
+                "remote {name} count exceeds protocol or remaining-byte bounds"
+            )));
+        }
+        Ok(count)
+    }
+
+    fn collection_count_exact(
+        &mut self,
+        minimum_item_bytes: usize,
+        name: &str,
+        expected_count: usize,
+    ) -> Result<usize, StorageError> {
+        let count = self.collection_count(minimum_item_bytes, name)?;
+        if count != expected_count {
+            return Err(corrupt(&format!(
+                "remote {name} count differs from the bounded payload item count"
+            )));
+        }
+        Ok(count)
+    }
+
     fn take(&mut self, length: usize) -> Result<&'a [u8], StorageError> {
         let end = self
             .offset
@@ -789,7 +840,7 @@ impl<'a> Decoder<'a> {
         if depth > MAX_NESTING {
             return Err(corrupt("remote property nesting exceeds provider bound"));
         }
-        let count = self.u32()?;
+        let count = self.collection_count(5, "property")?;
         let mut values = BTreeMap::new();
         for _ in 0..count {
             let name = self.string()?;
@@ -817,8 +868,8 @@ impl<'a> Decoder<'a> {
             4 => Ok(Value::Bytes(self.bytes()?)),
             5 => Ok(Value::String(self.string()?)),
             6 => {
-                let count = self.u32()?;
-                let mut values = Vec::new();
+                let count = self.collection_count(1, "list")?;
+                let mut values = Vec::with_capacity(count);
                 for _ in 0..count {
                     values.push(self.value(depth + 1)?);
                 }
@@ -898,4 +949,37 @@ fn corrupt(message: &str) -> StorageError {
 
 fn kernel_error(error: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(format!("invalid typed remote value: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_mutations, decode_snapshot_records};
+
+    fn message(error: dtg_storage::StorageError) -> String {
+        error.to_string()
+    }
+
+    #[test]
+    fn top_level_counts_are_rejected_before_allocation() {
+        let error = decode_mutations(&65_537_u32.to_be_bytes(), 65_537).unwrap_err();
+        assert!(message(error).contains("count exceeds"));
+
+        let error =
+            decode_snapshot_records(&u32::MAX.to_be_bytes(), u32::MAX as usize).unwrap_err();
+        assert!(message(error).contains("count exceeds"));
+    }
+
+    #[test]
+    fn nested_collection_counts_are_rejected_before_iteration() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&1_u32.to_be_bytes());
+        encoded.push(6); // PutReplicaMetadata
+        encoded.extend_from_slice(&1_u32.to_be_bytes());
+        encoded.push(b'k');
+        encoded.push(6); // Value::List
+        encoded.extend_from_slice(&65_537_u32.to_be_bytes());
+
+        let error = decode_mutations(&encoded, 1).unwrap_err();
+        assert!(message(error).contains("count exceeds"));
+    }
 }

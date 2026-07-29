@@ -94,7 +94,7 @@ impl RemoteReadView {
                 encode_text_request(name)?,
             )
             .await?;
-        let mut mutations = decode_mutations(&payload.body)?;
+        let mut mutations = decode_mutations(&payload.body, payload.item_count as usize)?;
         if mutations.len() > 1 {
             return Err(StorageError::Internal(
                 "remote metadata read returned multiple records".into(),
@@ -119,7 +119,7 @@ impl RemoteReadView {
                 encode_pushdown_request(request)?,
             )
             .await?;
-        decode_pushdown_outcome(&payload.body)
+        decode_pushdown_outcome(&payload.body, payload.item_count as usize)
     }
 
     async fn vertex_records(
@@ -127,7 +127,8 @@ impl RemoteReadView {
         operation: proto::ReadOperation,
         body: Vec<u8>,
     ) -> Result<Vec<VertexVersion>, StorageError> {
-        decode_mutations(&self.request(operation, body).await?.body)?
+        let payload = self.request(operation, body).await?;
+        decode_mutations(&payload.body, payload.item_count as usize)?
             .into_iter()
             .map(|mutation| match mutation {
                 LogicalMutation::PutVertex(vertex) => Ok(vertex),
@@ -143,7 +144,8 @@ impl RemoteReadView {
         operation: proto::ReadOperation,
         body: Vec<u8>,
     ) -> Result<Vec<EdgeVersion>, StorageError> {
-        decode_mutations(&self.request(operation, body).await?.body)?
+        let payload = self.request(operation, body).await?;
+        decode_mutations(&payload.body, payload.item_count as usize)?
             .into_iter()
             .map(|mutation| match mutation {
                 LogicalMutation::PutEdge(edge) => Ok(edge),
@@ -260,7 +262,7 @@ impl TemporalReadView for RemoteReadView {
                     ),
                 )
                 .await?;
-            decode_change_page(&payload.body)
+            decode_change_page(&payload.body, payload.item_count as usize)
         })
     }
 
@@ -280,7 +282,7 @@ impl TemporalReadView for RemoteReadView {
                     ),
                 )
                 .await?;
-            decode_vertex_page(&payload.body)
+            decode_vertex_page(&payload.body, payload.item_count as usize)
         })
     }
 
@@ -297,7 +299,7 @@ impl TemporalReadView for RemoteReadView {
                     ),
                 )
                 .await?;
-            decode_edge_page(&payload.body)
+            decode_edge_page(&payload.body, payload.item_count as usize)
         })
     }
 }

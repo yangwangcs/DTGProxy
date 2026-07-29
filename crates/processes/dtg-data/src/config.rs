@@ -18,6 +18,7 @@ pub enum CredentialProfile {
     None,
     PostgreSql(String),
     Neo4jBasic { username: String, password: String },
+    RemoteSignedToken([u8; 32]),
 }
 
 impl fmt::Debug for CredentialProfile {
@@ -30,6 +31,7 @@ impl fmt::Debug for CredentialProfile {
                 .field("username", username)
                 .field("password", &"[redacted]")
                 .finish(),
+            Self::RemoteSignedToken(_) => formatter.write_str("RemoteSignedToken([redacted])"),
         }
     }
 }

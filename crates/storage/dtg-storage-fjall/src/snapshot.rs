@@ -129,6 +129,8 @@ impl LogicalSnapshotWriter for FjallSnapshotWriter {
                     "snapshot chunk identity or order mismatch".into(),
                 ));
             }
+            let _guard = self.store.lock_graph()?;
+            self.store.verify_binding(&self.target_binding)?;
             let key = stage_key(chunk.snapshot_id().get(), chunk.ordinal());
             self.store
                 .namespace()
@@ -174,6 +176,8 @@ impl LogicalSnapshotWriter for FjallSnapshotWriter {
 
     fn abort(self: Box<Self>) -> StoreFuture<'static, ()> {
         Box::pin(async move {
+            let _guard = self.store.lock_graph()?;
+            self.store.verify_binding(&self.target_binding)?;
             for key in &self.stage_keys {
                 self.store
                     .namespace()

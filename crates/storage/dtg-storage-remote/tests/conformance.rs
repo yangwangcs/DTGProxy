@@ -11,7 +11,13 @@ use dtg_storage::{
     ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion, run_storage_tck,
 };
 use dtg_storage_fjall::FjallStorageTckFactory;
-use dtg_storage_remote::{ReferenceServerConfig, ReferenceStorageServer, StorageRemoteClient};
+use dtg_storage_remote::{
+    ReferenceServerConfig, ReferenceStorageServer, RemoteAuthToken, StorageRemoteClient,
+};
+
+fn auth(server: &ReferenceStorageServer, binding: &ReplicaBinding) -> RemoteAuthToken {
+    server.auth_token(binding.credential_ref()).unwrap()
+}
 
 fn fixture_binding(capabilities: &CapabilityManifest) -> ReplicaBinding {
     let provider = ProviderKind::Remote("reference".into());
@@ -66,6 +72,24 @@ async fn reference_factory_opens_an_empty_remote_store() {
 
     assert_eq!(ReplicaStateStore::binding(&*store), &binding);
     assert_eq!(store.applied_index().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_binding_scoped_authentication_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let factory = Arc::new(FjallStorageTckFactory::new(root.path()));
+    let server = ReferenceStorageServer::spawn(factory, ReferenceServerConfig::default())
+        .await
+        .unwrap();
+    let capabilities = server.tck_factory("reference").unwrap().capabilities();
+    let binding = fixture_binding(&capabilities);
+
+    let error =
+        StorageRemoteClient::connect(server.uri(), binding, RemoteAuthToken::new([0x5a; 32]))
+            .await
+            .unwrap_err();
+
+    assert!(error.to_string().contains("authentication failed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -177,9 +201,13 @@ async fn candidate_activation_is_authenticated_fenced_and_retry_safe() {
         .unwrap();
     let remote = server.tck_factory("reference").unwrap();
     let source_binding = remote.binding("activation-source", 1).unwrap();
-    let source = StorageRemoteClient::connect(server.uri(), source_binding.clone())
-        .await
-        .unwrap();
+    let source = StorageRemoteClient::connect(
+        server.uri(),
+        source_binding.clone(),
+        auth(&server, &source_binding),
+    )
+    .await
+    .unwrap();
     let mut reader = source
         .begin_snapshot(
             ReadFence::new(source_binding.clone(), 0),
@@ -206,9 +234,13 @@ async fn candidate_activation_is_authenticated_fenced_and_retry_safe() {
         .role(BindingRole::Active)
         .build()
         .unwrap();
-    let candidate = StorageRemoteClient::connect(server.uri(), candidate_binding.clone())
-        .await
-        .unwrap();
+    let candidate = StorageRemoteClient::connect(
+        server.uri(),
+        candidate_binding.clone(),
+        auth(&server, &candidate_binding),
+    )
+    .await
+    .unwrap();
     let mut writer = candidate
         .begin_restore(candidate_binding.clone(), header.clone())
         .await
@@ -276,7 +308,8 @@ async fn candidate_activation_is_authenticated_fenced_and_retry_safe() {
             .await,
         Err(StorageError::StaleBinding { .. })
     ));
-    let active = StorageRemoteClient::connect(server.uri(), active_binding)
+    let active_token = auth(&server, &active_binding);
+    let active = StorageRemoteClient::connect(server.uri(), active_binding, active_token)
         .await
         .unwrap();
     assert_eq!(active.applied_index().await.unwrap(), 0);
@@ -337,9 +370,11 @@ async fn major_contract_mismatch_fails_closed() {
     .await
     .unwrap();
 
-    let error = StorageRemoteClient::connect(server.uri(), fixture_binding(&capabilities))
-        .await
-        .unwrap_err();
+    let binding = fixture_binding(&capabilities);
+    let error =
+        StorageRemoteClient::connect(server.uri(), binding.clone(), auth(&server, &binding))
+            .await
+            .unwrap_err();
     assert_eq!(error.code(), "DTG-REMOTE-CONTRACT-MAJOR");
 }
 
@@ -355,9 +390,11 @@ async fn major_protocol_mismatch_fails_closed() {
     .await
     .unwrap();
 
-    let error = StorageRemoteClient::connect(server.uri(), fixture_binding(&capabilities))
-        .await
-        .unwrap_err();
+    let binding = fixture_binding(&capabilities);
+    let error =
+        StorageRemoteClient::connect(server.uri(), binding.clone(), auth(&server, &binding))
+            .await
+            .unwrap_err();
     assert_eq!(error.code(), "DTG-REMOTE-PROTOCOL-MAJOR");
 }
 
@@ -374,14 +411,17 @@ async fn capability_subsets_are_negotiated_and_drift_fails_closed() {
     .await
     .unwrap();
 
-    let error = StorageRemoteClient::connect(server.uri(), fixture_binding(&full_capabilities))
-        .await
-        .unwrap_err();
+    let binding = fixture_binding(&full_capabilities);
+    let error =
+        StorageRemoteClient::connect(server.uri(), binding.clone(), auth(&server, &binding))
+            .await
+            .unwrap_err();
     assert_eq!(error.code(), "DTG-REMOTE-CAPABILITIES");
 
     let remote = server.tck_factory("reference").unwrap();
     let binding = remote.binding("capability-subset", 1).unwrap();
-    let client = StorageRemoteClient::connect(server.uri(), binding)
+    let token = auth(&server, &binding);
+    let client = StorageRemoteClient::connect(server.uri(), binding, token)
         .await
         .unwrap();
     assert_eq!(client.capabilities(), &subset);

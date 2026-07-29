@@ -277,6 +277,88 @@ fn missing_retained_wal_suffix_is_rejected_before_candidate_restore() {
     assert!(block_on(consensus.snapshot_metadata()).unwrap().is_none());
 }
 
+#[test]
+fn snapshot_target_must_be_a_voter_or_learner() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot_with_membership(root.path(), vec![], 1);
+    let candidate_binding = binding(5, BindingRole::Candidate, "non-member-target");
+    let active_binding = binding(5, BindingRole::Active, "non-member-target");
+    let candidate = Arc::new(
+        FjallReplicaStore::open(
+            root.path().join("non-member-business"),
+            candidate_binding.clone(),
+        )
+        .unwrap(),
+    );
+    let consensus = Arc::new(
+        FjallConsensusStore::open(
+            root.path().join("non-member-consensus"),
+            active_binding.clone(),
+        )
+        .unwrap(),
+    );
+
+    assert!(
+        install_replica_snapshot(
+            &snapshot,
+            candidate.as_ref(),
+            candidate.as_ref(),
+            consensus.as_ref(),
+            candidate_binding,
+            active_binding,
+        )
+        .is_err()
+    );
+    assert_eq!(block_on(candidate.applied_index()).unwrap(), 0);
+    assert!(block_on(consensus.snapshot_metadata()).unwrap().is_none());
+}
+
+#[test]
+fn snapshot_term_increase_clears_a_vote_from_the_old_term() {
+    let root = tempfile::tempdir().unwrap();
+    let snapshot = create_source_snapshot_with_membership(
+        root.path(),
+        vec![dtg_storage::ReplicaId::new(5).unwrap()],
+        2,
+    );
+    let candidate_binding = binding(5, BindingRole::Candidate, "term-vote-target");
+    let active_binding = binding(5, BindingRole::Active, "term-vote-target");
+    let candidate = Arc::new(
+        FjallReplicaStore::open(
+            root.path().join("term-vote-business"),
+            candidate_binding.clone(),
+        )
+        .unwrap(),
+    );
+    let consensus = Arc::new(
+        FjallConsensusStore::open(
+            root.path().join("term-vote-consensus"),
+            active_binding.clone(),
+        )
+        .unwrap(),
+    );
+    block_on(consensus.set_hard_state(RaftHardState {
+        current_term: 1,
+        voted_for: Some(dtg_storage::ReplicaId::new(9).unwrap()),
+        committed_index: 0,
+    }))
+    .unwrap();
+
+    install_replica_snapshot(
+        &snapshot,
+        candidate.as_ref(),
+        candidate.as_ref(),
+        consensus.as_ref(),
+        candidate_binding,
+        active_binding,
+    )
+    .unwrap();
+
+    let installed = block_on(consensus.hard_state()).unwrap();
+    assert_eq!(installed.current_term, 2);
+    assert_eq!(installed.voted_for, None);
+}
+
 struct FailOnceActivation {
     inner: Arc<FjallReplicaStore>,
     failing: AtomicBool,
@@ -302,23 +384,40 @@ impl LogicalReplicaActivation for FailOnceActivation {
 }
 
 fn create_source_snapshot(root: &std::path::Path) -> ReplicaSnapshot {
+    create_source_snapshot_with_membership(root, vec![dtg_storage::ReplicaId::new(5).unwrap()], 1)
+}
+
+fn create_source_snapshot_with_membership(
+    root: &std::path::Path,
+    learners: Vec<dtg_storage::ReplicaId>,
+    current_term: u64,
+) -> ReplicaSnapshot {
     let source_binding = binding(4, BindingRole::Active, "source");
     let consensus = Arc::new(
         FjallConsensusStore::open(root.join("consensus"), source_binding.clone()).unwrap(),
     );
     block_on(consensus.set_membership(RaftMembership {
         voters: vec![source_binding.replica_id()],
-        learners: vec![],
+        learners,
         configuration_index: 0,
     }))
     .unwrap();
-    let state = Arc::new(FjallReplicaStore::open(root.join("business"), source_binding).unwrap());
+    let state =
+        Arc::new(FjallReplicaStore::open(root.join("business"), source_binding.clone()).unwrap());
     let mut replica = RaftReplica::open(consensus.clone(), state.clone()).unwrap();
     replica.start().unwrap();
     replica.campaign().unwrap();
     replica.drive_ready().unwrap();
     replica.propose(vertex_command(10)).unwrap();
     replica.drive_ready().unwrap();
+    if current_term > 1 {
+        block_on(consensus.set_hard_state(RaftHardState {
+            current_term,
+            voted_for: Some(source_binding.replica_id()),
+            committed_index: 2,
+        }))
+        .unwrap();
+    }
     let permit = replica.snapshot_read_permit(2).unwrap();
 
     create_replica_snapshot(state.as_ref(), consensus.as_ref(), &permit, 77, 1).unwrap()

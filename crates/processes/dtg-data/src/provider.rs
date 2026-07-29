@@ -8,7 +8,7 @@ use dtg_execution::{
 use dtg_storage_fjall::FjallReplicaStore;
 use dtg_storage_neo4j::{Neo4jConfig, Neo4jReplicaStore};
 use dtg_storage_postgres::PostgresReplicaStore;
-use dtg_storage_remote::{RemoteError, StorageRemoteClient};
+use dtg_storage_remote::{RemoteAuthToken, RemoteError, StorageRemoteClient};
 
 use crate::{CredentialProfile, DataProcessConfig, EndpointProfile};
 
@@ -180,15 +180,17 @@ impl ProviderResolver for RemoteResolver {
                     "remote binding resolved a non-remote endpoint profile".into(),
                 ));
             };
-            if self.profiles.credential(&binding)? != &CredentialProfile::None {
+            let CredentialProfile::RemoteSignedToken(secret) =
+                self.profiles.credential(&binding)?
+            else {
                 return Err(StorageError::InvalidBinding(
-                    "remote storage credentials are carried by the versioned remote protocol"
-                        .into(),
+                    "remote storage requires a binding-scoped signed-token credential".into(),
                 ));
-            }
-            let store = StorageRemoteClient::connect(endpoint, binding)
-                .await
-                .map_err(remote_storage_error)?;
+            };
+            let store =
+                StorageRemoteClient::connect(endpoint, binding, RemoteAuthToken::new(*secret))
+                    .await
+                    .map_err(remote_storage_error)?;
             Ok(Arc::new(store) as Arc<dyn ReplicaStateStore>)
         })
     }

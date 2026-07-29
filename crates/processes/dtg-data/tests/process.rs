@@ -99,7 +99,10 @@ async fn remote_provider_uses_the_versioned_storage_client_path() {
     let config = DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
         .with_remote_provider("third-party")
         .with_endpoint_profile(endpoint_profile, EndpointProfile::Remote(server.uri()))
-        .with_credential_profile(credential_profile, CredentialProfile::None)
+        .with_credential_profile(
+            credential_profile,
+            CredentialProfile::RemoteSignedToken([0xd7; 32]),
+        )
         .assign(binding);
 
     let node = DataNodeBuilder::from_config(config).start().await.unwrap();

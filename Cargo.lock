@@ -539,6 +539,7 @@ dependencies = [
 name = "dtg-storage-remote"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "dtg-storage",
  "dtg-storage-fjall",
  "dtg-storage-remote-protocol",

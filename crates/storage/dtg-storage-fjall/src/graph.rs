@@ -38,6 +38,7 @@ struct ReplicaInner {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum GraphPausePoint {
     ApplyBeforeCommit,
+    RestoreAfterOwnerCheckBeforeLock,
     RestoreBeforeCommit,
     SnapshotAfterFence,
 }
@@ -217,6 +218,11 @@ impl FjallReplicaStore {
     }
 
     #[cfg(feature = "tck")]
+    pub fn arm_tck_restore_after_owner_check_pause(&self) -> Result<FjallGraphPause, StorageError> {
+        self.arm_graph_pause(GraphPausePoint::RestoreAfterOwnerCheckBeforeLock)
+    }
+
+    #[cfg(feature = "tck")]
     pub fn arm_tck_snapshot_after_fence_pause(&self) -> Result<FjallGraphPause, StorageError> {
         self.arm_graph_pause(GraphPausePoint::SnapshotAfterFence)
     }
@@ -342,8 +348,10 @@ impl FjallReplicaStore {
         stage_keys: &[Vec<u8>],
         install_marker: Option<&[u8]>,
     ) -> Result<(), StorageError> {
-        self.inner.namespace.ensure_binding(&self.inner.binding)?;
+        #[cfg(feature = "tck")]
+        self.pause_graph_at(GraphPausePoint::RestoreAfterOwnerCheckBeforeLock)?;
         let _guard = self.lock_graph()?;
+        self.inner.namespace.ensure_binding(&self.inner.binding)?;
         let mut history = Vec::new();
         let mut transactions = Vec::new();
         let mut metadata = Vec::new();

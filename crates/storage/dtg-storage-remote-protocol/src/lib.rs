@@ -27,6 +27,7 @@ pub enum ProtocolError {
     InvalidRequestId,
     InvalidDeadline,
     MissingBinding,
+    MissingAuthContext,
     AuthContextTooLarge,
     InvalidResponseBudget,
     InvalidPayload(String),
@@ -42,6 +43,7 @@ impl ProtocolError {
             Self::InvalidRequestId => "DTG-REMOTE-REQUEST-ID",
             Self::InvalidDeadline => "DTG-REMOTE-DEADLINE",
             Self::MissingBinding => "DTG-REMOTE-BINDING",
+            Self::MissingAuthContext => "DTG-REMOTE-AUTH-CONTEXT",
             Self::AuthContextTooLarge => "DTG-REMOTE-AUTH-CONTEXT",
             Self::InvalidResponseBudget => "DTG-REMOTE-RESPONSE-BUDGET",
             Self::InvalidPayload(_) => "DTG-REMOTE-PAYLOAD",
@@ -117,6 +119,9 @@ pub fn validate_context(
     }
     if context.binding.is_none() {
         return Err(ProtocolError::MissingBinding);
+    }
+    if context.auth_context.is_empty() {
+        return Err(ProtocolError::MissingAuthContext);
     }
     if context.auth_context.len() > MAX_AUTH_CONTEXT_BYTES {
         return Err(ProtocolError::AuthContextTooLarge);

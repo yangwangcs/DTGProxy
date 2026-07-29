@@ -15,10 +15,11 @@ use dtg_storage::{
     ArtifactChunk, ArtifactKey, ArtifactKind, ArtifactManifest, ArtifactStore, BackendClass,
     BindingRole, CapabilityManifest, CommandId, CommittedShardBatch, ConsensusCommandEnvelope,
     ConsensusEntry, ConsensusStore, Digest32, EdgeId, EdgeTombstone, EdgeVersion, LogicalMutation,
-    LogicalSnapshotSink, LogicalSnapshotSource, ProviderKind, ReadFence, ReplicaBinding,
-    ReplicaMetadata, ReplicaStateStore, SnapshotChunk, SnapshotManifest, SnapshotRecord,
-    SnapshotRequest, StorageError, TransactionId, TransactionRecord, TransactionState,
-    TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion,
+    LogicalReplicaActivation, LogicalSnapshotCandidateReceipt, LogicalSnapshotSink,
+    LogicalSnapshotSource, ProviderKind, ReadFence, ReplicaBinding, ReplicaMetadata,
+    ReplicaStateStore, SnapshotChunk, SnapshotManifest, SnapshotRecord, SnapshotRequest,
+    StorageError, TransactionId, TransactionRecord, TransactionState, TransactionTime,
+    ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion,
 };
 use dtg_storage_fjall::{FjallArtifactStore, FjallConsensusStore, FjallReplicaStore};
 use fjall::{Database, KeyspaceCreateOptions};
@@ -854,6 +855,100 @@ fn apply_racing_restore_finishes_as_one_complete_serial_outcome() {
             .count(),
         1
     );
+}
+
+#[cfg(feature = "tck")]
+#[test]
+fn stale_candidate_restore_cannot_overwrite_an_activated_namespace() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("restore-owner-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(701).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(1, 1))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (first_header, first_chunks, first_manifest, first_records) =
+        export(&source, &source_binding, 1, 701);
+    block_on(
+        source.apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                2,
+                2,
+                CommandId::new(702).unwrap(),
+                vec![LogicalMutation::PutVertex(vertex(2, 2))],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (second_header, second_chunks, second_manifest, _) =
+        export(&source, &source_binding, 2, 702);
+
+    let candidate_binding = binding("restore-owner-target", 2)
+        .to_builder()
+        .role(BindingRole::Candidate)
+        .build()
+        .unwrap();
+    let active_binding = candidate_binding
+        .to_builder()
+        .role(BindingRole::Active)
+        .build()
+        .unwrap();
+    let candidate = FjallReplicaStore::open(target_dir.path(), candidate_binding.clone()).unwrap();
+    let stale_candidate =
+        FjallReplicaStore::open(target_dir.path(), candidate_binding.clone()).unwrap();
+    let activation_handle =
+        FjallReplicaStore::open(target_dir.path(), candidate_binding.clone()).unwrap();
+
+    let mut first_writer =
+        block_on(candidate.begin_restore(candidate_binding.clone(), first_header.clone())).unwrap();
+    for chunk in first_chunks {
+        block_on(first_writer.write_chunk(chunk)).unwrap();
+    }
+    block_on(first_writer.commit(first_manifest.clone())).unwrap();
+    let candidate_receipt = LogicalSnapshotCandidateReceipt::new(
+        candidate_binding.clone(),
+        first_header,
+        first_manifest,
+    )
+    .unwrap();
+
+    let mut stale_writer =
+        block_on(stale_candidate.begin_restore(candidate_binding.clone(), second_header)).unwrap();
+    for chunk in second_chunks {
+        block_on(stale_writer.write_chunk(chunk)).unwrap();
+    }
+    let pause = stale_candidate
+        .arm_tck_restore_after_owner_check_pause()
+        .unwrap();
+    let restore_thread = thread::spawn(move || block_on(stale_writer.commit(second_manifest)));
+    pause.wait_until_reached().unwrap();
+
+    block_on(activation_handle.activate_candidate(candidate_receipt, active_binding.clone()))
+        .unwrap();
+    pause.release().unwrap();
+    let stale_result = restore_thread.join().unwrap();
+    assert!(matches!(
+        stale_result,
+        Err(StorageError::NamespaceOwnerMismatch { .. })
+            | Err(StorageError::StaleBinding { .. })
+            | Err(StorageError::SnapshotIdentityMismatch)
+    ));
+
+    let active = FjallReplicaStore::open(target_dir.path(), active_binding.clone()).unwrap();
+    let (_, _, _, active_records) = export(&active, &active_binding, 1, 703);
+    assert_eq!(active_records, first_records);
 }
 
 #[test]

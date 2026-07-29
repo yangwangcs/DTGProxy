@@ -18,6 +18,7 @@ use dtg_storage_remote_protocol::{
 };
 use tonic::transport::Channel;
 
+use crate::auth::{RemoteAuthToken, sign_context};
 use crate::codec::encode_mutations;
 use crate::read_view::RemoteReadView;
 use crate::snapshot::{RemoteSnapshotReader, RemoteSnapshotWriter, encode_header, encode_manifest};
@@ -64,6 +65,7 @@ struct ClientInner {
     capabilities: CapabilityManifest,
     request_sequence: AtomicU64,
     deadline: Duration,
+    auth_token: RemoteAuthToken,
 }
 
 #[derive(Clone)]
@@ -84,6 +86,7 @@ impl StorageRemoteClient {
     pub async fn connect(
         endpoint: impl Into<String>,
         binding: ReplicaBinding,
+        auth_token: RemoteAuthToken,
     ) -> Result<Self, RemoteError> {
         if !matches!(binding.provider_kind(), ProviderKind::Remote(_)) {
             return Err(StorageError::InvalidBinding(
@@ -103,6 +106,7 @@ impl StorageRemoteClient {
                 capabilities: CapabilityManifest::from_names(std::iter::empty::<String>())?,
                 request_sequence: AtomicU64::new(1),
                 deadline: Duration::from_secs(30),
+                auth_token: auth_token.clone(),
             }),
         };
         let response = provisional
@@ -160,6 +164,7 @@ impl StorageRemoteClient {
                 capabilities,
                 request_sequence: AtomicU64::new(2),
                 deadline: provisional.inner.deadline,
+                auth_token,
             }),
         })
     }
@@ -173,7 +178,7 @@ impl StorageRemoteClient {
         let mut request_id = [0_u8; 16];
         request_id[..8].copy_from_slice(&sequence.to_be_bytes());
         request_id[8..].copy_from_slice(&self.inner.binding.replica_id().get().to_be_bytes());
-        proto::RequestContext {
+        let mut context = proto::RequestContext {
             protocol_major: PROTOCOL_MAJOR,
             protocol_minor: PROTOCOL_MINOR,
             contract_major: CONTRACT_MAJOR,
@@ -184,7 +189,9 @@ impl StorageRemoteClient {
             auth_context: Vec::new(),
             max_response_bytes: MAX_MESSAGE_BYTES as u64,
             max_response_items: MAX_MESSAGE_ITEMS as u32,
-        }
+        };
+        context.auth_context = sign_context(&context, &self.inner.auth_token);
+        context
     }
 
     pub fn capabilities(&self) -> &CapabilityManifest {

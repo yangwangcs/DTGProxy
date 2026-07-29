@@ -15,7 +15,7 @@ fn context() -> proto::RequestContext {
         request_id: vec![1; 16],
         deadline_unix_ms: 2,
         binding: Some(proto::Binding::default()),
-        auth_context: Vec::new(),
+        auth_context: vec![1; 32],
         max_response_bytes: MAX_MESSAGE_BYTES as u64,
         max_response_items: MAX_MESSAGE_ITEMS as u32,
     }
@@ -48,6 +48,16 @@ fn payload_and_authentication_bounds_are_enforced() {
     assert_eq!(
         validate_context(Some(&request), 1),
         Err(ProtocolError::AuthContextTooLarge)
+    );
+}
+
+#[test]
+fn empty_authentication_context_is_rejected() {
+    let mut request = context();
+    request.auth_context.clear();
+    assert_eq!(
+        validate_context(Some(&request), 1),
+        Err(ProtocolError::MissingAuthContext)
     );
 }
 

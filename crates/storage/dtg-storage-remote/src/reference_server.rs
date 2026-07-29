@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{RemoteAuthToken, verify_context};
 use crate::client::{RemoteError, StorageRemoteClient, now_ms};
 use crate::codec::{
     decode_adjacency_request, decode_changes_request, decode_history_request, decode_mutations,
@@ -50,6 +51,7 @@ pub struct ReferenceServerConfig {
     contract_major: u32,
     contract_minor: u32,
     capabilities: Option<CapabilityManifest>,
+    auth_tokens: BTreeMap<String, RemoteAuthToken>,
 }
 
 impl Default for ReferenceServerConfig {
@@ -60,6 +62,10 @@ impl Default for ReferenceServerConfig {
             contract_major: CONTRACT_MAJOR,
             contract_minor: CONTRACT_MINOR,
             capabilities: None,
+            auth_tokens: BTreeMap::from([(
+                "remote-reference".into(),
+                RemoteAuthToken::new([0xd7; 32]),
+            )]),
         }
     }
 }
@@ -80,6 +86,16 @@ impl ReferenceServerConfig {
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: CapabilityManifest) -> Self {
         self.capabilities = Some(capabilities);
+        self
+    }
+
+    #[must_use]
+    pub fn with_auth_token(
+        mut self,
+        credential_ref: impl Into<String>,
+        token: RemoteAuthToken,
+    ) -> Self {
+        self.auth_tokens.insert(credential_ref.into(), token);
         self
     }
 }
@@ -144,6 +160,10 @@ impl ReferenceStorageServer {
         self.uri.clone()
     }
 
+    pub fn auth_token(&self, credential_ref: &str) -> Option<RemoteAuthToken> {
+        self.state.config.auth_tokens.get(credential_ref).cloned()
+    }
+
     pub fn tck_factory(
         &self,
         provider_name: impl Into<String>,
@@ -161,6 +181,11 @@ impl ReferenceStorageServer {
             provider_name,
             capabilities,
             state: self.state.clone(),
+            auth_token: self.auth_token("remote-reference").ok_or_else(|| {
+                StorageError::InvalidBinding(
+                    "reference server has no remote-reference auth token".into(),
+                )
+            })?,
         })
     }
 
@@ -322,6 +347,29 @@ impl ReferenceState {
     }
 }
 
+fn authenticated_context<'a>(
+    state: &ReferenceState,
+    context: Option<&'a proto::RequestContext>,
+) -> Result<&'a proto::RequestContext, Status> {
+    let context = validate_context(context, now_ms())
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let binding = context
+        .binding
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("missing binding"))?;
+    let token = state
+        .config
+        .auth_tokens
+        .get(&binding.credential_ref)
+        .ok_or_else(|| Status::unauthenticated("unknown remote credential"))?;
+    if !verify_context(context, token) {
+        return Err(Status::unauthenticated(
+            "remote request authentication failed",
+        ));
+    }
+    Ok(context)
+}
+
 #[tonic::async_trait]
 impl Storage for ReferenceService {
     async fn handshake(
@@ -329,8 +377,7 @@ impl Storage for ReferenceService {
         request: Request<proto::HandshakeRequest>,
     ) -> Result<Response<proto::HandshakeResponse>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let binding = context
             .binding
             .as_ref()
@@ -376,8 +423,7 @@ impl Storage for ReferenceService {
         request: Request<proto::ApplyRequest>,
     ) -> Result<Response<proto::ApplyResponse>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let external_binding = decode_binding(
             context
                 .binding
@@ -404,7 +450,8 @@ impl Storage for ReferenceService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("missing mutation payload"))?;
         validate_payload(payload).map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let mutations = decode_mutations(&payload.body).map_err(storage_status)?;
+        let mutations =
+            decode_mutations(&payload.body, payload.item_count as usize).map_err(storage_status)?;
         if payload.item_count as usize != mutations.len() {
             return Err(Status::invalid_argument(
                 "mutation payload item count differs from its body",
@@ -453,8 +500,7 @@ impl Storage for ReferenceService {
         request: Request<proto::BeginReadRequest>,
     ) -> Result<Response<proto::BeginReadResponse>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let external_binding = decode_binding(
             context
                 .binding
@@ -517,8 +563,7 @@ impl Storage for ReferenceService {
         request: Request<proto::ReadRequest>,
     ) -> Result<Response<proto::ReadResponse>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let external_binding = decode_binding(
             context
                 .binding
@@ -602,8 +647,7 @@ impl Storage for ReferenceService {
         request: Request<proto::EndReadRequest>,
     ) -> Result<Response<proto::EndReadResponse>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let external_binding = decode_binding(
             context
                 .binding
@@ -643,8 +687,7 @@ impl Storage for ReferenceService {
         request: Request<proto::ExportSnapshotRequest>,
     ) -> Result<Response<Self::ExportSnapshotStream>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let external_binding = decode_binding(
             context
                 .binding
@@ -763,8 +806,7 @@ impl Storage for ReferenceService {
         request: Request<proto::ActivateRequest>,
     ) -> Result<Response<proto::ActivateResponse>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let context_binding = decode_binding(
             context
                 .binding
@@ -915,8 +957,7 @@ impl Storage for ReferenceService {
         request: Request<proto::HealthRequest>,
     ) -> Result<Response<proto::HealthResponse>, Status> {
         let request = request.into_inner();
-        let context = validate_context(request.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let context = authenticated_context(&self.state, request.context.as_ref())?;
         let binding = decode_binding(
             context
                 .binding
@@ -1111,8 +1152,7 @@ async fn import_snapshot_stream(
             "snapshot import did not begin with a valid header frame",
         ));
     }
-    let context = validate_context(first.context.as_ref(), now_ms())
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let context = authenticated_context(state, first.context.as_ref())?;
     let external_binding = decode_binding(
         context
             .binding
@@ -1163,8 +1203,7 @@ async fn import_snapshot_stream(
                 "snapshot import stream identity or sequence changed",
             ));
         }
-        let frame_context = validate_context(frame.context.as_ref(), now_ms())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let frame_context = authenticated_context(state, frame.context.as_ref())?;
         let frame_binding = decode_binding(
             frame_context
                 .binding
@@ -1264,6 +1303,7 @@ pub struct ReferenceStorageTckFactory {
     provider_name: String,
     capabilities: CapabilityManifest,
     state: Arc<ReferenceState>,
+    auth_token: RemoteAuthToken,
 }
 
 impl StorageTckFactory for ReferenceStorageTckFactory {
@@ -1304,9 +1344,10 @@ impl StorageTckFactory for ReferenceStorageTckFactory {
 
     fn open(&self, binding: ReplicaBinding) -> StoreFuture<'_, Box<dyn StorageTckStore>> {
         Box::pin(async move {
-            let client = StorageRemoteClient::connect(self.uri.clone(), binding)
-                .await
-                .map_err(remote_storage_error)?;
+            let client =
+                StorageRemoteClient::connect(self.uri.clone(), binding, self.auth_token.clone())
+                    .await
+                    .map_err(remote_storage_error)?;
             Ok(Box::new(ReferenceStorageTckStore {
                 client,
                 state: self.state.clone(),
