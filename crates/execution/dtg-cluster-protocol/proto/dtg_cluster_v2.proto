@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package dtgproxy.cluster.v2;
+
+message RequestContext {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  bytes cluster_id = 3;
+  bytes request_id = 4;
+  uint64 deadline_unix_ms = 5;
+  bytes trace_context = 6;
+}
+
+message ShardContext {
+  RequestContext request = 1;
+  uint64 graph_id = 2;
+  uint32 shard_id = 3;
+  uint64 placement_epoch = 4;
+  uint64 backend_generation = 5;
+  uint64 catalog_version = 6;
+}
+
+message BoundedPayload {
+  uint32 format_version = 1;
+  uint64 declared_len = 2;
+  uint32 item_count = 3;
+  bytes checksum = 4;
+  bytes body = 5;
+}
+
+message ExecutionFragment {
+  ShardContext context = 1;
+  bytes fragment_id = 2;
+  BoundedPayload payload = 3;
+}
+
+message ColumnBatch {
+  RequestContext request = 1;
+  bytes fragment_id = 2;
+  uint64 sequence = 3;
+  uint32 row_count = 4;
+  BoundedPayload payload = 5;
+}
+
+enum TransactionOperation {
+  TRANSACTION_OPERATION_UNSPECIFIED = 0;
+  TRANSACTION_OPERATION_PREWRITE = 1;
+  TRANSACTION_OPERATION_COMMIT = 2;
+  TRANSACTION_OPERATION_ABORT = 3;
+  TRANSACTION_OPERATION_RECOVER = 4;
+}
+
+message TransactionRequest {
+  ShardContext context = 1;
+  bytes transaction_id = 2;
+  TransactionOperation operation = 3;
+  bytes idempotency_key = 4;
+  BoundedPayload payload = 5;
+}
+
+enum RaftMessageKind {
+  RAFT_MESSAGE_KIND_UNSPECIFIED = 0;
+  RAFT_MESSAGE_KIND_APPEND = 1;
+  RAFT_MESSAGE_KIND_VOTE = 2;
+  RAFT_MESSAGE_KIND_SNAPSHOT = 3;
+  RAFT_MESSAGE_KIND_HEARTBEAT = 4;
+}
+
+message RaftEnvelope {
+  ShardContext context = 1;
+  uint64 from_replica_id = 2;
+  uint64 to_replica_id = 3;
+  uint64 term = 4;
+  uint64 committed_index = 5;
+  RaftMessageKind kind = 6;
+  BoundedPayload payload = 7;
+}
+
+message LogicalReplicaSnapshot {
+  ShardContext context = 1;
+  bytes snapshot_id = 2;
+  uint32 snapshot_version = 3;
+  uint64 last_included_term = 4;
+  uint64 last_included_index = 5;
+  uint32 chunk_index = 6;
+  uint32 chunk_count = 7;
+  BoundedPayload payload = 8;
+}
+
+message ControlObservation {
+  RequestContext request = 1;
+  bytes node_id = 2;
+  uint32 observation_version = 3;
+  uint64 observed_at_unix_ms = 4;
+  BoundedPayload payload = 5;
+}
+
+enum StatusCode {
+  STATUS_CODE_UNSPECIFIED = 0;
+  STATUS_CODE_OK = 1;
+  STATUS_CODE_INVALID_REQUEST = 2;
+  STATUS_CODE_STALE_FENCE = 3;
+  STATUS_CODE_CONFLICT = 4;
+  STATUS_CODE_UNAVAILABLE = 5;
+  STATUS_CODE_INTERNAL = 6;
+}
+
+enum RetryDisposition {
+  RETRY_DISPOSITION_UNSPECIFIED = 0;
+  RETRY_DISPOSITION_NEVER = 1;
+  RETRY_DISPOSITION_SAFE = 2;
+  RETRY_DISPOSITION_REPLAY = 3;
+}
+
+message TypedStatus {
+  RequestContext request = 1;
+  StatusCode code = 2;
+  RetryDisposition retry = 3;
+  string message = 4;
+  bytes idempotency_key = 5;
+  BoundedPayload details = 6;
+}
+
+message GatewayRequest {
+  RequestContext request = 1;
+  BoundedPayload execution_request = 2;
+}
+
+message GatewayResponse {
+  TypedStatus status = 1;
+  ColumnBatch batch = 2;
+}
+
+service GatewayService {
+  rpc Execute(GatewayRequest) returns (stream GatewayResponse);
+}
+
+service DataService {
+  rpc ExecuteFragment(ExecutionFragment) returns (stream ColumnBatch);
+  rpc ApplyTransaction(TransactionRequest) returns (TypedStatus);
+  rpc SendRaft(RaftEnvelope) returns (TypedStatus);
+  rpc InstallReplicaSnapshot(LogicalReplicaSnapshot) returns (TypedStatus);
+}
+
+service MetaService {
+  rpc SubmitTransaction(TransactionRequest) returns (TypedStatus);
+  rpc ReportObservation(ControlObservation) returns (TypedStatus);
+}
+
+service ControllerService {
+  rpc Observe(ControlObservation) returns (TypedStatus);
+}

@@ -705,6 +705,14 @@ version = "1.0.0"
 [[package]]
 name = "dtg-cluster-protocol"
 version = "1.0.0"
+dependencies = [
+ "blake3",
+ "dtg-kernel",
+ "prost 0.14.4",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
 
 [[package]]
 name = "dtg-control"

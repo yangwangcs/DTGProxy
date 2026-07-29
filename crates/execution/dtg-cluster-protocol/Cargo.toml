@@ -7,3 +7,16 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[lib]
+name = "dtg_cluster_v2"
+
+[dependencies]
+blake3 = "=1.8.5"
+dtg-kernel = { path = "../../kernel/dtg-kernel" }
+prost = "=0.14.4"
+tonic = { version = "=0.14.6", default-features = false, features = ["channel", "codegen", "server"] }
+tonic-prost = "=0.14.6"
+
+[build-dependencies]
+tonic-prost-build = "=0.14.6"
