@@ -19,6 +19,8 @@ dtg-query = { path = "../dtg-query" }
 dtg-shard = { path = "../dtg-shard" }
 dtg-storage = { path = "../../storage/dtg-storage" }
 dtg-transaction = { path = "../dtg-transaction" }
+raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
+prost-011 = { package = "prost", version = "=0.11.9" }
 tonic = { version = "=0.14.6", features = ["transport"] }
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
 slog = "=2.8.2"

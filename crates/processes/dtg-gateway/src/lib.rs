@@ -4,7 +4,7 @@ mod bolt;
 mod config;
 mod service;
 
-pub use bolt::{BoltError, BoltQuery, BoltSession, BoltTransaction};
+pub use bolt::{BoltError, BoltQuery, BoltSession, BoltTransaction, serve_bolt};
 pub use config::{GatewayConfig, GatewayConfigError};
 pub use service::GatewayService;
 

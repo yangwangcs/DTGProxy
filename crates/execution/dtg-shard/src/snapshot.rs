@@ -131,7 +131,7 @@ pub fn create_replica_snapshot(
             "snapshot creation requires an exact snapshot permit and nonzero bounds",
         ));
     }
-    if consensus.binding() != permit.fence().binding() {
+    if !consensus_binding_matches_business(consensus.binding(), permit.fence().binding()) {
         return Err(ReplicaSnapshotError::InvalidRequest(
             "snapshot consensus and logical bindings differ",
         ));
@@ -182,7 +182,7 @@ pub fn install_replica_snapshot(
     if candidate_binding.role() != BindingRole::Candidate
         || active_binding.role() != BindingRole::Active
         || !same_binding_except_role(&candidate_binding, &active_binding)
-        || consensus.binding() != &active_binding
+        || !consensus_binding_matches_business(consensus.binding(), &active_binding)
         || !compatible_snapshot_target(manifest.binding(), &active_binding)
     {
         return Err(ReplicaSnapshotError::InvalidRequest(
@@ -301,7 +301,7 @@ pub fn recover_replica_snapshot_install(
     let Some(install) = block_on(consensus.snapshot_install())? else {
         return Ok(None);
     };
-    if consensus.binding() != install.active_binding() {
+    if !consensus_binding_matches_business(consensus.binding(), install.active_binding()) {
         return Err(ReplicaSnapshotError::InvalidRequest(
             "snapshot install journal and consensus bindings differ",
         ));
@@ -415,6 +415,18 @@ fn same_binding_except_role(left: &ReplicaBinding, right: &ReplicaBinding) -> bo
         .role(right.role())
         .build()
         .is_ok_and(|normalized| normalized == *right)
+}
+
+fn consensus_binding_matches_business(
+    consensus: &ReplicaBinding,
+    business: &ReplicaBinding,
+) -> bool {
+    consensus.cluster_id() == business.cluster_id()
+        && consensus.graph_id() == business.graph_id()
+        && consensus.shard_id() == business.shard_id()
+        && consensus.replica_id() == business.replica_id()
+        && consensus.placement_epoch() == business.placement_epoch()
+        && consensus.backend_generation() == business.backend_generation()
 }
 
 fn compatible_snapshot_target(source: &ReplicaBinding, target: &ReplicaBinding) -> bool {

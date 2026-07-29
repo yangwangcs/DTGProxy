@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 dtg-execution = { path = "../../execution/dtg-execution" }
-tokio = { version = "=1.53.0", features = ["macros", "rt", "signal"] }
+tokio = { version = "=1.53.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync"] }
 
 [dev-dependencies]
 dtg-controller = { path = "../dtg-controller" }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use dtg_data::DataNodeBuilder;
+use dtg_execution::shard::ReplicaLifecycle;
 use dtg_execution::storage::{
     ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommittedShardBatch, ReadFence,
     ReplicaMetadata, TemporalReadView,
@@ -56,8 +57,8 @@ impl ReplicaStateStore for FixtureStore {
         Box::pin(async { Ok(None) })
     }
 
-    fn apply(&self, _batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+    fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
+        Box::pin(async move { Ok(ApplyReceipt::new(&batch, false)) })
     }
 
     fn begin_read_view(&self, _fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
@@ -139,6 +140,12 @@ async fn one_data_node_hosts_three_independent_backend_classes() {
         "unexpected replica failures: {failures:#?}"
     );
     assert_eq!(node.observed_replicas().await.len(), 3);
+    assert!(
+        node.replica_observations()
+            .await
+            .iter()
+            .all(|observation| observation.lifecycle() == ReplicaLifecycle::Running)
+    );
 }
 
 #[tokio::test]

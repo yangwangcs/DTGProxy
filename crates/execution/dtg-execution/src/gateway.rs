@@ -39,7 +39,7 @@ use tonic::transport::Channel;
 
 use crate::ExecutionBuildError;
 
-trait AnalyticsRuntime {
+trait AnalyticsRuntime: Send + Sync {
     fn tick(
         &mut self,
         ledger: &mut AnalyticsLedger,
@@ -50,9 +50,9 @@ trait AnalyticsRuntime {
 
 impl<P, A, R> AnalyticsRuntime for AnalyticsScheduler<P, A, R>
 where
-    P: AnalyticsProjectionProvider + 'static,
-    A: AnalyticsStepProvider + 'static,
-    R: AnalyticsArtifactRepository + 'static,
+    P: AnalyticsProjectionProvider + Send + Sync + 'static,
+    A: AnalyticsStepProvider + Send + Sync + 'static,
+    R: AnalyticsArtifactRepository + Send + Sync + 'static,
 {
     fn tick(
         &mut self,
@@ -64,7 +64,7 @@ where
     }
 }
 
-pub type GatewayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+pub type GatewayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum GatewayValue {
@@ -812,9 +812,9 @@ impl GatewayExecutionBuilder {
         analytics: AnalyticsScheduler<P, A, R>,
     ) -> Self
     where
-        P: AnalyticsProjectionProvider + 'static,
-        A: AnalyticsStepProvider + 'static,
-        R: AnalyticsArtifactRepository + 'static,
+        P: AnalyticsProjectionProvider + Send + Sync + 'static,
+        A: AnalyticsStepProvider + Send + Sync + 'static,
+        R: AnalyticsArtifactRepository + Send + Sync + 'static,
     {
         self.analytics = Some(Box::new(analytics));
         self

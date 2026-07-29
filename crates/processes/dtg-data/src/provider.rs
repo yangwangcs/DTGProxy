@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dtg_execution::{
-    ProviderKind, ProviderResolver, ReplicaBinding, ReplicaStateStore, StorageError, StoreFuture,
+    ProviderKind, ProviderResolver, ReplicaBinding, ReplicaStateStore, ResolvedReplicaStore,
+    StorageError, StoreFuture,
 };
 use dtg_storage_fjall::FjallReplicaStore;
 use dtg_storage_neo4j::{Neo4jConfig, Neo4jReplicaStore};
@@ -76,6 +77,22 @@ impl ProviderResolver for FjallResolver {
             Ok(Arc::new(store) as Arc<dyn ReplicaStateStore>)
         })
     }
+
+    fn open_runtime<'a>(
+        &'a self,
+        binding: ReplicaBinding,
+    ) -> StoreFuture<'a, ResolvedReplicaStore> {
+        Box::pin(async move {
+            std::fs::create_dir_all(&self.root).map_err(|error| {
+                StorageError::Internal(format!("cannot create Fjall data root: {error}"))
+            })?;
+            let path = self.root.join(binding.namespace_id().as_str());
+            let store = Arc::new(FjallReplicaStore::open(path, binding)?);
+            Ok(ResolvedReplicaStore::state_only(store.clone())
+                .with_snapshot_runtime(store.clone(), store.clone())
+                .with_pushdown(store))
+        })
+    }
 }
 
 pub struct PostgresResolver {
@@ -111,6 +128,31 @@ impl ProviderResolver for PostgresResolver {
             let connection_string = format!("{endpoint} {credential}");
             let store = PostgresReplicaStore::open(connection_string, binding).await?;
             Ok(Arc::new(store) as Arc<dyn ReplicaStateStore>)
+        })
+    }
+
+    fn open_runtime<'a>(
+        &'a self,
+        binding: ReplicaBinding,
+    ) -> StoreFuture<'a, ResolvedReplicaStore> {
+        Box::pin(async move {
+            let EndpointProfile::PostgreSql(endpoint) = self.profiles.endpoint(&binding)? else {
+                return Err(StorageError::InvalidBinding(
+                    "PostgreSQL binding resolved a non-PostgreSQL endpoint profile".into(),
+                ));
+            };
+            let CredentialProfile::PostgreSql(credential) = self.profiles.credential(&binding)?
+            else {
+                return Err(StorageError::InvalidBinding(
+                    "PostgreSQL binding resolved incompatible credentials".into(),
+                ));
+            };
+            let store = Arc::new(
+                PostgresReplicaStore::open(format!("{endpoint} {credential}"), binding).await?,
+            );
+            Ok(ResolvedReplicaStore::state_only(store.clone())
+                .with_snapshot_runtime(store.clone(), store.clone())
+                .with_pushdown(store))
         })
     }
 }
@@ -150,6 +192,32 @@ impl ProviderResolver for Neo4jResolver {
             let config = Neo4jConfig::new(endpoint, username, password)?.with_database(database);
             let store = Neo4jReplicaStore::open(config, binding).await?;
             Ok(Arc::new(store) as Arc<dyn ReplicaStateStore>)
+        })
+    }
+
+    fn open_runtime<'a>(
+        &'a self,
+        binding: ReplicaBinding,
+    ) -> StoreFuture<'a, ResolvedReplicaStore> {
+        Box::pin(async move {
+            let EndpointProfile::Neo4j { endpoint, database } = self.profiles.endpoint(&binding)?
+            else {
+                return Err(StorageError::InvalidBinding(
+                    "Neo4j binding resolved a non-Neo4j endpoint profile".into(),
+                ));
+            };
+            let CredentialProfile::Neo4jBasic { username, password } =
+                self.profiles.credential(&binding)?
+            else {
+                return Err(StorageError::InvalidBinding(
+                    "Neo4j binding resolved incompatible credentials".into(),
+                ));
+            };
+            let config = Neo4jConfig::new(endpoint, username, password)?.with_database(database);
+            let store = Arc::new(Neo4jReplicaStore::open(config, binding).await?);
+            Ok(ResolvedReplicaStore::state_only(store.clone())
+                .with_snapshot_runtime(store.clone(), store.clone())
+                .with_pushdown(store))
         })
     }
 }
@@ -192,6 +260,34 @@ impl ProviderResolver for RemoteResolver {
                     .await
                     .map_err(remote_storage_error)?;
             Ok(Arc::new(store) as Arc<dyn ReplicaStateStore>)
+        })
+    }
+
+    fn open_runtime<'a>(
+        &'a self,
+        binding: ReplicaBinding,
+    ) -> StoreFuture<'a, ResolvedReplicaStore> {
+        Box::pin(async move {
+            let EndpointProfile::Remote(endpoint) = self.profiles.endpoint(&binding)? else {
+                return Err(StorageError::InvalidBinding(
+                    "remote binding resolved a non-remote endpoint profile".into(),
+                ));
+            };
+            let CredentialProfile::RemoteSignedToken(secret) =
+                self.profiles.credential(&binding)?
+            else {
+                return Err(StorageError::InvalidBinding(
+                    "remote storage requires a binding-scoped signed-token credential".into(),
+                ));
+            };
+            let store = Arc::new(
+                StorageRemoteClient::connect(endpoint, binding, RemoteAuthToken::new(*secret))
+                    .await
+                    .map_err(remote_storage_error)?,
+            );
+            Ok(ResolvedReplicaStore::state_only(store.clone())
+                .with_snapshot_runtime(store.clone(), store.clone())
+                .with_pushdown(store))
         })
     }
 }

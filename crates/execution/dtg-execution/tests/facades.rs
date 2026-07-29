@@ -474,7 +474,7 @@ fn data_execution_rejects_namespace_reuse_by_a_different_binding() {
 
 #[test]
 fn data_execution_keeps_each_shard_generation_backend_homogeneous() {
-    let mut runtime = DataExecution::builder()
+    let runtime = DataExecution::builder()
         .with_provider(
             ProviderKind::Fjall,
             Arc::new(EchoResolver {

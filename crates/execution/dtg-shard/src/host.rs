@@ -125,6 +125,14 @@ impl ShardHost {
         Ok(self.replica(key)?.observe())
     }
 
+    pub fn observations(&self) -> Vec<ReplicaObservation> {
+        self.replicas.values().map(RaftReplica::observe).collect()
+    }
+
+    pub fn keys(&self) -> Vec<ReplicaKey> {
+        self.replicas.keys().copied().collect()
+    }
+
     pub fn seal(&mut self, key: ReplicaKey) -> Result<(), ShardError> {
         self.replica_mut(key)?.seal()
     }

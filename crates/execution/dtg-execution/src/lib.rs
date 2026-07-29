@@ -10,12 +10,14 @@ pub use dtg_analytics as analytics;
 pub use dtg_cluster_v2 as cluster_protocol;
 pub use dtg_control as control;
 pub use dtg_plan as planning;
+pub use dtg_shard as shard;
 pub use dtg_storage as storage;
 pub use dtg_transaction as transaction;
 
 pub use controller::{ControlActionExecutor, ControllerExecution, ControllerExecutionBuilder};
 pub use data::{
-    DataExecution, DataExecutionBuilder, ExecutionBuildError, ProviderResolver, ProviderResolverSet,
+    DataExecution, DataExecutionBuilder, ExecutionBuildError, ProviderResolver,
+    ProviderResolverSet, ResolvedReplicaStore,
 };
 pub use dtg_storage::{ProviderKind, ReplicaBinding, ReplicaStateStore, StorageError, StoreFuture};
 pub use gateway::{

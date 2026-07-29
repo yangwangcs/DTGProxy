@@ -295,7 +295,7 @@ impl ConsensusStore for FjallConsensusStore {
         Box::pin(async move {
             let _guard = self.lock()?;
             self.ensure_binding()?;
-            if install.active_binding() != &self.binding {
+            if !same_replica_generation(install.active_binding(), &self.binding) {
                 return Err(StorageError::InvalidConsensus(
                     "snapshot install journal binding differs from consensus owner".into(),
                 ));
@@ -329,7 +329,7 @@ impl ConsensusStore for FjallConsensusStore {
         Box::pin(async move {
             let _guard = self.lock()?;
             self.ensure_binding()?;
-            if install.active_binding() != &self.binding {
+            if !same_replica_generation(install.active_binding(), &self.binding) {
                 return Err(StorageError::InvalidConsensus(
                     "snapshot install commit binding differs from consensus owner".into(),
                 ));
@@ -407,6 +407,15 @@ impl FjallConsensusStore {
         }
         Ok(entries)
     }
+}
+
+fn same_replica_generation(left: &ReplicaBinding, right: &ReplicaBinding) -> bool {
+    left.cluster_id() == right.cluster_id()
+        && left.graph_id() == right.graph_id()
+        && left.shard_id() == right.shard_id()
+        && left.replica_id() == right.replica_id()
+        && left.placement_epoch() == right.placement_epoch()
+        && left.backend_generation() == right.backend_generation()
 }
 
 fn decode_log_index(bytes: &[u8]) -> Result<u64, StorageError> {

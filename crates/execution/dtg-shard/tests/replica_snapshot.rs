@@ -189,13 +189,18 @@ fn startup_recovery_finishes_an_activation_whose_response_was_lost() {
     let snapshot = create_source_snapshot(root.path());
     let candidate_binding = binding(5, BindingRole::Candidate, "activation-loss-target");
     let active_binding = binding(5, BindingRole::Active, "activation-loss-target");
+    let consensus_binding = active_binding
+        .to_builder()
+        .namespace_id("activation-loss-consensus-owner")
+        .build()
+        .unwrap();
     let business_path = root.path().join("activation-loss-business");
     let candidate =
         Arc::new(FjallReplicaStore::open(&business_path, candidate_binding.clone()).unwrap());
     let consensus = Arc::new(
         FjallConsensusStore::open(
             root.path().join("activation-loss-consensus"),
-            active_binding.clone(),
+            consensus_binding,
         )
         .unwrap(),
     );
