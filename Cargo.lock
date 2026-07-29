@@ -701,6 +701,12 @@ dependencies = [
 [[package]]
 name = "dtg-analytics"
 version = "1.0.0"
+dependencies = [
+ "blake3",
+ "dtg-kernel",
+ "dtg-language-ir",
+ "dtg-storage",
+]
 
 [[package]]
 name = "dtg-cluster-protocol"
