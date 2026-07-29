@@ -1,21 +1,21 @@
-use std::collections::{BTreeMap, BTreeSet};
-
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dtg_storage::{
-    BindingRole, ChangeRecord, CommittedShardBatch, LogicalMutation,
-    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotReader,
-    LogicalSnapshotWriter, ReadFence, ReplicaBinding, ReplicaMetadata, SnapshotChunk,
-    SnapshotHeader, SnapshotManifest, SnapshotRecord, SnapshotReplayRecord, SnapshotRequest,
-    SnapshotRestoreReceipt, StorageError, StoreFuture, TransactionId, TransactionRecord,
+    BindingRole, CommittedShardBatch, LogicalMutation, LogicalReplicaActivationReceipt,
+    LogicalSnapshotCandidateReceipt, LogicalSnapshotReader, LogicalSnapshotWriter, ReadFence,
+    ReplicaBinding, SnapshotChunk, SnapshotHeader, SnapshotManifest, SnapshotManifestBuilder,
+    SnapshotRecord, SnapshotRequest, SnapshotRestoreReceipt, StorageError, StoreFuture,
 };
 use serde_json::Value;
 
 use crate::{
     Neo4jReplicaStore,
-    apply::{insert_replay, stage_mutation},
-    codec::encode_mutation,
+    apply::{decode_payload, insert_replay, stage_mutation},
+    codec::{encode_mutation, mutation_kind},
+    config::QueryApiTransaction,
+    read_view::{Neo4jReadView, SnapshotPageKind},
     schema::{
-        begin_fenced_transaction, digest_text, fenced_parameters, owner_parameters,
-        read_applied_index, u64_hex, u128_hex,
+        begin_fenced_transaction, decode_digest, decode_u64_hex, decode_u128_hex, digest_text,
+        fenced_parameters, owner_parameters, read_applied_index, text, u64_hex, u128_hex,
     },
 };
 
@@ -31,7 +31,12 @@ const CANDIDATE_SNAPSHOT_PUBLISH_QUERY: &str = "MATCH (owner:DtgOwner {
        backend_generation: $backend_generation,
        restore_id: $snapshot_id
      })
-     DETACH DELETE stage
+     OPTIONAL MATCH (record:DtgSnapshotRecord {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation,
+       restore_id: $snapshot_id
+     })
+     DETACH DELETE stage, record
      WITH DISTINCT owner
      MERGE (install:DtgSnapshotInstall {
        namespace_id: $namespace_id,
@@ -58,7 +63,12 @@ const ACTIVE_SNAPSHOT_PUBLISH_QUERY: &str = "MATCH (owner:DtgOwner {
        backend_generation: $backend_generation,
        restore_id: $snapshot_id
      })
-     DETACH DELETE stage
+     OPTIONAL MATCH (record:DtgSnapshotRecord {
+       namespace_id: $namespace_id,
+       backend_generation: $backend_generation,
+       restore_id: $snapshot_id
+     })
+     DETACH DELETE stage, record
      WITH DISTINCT owner
      OPTIONAL MATCH (install:DtgSnapshotInstall {
        namespace_id: $namespace_id,
@@ -178,25 +188,25 @@ pub(crate) async fn snapshot_reader(
         fence.applied_index(),
         dtg_storage::SUPPORTED_SNAPSHOT_FORMAT_VERSION,
     )?;
-    let records = view.snapshot_records().await?;
-    let chunks = records
-        .chunks(request.max_records_per_chunk() as usize)
-        .enumerate()
-        .map(|(ordinal, records)| {
-            SnapshotChunk::new(request.snapshot_id(), ordinal as u64, records.to_vec())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(Neo4jSnapshotReader {
+        manifest: SnapshotManifestBuilder::new(header.clone()),
         header,
-        chunks,
-        next: 0,
+        view,
+        max_records_per_chunk: request.max_records_per_chunk() as usize,
+        kind: SnapshotPageKind::History,
+        offset: 0,
+        exhausted: false,
     }))
 }
 
 struct Neo4jSnapshotReader {
     header: SnapshotHeader,
-    chunks: Vec<SnapshotChunk>,
-    next: usize,
+    manifest: SnapshotManifestBuilder,
+    view: Neo4jReadView,
+    max_records_per_chunk: usize,
+    kind: SnapshotPageKind,
+    offset: usize,
+    exhausted: bool,
 }
 
 impl LogicalSnapshotReader for Neo4jSnapshotReader {
@@ -206,20 +216,49 @@ impl LogicalSnapshotReader for Neo4jSnapshotReader {
 
     fn next_chunk(&mut self) -> StoreFuture<'_, Option<SnapshotChunk>> {
         Box::pin(async move {
-            let chunk = self.chunks.get(self.next).cloned();
-            if chunk.is_some() {
-                self.next += 1;
+            if self.exhausted {
+                return Ok(None);
             }
-            Ok(chunk)
+            let mut records = Vec::with_capacity(self.max_records_per_chunk);
+            while records.len() < self.max_records_per_chunk {
+                let remaining = self.max_records_per_chunk - records.len();
+                let page = self
+                    .view
+                    .snapshot_page(self.kind, self.offset, remaining)
+                    .await?;
+                if page.is_empty() {
+                    self.kind = self.kind.next();
+                    self.offset = 0;
+                    if matches!(self.kind, SnapshotPageKind::Done) {
+                        self.exhausted = true;
+                        break;
+                    }
+                    continue;
+                }
+                self.offset = self.offset.checked_add(page.len()).ok_or_else(|| {
+                    StorageError::CorruptSnapshot("Neo4j snapshot offset overflow".into())
+                })?;
+                records.extend(page);
+            }
+            if records.is_empty() {
+                return Ok(None);
+            }
+            let chunk = SnapshotChunk::new(
+                self.header.snapshot_id(),
+                self.manifest.next_ordinal(),
+                records,
+            )?;
+            self.manifest.push(&chunk)?;
+            Ok(Some(chunk))
         })
     }
 
     fn finish(self: Box<Self>) -> StoreFuture<'static, SnapshotManifest> {
         Box::pin(async move {
-            if self.next != self.chunks.len() {
+            if !self.exhausted {
                 return Err(StorageError::SnapshotNotExhausted);
             }
-            SnapshotManifest::new(&self.header, &self.chunks)
+            Ok(self.manifest.finish())
         })
     }
 }
@@ -243,8 +282,8 @@ pub(crate) async fn snapshot_writer(
     Ok(Box::new(Neo4jSnapshotWriter {
         store: store.clone(),
         target_binding: store.binding_ref().clone(),
+        manifest: SnapshotManifestBuilder::new(header.clone()),
         header,
-        chunks: Vec::new(),
     }))
 }
 
@@ -252,7 +291,7 @@ struct Neo4jSnapshotWriter {
     store: Neo4jReplicaStore,
     target_binding: ReplicaBinding,
     header: SnapshotHeader,
-    chunks: Vec<SnapshotChunk>,
+    manifest: SnapshotManifestBuilder,
 }
 
 impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
@@ -268,7 +307,7 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
         Box::pin(async move {
             chunk.validate()?;
             if chunk.snapshot_id() != self.header.snapshot_id()
-                || chunk.ordinal() != self.chunks.len() as u64
+                || chunk.ordinal() != self.manifest.next_ordinal()
             {
                 return Err(StorageError::CorruptSnapshot(
                     "snapshot chunk identity or order mismatch".into(),
@@ -316,7 +355,79 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
                     "Neo4j snapshot stage lost its owner fence".into(),
                 ));
             }
-            self.chunks.push(chunk);
+            for (record_ordinal, record) in chunk.records().iter().enumerate() {
+                let staged = staged_record(record)?;
+                let mut parameters = fenced_parameters(self.store.binding_ref());
+                parameters.insert(
+                    "restore_id".into(),
+                    Value::String(u128_hex(chunk.snapshot_id().get())),
+                );
+                parameters.insert(
+                    "chunk_ordinal".into(),
+                    Value::String(u64_hex(chunk.ordinal())),
+                );
+                parameters.insert(
+                    "record_ordinal".into(),
+                    Value::String(u64_hex(record_ordinal as u64)),
+                );
+                parameters.insert("record_kind".into(), Value::from(staged.kind));
+                parameters.insert(
+                    "mutation_kind".into(),
+                    staged.mutation_kind.map(Value::from).unwrap_or(Value::Null),
+                );
+                parameters.insert(
+                    "logical_key".into(),
+                    staged.logical_key.map(Value::String).unwrap_or(Value::Null),
+                );
+                parameters.insert(
+                    "payload".into(),
+                    staged.payload.map(Value::String).unwrap_or(Value::Null),
+                );
+                parameters.insert(
+                    "raft_index".into(),
+                    staged
+                        .raft_index
+                        .map(|v| Value::String(u64_hex(v)))
+                        .unwrap_or(Value::Null),
+                );
+                parameters.insert(
+                    "raft_term_or_ordinal".into(),
+                    staged
+                        .raft_term_or_ordinal
+                        .map(|v| Value::String(u64_hex(v)))
+                        .unwrap_or(Value::Null),
+                );
+                parameters.insert(
+                    "command_id".into(),
+                    staged
+                        .command_id
+                        .map(|v| Value::String(u128_hex(v)))
+                        .unwrap_or(Value::Null),
+                );
+                parameters.insert(
+                    "digest".into(),
+                    staged
+                        .digest
+                        .map(|v| Value::String(crate::schema::digest_text(v)))
+                        .unwrap_or(Value::Null),
+                );
+                let rows = client.execute(
+                    "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest})
+                     MERGE (record:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, chunk_ordinal:$chunk_ordinal, record_ordinal:$record_ordinal})
+                     SET record.record_kind=$record_kind, record.mutation_kind=$mutation_kind,
+                         record.logical_key=$logical_key, record.payload=$payload,
+                         record.raft_index=$raft_index, record.raft_term_or_ordinal=$raft_term_or_ordinal,
+                         record.command_id=$command_id, record.digest=$digest
+                     RETURN record.record_ordinal",
+                    Value::Object(parameters),
+                ).await?;
+                if rows.len() != 1 {
+                    return Err(StorageError::Internal(
+                        "Neo4j snapshot record stage lost its owner fence".into(),
+                    ));
+                }
+            }
+            self.manifest.push(&chunk)?;
             Ok(())
         })
     }
@@ -326,24 +437,40 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
         manifest: SnapshotManifest,
     ) -> StoreFuture<'static, SnapshotRestoreReceipt> {
         Box::pin(async move {
-            manifest.validate(&self.header, &self.chunks)?;
-            let records = self
-                .chunks
-                .iter()
-                .flat_map(|chunk| chunk.records().iter().cloned())
-                .collect::<Vec<_>>();
-            let batches = validate_restored_records(
-                &self.target_binding,
-                self.header.applied_index(),
-                &records,
-            )?;
+            if self.manifest.finish() != manifest {
+                return Err(StorageError::CorruptSnapshot(
+                    "Neo4j staged snapshot manifest mismatch".into(),
+                ));
+            }
             let _guard = self.store.inner.apply_guard.lock().await;
             let client = self.store.client()?;
             let (transaction, _) =
                 begin_fenced_transaction(&client, self.store.binding_ref(), true).await?;
             let result = async {
+                validate_staged_state_sets(
+                    &transaction,
+                    self.store.binding_ref(),
+                    self.header.snapshot_id().get(),
+                    &manifest,
+                )
+                .await?;
                 clear_logical_state(&transaction, self.store.binding_ref()).await?;
-                for batch in &batches {
+                let mut change_count = 0_u64;
+                for raft_index in 1..=self.header.applied_index() {
+                    let batch = load_staged_batch(
+                        &transaction,
+                        self.store.binding_ref(),
+                        self.header.snapshot_id().get(),
+                        raft_index,
+                    )
+                    .await?;
+                    change_count = change_count
+                        .checked_add(batch.mutations().len() as u64)
+                        .ok_or_else(|| {
+                            StorageError::CorruptSnapshot(
+                                "Neo4j staged change count overflow".into(),
+                            )
+                        })?;
                     for (ordinal, mutation) in batch.mutations().iter().enumerate() {
                         stage_mutation(
                             &transaction,
@@ -354,8 +481,15 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
                         )
                         .await?;
                     }
-                    insert_replay(&transaction, batch).await?;
+                    insert_replay(&transaction, &batch).await?;
                 }
+                verify_staged_change_count(
+                    &transaction,
+                    self.store.binding_ref(),
+                    self.header.snapshot_id().get(),
+                    change_count,
+                )
+                .await?;
                 let parameters =
                     snapshot_publish_parameters(self.store.binding_ref(), &self.header, &manifest);
                 let publish_query = match self.target_binding.role() {
@@ -410,7 +544,12 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
                       backend_generation: $backend_generation,
                       restore_id: $restore_id
                     })
-                    DETACH DELETE stage
+                    OPTIONAL MATCH (record:DtgSnapshotRecord {
+                      namespace_id: $namespace_id,
+                      backend_generation: $backend_generation,
+                      restore_id: $restore_id
+                    })
+                    DETACH DELETE stage, record
                     WITH DISTINCT owner
                     RETURN owner.namespace_id",
                     Value::Object(parameters),
@@ -424,6 +563,238 @@ impl LogicalSnapshotWriter for Neo4jSnapshotWriter {
             Ok(())
         })
     }
+}
+
+struct StagedRecord {
+    kind: i64,
+    mutation_kind: Option<i64>,
+    logical_key: Option<String>,
+    payload: Option<String>,
+    raft_index: Option<u64>,
+    raft_term_or_ordinal: Option<u64>,
+    command_id: Option<u128>,
+    digest: Option<dtg_storage::Digest32>,
+}
+
+fn staged_record(record: &SnapshotRecord) -> Result<StagedRecord, StorageError> {
+    let mutation = match record {
+        SnapshotRecord::Vertex(value) => Some(LogicalMutation::PutVertex(value.clone())),
+        SnapshotRecord::VertexTombstone(value) => {
+            Some(LogicalMutation::DeleteVertex(value.clone()))
+        }
+        SnapshotRecord::Edge(value) => Some(LogicalMutation::PutEdge(value.clone())),
+        SnapshotRecord::EdgeTombstone(value) => Some(LogicalMutation::DeleteEdge(value.clone())),
+        SnapshotRecord::Transaction(value) => Some(LogicalMutation::PutTransaction(value.clone())),
+        SnapshotRecord::ReplicaMetadata(value) => {
+            Some(LogicalMutation::PutReplicaMetadata(value.clone()))
+        }
+        SnapshotRecord::Replay(_) => None,
+        SnapshotRecord::Change(value) => Some(value.mutation().clone()),
+    };
+    let (kind, raft_index, raft_term_or_ordinal, command_id, digest) = match record {
+        SnapshotRecord::Vertex(_) => (1, None, None, None, None),
+        SnapshotRecord::VertexTombstone(_) => (2, None, None, None, None),
+        SnapshotRecord::Edge(_) => (3, None, None, None, None),
+        SnapshotRecord::EdgeTombstone(_) => (4, None, None, None, None),
+        SnapshotRecord::Transaction(_) => (5, None, None, None, None),
+        SnapshotRecord::ReplicaMetadata(_) => (6, None, None, None, None),
+        SnapshotRecord::Replay(value) => (
+            7,
+            Some(value.raft_index()),
+            Some(value.raft_term()),
+            Some(value.command_id().get()),
+            Some(value.mutation_digest()),
+        ),
+        SnapshotRecord::Change(value) => (
+            8,
+            Some(value.raft_index()),
+            Some(value.mutation_ordinal()),
+            None,
+            None,
+        ),
+    };
+    Ok(StagedRecord {
+        kind,
+        mutation_kind: mutation
+            .as_ref()
+            .map(|value| i64::from(mutation_kind(value))),
+        logical_key: mutation.as_ref().and_then(|value| match value {
+            LogicalMutation::PutTransaction(record) => Some(u128_hex(record.id().get())),
+            LogicalMutation::PutReplicaMetadata(record) => Some(record.name().to_owned()),
+            _ => None,
+        }),
+        payload: mutation
+            .as_ref()
+            .map(encode_mutation)
+            .transpose()?
+            .map(|bytes| STANDARD.encode(bytes)),
+        raft_index,
+        raft_term_or_ordinal,
+        command_id,
+        digest,
+    })
+}
+
+async fn validate_staged_state_sets(
+    transaction: &QueryApiTransaction,
+    binding: &ReplicaBinding,
+    snapshot_id: u128,
+    manifest: &SnapshotManifest,
+) -> Result<(), StorageError> {
+    let mut parameters = fenced_parameters(binding);
+    parameters.insert("restore_id".into(), Value::String(u128_hex(snapshot_id)));
+    let rows = transaction.execute(
+        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest})
+         MATCH (record:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id})
+         RETURN count(record)",
+        Value::Object(parameters.clone()),
+    ).await?;
+    let count = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            StorageError::CorruptSnapshot("Neo4j staged snapshot count is missing".into())
+        })?;
+    if count != manifest.record_count() {
+        return Err(StorageError::CorruptSnapshot(
+            "Neo4j staged snapshot record count mismatch".into(),
+        ));
+    }
+    for query in [
+        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id}) WHERE supplied.record_kind IN [1,2,3,4] WITH owner, supplied.payload AS payload, count(supplied) AS copies OPTIONAL MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8, payload:payload}) WHERE authenticated.mutation_kind IN [1,2,3,4] WITH copies, count(authenticated) AS actual WHERE copies <> actual RETURN count(*)",
+        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8}) WHERE authenticated.mutation_kind IN [1,2,3,4] WITH owner, authenticated.payload AS payload, count(authenticated) AS copies OPTIONAL MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, payload:payload}) WHERE supplied.record_kind IN [1,2,3,4] WITH copies, count(supplied) AS actual WHERE copies <> actual RETURN count(*)",
+    ] {
+        require_zero_count(transaction, query, parameters.clone(), "graph history").await?;
+    }
+    for (record_kind, mutation_kind_value, name) in [
+        (5_i64, 5_i64, "transaction state"),
+        (6, 6, "metadata state"),
+    ] {
+        let mut typed = parameters.clone();
+        typed.insert("record_kind".into(), Value::from(record_kind));
+        typed.insert("mutation_kind".into(), Value::from(mutation_kind_value));
+        require_zero_count(
+            transaction,
+            "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:$record_kind}) WITH owner, supplied.logical_key AS logical_key, count(supplied) AS copies WHERE copies <> 1 RETURN count(*)",
+            typed.clone(),
+            name,
+        ).await?;
+        require_zero_count(
+            transaction,
+            "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:$record_kind}) OPTIONAL MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8, mutation_kind:$mutation_kind, logical_key:supplied.logical_key}) WITH supplied, authenticated ORDER BY authenticated.chunk_ordinal DESC, authenticated.record_ordinal DESC WITH supplied, head(collect(authenticated)) AS latest WHERE latest IS NULL OR latest.payload <> supplied.payload RETURN count(*)",
+            typed.clone(),
+            name,
+        ).await?;
+        require_zero_count(
+            transaction,
+            "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8, mutation_kind:$mutation_kind}) WITH owner, authenticated.logical_key AS logical_key OPTIONAL MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:$record_kind, logical_key:logical_key}) WITH logical_key, count(supplied) AS copies WHERE copies = 0 RETURN count(*)",
+            typed,
+            name,
+        ).await?;
+    }
+    Ok(())
+}
+
+async fn require_zero_count(
+    transaction: &QueryApiTransaction,
+    query: &str,
+    parameters: serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<(), StorageError> {
+    let rows = transaction
+        .execute(query, Value::Object(parameters))
+        .await?;
+    let count = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            StorageError::CorruptSnapshot(format!("Neo4j staged {name} validation is missing"))
+        })?;
+    if count != 0 {
+        return Err(StorageError::CorruptSnapshot(format!(
+            "Neo4j staged {name} does not match authenticated changes"
+        )));
+    }
+    Ok(())
+}
+
+async fn load_staged_batch(
+    transaction: &QueryApiTransaction,
+    binding: &ReplicaBinding,
+    snapshot_id: u128,
+    raft_index: u64,
+) -> Result<CommittedShardBatch, StorageError> {
+    let mut parameters = fenced_parameters(binding);
+    parameters.insert("restore_id".into(), Value::String(u128_hex(snapshot_id)));
+    parameters.insert("raft_index".into(), Value::String(u64_hex(raft_index)));
+    let replay_rows = transaction.execute(
+        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (record:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:7, raft_index:$raft_index}) RETURN record.raft_term_or_ordinal, record.command_id, record.digest",
+        Value::Object(parameters.clone()),
+    ).await?;
+    let [replay] = replay_rows.as_slice() else {
+        return Err(StorageError::CorruptSnapshot(
+            "Neo4j staged replay identity is missing or duplicated".into(),
+        ));
+    };
+    let term = decode_u64_hex(text(&replay[0], "staged replay term")?)?;
+    let command_id =
+        dtg_storage::CommandId::new(decode_u128_hex(text(&replay[1], "staged replay command")?)?)?;
+    let expected_digest = decode_digest(text(&replay[2], "staged replay digest")?)?;
+    let rows = transaction.execute(
+        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (record:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8, raft_index:$raft_index}) RETURN record.raft_term_or_ordinal, record.payload ORDER BY record.raft_term_or_ordinal",
+        Value::Object(parameters),
+    ).await?;
+    let mut mutations = Vec::with_capacity(rows.len());
+    for (expected_ordinal, row) in rows.iter().enumerate() {
+        let ordinal = decode_u64_hex(text(&row[0], "staged change ordinal")?)?;
+        if ordinal != expected_ordinal as u64 {
+            return Err(StorageError::CorruptSnapshot(
+                "Neo4j staged change ordinals are not contiguous".into(),
+            ));
+        }
+        mutations.push(decode_payload(&row[1])?);
+    }
+    let batch = CommittedShardBatch::new(binding.clone(), term, raft_index, command_id, mutations)
+        .map_err(|error| {
+            StorageError::CorruptSnapshot(format!(
+                "Neo4j staged batch cannot be reconstructed: {error}"
+            ))
+        })?;
+    if batch.mutation_digest() != expected_digest {
+        return Err(StorageError::CorruptSnapshot(
+            "Neo4j staged batch digest mismatch".into(),
+        ));
+    }
+    Ok(batch)
+}
+
+async fn verify_staged_change_count(
+    transaction: &QueryApiTransaction,
+    binding: &ReplicaBinding,
+    snapshot_id: u128,
+    expected: u64,
+) -> Result<(), StorageError> {
+    let mut parameters = fenced_parameters(binding);
+    parameters.insert("restore_id".into(), Value::String(u128_hex(snapshot_id)));
+    let rows = transaction.execute(
+        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (record:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8}) RETURN count(record)",
+        Value::Object(parameters),
+    ).await?;
+    let actual = rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            StorageError::CorruptSnapshot("Neo4j staged change count is missing".into())
+        })?;
+    if actual != expected {
+        return Err(StorageError::CorruptSnapshot(
+            "Neo4j staged snapshot contains changes outside the applied prefix".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) async fn activate_candidate(
@@ -552,169 +923,12 @@ async fn clear_logical_state(
             WHERE node.namespace_id = $namespace_id
               AND node.backend_generation = $backend_generation
               AND NOT node:DtgOwner AND NOT node:DtgSnapshotStage
+              AND NOT node:DtgSnapshotRecord
             DETACH DELETE node RETURN count(node)",
             Value::Object(fenced_parameters(binding)),
         )
         .await?;
     Ok(())
-}
-
-fn validate_restored_records(
-    binding: &ReplicaBinding,
-    applied_index: u64,
-    records: &[SnapshotRecord],
-) -> Result<Vec<CommittedShardBatch>, StorageError> {
-    let mut supplied_graph = Vec::new();
-    let mut supplied_transactions = BTreeMap::<TransactionId, TransactionRecord>::new();
-    let mut supplied_metadata = BTreeMap::<String, ReplicaMetadata>::new();
-    let mut replay = BTreeMap::<u64, SnapshotReplayRecord>::new();
-    let mut changes = BTreeMap::<u64, Vec<ChangeRecord>>::new();
-    for record in records {
-        match record {
-            SnapshotRecord::Vertex(vertex) => {
-                supplied_graph.push(LogicalMutation::PutVertex(vertex.clone()));
-            }
-            SnapshotRecord::VertexTombstone(tombstone) => {
-                supplied_graph.push(LogicalMutation::DeleteVertex(tombstone.clone()));
-            }
-            SnapshotRecord::Edge(edge) => {
-                supplied_graph.push(LogicalMutation::PutEdge(edge.clone()));
-            }
-            SnapshotRecord::EdgeTombstone(tombstone) => {
-                supplied_graph.push(LogicalMutation::DeleteEdge(tombstone.clone()));
-            }
-            SnapshotRecord::Transaction(transaction) => {
-                if supplied_transactions
-                    .insert(transaction.id(), transaction.clone())
-                    .is_some()
-                {
-                    return Err(StorageError::CorruptSnapshot(
-                        "snapshot transaction state contains duplicate identifiers".into(),
-                    ));
-                }
-            }
-            SnapshotRecord::ReplicaMetadata(metadata) => {
-                if supplied_metadata
-                    .insert(metadata.name().to_owned(), metadata.clone())
-                    .is_some()
-                {
-                    return Err(StorageError::CorruptSnapshot(
-                        "snapshot replica metadata contains duplicate names".into(),
-                    ));
-                }
-            }
-            SnapshotRecord::Replay(record) => {
-                if replay.insert(record.raft_index(), record.clone()).is_some() {
-                    return Err(StorageError::CorruptSnapshot(
-                        "snapshot replay identities are duplicated".into(),
-                    ));
-                }
-            }
-            SnapshotRecord::Change(record) => {
-                changes
-                    .entry(record.raft_index())
-                    .or_default()
-                    .push(record.clone());
-            }
-        }
-    }
-    if replay.keys().copied().ne(1..=applied_index) {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot replay identities are not contiguous through the applied index".into(),
-        ));
-    }
-
-    let mut authenticated_graph = Vec::new();
-    let mut authenticated_transactions = BTreeMap::new();
-    let mut authenticated_metadata = BTreeMap::new();
-    let mut batches = Vec::new();
-    for index in 1..=applied_index {
-        let replay_record = replay
-            .get(&index)
-            .ok_or_else(|| StorageError::CorruptSnapshot("snapshot replay is missing".into()))?;
-        let changes_at_index = changes.get_mut(&index).ok_or_else(|| {
-            StorageError::CorruptSnapshot("snapshot committed batch has no changes".into())
-        })?;
-        changes_at_index.sort_by_key(ChangeRecord::mutation_ordinal);
-        if changes_at_index
-            .iter()
-            .enumerate()
-            .any(|(ordinal, change)| change.mutation_ordinal() != ordinal as u64)
-        {
-            return Err(StorageError::CorruptSnapshot(
-                "snapshot change ordinals are not contiguous".into(),
-            ));
-        }
-        let mutations = changes_at_index
-            .iter()
-            .map(|change| change.mutation().clone())
-            .collect::<Vec<_>>();
-        let batch = CommittedShardBatch::new(
-            binding.clone(),
-            replay_record.raft_term(),
-            index,
-            replay_record.command_id(),
-            mutations,
-        )
-        .map_err(|error| {
-            StorageError::CorruptSnapshot(format!(
-                "snapshot committed batch cannot be reconstructed: {error}"
-            ))
-        })?;
-        if batch.mutation_digest() != replay_record.mutation_digest() {
-            return Err(StorageError::CorruptSnapshot(format!(
-                "snapshot change digest does not match replay identity at Raft index {index}"
-            )));
-        }
-        for mutation in batch.mutations() {
-            match mutation {
-                LogicalMutation::PutVertex(_)
-                | LogicalMutation::DeleteVertex(_)
-                | LogicalMutation::PutEdge(_)
-                | LogicalMutation::DeleteEdge(_) => authenticated_graph.push(mutation.clone()),
-                LogicalMutation::PutTransaction(transaction) => {
-                    authenticated_transactions.insert(transaction.id(), transaction.clone());
-                }
-                LogicalMutation::PutReplicaMetadata(metadata) => {
-                    authenticated_metadata.insert(metadata.name().to_owned(), metadata.clone());
-                }
-            }
-        }
-        batches.push(batch);
-    }
-    if changes.keys().copied().collect::<BTreeSet<_>>()
-        != (1..=applied_index).collect::<BTreeSet<_>>()
-    {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot changes contain an unknown replay identity".into(),
-        ));
-    }
-    if mutation_multiset(&supplied_graph)? != mutation_multiset(&authenticated_graph)? {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot graph history does not match authenticated changes".into(),
-        ));
-    }
-    if supplied_transactions != authenticated_transactions {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot transaction state does not match authenticated changes".into(),
-        ));
-    }
-    if supplied_metadata != authenticated_metadata {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot replica metadata does not match authenticated changes".into(),
-        ));
-    }
-    Ok(batches)
-}
-
-fn mutation_multiset(
-    mutations: &[LogicalMutation],
-) -> Result<BTreeMap<Vec<u8>, usize>, StorageError> {
-    let mut multiset = BTreeMap::new();
-    for mutation in mutations {
-        *multiset.entry(encode_mutation(mutation)?).or_default() += 1;
-    }
-    Ok(multiset)
 }
 
 fn same_logical_identity(left: &ReplicaBinding, right: &ReplicaBinding) -> bool {

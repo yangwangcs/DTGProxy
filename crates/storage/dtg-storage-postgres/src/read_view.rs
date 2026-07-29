@@ -19,113 +19,145 @@ pub(crate) struct PostgresReadView {
     fence: ReadFence,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SnapshotPageKind {
+    Vertices,
+    Edges,
+    Transactions,
+    Metadata,
+    Replay,
+    Changes,
+    Done,
+}
+
+impl SnapshotPageKind {
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::Vertices => Self::Edges,
+            Self::Edges => Self::Transactions,
+            Self::Transactions => Self::Metadata,
+            Self::Metadata => Self::Replay,
+            Self::Replay => Self::Changes,
+            Self::Changes | Self::Done => Self::Done,
+        }
+    }
+}
+
 impl PostgresReadView {
     pub(crate) const fn new(client: Client, fence: ReadFence) -> Self {
         Self { client, fence }
     }
 
-    pub(crate) async fn snapshot_records(&self) -> Result<Vec<SnapshotRecord>, StorageError> {
-        let mut records = Vec::new();
-        for row in self
-            .client
-            .query(
-                "SELECT vertex_id, version, valid_from, valid_to, transaction_time,
-                        properties, tombstone
-                 FROM vertex_history ORDER BY raft_index, mutation_ordinal",
-                &[],
-            )
-            .await
-            .map_err(postgres_error)?
-        {
-            records.push(match decode_vertex_event(&row)? {
-                LogicalMutation::PutVertex(vertex) => SnapshotRecord::Vertex(vertex),
-                LogicalMutation::DeleteVertex(tombstone) => {
-                    SnapshotRecord::VertexTombstone(tombstone)
-                }
-                _ => unreachable!("vertex event decoder returned a non-vertex mutation"),
-            });
-        }
-        for row in self
-            .client
-            .query(
-                "SELECT edge_id, source_vertex_id, target_vertex_id, edge_type, version,
-                        valid_from, valid_to, transaction_time, properties, tombstone
-                 FROM edge_history ORDER BY raft_index, mutation_ordinal",
-                &[],
-            )
-            .await
-            .map_err(postgres_error)?
-        {
-            records.push(match decode_edge_event(&row)? {
-                LogicalMutation::PutEdge(edge) => SnapshotRecord::Edge(edge),
-                LogicalMutation::DeleteEdge(tombstone) => SnapshotRecord::EdgeTombstone(tombstone),
-                _ => unreachable!("edge event decoder returned a non-edge mutation"),
-            });
-        }
-        for row in self
-            .client
-            .query(
-                "SELECT transaction_id, state, transaction_time, record_digest
-                 FROM transaction_state ORDER BY transaction_id",
-                &[],
-            )
-            .await
-            .map_err(postgres_error)?
-        {
-            records.push(SnapshotRecord::Transaction(decode_transaction(&row)?));
-        }
-        for row in self
-            .client
-            .query(
-                "SELECT name, value FROM replica_metadata ORDER BY name",
-                &[],
-            )
-            .await
-            .map_err(postgres_error)?
-        {
-            records.push(SnapshotRecord::ReplicaMetadata(
-                dtg_storage::ReplicaMetadata::new(
-                    row.get::<_, String>(0),
-                    decode_value(row.get::<_, Vec<u8>>(1).as_slice())?,
-                )?,
+    pub(crate) async fn snapshot_page(
+        &self,
+        kind: SnapshotPageKind,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<SnapshotRecord>, StorageError> {
+        if limit <= 0 || offset < 0 {
+            return Err(StorageError::CorruptSnapshot(
+                "PostgreSQL snapshot page bounds are invalid".into(),
             ));
         }
-        for row in self
-            .client
-            .query(
-                "SELECT raft_index, raft_term, command_id, mutation_digest
-                 FROM replay_identity ORDER BY raft_index",
-                &[],
-            )
-            .await
-            .map_err(postgres_error)?
-        {
-            records.push(SnapshotRecord::Replay(SnapshotReplayRecord::new(
-                decode_u64(row.get::<_, Vec<u8>>(0).as_slice())?,
-                decode_u64(row.get::<_, Vec<u8>>(1).as_slice())?,
-                dtg_storage::CommandId::new(decode_u128(row.get::<_, Vec<u8>>(2).as_slice())?)?,
-                decode_digest(row.get::<_, Vec<u8>>(3).as_slice())?,
-            )?));
-        }
-        for row in self
-            .client
-            .query(
-                "SELECT raft_index, mutation_ordinal, mutation_payload
-                 FROM change_record ORDER BY raft_index, mutation_ordinal",
-                &[],
-            )
-            .await
-            .map_err(postgres_error)?
-        {
-            records.push(SnapshotRecord::Change(ChangeRecord::new(
-                ChangeCursor::new(
+        let rows = match kind {
+            SnapshotPageKind::Vertices => self
+                .client
+                .query(
+                    "SELECT vertex_id, version, valid_from, valid_to, transaction_time,
+                        properties, tombstone
+                 FROM vertex_history ORDER BY raft_index, mutation_ordinal LIMIT $1 OFFSET $2",
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(postgres_error)?,
+            SnapshotPageKind::Edges => self
+                .client
+                .query(
+                    "SELECT edge_id, source_vertex_id, target_vertex_id, edge_type, version,
+                        valid_from, valid_to, transaction_time, properties, tombstone
+                 FROM edge_history ORDER BY raft_index, mutation_ordinal LIMIT $1 OFFSET $2",
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(postgres_error)?,
+            SnapshotPageKind::Transactions => self
+                .client
+                .query(
+                    "SELECT transaction_id, state, transaction_time, record_digest
+                 FROM transaction_state ORDER BY transaction_id LIMIT $1 OFFSET $2",
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(postgres_error)?,
+            SnapshotPageKind::Metadata => self
+                .client
+                .query(
+                    "SELECT name, value FROM replica_metadata ORDER BY name LIMIT $1 OFFSET $2",
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(postgres_error)?,
+            SnapshotPageKind::Replay => self
+                .client
+                .query(
+                    "SELECT raft_index, raft_term, command_id, mutation_digest
+                 FROM replay_identity ORDER BY raft_index LIMIT $1 OFFSET $2",
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(postgres_error)?,
+            SnapshotPageKind::Changes => self
+                .client
+                .query(
+                    "SELECT raft_index, mutation_ordinal, mutation_payload
+                 FROM change_record ORDER BY raft_index, mutation_ordinal LIMIT $1 OFFSET $2",
+                    &[&limit, &offset],
+                )
+                .await
+                .map_err(postgres_error)?,
+            SnapshotPageKind::Done => return Ok(Vec::new()),
+        };
+        rows.into_iter()
+            .map(|row| match kind {
+                SnapshotPageKind::Vertices => Ok(match decode_vertex_event(&row)? {
+                    LogicalMutation::PutVertex(vertex) => SnapshotRecord::Vertex(vertex),
+                    LogicalMutation::DeleteVertex(tombstone) => {
+                        SnapshotRecord::VertexTombstone(tombstone)
+                    }
+                    _ => unreachable!("vertex event decoder returned a non-vertex mutation"),
+                }),
+                SnapshotPageKind::Edges => Ok(match decode_edge_event(&row)? {
+                    LogicalMutation::PutEdge(edge) => SnapshotRecord::Edge(edge),
+                    LogicalMutation::DeleteEdge(tombstone) => {
+                        SnapshotRecord::EdgeTombstone(tombstone)
+                    }
+                    _ => unreachable!("edge event decoder returned a non-edge mutation"),
+                }),
+                SnapshotPageKind::Transactions => {
+                    Ok(SnapshotRecord::Transaction(decode_transaction(&row)?))
+                }
+                SnapshotPageKind::Metadata => Ok(SnapshotRecord::ReplicaMetadata(
+                    dtg_storage::ReplicaMetadata::new(
+                        row.get::<_, String>(0),
+                        decode_value(row.get::<_, Vec<u8>>(1).as_slice())?,
+                    )?,
+                )),
+                SnapshotPageKind::Replay => Ok(SnapshotRecord::Replay(SnapshotReplayRecord::new(
                     decode_u64(row.get::<_, Vec<u8>>(0).as_slice())?,
                     decode_u64(row.get::<_, Vec<u8>>(1).as_slice())?,
-                ),
-                decode_mutation(row.get::<_, Vec<u8>>(2).as_slice())?,
-            )));
-        }
-        Ok(records)
+                    dtg_storage::CommandId::new(decode_u128(row.get::<_, Vec<u8>>(2).as_slice())?)?,
+                    decode_digest(row.get::<_, Vec<u8>>(3).as_slice())?,
+                )?)),
+                SnapshotPageKind::Changes => Ok(SnapshotRecord::Change(ChangeRecord::new(
+                    ChangeCursor::new(
+                        decode_u64(row.get::<_, Vec<u8>>(0).as_slice())?,
+                        decode_u64(row.get::<_, Vec<u8>>(1).as_slice())?,
+                    ),
+                    decode_mutation(row.get::<_, Vec<u8>>(2).as_slice())?,
+                ))),
+                SnapshotPageKind::Done => unreachable!(),
+            })
+            .collect()
     }
 
     async fn vertex(&self, request: &VertexRead) -> Result<Option<VertexVersion>, StorageError> {

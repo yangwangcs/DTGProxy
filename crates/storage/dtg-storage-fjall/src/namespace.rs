@@ -17,6 +17,7 @@ use crate::codec::{decode_binding, encode_binding};
 pub(crate) const OWNER_KEY: &[u8] = b"binding";
 pub(crate) const SNAPSHOT_ACTIVATION_KEY: &[u8] = b"snapshot_activation";
 pub(crate) const SNAPSHOT_INSTALL_KEY: &[u8] = b"snapshot_install";
+pub(crate) const SNAPSHOT_RESTORE_IN_PROGRESS_KEY: &[u8] = b"snapshot_restore_in_progress";
 pub(crate) const FJALL_CONTRACT_VERSION: u32 = 1;
 pub(crate) const FJALL_LAYOUT_VERSION: u32 = 1;
 

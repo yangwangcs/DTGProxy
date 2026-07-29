@@ -438,7 +438,8 @@ pub(crate) async fn stage_mutation(
                        backend_generation: $backend_generation,
                        key: $key
                      })
-                     SET metadata.value = $value
+                     SET metadata.value = $value,
+                       metadata.payload = $payload
                      RETURN metadata.key",
                     Value::Object(parameters.clone()),
                 )

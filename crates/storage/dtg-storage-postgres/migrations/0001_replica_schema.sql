@@ -140,6 +140,20 @@ CREATE TABLE IF NOT EXISTS snapshot_stage (
     PRIMARY KEY (snapshot_id, chunk_ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS snapshot_stage_record (
+    snapshot_id BYTEA NOT NULL CHECK (octet_length(snapshot_id) = 16),
+    chunk_ordinal BYTEA NOT NULL CHECK (octet_length(chunk_ordinal) = 8),
+    record_ordinal BYTEA NOT NULL CHECK (octet_length(record_ordinal) = 8),
+    record_kind SMALLINT NOT NULL CHECK (record_kind BETWEEN 1 AND 8),
+    mutation_payload BYTEA,
+    logical_key BYTEA,
+    raft_index BYTEA,
+    raft_term_or_ordinal BYTEA,
+    command_id BYTEA,
+    digest BYTEA,
+    PRIMARY KEY (snapshot_id, chunk_ordinal, record_ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS snapshot_install (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     candidate_binding_digest BYTEA NOT NULL CHECK (octet_length(candidate_binding_digest) = 32),

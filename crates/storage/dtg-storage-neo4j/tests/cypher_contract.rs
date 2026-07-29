@@ -4,9 +4,11 @@
 fn every_read_query_is_owner_fenced_and_bounded() {
     let source = include_str!("../src/read_view.rs");
     let query_count = source.matches(".execute(").count();
-    assert_eq!(query_count, 13, "unexpected read query surface change");
-    assert_eq!(source.matches("MATCH (owner:DtgOwner").count(), query_count);
-    assert_eq!(source.matches("LIMIT $limit").count(), query_count);
+    assert_eq!(query_count, 9, "unexpected read query surface change");
+    let owner_fences = source.matches("MATCH (owner:DtgOwner").count();
+    let bounded_queries = source.matches("LIMIT $limit").count();
+    assert_eq!(owner_fences, 13);
+    assert_eq!(bounded_queries, owner_fences);
     assert!(!source.contains("CanonicalKv"));
     assert!(!source.contains("CANONICAL_ENTRY"));
 }
@@ -57,4 +59,16 @@ fn candidate_restore_and_activation_are_owner_fenced_atomic_and_exact() {
     assert!(source.contains("Neo4j snapshot abort lost its owner fence"));
     assert!(!source.contains("CanonicalKv"));
     assert!(!source.contains("Sidecar"));
+}
+
+#[test]
+fn snapshot_restore_uses_native_staging_and_reads_one_raft_batch_at_a_time() {
+    let source = include_str!("../src/snapshot.rs");
+    assert!(source.contains("DtgSnapshotRecord"));
+    assert!(source.contains("validate_staged_state_sets"));
+    assert!(source.contains("record_kind:8, raft_index:$raft_index"));
+    assert!(source.contains("ORDER BY record.raft_term_or_ordinal"));
+    assert!(source.contains("verify_staged_change_count"));
+    assert!(!source.contains("staged_snapshot_records"));
+    assert!(!source.contains("Vec<SnapshotRecord>"));
 }

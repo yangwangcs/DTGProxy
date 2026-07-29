@@ -86,7 +86,13 @@ fn snapshot_install(active: &ReplicaBinding) -> ConsensusSnapshotInstall {
         .role(BindingRole::Candidate)
         .build()
         .unwrap();
-    let header = SnapshotHeader::new(SnapshotId::new(91).unwrap(), active.clone(), 10, 1).unwrap();
+    let header = SnapshotHeader::new(
+        SnapshotId::new(91).unwrap(),
+        active.clone(),
+        10,
+        dtg_storage::SUPPORTED_SNAPSHOT_FORMAT_VERSION,
+    )
+    .unwrap();
     let manifest = SnapshotManifest {
         snapshot_id: header.snapshot_id(),
         chunk_count: 2,

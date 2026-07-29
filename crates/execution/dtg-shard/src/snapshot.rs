@@ -1,36 +1,31 @@
-use dtg_kernel::{Digest32, Version};
+use dtg_kernel::Version;
 use dtg_storage::{
     BindingRole, ConsensusSnapshotInstall, ConsensusSnapshotMetadata, ConsensusStore,
     LogicalReplicaActivation, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,
-    LogicalSnapshotSink, LogicalSnapshotSource, RaftHardState, RaftMembership, ReplicaBinding,
-    SnapshotChunk, SnapshotHeader, SnapshotManifest, SnapshotRequest, StorageError,
+    LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, RaftHardState,
+    RaftMembership, ReplicaBinding, SUPPORTED_SNAPSHOT_FORMAT_VERSION, SnapshotHeader,
+    SnapshotManifest, SnapshotManifestBuilder, SnapshotRequest, StorageError,
 };
 
 use crate::{ReadMode, ReadPermit, state_machine::block_on};
 
 pub const SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ReplicaSnapshotManifest {
     format: Version,
     binding: ReplicaBinding,
     last_included_term: u64,
     last_included_index: u64,
-    logical_digest: Digest32,
-    chunks: u32,
-    records: u64,
-    bytes: u64,
 }
 
 impl ReplicaSnapshotManifest {
     pub const fn format(&self) -> Version {
         self.format
     }
-
     pub const fn binding(&self) -> &ReplicaBinding {
         &self.binding
     }
-
     pub const fn last_included_term(&self) -> u64 {
         self.last_included_term
     }
@@ -38,30 +33,12 @@ impl ReplicaSnapshotManifest {
     pub const fn last_included_index(&self) -> u64 {
         self.last_included_index
     }
-
-    pub const fn logical_digest(&self) -> Digest32 {
-        self.logical_digest
-    }
-
-    pub const fn chunks(&self) -> u32 {
-        self.chunks
-    }
-
-    pub const fn records(&self) -> u64 {
-        self.records
-    }
-
-    pub const fn bytes(&self) -> u64 {
-        self.bytes
-    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaSnapshot {
     manifest: ReplicaSnapshotManifest,
     header: SnapshotHeader,
-    chunks: Vec<SnapshotChunk>,
-    logical_manifest: SnapshotManifest,
+    reader: Box<dyn LogicalSnapshotReader>,
     hard_state: RaftHardState,
     membership: RaftMembership,
 }
@@ -73,18 +50,6 @@ impl ReplicaSnapshot {
 
     pub const fn header(&self) -> &SnapshotHeader {
         &self.header
-    }
-
-    pub fn chunks(&self) -> &[SnapshotChunk] {
-        &self.chunks
-    }
-
-    pub fn chunks_mut(&mut self) -> &mut [SnapshotChunk] {
-        &mut self.chunks
-    }
-
-    pub const fn logical_manifest(&self) -> &SnapshotManifest {
-        &self.logical_manifest
     }
 }
 
@@ -100,6 +65,7 @@ pub struct ReplicaSnapshotInstallReceipt {
     active_binding: ReplicaBinding,
     candidate_receipt: LogicalSnapshotCandidateReceipt,
     activation_receipt: LogicalReplicaActivationReceipt,
+    logical_manifest: SnapshotManifest,
 }
 
 impl ReplicaSnapshotInstallReceipt {
@@ -117,6 +83,10 @@ impl ReplicaSnapshotInstallReceipt {
 
     pub const fn activation_receipt(&self) -> &LogicalReplicaActivationReceipt {
         &self.activation_receipt
+    }
+
+    pub const fn logical_manifest(&self) -> &SnapshotManifest {
+        &self.logical_manifest
     }
 }
 
@@ -176,64 +146,53 @@ pub fn create_replica_snapshot(
     }
     let last_included_term = consensus_term(consensus, last_included_index)?;
     let request = SnapshotRequest::new(snapshot_id, max_records_per_chunk)?;
-    let mut reader = block_on(source.begin_snapshot(permit.fence().clone(), request))?;
+    let reader = block_on(source.begin_snapshot(permit.fence().clone(), request))?;
     let header = reader.header().clone();
-    let mut chunks = Vec::new();
-    while let Some(chunk) = block_on(reader.next_chunk())? {
-        chunk.validate()?;
-        chunks.push(chunk);
-    }
-    let logical_manifest = block_on(reader.finish())?;
-    logical_manifest.validate(&header, &chunks)?;
-    let chunk_count: u32 = chunks
-        .len()
-        .try_into()
-        .map_err(|_| ReplicaSnapshotError::InvalidRequest("too many snapshot chunks"))?;
-    let bytes = snapshot_bytes(&chunks)?;
     let manifest = ReplicaSnapshotManifest {
         format: Version::new(u64::from(SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION)),
         binding: permit.fence().binding().clone(),
         last_included_term,
         last_included_index,
-        logical_digest: logical_manifest.content_digest(),
-        chunks: chunk_count,
-        records: logical_manifest.record_count(),
-        bytes,
     };
     Ok(ReplicaSnapshot {
         manifest,
         header,
-        chunks,
-        logical_manifest,
+        reader,
         hard_state,
         membership,
     })
 }
 
 pub fn install_replica_snapshot(
-    snapshot: &ReplicaSnapshot,
+    snapshot: ReplicaSnapshot,
     sink: &dyn LogicalSnapshotSink,
     activation: &dyn LogicalReplicaActivation,
     consensus: &dyn ConsensusStore,
     candidate_binding: ReplicaBinding,
     active_binding: ReplicaBinding,
 ) -> Result<ReplicaSnapshotInstallReceipt, ReplicaSnapshotError> {
-    validate_snapshot(snapshot)?;
+    validate_snapshot(&snapshot)?;
+    let ReplicaSnapshot {
+        manifest,
+        header,
+        mut reader,
+        hard_state,
+        membership,
+    } = snapshot;
     if candidate_binding.role() != BindingRole::Candidate
         || active_binding.role() != BindingRole::Active
         || !same_binding_except_role(&candidate_binding, &active_binding)
         || consensus.binding() != &active_binding
-        || !compatible_snapshot_target(snapshot.manifest.binding(), &active_binding)
+        || !compatible_snapshot_target(manifest.binding(), &active_binding)
     {
         return Err(ReplicaSnapshotError::InvalidRequest(
             "snapshot target binding is invalid",
         ));
     }
-    let target_membership_count = snapshot
-        .membership
+    let target_membership_count = membership
         .voters
         .iter()
-        .chain(&snapshot.membership.learners)
+        .chain(&membership.learners)
         .filter(|replica| **replica == active_binding.replica_id())
         .count();
     if target_membership_count != 1 {
@@ -243,21 +202,31 @@ pub fn install_replica_snapshot(
     }
     validate_retained_suffix(
         consensus,
-        snapshot.manifest.last_included_index,
+        manifest.last_included_index,
         block_on(consensus.hard_state())?.committed_index,
     )?;
 
-    let mut writer =
-        block_on(sink.begin_restore(candidate_binding.clone(), snapshot.header.clone()))?;
-    for chunk in snapshot.chunks.iter().cloned() {
+    let mut writer = block_on(sink.begin_restore(candidate_binding.clone(), header.clone()))?;
+    let mut logical_builder = SnapshotManifestBuilder::new(header.clone());
+    while let Some(chunk) = block_on(reader.next_chunk())? {
+        chunk.validate()?;
+        logical_builder.push(&chunk)?;
         if let Err(error) = block_on(writer.write_chunk(chunk)) {
             let _ = block_on(writer.abort());
             return Err(error.into());
         }
     }
-    let restore_receipt = block_on(writer.commit(snapshot.logical_manifest.clone()))?;
+    let source_manifest = block_on(reader.finish())?;
+    let logical_manifest = logical_builder.finish();
+    if source_manifest != logical_manifest {
+        let _ = block_on(writer.abort());
+        return Err(ReplicaSnapshotError::InvalidRequest(
+            "snapshot source manifest does not match its stream",
+        ));
+    }
+    let restore_receipt = block_on(writer.commit(logical_manifest.clone()))?;
     if restore_receipt.binding() != &candidate_binding
-        || restore_receipt.manifest() != &snapshot.logical_manifest
+        || restore_receipt.manifest() != &logical_manifest
     {
         return Err(ReplicaSnapshotError::InvalidRequest(
             "snapshot sink returned a mismatched restore receipt",
@@ -265,34 +234,32 @@ pub fn install_replica_snapshot(
     }
     let candidate_receipt = LogicalSnapshotCandidateReceipt::new(
         candidate_binding,
-        snapshot.header.clone(),
-        snapshot.logical_manifest.clone(),
+        header.clone(),
+        logical_manifest.clone(),
     )?;
 
     let existing = block_on(consensus.hard_state())?;
     let installed_term = existing
         .current_term
-        .max(snapshot.hard_state.current_term)
-        .max(snapshot.manifest.last_included_term);
+        .max(hard_state.current_term)
+        .max(manifest.last_included_term);
     let installed_hard_state = RaftHardState {
         current_term: installed_term,
         voted_for: (installed_term == existing.current_term)
             .then_some(existing.voted_for)
             .flatten(),
-        committed_index: existing
-            .committed_index
-            .max(snapshot.manifest.last_included_index),
+        committed_index: existing.committed_index.max(manifest.last_included_index),
     };
     let install = ConsensusSnapshotInstall::new(
         candidate_receipt.clone(),
         active_binding.clone(),
         installed_hard_state,
-        snapshot.membership.clone(),
+        membership.clone(),
         ConsensusSnapshotMetadata {
-            snapshot_id: snapshot.header.snapshot_id().get(),
-            last_included_term: snapshot.manifest.last_included_term,
-            last_included_index: snapshot.manifest.last_included_index,
-            content_digest: snapshot.manifest.logical_digest,
+            snapshot_id: header.snapshot_id().get(),
+            last_included_term: manifest.last_included_term,
+            last_included_index: manifest.last_included_index,
+            content_digest: logical_manifest.content_digest(),
         },
     )?;
     block_on(consensus.stage_snapshot_install(install.clone()))?;
@@ -300,23 +267,30 @@ pub fn install_replica_snapshot(
     let activation_receipt =
         block_on(activation.activate_candidate(candidate_receipt.clone(), active_binding.clone()))?;
     if activation_receipt.active_binding() != &active_binding
-        || activation_receipt.snapshot_id() != snapshot.header.snapshot_id()
-        || activation_receipt.applied_index() != snapshot.manifest.last_included_index
-        || activation_receipt.content_digest() != snapshot.manifest.logical_digest
-        || activation_receipt.format_version()
-            != u32::try_from(snapshot.manifest.format.get()).unwrap_or(u32::MAX)
+        || activation_receipt.snapshot_id() != header.snapshot_id()
+        || activation_receipt.applied_index() != manifest.last_included_index
+        || activation_receipt.content_digest() != logical_manifest.content_digest()
+        || activation_receipt.format_version() != header.format_version()
     {
         return Err(ReplicaSnapshotError::InvalidRequest(
             "snapshot activation receipt is invalid",
         ));
     }
     block_on(consensus.commit_snapshot_install(install))?;
-    verify_consensus_install(consensus, snapshot, installed_hard_state)?;
+    verify_consensus_install(
+        consensus,
+        &manifest,
+        &header,
+        &logical_manifest,
+        &membership,
+        installed_hard_state,
+    )?;
     Ok(ReplicaSnapshotInstallReceipt {
         state: ReplicaSnapshotInstallState::Active,
         active_binding,
         candidate_receipt,
         activation_receipt,
+        logical_manifest,
     })
 }
 
@@ -333,6 +307,7 @@ pub fn recover_replica_snapshot_install(
         ));
     }
     let candidate_receipt = install.candidate().clone();
+    let logical_manifest = candidate_receipt.manifest().clone();
     let active_binding = install.active_binding().clone();
     let activation_receipt =
         block_on(activation.activate_candidate(candidate_receipt.clone(), active_binding.clone()))?;
@@ -352,6 +327,7 @@ pub fn recover_replica_snapshot_install(
         active_binding,
         candidate_receipt,
         activation_receipt,
+        logical_manifest,
     }))
 }
 
@@ -360,7 +336,7 @@ fn validate_snapshot(snapshot: &ReplicaSnapshot) -> Result<(), ReplicaSnapshotEr
         != Version::new(u64::from(SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION))
         || snapshot.header.source_binding() != &snapshot.manifest.binding
         || snapshot.header.applied_index() != snapshot.manifest.last_included_index
-        || snapshot.header.format_version() != SUPPORTED_REPLICA_SNAPSHOT_FORMAT_VERSION
+        || snapshot.header.format_version() != SUPPORTED_SNAPSHOT_FORMAT_VERSION
         || snapshot.manifest.last_included_term == 0
         || snapshot.manifest.last_included_index == 0
         || snapshot.hard_state.committed_index < snapshot.manifest.last_included_index
@@ -369,43 +345,26 @@ fn validate_snapshot(snapshot: &ReplicaSnapshot) -> Result<(), ReplicaSnapshotEr
             "replica snapshot manifest is inconsistent",
         ));
     }
-    for chunk in &snapshot.chunks {
-        chunk.validate()?;
-    }
-    snapshot
-        .logical_manifest
-        .validate(&snapshot.header, &snapshot.chunks)?;
-    let chunks: u32 = snapshot
-        .chunks
-        .len()
-        .try_into()
-        .map_err(|_| ReplicaSnapshotError::InvalidRequest("too many snapshot chunks"))?;
-    if snapshot.manifest.logical_digest != snapshot.logical_manifest.content_digest()
-        || snapshot.manifest.chunks != chunks
-        || snapshot.manifest.records != snapshot.logical_manifest.record_count()
-        || snapshot.manifest.bytes != snapshot_bytes(&snapshot.chunks)?
-    {
-        return Err(ReplicaSnapshotError::InvalidRequest(
-            "replica snapshot totals or digest mismatch",
-        ));
-    }
     Ok(())
 }
 
 fn verify_consensus_install(
     consensus: &dyn ConsensusStore,
-    snapshot: &ReplicaSnapshot,
+    manifest: &ReplicaSnapshotManifest,
+    header: &SnapshotHeader,
+    logical_manifest: &SnapshotManifest,
+    membership: &RaftMembership,
     expected_hard_state: RaftHardState,
 ) -> Result<(), ReplicaSnapshotError> {
     let metadata = block_on(consensus.snapshot_metadata())?.ok_or(
         ReplicaSnapshotError::InvalidRequest("consensus snapshot metadata is missing"),
     )?;
-    if metadata.snapshot_id != snapshot.header.snapshot_id().get()
-        || metadata.last_included_term != snapshot.manifest.last_included_term
-        || metadata.last_included_index != snapshot.manifest.last_included_index
-        || metadata.content_digest != snapshot.manifest.logical_digest
+    if metadata.snapshot_id != header.snapshot_id().get()
+        || metadata.last_included_term != manifest.last_included_term
+        || metadata.last_included_index != manifest.last_included_index
+        || metadata.content_digest != logical_manifest.content_digest()
         || block_on(consensus.hard_state())? != expected_hard_state
-        || block_on(consensus.membership())? != snapshot.membership
+        || block_on(consensus.membership())? != *membership
     {
         return Err(ReplicaSnapshotError::InvalidRequest(
             "consensus snapshot installation did not persist exactly",
@@ -413,7 +372,7 @@ fn verify_consensus_install(
     }
     validate_retained_suffix(
         consensus,
-        snapshot.manifest.last_included_index,
+        manifest.last_included_index,
         expected_hard_state.committed_index,
     )
 }
@@ -490,15 +449,4 @@ fn consensus_term(consensus: &dyn ConsensusStore, index: u64) -> Result<u64, Rep
         .ok_or(ReplicaSnapshotError::InvalidRequest(
             "snapshot term is unavailable",
         ))
-}
-
-fn snapshot_bytes(chunks: &[SnapshotChunk]) -> Result<u64, ReplicaSnapshotError> {
-    chunks.iter().try_fold(0_u64, |bytes, chunk| {
-        let chunk_bytes = chunk.encoded_len()?;
-        bytes
-            .checked_add(chunk_bytes)
-            .ok_or(ReplicaSnapshotError::InvalidRequest(
-                "snapshot byte count overflow",
-            ))
-    })
 }

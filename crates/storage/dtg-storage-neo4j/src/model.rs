@@ -7,6 +7,7 @@ const LABELS: &[&str] = &[
     "DtgReplay",
     "DtgChange",
     "DtgSnapshotStage",
+    "DtgSnapshotRecord",
     "DtgSnapshotInstall",
     "DtgSnapshotActivation",
 ];
@@ -22,6 +23,7 @@ const CONSTRAINTS: &[&str] = &[
     "CREATE CONSTRAINT dtg_replay_identity IF NOT EXISTS FOR (replay:DtgReplay) REQUIRE (replay.namespace_id, replay.backend_generation, replay.raft_index) IS UNIQUE",
     "CREATE CONSTRAINT dtg_change_identity IF NOT EXISTS FOR (change:DtgChange) REQUIRE (change.namespace_id, change.backend_generation, change.raft_index, change.ordinal) IS UNIQUE",
     "CREATE CONSTRAINT dtg_snapshot_stage_identity IF NOT EXISTS FOR (stage:DtgSnapshotStage) REQUIRE (stage.namespace_id, stage.backend_generation, stage.restore_id, stage.ordinal) IS UNIQUE",
+    "CREATE CONSTRAINT dtg_snapshot_record_identity IF NOT EXISTS FOR (record:DtgSnapshotRecord) REQUIRE (record.namespace_id, record.backend_generation, record.restore_id, record.chunk_ordinal, record.record_ordinal) IS UNIQUE",
     "CREATE CONSTRAINT dtg_snapshot_install_identity IF NOT EXISTS FOR (stage:DtgSnapshotInstall) REQUIRE (stage.namespace_id, stage.backend_generation) IS UNIQUE",
     "CREATE CONSTRAINT dtg_snapshot_activation_identity IF NOT EXISTS FOR (activation:DtgSnapshotActivation) REQUIRE (activation.namespace_id, activation.backend_generation) IS UNIQUE",
 ];

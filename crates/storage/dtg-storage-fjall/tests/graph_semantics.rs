@@ -187,6 +187,81 @@ fn export(
     (header, chunks, manifest, records)
 }
 
+#[cfg(feature = "tck")]
+#[test]
+fn snapshot_reader_retains_at_most_the_requested_chunk_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = binding("bounded-snapshot-reader", 1);
+    let store = FjallReplicaStore::open(root.path(), binding.clone()).unwrap();
+    for index in 1..=32 {
+        block_on(
+            store.apply(
+                CommittedShardBatch::new(
+                    binding.clone(),
+                    1,
+                    index,
+                    CommandId::new(1000 + u128::from(index)).unwrap(),
+                    vec![LogicalMutation::PutVertex(vertex(u128::from(index), index))],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+
+    let mut reader = block_on(store.begin_snapshot(
+        ReadFence::new(binding, 32),
+        SnapshotRequest::new(999, 3).unwrap(),
+    ))
+    .unwrap();
+    while block_on(reader.next_chunk()).unwrap().is_some() {}
+    block_on(reader.finish()).unwrap();
+
+    assert_eq!(store.tck_snapshot_buffer_high_watermark(), 3);
+}
+
+#[cfg(feature = "tck")]
+#[test]
+fn snapshot_restore_never_buffers_the_complete_snapshot() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_binding = binding("bounded-snapshot-restore-source", 1);
+    let source = FjallReplicaStore::open(source_dir.path(), source_binding.clone()).unwrap();
+    for index in 1..=32 {
+        block_on(
+            source.apply(
+                CommittedShardBatch::new(
+                    source_binding.clone(),
+                    1,
+                    index,
+                    CommandId::new(2000 + u128::from(index)).unwrap(),
+                    vec![LogicalMutation::PutVertex(vertex(u128::from(index), index))],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+
+    let mut reader = block_on(source.begin_snapshot(
+        ReadFence::new(source_binding, 32),
+        SnapshotRequest::new(1001, 3).unwrap(),
+    ))
+    .unwrap();
+    let header = reader.header().clone();
+    let target_binding = binding("bounded-snapshot-restore-target", 2);
+    let target = FjallReplicaStore::open(target_dir.path(), target_binding.clone()).unwrap();
+    let mut writer = block_on(target.begin_restore(target_binding, header)).unwrap();
+    while let Some(chunk) = block_on(reader.next_chunk()).unwrap() {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    let manifest = block_on(reader.finish()).unwrap();
+    block_on(writer.commit(manifest)).unwrap();
+
+    assert_eq!(target.tck_snapshot_writer_buffer_high_watermark(), 3);
+    assert_eq!(target.tck_snapshot_commit_buffer_high_watermark(), 1);
+}
+
 #[test]
 fn snapshot_restore_replaces_dirty_state_preserves_deletes_and_survives_restart() {
     let source_dir = tempfile::tempdir().unwrap();

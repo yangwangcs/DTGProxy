@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use dtg_storage::{
     AdjacencyDirection, AdjacencyRead, ChangeCursor, ChangePage, ChangeRecord, ChangesRead,
     EdgeHistoryRead, EdgeId, EdgeRead, EdgeScan, EdgeVersion, LogicalMutation, ReadFence, ScanPage,
@@ -16,8 +14,29 @@ use crate::{
     },
 };
 
-const SNAPSHOT_RECORD_LIMIT: i64 = 1_000_000;
 const CANDIDATE_LIMIT: i64 = 1_000_000;
+
+#[derive(Clone, Copy)]
+pub(crate) enum SnapshotPageKind {
+    History,
+    Transactions,
+    Metadata,
+    Replay,
+    Changes,
+    Done,
+}
+
+impl SnapshotPageKind {
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::History => Self::Transactions,
+            Self::Transactions => Self::Metadata,
+            Self::Metadata => Self::Replay,
+            Self::Replay => Self::Changes,
+            Self::Changes | Self::Done => Self::Done,
+        }
+    }
+}
 
 pub(crate) struct Neo4jReadView {
     transaction: QueryApiTransaction,
@@ -38,174 +57,103 @@ impl Neo4jReadView {
         parameters
     }
 
-    pub(crate) async fn snapshot_records(&self) -> Result<Vec<SnapshotRecord>, StorageError> {
-        let mut records = Vec::new();
+    pub(crate) async fn snapshot_page(
+        &self,
+        kind: SnapshotPageKind,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SnapshotRecord>, StorageError> {
+        if limit == 0 {
+            return Err(StorageError::CorruptSnapshot(
+                "Neo4j snapshot page bound must be nonzero".into(),
+            ));
+        }
         let mut parameters = self.parameters();
-        parameters.insert("limit".into(), Value::from(SNAPSHOT_RECORD_LIMIT));
-        for row in self
-            .transaction
-            .execute(
-                "MATCH (owner:DtgOwner {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation,
-                   binding_digest: $binding_digest
-                 })
-                 MATCH (history:DtgVersion {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation
-                 })
-                 WHERE history.raft_index <= $fence_index
-                 RETURN history.payload
-                 ORDER BY history.raft_index, history.ordinal
-                 LIMIT $limit",
-                Value::Object(parameters.clone()),
-            )
-            .await?
-        {
-            records.push(
-                match decode_payload(row.first().ok_or_else(|| {
-                    StorageError::Internal("Neo4j version row omitted payload".into())
-                })?)? {
-                    LogicalMutation::PutVertex(value) => SnapshotRecord::Vertex(value),
-                    LogicalMutation::DeleteVertex(value) => SnapshotRecord::VertexTombstone(value),
-                    LogicalMutation::PutEdge(value) => SnapshotRecord::Edge(value),
-                    LogicalMutation::DeleteEdge(value) => SnapshotRecord::EdgeTombstone(value),
-                    _ => {
-                        return Err(StorageError::Internal(
-                            "Neo4j version node contained a non-graph mutation".into(),
-                        ));
-                    }
-                },
-            );
-        }
-        let mut transactions = BTreeMap::new();
-        for row in self
-            .transaction
-            .execute(
-                "MATCH (owner:DtgOwner {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation,
-                   binding_digest: $binding_digest
-                 })
-                 MATCH (change:DtgChange {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation
-                 })
-                 WHERE change.raft_index <= $fence_index AND change.mutation_kind = 5
-                 RETURN change.payload
-                 ORDER BY change.raft_index, change.ordinal LIMIT $limit",
-                Value::Object(parameters.clone()),
-            )
-            .await?
-        {
-            match decode_payload(row.first().ok_or_else(|| {
-                StorageError::Internal("Neo4j transaction row omitted payload".into())
-            })?)? {
-                LogicalMutation::PutTransaction(value) => {
-                    transactions.insert(value.id(), value);
-                }
-                _ => {
-                    return Err(StorageError::Internal(
-                        "Neo4j transaction node contained an invalid payload".into(),
-                    ));
-                }
+        parameters.insert("offset".into(), Value::from(offset));
+        parameters.insert("limit".into(), Value::from(limit));
+        let query = match kind {
+            SnapshotPageKind::History => {
+                "MATCH (owner:DtgOwner {namespace_id: $namespace_id, backend_generation: $backend_generation, binding_digest: $binding_digest}) MATCH (record:DtgVersion {namespace_id: $namespace_id, backend_generation: $backend_generation}) WHERE record.raft_index <= $fence_index RETURN record.payload ORDER BY record.raft_index, record.ordinal SKIP $offset LIMIT $limit"
             }
-        }
-        records.extend(transactions.into_values().map(SnapshotRecord::Transaction));
-
-        let mut metadata_records = BTreeMap::new();
-        for row in self
-            .transaction
-            .execute(
-                "MATCH (owner:DtgOwner {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation,
-                   binding_digest: $binding_digest
-                 })
-                 MATCH (change:DtgChange {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation
-                 })
-                 WHERE change.raft_index <= $fence_index AND change.mutation_kind = 6
-                 RETURN change.payload
-                 ORDER BY change.raft_index, change.ordinal LIMIT $limit",
-                Value::Object(parameters.clone()),
-            )
-            .await?
-        {
-            match decode_payload(row.first().ok_or_else(|| {
-                StorageError::Internal("Neo4j metadata change omitted payload".into())
-            })?)? {
-                LogicalMutation::PutReplicaMetadata(value) => {
-                    metadata_records.insert(value.name().to_owned(), value);
-                }
-                _ => {
-                    return Err(StorageError::Internal(
-                        "Neo4j metadata change contained an invalid payload".into(),
-                    ));
-                }
+            SnapshotPageKind::Transactions => {
+                "MATCH (owner:DtgOwner {namespace_id: $namespace_id, backend_generation: $backend_generation, binding_digest: $binding_digest}) MATCH (record:DtgTransaction {namespace_id: $namespace_id, backend_generation: $backend_generation}) RETURN record.payload ORDER BY record.transaction_id SKIP $offset LIMIT $limit"
             }
-        }
-        records.extend(
-            metadata_records
-                .into_values()
-                .map(SnapshotRecord::ReplicaMetadata),
-        );
-        for row in self
-            .transaction
-            .execute(
-                "MATCH (owner:DtgOwner {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation,
-                   binding_digest: $binding_digest
-                 })
-                 MATCH (replay:DtgReplay {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation
-                 })
-                 WHERE replay.raft_index <= $fence_index
-                 RETURN replay.raft_index, replay.raft_term,
-                   replay.command_id, replay.mutation_digest
-                 ORDER BY replay.raft_index LIMIT $limit",
-                Value::Object(parameters.clone()),
-            )
+            SnapshotPageKind::Metadata => {
+                "MATCH (owner:DtgOwner {namespace_id: $namespace_id, backend_generation: $backend_generation, binding_digest: $binding_digest}) MATCH (record:DtgMetadata {namespace_id: $namespace_id, backend_generation: $backend_generation}) RETURN record.payload ORDER BY record.key SKIP $offset LIMIT $limit"
+            }
+            SnapshotPageKind::Replay => {
+                "MATCH (owner:DtgOwner {namespace_id: $namespace_id, backend_generation: $backend_generation, binding_digest: $binding_digest}) MATCH (record:DtgReplay {namespace_id: $namespace_id, backend_generation: $backend_generation}) WHERE record.raft_index <= $fence_index RETURN record.raft_index, record.raft_term, record.command_id, record.mutation_digest ORDER BY record.raft_index SKIP $offset LIMIT $limit"
+            }
+            SnapshotPageKind::Changes => {
+                "MATCH (owner:DtgOwner {namespace_id: $namespace_id, backend_generation: $backend_generation, binding_digest: $binding_digest}) MATCH (record:DtgChange {namespace_id: $namespace_id, backend_generation: $backend_generation}) WHERE record.raft_index <= $fence_index RETURN record.raft_index, record.ordinal, record.payload ORDER BY record.raft_index, record.ordinal SKIP $offset LIMIT $limit"
+            }
+            SnapshotPageKind::Done => return Ok(Vec::new()),
+        };
+        self.transaction
+            .execute(query, Value::Object(parameters))
             .await?
-        {
-            records.push(SnapshotRecord::Replay(SnapshotReplayRecord::new(
-                decode_u64_hex(text(&row[0], "replay index")?)?,
-                decode_u64_hex(text(&row[1], "replay term")?)?,
-                dtg_storage::CommandId::new(decode_u128_hex(text(&row[2], "replay command")?)?)?,
-                decode_digest(text(&row[3], "replay digest")?)?,
-            )?));
-        }
-        for row in self
-            .transaction
-            .execute(
-                "MATCH (owner:DtgOwner {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation,
-                   binding_digest: $binding_digest
-                 })
-                 MATCH (change:DtgChange {
-                   namespace_id: $namespace_id,
-                   backend_generation: $backend_generation
-                 })
-                 WHERE change.raft_index <= $fence_index
-                 RETURN change.raft_index, change.ordinal, change.payload
-                 ORDER BY change.raft_index, change.ordinal LIMIT $limit",
-                Value::Object(parameters),
-            )
-            .await?
-        {
-            records.push(SnapshotRecord::Change(ChangeRecord::new(
-                ChangeCursor::new(
-                    decode_u64_hex(text(&row[0], "change index")?)?,
-                    decode_u64_hex(text(&row[1], "change ordinal")?)?,
+            .into_iter()
+            .map(|row| match kind {
+                SnapshotPageKind::History => Ok(
+                    match decode_payload(row.first().ok_or_else(|| {
+                        StorageError::Internal("Neo4j history page omitted payload".into())
+                    })?)? {
+                        LogicalMutation::PutVertex(value) => SnapshotRecord::Vertex(value),
+                        LogicalMutation::DeleteVertex(value) => {
+                            SnapshotRecord::VertexTombstone(value)
+                        }
+                        LogicalMutation::PutEdge(value) => SnapshotRecord::Edge(value),
+                        LogicalMutation::DeleteEdge(value) => SnapshotRecord::EdgeTombstone(value),
+                        _ => {
+                            return Err(StorageError::Internal(
+                                "Neo4j history page contained non-graph mutation".into(),
+                            ));
+                        }
+                    },
                 ),
-                decode_payload(&row[2])?,
-            )));
-        }
-        Ok(records)
+                SnapshotPageKind::Transactions => {
+                    match decode_payload(row.first().ok_or_else(|| {
+                        StorageError::Internal("Neo4j transaction page omitted payload".into())
+                    })?)? {
+                        LogicalMutation::PutTransaction(value) => {
+                            Ok(SnapshotRecord::Transaction(value))
+                        }
+                        _ => Err(StorageError::Internal(
+                            "Neo4j transaction page contained invalid payload".into(),
+                        )),
+                    }
+                }
+                SnapshotPageKind::Metadata => {
+                    match decode_payload(row.first().ok_or_else(|| {
+                        StorageError::Internal("Neo4j metadata page omitted payload".into())
+                    })?)? {
+                        LogicalMutation::PutReplicaMetadata(value) => {
+                            Ok(SnapshotRecord::ReplicaMetadata(value))
+                        }
+                        _ => Err(StorageError::Internal(
+                            "Neo4j metadata page contained invalid payload".into(),
+                        )),
+                    }
+                }
+                SnapshotPageKind::Replay => Ok(SnapshotRecord::Replay(SnapshotReplayRecord::new(
+                    decode_u64_hex(text(&row[0], "replay index")?)?,
+                    decode_u64_hex(text(&row[1], "replay term")?)?,
+                    dtg_storage::CommandId::new(decode_u128_hex(text(
+                        &row[2],
+                        "replay command",
+                    )?)?)?,
+                    decode_digest(text(&row[3], "replay digest")?)?,
+                )?)),
+                SnapshotPageKind::Changes => Ok(SnapshotRecord::Change(ChangeRecord::new(
+                    ChangeCursor::new(
+                        decode_u64_hex(text(&row[0], "change index")?)?,
+                        decode_u64_hex(text(&row[1], "change ordinal")?)?,
+                    ),
+                    decode_payload(&row[2])?,
+                ))),
+                SnapshotPageKind::Done => unreachable!(),
+            })
+            .collect()
     }
 
     async fn vertex(&self, request: &VertexRead) -> Result<Option<VertexVersion>, StorageError> {

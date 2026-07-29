@@ -17,6 +17,7 @@ fn schema_uses_native_typed_tables_without_a_canonical_mirror() {
         "replay_identity",
         "change_record",
         "snapshot_stage",
+        "snapshot_stage_record",
     ] {
         assert!(
             normalized.contains(&format!("create table {table}"))
@@ -137,6 +138,20 @@ fn candidate_commit_persists_marker_in_the_restore_transaction() {
     assert!(snapshot.contains("manifest.record_count()"));
     assert!(snapshot.contains("manifest.content_digest()"));
     assert!(snapshot.contains("verify_staged_chunks"));
+}
+
+#[test]
+fn snapshot_restore_validates_in_database_and_loads_one_raft_batch_at_a_time() {
+    let snapshot = include_str!("../src/snapshot.rs").to_ascii_lowercase();
+    assert!(snapshot.contains("validate_staged_state_sets"));
+    assert!(
+        snapshot.contains("select * from supplied_graph except select * from authenticated_graph")
+    );
+    assert!(snapshot.contains("distinct on (logical_key)"));
+    assert!(snapshot.contains("where snapshot_id = $1 and record_kind = 8 and raft_index = $2"));
+    assert!(snapshot.contains("verify_staged_change_count"));
+    assert!(!snapshot.contains("staged_snapshot_records"));
+    assert!(!snapshot.contains("vec<snapshotrecord>"));
 }
 
 #[test]

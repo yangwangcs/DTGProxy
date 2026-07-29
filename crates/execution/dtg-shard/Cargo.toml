@@ -16,5 +16,5 @@ raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"
 slog = "2"
 
 [dev-dependencies]
-dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
+dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall", features = ["tck"] }
 tempfile = "3"

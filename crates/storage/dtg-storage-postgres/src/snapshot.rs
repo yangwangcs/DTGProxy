@@ -1,19 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use dtg_storage::{
-    BindingRole, ChangeRecord, CommittedShardBatch, Digest32, LogicalMutation,
-    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotReader,
-    LogicalSnapshotWriter, ReadFence, ReplicaBinding, ReplicaMetadata, SnapshotChunk,
-    SnapshotHeader, SnapshotManifest, SnapshotRecord, SnapshotReplayRecord, SnapshotRequest,
-    SnapshotRestoreReceipt, StorageError, StoreFuture, TransactionId, TransactionRecord,
+    BindingRole, CommittedShardBatch, Digest32, LogicalMutation, LogicalReplicaActivationReceipt,
+    LogicalSnapshotCandidateReceipt, LogicalSnapshotReader, LogicalSnapshotWriter, ReadFence,
+    ReplicaBinding, SnapshotChunk, SnapshotHeader, SnapshotManifest, SnapshotManifestBuilder,
+    SnapshotRecord, SnapshotRequest, SnapshotRestoreReceipt, StorageError, StoreFuture,
 };
 use tokio_postgres::{Client, Row};
 
 use crate::{
     PostgresReplicaStore,
     apply::{insert_replay, stage_mutation},
-    codec::encode_mutation,
+    codec::{decode_mutation, encode_mutation},
     config::postgres_error,
+    read_view::{PostgresReadView, SnapshotPageKind},
     schema::{
         decode_digest, decode_u64, finish_transaction, load_owner, read_applied_index, role_tag,
         u64_bytes, u128_bytes, verify_owner,
@@ -33,25 +31,25 @@ pub(crate) async fn snapshot_reader(
         fence.applied_index(),
         dtg_storage::SUPPORTED_SNAPSHOT_FORMAT_VERSION,
     )?;
-    let records = view.snapshot_records().await?;
-    let chunks = records
-        .chunks(request.max_records_per_chunk() as usize)
-        .enumerate()
-        .map(|(ordinal, records)| {
-            SnapshotChunk::new(request.snapshot_id(), ordinal as u64, records.to_vec())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(PostgresSnapshotReader {
+        manifest: SnapshotManifestBuilder::new(header.clone()),
         header,
-        chunks,
-        next: 0,
+        view,
+        max_records_per_chunk: request.max_records_per_chunk() as usize,
+        kind: SnapshotPageKind::Vertices,
+        offset: 0,
+        exhausted: false,
     }))
 }
 
 struct PostgresSnapshotReader {
     header: SnapshotHeader,
-    chunks: Vec<SnapshotChunk>,
-    next: usize,
+    manifest: SnapshotManifestBuilder,
+    view: PostgresReadView,
+    max_records_per_chunk: usize,
+    kind: SnapshotPageKind,
+    offset: i64,
+    exhausted: bool,
 }
 
 impl LogicalSnapshotReader for PostgresSnapshotReader {
@@ -61,20 +59,57 @@ impl LogicalSnapshotReader for PostgresSnapshotReader {
 
     fn next_chunk(&mut self) -> StoreFuture<'_, Option<SnapshotChunk>> {
         Box::pin(async move {
-            let chunk = self.chunks.get(self.next).cloned();
-            if chunk.is_some() {
-                self.next += 1;
+            if self.exhausted {
+                return Ok(None);
             }
-            Ok(chunk)
+            let mut records = Vec::with_capacity(self.max_records_per_chunk);
+            while records.len() < self.max_records_per_chunk {
+                let remaining = self.max_records_per_chunk - records.len();
+                let page = self
+                    .view
+                    .snapshot_page(
+                        self.kind,
+                        self.offset,
+                        i64::try_from(remaining).map_err(|_| {
+                            StorageError::CorruptSnapshot(
+                                "PostgreSQL snapshot chunk bound exceeds BIGINT".into(),
+                            )
+                        })?,
+                    )
+                    .await?;
+                if page.is_empty() {
+                    self.kind = self.kind.next();
+                    self.offset = 0;
+                    if matches!(self.kind, SnapshotPageKind::Done) {
+                        self.exhausted = true;
+                        break;
+                    }
+                    continue;
+                }
+                self.offset += i64::try_from(page.len()).map_err(|_| {
+                    StorageError::CorruptSnapshot("PostgreSQL snapshot offset overflow".into())
+                })?;
+                records.extend(page);
+            }
+            if records.is_empty() {
+                return Ok(None);
+            }
+            let chunk = SnapshotChunk::new(
+                self.header.snapshot_id(),
+                self.manifest.next_ordinal(),
+                records,
+            )?;
+            self.manifest.push(&chunk)?;
+            Ok(Some(chunk))
         })
     }
 
     fn finish(self: Box<Self>) -> StoreFuture<'static, SnapshotManifest> {
         Box::pin(async move {
-            if self.next != self.chunks.len() {
+            if !self.exhausted {
                 return Err(StorageError::SnapshotNotExhausted);
             }
-            SnapshotManifest::new(&self.header, &self.chunks)
+            Ok(self.manifest.finish())
         })
     }
 }
@@ -98,8 +133,8 @@ pub(crate) async fn snapshot_writer(
     Ok(Box::new(PostgresSnapshotWriter {
         store: store.clone(),
         target_binding: store.binding_ref().clone(),
+        manifest: SnapshotManifestBuilder::new(header.clone()),
         header,
-        chunks: Vec::new(),
     }))
 }
 
@@ -107,7 +142,7 @@ struct PostgresSnapshotWriter {
     store: PostgresReplicaStore,
     target_binding: ReplicaBinding,
     header: SnapshotHeader,
-    chunks: Vec<SnapshotChunk>,
+    manifest: SnapshotManifestBuilder,
 }
 
 impl LogicalSnapshotWriter for PostgresSnapshotWriter {
@@ -123,7 +158,7 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
         Box::pin(async move {
             chunk.validate()?;
             if chunk.snapshot_id() != self.header.snapshot_id()
-                || chunk.ordinal() != self.chunks.len() as u64
+                || chunk.ordinal() != self.manifest.next_ordinal()
             {
                 return Err(StorageError::CorruptSnapshot(
                     "snapshot chunk identity or order mismatch".into(),
@@ -160,11 +195,44 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
                     )
                     .await
                     .map_err(postgres_error)?;
+                for (record_ordinal, record) in chunk.records().iter().enumerate() {
+                    let staged = staged_record(record)?;
+                    client
+                        .execute(
+                            "INSERT INTO snapshot_stage_record (
+                           snapshot_id, chunk_ordinal, record_ordinal, record_kind,
+                           mutation_payload, logical_key, raft_index, raft_term_or_ordinal,
+                           command_id, digest
+                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                         ON CONFLICT (snapshot_id, chunk_ordinal, record_ordinal) DO UPDATE SET
+                           record_kind=EXCLUDED.record_kind,
+                           mutation_payload=EXCLUDED.mutation_payload,
+                           logical_key=EXCLUDED.logical_key,
+                           raft_index=EXCLUDED.raft_index,
+                           raft_term_or_ordinal=EXCLUDED.raft_term_or_ordinal,
+                           command_id=EXCLUDED.command_id,
+                           digest=EXCLUDED.digest",
+                            &[
+                                &u128_bytes(chunk.snapshot_id().get()),
+                                &u64_bytes(chunk.ordinal()),
+                                &u64_bytes(record_ordinal as u64),
+                                &staged.kind,
+                                &staged.mutation,
+                                &staged.logical_key,
+                                &staged.raft_index,
+                                &staged.raft_term_or_ordinal,
+                                &staged.command_id,
+                                &staged.digest,
+                            ],
+                        )
+                        .await
+                        .map_err(postgres_error)?;
+                }
                 Ok(())
             }
             .await;
             finish_transaction(&client, result).await?;
-            self.chunks.push(chunk);
+            self.manifest.push(&chunk)?;
             Ok(())
         })
     }
@@ -174,17 +242,11 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
         manifest: SnapshotManifest,
     ) -> StoreFuture<'static, SnapshotRestoreReceipt> {
         Box::pin(async move {
-            manifest.validate(&self.header, &self.chunks)?;
-            let records = self
-                .chunks
-                .iter()
-                .flat_map(|chunk| chunk.records().iter().cloned())
-                .collect::<Vec<_>>();
-            let batches = validate_restored_records(
-                &self.target_binding,
-                self.header.applied_index(),
-                &records,
-            )?;
+            if self.manifest.finish() != manifest {
+                return Err(StorageError::CorruptSnapshot(
+                    "PostgreSQL staged snapshot manifest mismatch".into(),
+                ));
+            }
             let client = self.store.connect().await?;
             client
                 .batch_execute(
@@ -195,15 +257,34 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
                 .map_err(postgres_error)?;
             let result = async {
                 verify_owner(&client, self.store.binding_ref(), true).await?;
-                verify_staged_chunks(&client, &self.header, &self.chunks).await?;
+                verify_staged_chunks(&client, &self.header, &manifest).await?;
+                validate_staged_state_sets(&client, self.header.snapshot_id().get(), &manifest)
+                    .await?;
                 clear_logical_state(&client).await?;
-                for batch in &batches {
+                let mut change_count = 0_u64;
+                for raft_index in 1..=self.header.applied_index() {
+                    let batch = load_staged_batch(
+                        &client,
+                        &self.target_binding,
+                        self.header.snapshot_id().get(),
+                        raft_index,
+                    )
+                    .await?;
+                    change_count = change_count
+                        .checked_add(batch.mutations().len() as u64)
+                        .ok_or_else(|| {
+                            StorageError::CorruptSnapshot(
+                                "PostgreSQL staged change count overflow".into(),
+                            )
+                        })?;
                     for (ordinal, mutation) in batch.mutations().iter().enumerate() {
                         stage_mutation(&client, batch.raft_index(), ordinal as u64, mutation)
                             .await?;
                     }
-                    insert_replay(&client, batch).await?;
+                    insert_replay(&client, &batch).await?;
                 }
+                verify_staged_change_count(&client, self.header.snapshot_id().get(), change_count)
+                    .await?;
                 client
                     .execute(
                         "UPDATE replica_meta SET applied_index = $1 WHERE singleton = TRUE",
@@ -223,6 +304,13 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
                         .await
                         .map_err(postgres_error)?;
                 }
+                client
+                    .execute(
+                        "DELETE FROM snapshot_stage_record WHERE snapshot_id = $1",
+                        &[&u128_bytes(self.header.snapshot_id().get())],
+                    )
+                    .await
+                    .map_err(postgres_error)?;
                 client
                     .execute(
                         "DELETE FROM snapshot_stage WHERE snapshot_id = $1",
@@ -255,6 +343,13 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
                 verify_owner(&client, self.store.binding_ref(), true).await?;
                 client
                     .execute(
+                        "DELETE FROM snapshot_stage_record WHERE snapshot_id = $1",
+                        &[&u128_bytes(self.header.snapshot_id().get())],
+                    )
+                    .await
+                    .map_err(postgres_error)?;
+                client
+                    .execute(
                         "DELETE FROM snapshot_stage WHERE snapshot_id = $1",
                         &[&u128_bytes(self.header.snapshot_id().get())],
                     )
@@ -266,6 +361,234 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
             finish_transaction(&client, result).await
         })
     }
+}
+
+struct StagedRecord {
+    kind: i16,
+    mutation: Option<Vec<u8>>,
+    logical_key: Option<Vec<u8>>,
+    raft_index: Option<Vec<u8>>,
+    raft_term_or_ordinal: Option<Vec<u8>>,
+    command_id: Option<Vec<u8>>,
+    digest: Option<Vec<u8>>,
+}
+
+fn staged_record(record: &SnapshotRecord) -> Result<StagedRecord, StorageError> {
+    let mutation = match record {
+        SnapshotRecord::Vertex(value) => Some(LogicalMutation::PutVertex(value.clone())),
+        SnapshotRecord::VertexTombstone(value) => {
+            Some(LogicalMutation::DeleteVertex(value.clone()))
+        }
+        SnapshotRecord::Edge(value) => Some(LogicalMutation::PutEdge(value.clone())),
+        SnapshotRecord::EdgeTombstone(value) => Some(LogicalMutation::DeleteEdge(value.clone())),
+        SnapshotRecord::Transaction(value) => Some(LogicalMutation::PutTransaction(value.clone())),
+        SnapshotRecord::ReplicaMetadata(value) => {
+            Some(LogicalMutation::PutReplicaMetadata(value.clone()))
+        }
+        SnapshotRecord::Replay(_) | SnapshotRecord::Change(_) => None,
+    };
+    let (kind, raft_index, raft_term_or_ordinal, command_id, digest) = match record {
+        SnapshotRecord::Vertex(_) => (1, None, None, None, None),
+        SnapshotRecord::VertexTombstone(_) => (2, None, None, None, None),
+        SnapshotRecord::Edge(_) => (3, None, None, None, None),
+        SnapshotRecord::EdgeTombstone(_) => (4, None, None, None, None),
+        SnapshotRecord::Transaction(_) => (5, None, None, None, None),
+        SnapshotRecord::ReplicaMetadata(_) => (6, None, None, None, None),
+        SnapshotRecord::Replay(value) => (
+            7,
+            Some(u64_bytes(value.raft_index())),
+            Some(u64_bytes(value.raft_term())),
+            Some(u128_bytes(value.command_id().get())),
+            Some(value.mutation_digest().get().to_vec()),
+        ),
+        SnapshotRecord::Change(value) => (
+            8,
+            Some(u64_bytes(value.raft_index())),
+            Some(u64_bytes(value.mutation_ordinal())),
+            None,
+            None,
+        ),
+    };
+    Ok(StagedRecord {
+        kind,
+        mutation: mutation
+            .as_ref()
+            .or_else(|| match record {
+                SnapshotRecord::Change(value) => Some(value.mutation()),
+                _ => None,
+            })
+            .map(encode_mutation)
+            .transpose()?,
+        logical_key: mutation
+            .as_ref()
+            .or_else(|| match record {
+                SnapshotRecord::Change(value) => Some(value.mutation()),
+                _ => None,
+            })
+            .and_then(mutation_logical_key),
+        raft_index,
+        raft_term_or_ordinal,
+        command_id,
+        digest,
+    })
+}
+
+fn mutation_logical_key(mutation: &LogicalMutation) -> Option<Vec<u8>> {
+    match mutation {
+        LogicalMutation::PutTransaction(value) => Some(value.id().get().to_be_bytes().to_vec()),
+        LogicalMutation::PutReplicaMetadata(value) => Some(value.name().as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+async fn validate_staged_state_sets(
+    client: &Client,
+    snapshot_id: u128,
+    manifest: &SnapshotManifest,
+) -> Result<(), StorageError> {
+    let row = client
+        .query_one(
+            "WITH staged AS (
+               SELECT * FROM snapshot_stage_record WHERE snapshot_id = $1
+             ), supplied_graph AS (
+               SELECT mutation_payload, count(*) AS copies FROM staged
+               WHERE record_kind BETWEEN 1 AND 4 GROUP BY mutation_payload
+             ), authenticated_graph AS (
+               SELECT mutation_payload, count(*) AS copies FROM staged
+               WHERE record_kind = 8 AND get_byte(mutation_payload, 0) BETWEEN 1 AND 4
+               GROUP BY mutation_payload
+             ), supplied_transactions AS (
+               SELECT logical_key, mutation_payload FROM staged WHERE record_kind = 5
+             ), authenticated_transactions AS (
+               SELECT DISTINCT ON (logical_key) logical_key, mutation_payload FROM staged
+               WHERE record_kind = 8 AND get_byte(mutation_payload, 0) = 5
+               ORDER BY logical_key, chunk_ordinal DESC, record_ordinal DESC
+             ), supplied_metadata AS (
+               SELECT logical_key, mutation_payload FROM staged WHERE record_kind = 6
+             ), authenticated_metadata AS (
+               SELECT DISTINCT ON (logical_key) logical_key, mutation_payload FROM staged
+               WHERE record_kind = 8 AND get_byte(mutation_payload, 0) = 6
+               ORDER BY logical_key, chunk_ordinal DESC, record_ordinal DESC
+             )
+             SELECT
+               (SELECT count(*) FROM staged),
+               NOT EXISTS ((SELECT * FROM supplied_graph EXCEPT SELECT * FROM authenticated_graph)
+                 UNION ALL (SELECT * FROM authenticated_graph EXCEPT SELECT * FROM supplied_graph)),
+               NOT EXISTS ((SELECT * FROM supplied_transactions EXCEPT SELECT * FROM authenticated_transactions)
+                 UNION ALL (SELECT * FROM authenticated_transactions EXCEPT SELECT * FROM supplied_transactions)),
+               NOT EXISTS ((SELECT * FROM supplied_metadata EXCEPT SELECT * FROM authenticated_metadata)
+                 UNION ALL (SELECT * FROM authenticated_metadata EXCEPT SELECT * FROM supplied_metadata)),
+               (SELECT count(*) = count(DISTINCT logical_key) FROM supplied_transactions),
+               (SELECT count(*) = count(DISTINCT logical_key) FROM supplied_metadata)",
+            &[&u128_bytes(snapshot_id)],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let record_count: i64 = row.get(0);
+    let valid = row.get::<_, bool>(1)
+        && row.get::<_, bool>(2)
+        && row.get::<_, bool>(3)
+        && row.get::<_, bool>(4)
+        && row.get::<_, bool>(5);
+    if u64::try_from(record_count).ok() != Some(manifest.record_count()) || !valid {
+        return Err(StorageError::CorruptSnapshot(
+            "PostgreSQL staged snapshot state does not match authenticated changes".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn load_staged_batch(
+    client: &Client,
+    binding: &ReplicaBinding,
+    snapshot_id: u128,
+    raft_index: u64,
+) -> Result<CommittedShardBatch, StorageError> {
+    let replay_rows = client
+        .query(
+            "SELECT raft_term_or_ordinal, command_id, digest
+             FROM snapshot_stage_record
+             WHERE snapshot_id = $1 AND record_kind = 7 AND raft_index = $2",
+            &[&u128_bytes(snapshot_id), &u64_bytes(raft_index)],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let [replay] = replay_rows.as_slice() else {
+        return Err(StorageError::CorruptSnapshot(
+            "PostgreSQL staged replay identity is missing or duplicated".into(),
+        ));
+    };
+    let term = decode_u64(&required_stage_bytes(replay, 0, "replay term")?)?;
+    let command_id = dtg_storage::CommandId::new(u128::from_be_bytes(
+        required_stage_bytes(replay, 1, "replay command")?
+            .as_slice()
+            .try_into()
+            .map_err(|_| StorageError::CorruptSnapshot("invalid replay command".into()))?,
+    ))?;
+    let expected_digest = decode_digest(&required_stage_bytes(replay, 2, "replay digest")?)?;
+    let rows = client
+        .query(
+            "SELECT raft_term_or_ordinal, mutation_payload
+             FROM snapshot_stage_record
+             WHERE snapshot_id = $1 AND record_kind = 8 AND raft_index = $2
+             ORDER BY raft_term_or_ordinal",
+            &[&u128_bytes(snapshot_id), &u64_bytes(raft_index)],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let mut mutations = Vec::with_capacity(rows.len());
+    for (expected_ordinal, row) in rows.iter().enumerate() {
+        let ordinal = decode_u64(&required_stage_bytes(row, 0, "change ordinal")?)?;
+        if ordinal != expected_ordinal as u64 {
+            return Err(StorageError::CorruptSnapshot(
+                "PostgreSQL staged change ordinals are not contiguous".into(),
+            ));
+        }
+        mutations.push(decode_mutation(&required_stage_bytes(
+            row,
+            1,
+            "change payload",
+        )?)?);
+    }
+    let batch = CommittedShardBatch::new(binding.clone(), term, raft_index, command_id, mutations)
+        .map_err(|error| {
+            StorageError::CorruptSnapshot(format!(
+                "PostgreSQL staged batch cannot be reconstructed: {error}"
+            ))
+        })?;
+    if batch.mutation_digest() != expected_digest {
+        return Err(StorageError::CorruptSnapshot(
+            "PostgreSQL staged batch digest mismatch".into(),
+        ));
+    }
+    Ok(batch)
+}
+
+async fn verify_staged_change_count(
+    client: &Client,
+    snapshot_id: u128,
+    expected: u64,
+) -> Result<(), StorageError> {
+    let row = client
+        .query_one(
+            "SELECT count(*) FROM snapshot_stage_record
+             WHERE snapshot_id = $1 AND record_kind = 8",
+            &[&u128_bytes(snapshot_id)],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let actual: i64 = row.get(0);
+    if u64::try_from(actual).ok() != Some(expected) {
+        return Err(StorageError::CorruptSnapshot(
+            "PostgreSQL staged snapshot contains changes outside the applied prefix".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_stage_bytes(row: &Row, column: usize, name: &str) -> Result<Vec<u8>, StorageError> {
+    row.get::<_, Option<Vec<u8>>>(column)
+        .ok_or_else(|| StorageError::CorruptSnapshot(format!("missing PostgreSQL {name}")))
 }
 
 pub(crate) async fn activate_candidate(
@@ -452,7 +775,7 @@ impl SnapshotActivationMarker {
 async fn verify_staged_chunks(
     client: &Client,
     header: &SnapshotHeader,
-    chunks: &[SnapshotChunk],
+    manifest: &SnapshotManifest,
 ) -> Result<(), StorageError> {
     let rows = client
         .query(
@@ -463,19 +786,16 @@ async fn verify_staged_chunks(
         )
         .await
         .map_err(postgres_error)?;
-    if rows.len() != chunks.len() {
+    if rows.len() as u64 != manifest.chunk_count() {
         return Err(StorageError::CorruptSnapshot(
             "PostgreSQL snapshot staging is incomplete".into(),
         ));
     }
-    for (row, chunk) in rows.iter().zip(chunks) {
+    for (expected_ordinal, row) in rows.iter().enumerate() {
         let ordinal = marker_u64(row.get::<_, Vec<u8>>(0).as_slice())?;
         let digest = marker_digest(row.get::<_, Vec<u8>>(1).as_slice())?;
         let record_count: i64 = row.get(2);
-        if ordinal != chunk.ordinal()
-            || digest != chunk.digest
-            || u64::try_from(record_count).ok() != Some(chunk.records().len() as u64)
-        {
+        if ordinal != expected_ordinal as u64 || digest.get() == [0; 32] || record_count <= 0 {
             return Err(StorageError::CorruptSnapshot(
                 "PostgreSQL snapshot staging does not match submitted chunks".into(),
             ));
@@ -631,164 +951,6 @@ async fn clear_logical_state(client: &tokio_postgres::Client) -> Result<(), Stor
         )
         .await
         .map_err(postgres_error)
-}
-
-fn validate_restored_records(
-    binding: &ReplicaBinding,
-    applied_index: u64,
-    records: &[SnapshotRecord],
-) -> Result<Vec<CommittedShardBatch>, StorageError> {
-    let mut supplied_graph = Vec::new();
-    let mut supplied_transactions = BTreeMap::<TransactionId, TransactionRecord>::new();
-    let mut supplied_metadata = BTreeMap::<String, ReplicaMetadata>::new();
-    let mut replay = BTreeMap::<u64, SnapshotReplayRecord>::new();
-    let mut changes = BTreeMap::<u64, Vec<ChangeRecord>>::new();
-    for record in records {
-        match record {
-            SnapshotRecord::Vertex(vertex) => {
-                supplied_graph.push(LogicalMutation::PutVertex(vertex.clone()));
-            }
-            SnapshotRecord::VertexTombstone(tombstone) => {
-                supplied_graph.push(LogicalMutation::DeleteVertex(tombstone.clone()));
-            }
-            SnapshotRecord::Edge(edge) => {
-                supplied_graph.push(LogicalMutation::PutEdge(edge.clone()));
-            }
-            SnapshotRecord::EdgeTombstone(tombstone) => {
-                supplied_graph.push(LogicalMutation::DeleteEdge(tombstone.clone()));
-            }
-            SnapshotRecord::Transaction(transaction) => {
-                if supplied_transactions
-                    .insert(transaction.id(), transaction.clone())
-                    .is_some()
-                {
-                    return Err(StorageError::CorruptSnapshot(
-                        "snapshot transaction state contains duplicate identifiers".into(),
-                    ));
-                }
-            }
-            SnapshotRecord::ReplicaMetadata(metadata) => {
-                if supplied_metadata
-                    .insert(metadata.name().to_owned(), metadata.clone())
-                    .is_some()
-                {
-                    return Err(StorageError::CorruptSnapshot(
-                        "snapshot replica metadata contains duplicate names".into(),
-                    ));
-                }
-            }
-            SnapshotRecord::Replay(record) => {
-                if replay.insert(record.raft_index(), record.clone()).is_some() {
-                    return Err(StorageError::CorruptSnapshot(
-                        "snapshot replay identities are duplicated".into(),
-                    ));
-                }
-            }
-            SnapshotRecord::Change(record) => {
-                changes
-                    .entry(record.raft_index())
-                    .or_default()
-                    .push(record.clone());
-            }
-        }
-    }
-    if replay.keys().copied().ne(1..=applied_index) {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot replay identities are not contiguous through the applied index".into(),
-        ));
-    }
-
-    let mut authenticated_graph = Vec::new();
-    let mut authenticated_transactions = BTreeMap::new();
-    let mut authenticated_metadata = BTreeMap::new();
-    let mut batches = Vec::new();
-    for index in 1..=applied_index {
-        let replay_record = replay
-            .get(&index)
-            .ok_or_else(|| StorageError::CorruptSnapshot("snapshot replay is missing".into()))?;
-        let changes_at_index = changes.get_mut(&index).ok_or_else(|| {
-            StorageError::CorruptSnapshot("snapshot committed batch has no changes".into())
-        })?;
-        changes_at_index.sort_by_key(ChangeRecord::mutation_ordinal);
-        if changes_at_index
-            .iter()
-            .enumerate()
-            .any(|(ordinal, change)| change.mutation_ordinal() != ordinal as u64)
-        {
-            return Err(StorageError::CorruptSnapshot(
-                "snapshot change ordinals are not contiguous".into(),
-            ));
-        }
-        let mutations = changes_at_index
-            .iter()
-            .map(|change| change.mutation().clone())
-            .collect::<Vec<_>>();
-        let batch = CommittedShardBatch::new(
-            binding.clone(),
-            replay_record.raft_term(),
-            index,
-            replay_record.command_id(),
-            mutations,
-        )
-        .map_err(|error| {
-            StorageError::CorruptSnapshot(format!(
-                "snapshot committed batch cannot be reconstructed: {error}"
-            ))
-        })?;
-        if batch.mutation_digest() != replay_record.mutation_digest() {
-            return Err(StorageError::CorruptSnapshot(format!(
-                "snapshot change digest does not match replay identity at Raft index {index}"
-            )));
-        }
-        for mutation in batch.mutations() {
-            match mutation {
-                LogicalMutation::PutVertex(_)
-                | LogicalMutation::DeleteVertex(_)
-                | LogicalMutation::PutEdge(_)
-                | LogicalMutation::DeleteEdge(_) => authenticated_graph.push(mutation.clone()),
-                LogicalMutation::PutTransaction(transaction) => {
-                    authenticated_transactions.insert(transaction.id(), transaction.clone());
-                }
-                LogicalMutation::PutReplicaMetadata(metadata) => {
-                    authenticated_metadata.insert(metadata.name().to_owned(), metadata.clone());
-                }
-            }
-        }
-        batches.push(batch);
-    }
-    if changes.keys().copied().collect::<BTreeSet<_>>()
-        != (1..=applied_index).collect::<BTreeSet<_>>()
-    {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot changes contain an unknown replay identity".into(),
-        ));
-    }
-    if mutation_multiset(&supplied_graph)? != mutation_multiset(&authenticated_graph)? {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot graph history does not match authenticated changes".into(),
-        ));
-    }
-    if supplied_transactions != authenticated_transactions {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot transaction state does not match authenticated changes".into(),
-        ));
-    }
-    if supplied_metadata != authenticated_metadata {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot replica metadata does not match authenticated changes".into(),
-        ));
-    }
-    Ok(batches)
-}
-
-fn mutation_multiset(
-    mutations: &[LogicalMutation],
-) -> Result<BTreeMap<Vec<u8>, usize>, StorageError> {
-    let mut multiset = BTreeMap::new();
-    for mutation in mutations {
-        *multiset.entry(encode_mutation(mutation)?).or_default() += 1;
-    }
-    Ok(multiset)
 }
 
 fn same_logical_identity(left: &ReplicaBinding, right: &ReplicaBinding) -> bool {

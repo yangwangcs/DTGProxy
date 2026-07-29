@@ -6,19 +6,21 @@ use std::{
 };
 
 #[cfg(feature = "tck")]
-use std::sync::{Condvar, Mutex};
+use std::sync::{
+    Condvar, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use dtg_storage::{
-    ApplyReceipt, CapabilityManifest, ChangeRecord, CommittedShardBatch, EdgeId, EdgeTombstone,
-    EdgeVersion, LogicalMutation, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore,
-    SnapshotRecord, SnapshotReplayRecord, StorageError, StoreFuture, TemporalReadView,
-    TransactionId, TransactionRecord, VertexTombstone, VertexVersion,
+    ApplyReceipt, CapabilityManifest, CommittedShardBatch, EdgeId, EdgeTombstone, EdgeVersion,
+    LogicalMutation, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError,
+    StoreFuture, TemporalReadView, VertexTombstone, VertexVersion,
 };
-use fjall::{Keyspace, OwnedWriteBatch, PersistMode};
+use fjall::{OwnedWriteBatch, PersistMode};
 
 use crate::{
     codec::{decode_mutation, decode_replay_identity, encode_mutation, encode_replay_identity},
-    namespace::{NamespaceDb, fjall_capabilities, fjall_error},
+    namespace::{NamespaceDb, SNAPSHOT_RESTORE_IN_PROGRESS_KEY, fjall_capabilities, fjall_error},
     read_view::FjallReadView,
 };
 
@@ -32,6 +34,12 @@ struct ReplicaInner {
     injected_failure_after: Mutex<Option<usize>>,
     #[cfg(feature = "tck")]
     graph_pauses: Mutex<BTreeMap<GraphPausePoint, Arc<GraphPauseState>>>,
+    #[cfg(feature = "tck")]
+    snapshot_buffer_high_watermark: AtomicUsize,
+    #[cfg(feature = "tck")]
+    snapshot_writer_buffer_high_watermark: AtomicUsize,
+    #[cfg(feature = "tck")]
+    snapshot_commit_buffer_high_watermark: AtomicUsize,
 }
 
 #[cfg(feature = "tck")]
@@ -143,6 +151,12 @@ impl FjallReplicaStore {
                 injected_failure_after: Mutex::new(None),
                 #[cfg(feature = "tck")]
                 graph_pauses: Mutex::new(BTreeMap::new()),
+                #[cfg(feature = "tck")]
+                snapshot_buffer_high_watermark: AtomicUsize::new(0),
+                #[cfg(feature = "tck")]
+                snapshot_writer_buffer_high_watermark: AtomicUsize::new(0),
+                #[cfg(feature = "tck")]
+                snapshot_commit_buffer_high_watermark: AtomicUsize::new(0),
             }),
         })
     }
@@ -169,6 +183,7 @@ impl FjallReplicaStore {
 
     pub(crate) fn verify_fence(&self, fence: &ReadFence) -> Result<(), StorageError> {
         self.verify_binding(fence.binding())?;
+        self.ensure_no_restore_in_progress()?;
         if fence.capability_digest() != self.inner.binding.capability_digest() {
             return Err(StorageError::CapabilityDrift);
         }
@@ -203,6 +218,23 @@ impl FjallReplicaStore {
             .map(Option::unwrap_or_default)
     }
 
+    fn ensure_no_restore_in_progress(&self) -> Result<(), StorageError> {
+        if self
+            .inner
+            .namespace
+            .owner
+            .get(SNAPSHOT_RESTORE_IN_PROGRESS_KEY)
+            .map_err(fjall_error)?
+            .is_some()
+        {
+            Err(StorageError::CorruptSnapshot(
+                "Fjall snapshot restore is incomplete".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn lock_graph(&self) -> Result<MutexGuard<'_, ()>, StorageError> {
         self.inner.namespace.graph_guard.lock()
     }
@@ -233,6 +265,48 @@ impl FjallReplicaStore {
     }
 
     #[cfg(feature = "tck")]
+    pub fn tck_snapshot_buffer_high_watermark(&self) -> usize {
+        self.inner
+            .snapshot_buffer_high_watermark
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "tck")]
+    pub(crate) fn observe_tck_snapshot_buffer(&self, records: usize) {
+        self.inner
+            .snapshot_buffer_high_watermark
+            .fetch_max(records, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "tck")]
+    pub fn tck_snapshot_writer_buffer_high_watermark(&self) -> usize {
+        self.inner
+            .snapshot_writer_buffer_high_watermark
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "tck")]
+    pub(crate) fn observe_tck_snapshot_writer_buffer(&self, records: usize) {
+        self.inner
+            .snapshot_writer_buffer_high_watermark
+            .fetch_max(records, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "tck")]
+    pub fn tck_snapshot_commit_buffer_high_watermark(&self) -> usize {
+        self.inner
+            .snapshot_commit_buffer_high_watermark
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "tck")]
+    pub(crate) fn observe_tck_snapshot_commit_buffer(&self, records: usize) {
+        self.inner
+            .snapshot_commit_buffer_high_watermark
+            .fetch_max(records, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "tck")]
     fn arm_graph_pause(&self, point: GraphPausePoint) -> Result<FjallGraphPause, StorageError> {
         let state = Arc::new(GraphPauseState::new());
         let mut pauses = lock(&self.inner.graph_pauses)?;
@@ -255,6 +329,18 @@ impl FjallReplicaStore {
     }
 
     #[cfg(feature = "tck")]
+    pub(crate) fn pause_tck_restore_after_owner_check_before_lock(
+        &self,
+    ) -> Result<(), StorageError> {
+        self.pause_graph_at(GraphPausePoint::RestoreAfterOwnerCheckBeforeLock)
+    }
+
+    #[cfg(feature = "tck")]
+    pub(crate) fn pause_tck_restore_before_commit(&self) -> Result<(), StorageError> {
+        self.pause_graph_at(GraphPausePoint::RestoreBeforeCommit)
+    }
+
+    #[cfg(feature = "tck")]
     fn pause_graph_at(&self, point: GraphPausePoint) -> Result<(), StorageError> {
         let pause = lock(&self.inner.graph_pauses)?.remove(&point);
         match pause {
@@ -267,6 +353,7 @@ impl FjallReplicaStore {
         batch.validate()?;
         self.verify_binding(batch.binding())?;
         let _guard = self.lock_graph()?;
+        self.ensure_no_restore_in_progress()?;
         let applied = self.applied_index_sync()?;
         if batch.raft_index() <= applied {
             let replay = self
@@ -339,138 +426,6 @@ impl FjallReplicaStore {
         self.pause_graph_at(GraphPausePoint::ApplyBeforeCommit)?;
         write.commit().map_err(fjall_error)?;
         Ok(ApplyReceipt::new(&batch, false))
-    }
-
-    pub(crate) fn restore_records(
-        &self,
-        records: &[SnapshotRecord],
-        applied_index: u64,
-        stage_keys: &[Vec<u8>],
-        install_marker: Option<&[u8]>,
-    ) -> Result<(), StorageError> {
-        #[cfg(feature = "tck")]
-        self.pause_graph_at(GraphPausePoint::RestoreAfterOwnerCheckBeforeLock)?;
-        let _guard = self.lock_graph()?;
-        self.inner.namespace.ensure_binding(&self.inner.binding)?;
-        let mut history = Vec::new();
-        let mut transactions = Vec::new();
-        let mut metadata = Vec::new();
-        let mut replay = Vec::new();
-        let mut changes = Vec::new();
-        for record in records {
-            match record {
-                SnapshotRecord::Vertex(vertex) => {
-                    history.push(LogicalMutation::PutVertex(vertex.clone()));
-                }
-                SnapshotRecord::VertexTombstone(tombstone) => {
-                    history.push(LogicalMutation::DeleteVertex(tombstone.clone()));
-                }
-                SnapshotRecord::Edge(edge) => {
-                    history.push(LogicalMutation::PutEdge(edge.clone()));
-                }
-                SnapshotRecord::EdgeTombstone(tombstone) => {
-                    history.push(LogicalMutation::DeleteEdge(tombstone.clone()));
-                }
-                SnapshotRecord::Transaction(transaction) => {
-                    transactions.push(transaction.clone());
-                }
-                SnapshotRecord::ReplicaMetadata(record) => metadata.push(record.clone()),
-                SnapshotRecord::Replay(record) => replay.push(record.clone()),
-                SnapshotRecord::Change(record) => changes.push(record.clone()),
-            }
-        }
-        changes.sort_by_key(ChangeRecord::cursor);
-        let authenticated_current = validate_restored_state(
-            &self.inner.binding,
-            applied_index,
-            &history,
-            &transactions,
-            &metadata,
-            &replay,
-            &changes,
-        )?;
-
-        let mut write = self
-            .inner
-            .namespace
-            .db
-            .batch()
-            .durability(Some(PersistMode::SyncAll));
-        clear_logical_state(&self.inner.namespace, &mut write)?;
-        for change in &changes {
-            if is_graph_mutation(change.mutation()) {
-                stage_history_mutation(
-                    &self.inner.namespace,
-                    &mut write,
-                    change.raft_index(),
-                    change.mutation_ordinal(),
-                    change.mutation(),
-                )?;
-            }
-        }
-        for transaction in authenticated_current.transactions.values() {
-            let mutation = LogicalMutation::PutTransaction(transaction.clone());
-            stage_current_mutation(
-                &self.inner.namespace,
-                &mut write,
-                &mutation,
-                &mut EdgeAdjacencyState::default(),
-            )?;
-        }
-        for record in authenticated_current.metadata.values() {
-            let mutation = LogicalMutation::PutReplicaMetadata(record.clone());
-            stage_current_mutation(
-                &self.inner.namespace,
-                &mut write,
-                &mutation,
-                &mut EdgeAdjacencyState::default(),
-            )?;
-        }
-        for record in &replay {
-            write.insert(
-                &self.inner.namespace.identity,
-                record.raft_index().to_be_bytes(),
-                encode_replay_identity(
-                    record.raft_term(),
-                    record.command_id(),
-                    record.mutation_digest(),
-                )?,
-            );
-        }
-        let mut adjacency = EdgeAdjacencyState::default();
-        for change in &changes {
-            write.insert(
-                &self.inner.namespace.temporal_index,
-                change_key(change.raft_index(), change.mutation_ordinal()),
-                encode_mutation(change.mutation())?,
-            );
-            if is_graph_mutation(change.mutation()) {
-                stage_current_mutation(
-                    &self.inner.namespace,
-                    &mut write,
-                    change.mutation(),
-                    &mut adjacency,
-                )?;
-            }
-        }
-        for key in stage_keys {
-            write.remove(&self.inner.namespace.snapshot_stage, key);
-        }
-        write.insert(
-            &self.inner.namespace.replica_meta,
-            APPLIED_INDEX_KEY,
-            applied_index.to_be_bytes(),
-        );
-        if let Some(marker) = install_marker {
-            write.insert(
-                &self.inner.namespace.owner,
-                crate::namespace::SNAPSHOT_INSTALL_KEY,
-                marker,
-            );
-        }
-        #[cfg(feature = "tck")]
-        self.pause_graph_at(GraphPausePoint::RestoreBeforeCommit)?;
-        write.commit().map_err(fjall_error)
     }
 }
 
@@ -651,214 +606,6 @@ fn stage_current_mutation(
     Ok(())
 }
 
-struct AuthenticatedCurrentState {
-    transactions: BTreeMap<TransactionId, TransactionRecord>,
-    metadata: BTreeMap<String, ReplicaMetadata>,
-}
-
-fn validate_restored_state(
-    binding: &ReplicaBinding,
-    applied_index: u64,
-    history: &[LogicalMutation],
-    transactions: &[TransactionRecord],
-    metadata: &[ReplicaMetadata],
-    replay: &[SnapshotReplayRecord],
-    changes: &[ChangeRecord],
-) -> Result<AuthenticatedCurrentState, StorageError> {
-    let mut replay_indices = replay
-        .iter()
-        .map(SnapshotReplayRecord::raft_index)
-        .collect::<Vec<_>>();
-    replay_indices.sort_unstable();
-    replay_indices.dedup();
-    if replay_indices.len() != replay.len() || replay_indices.iter().copied().ne(1..=applied_index)
-    {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot replay identities are not contiguous through the applied index".into(),
-        ));
-    }
-    let replay_indices = replay_indices.into_iter().collect::<BTreeSet<_>>();
-    let mut cursors = changes.iter().map(ChangeRecord::cursor).collect::<Vec<_>>();
-    cursors.sort_unstable();
-    if cursors.windows(2).any(|pair| pair[0] == pair[1])
-        || cursors
-            .iter()
-            .any(|cursor| !replay_indices.contains(&cursor.raft_index()))
-    {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot change ordering is duplicated or lacks replay identity".into(),
-        ));
-    }
-    let mut expected = BTreeMap::<u64, u64>::new();
-    for cursor in cursors {
-        let ordinal = expected.entry(cursor.raft_index()).or_default();
-        if cursor.mutation_ordinal() != *ordinal {
-            return Err(StorageError::CorruptSnapshot(
-                "snapshot change ordinals are not contiguous".into(),
-            ));
-        }
-        *ordinal += 1;
-    }
-    let replay_by_index = replay
-        .iter()
-        .map(|record| (record.raft_index(), record))
-        .collect::<BTreeMap<_, _>>();
-    let mut mutations_by_index = BTreeMap::<u64, Vec<LogicalMutation>>::new();
-    for change in changes {
-        mutations_by_index
-            .entry(change.raft_index())
-            .or_default()
-            .push(change.mutation().clone());
-    }
-    for index in 1..=applied_index {
-        let replay = replay_by_index.get(&index).ok_or_else(|| {
-            StorageError::CorruptSnapshot("snapshot replay identity is missing".into())
-        })?;
-        let mutations = mutations_by_index.get(&index).ok_or_else(|| {
-            StorageError::CorruptSnapshot("snapshot committed batch has no changes".into())
-        })?;
-        let batch = CommittedShardBatch::new(
-            binding.clone(),
-            replay.raft_term(),
-            index,
-            replay.command_id(),
-            mutations.clone(),
-        )
-        .map_err(|error| {
-            StorageError::CorruptSnapshot(format!(
-                "snapshot committed batch cannot be reconstructed: {error}"
-            ))
-        })?;
-        if batch.mutation_digest() != replay.mutation_digest() {
-            return Err(StorageError::CorruptSnapshot(format!(
-                "snapshot change digest does not match replay identity at Raft index {index}"
-            )));
-        }
-    }
-    let supplied_history = graph_history_multiset(history.iter())?;
-    let authenticated_history = graph_history_multiset(changes.iter().map(ChangeRecord::mutation))?;
-    if supplied_history != authenticated_history {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot graph history does not match authenticated changes".into(),
-        ));
-    }
-    let supplied_transactions = unique_transaction_map(transactions)?;
-    let supplied_metadata = unique_metadata_map(metadata)?;
-    let mut authenticated_transactions = BTreeMap::new();
-    let mut authenticated_metadata = BTreeMap::new();
-    for change in changes {
-        match change.mutation() {
-            LogicalMutation::PutTransaction(transaction) => {
-                authenticated_transactions.insert(transaction.id(), transaction.clone());
-            }
-            LogicalMutation::PutReplicaMetadata(metadata) => {
-                authenticated_metadata.insert(metadata.name().to_owned(), metadata.clone());
-            }
-            LogicalMutation::PutVertex(_)
-            | LogicalMutation::DeleteVertex(_)
-            | LogicalMutation::PutEdge(_)
-            | LogicalMutation::DeleteEdge(_) => {}
-        }
-    }
-    if supplied_transactions != authenticated_transactions {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot transaction state does not match authenticated changes".into(),
-        ));
-    }
-    if supplied_metadata != authenticated_metadata {
-        return Err(StorageError::CorruptSnapshot(
-            "snapshot replica metadata does not match authenticated changes".into(),
-        ));
-    }
-    Ok(AuthenticatedCurrentState {
-        transactions: authenticated_transactions,
-        metadata: authenticated_metadata,
-    })
-}
-
-fn unique_transaction_map(
-    transactions: &[TransactionRecord],
-) -> Result<BTreeMap<TransactionId, TransactionRecord>, StorageError> {
-    let mut records = BTreeMap::new();
-    for transaction in transactions {
-        if records
-            .insert(transaction.id(), transaction.clone())
-            .is_some()
-        {
-            return Err(StorageError::CorruptSnapshot(
-                "snapshot transaction state contains duplicate identifiers".into(),
-            ));
-        }
-    }
-    Ok(records)
-}
-
-fn unique_metadata_map(
-    metadata: &[ReplicaMetadata],
-) -> Result<BTreeMap<String, ReplicaMetadata>, StorageError> {
-    let mut records = BTreeMap::new();
-    for record in metadata {
-        if records
-            .insert(record.name().to_owned(), record.clone())
-            .is_some()
-        {
-            return Err(StorageError::CorruptSnapshot(
-                "snapshot replica metadata contains duplicate names".into(),
-            ));
-        }
-    }
-    Ok(records)
-}
-
-fn graph_history_multiset<'a>(
-    mutations: impl Iterator<Item = &'a LogicalMutation>,
-) -> Result<BTreeMap<Vec<u8>, usize>, StorageError> {
-    let mut multiset = BTreeMap::new();
-    for mutation in mutations.filter(|mutation| is_graph_mutation(mutation)) {
-        *multiset.entry(encode_mutation(mutation)?).or_default() += 1;
-    }
-    Ok(multiset)
-}
-
-fn is_graph_mutation(mutation: &LogicalMutation) -> bool {
-    matches!(
-        mutation,
-        LogicalMutation::PutVertex(_)
-            | LogicalMutation::DeleteVertex(_)
-            | LogicalMutation::PutEdge(_)
-            | LogicalMutation::DeleteEdge(_)
-    )
-}
-
-fn clear_logical_state(
-    namespace: &NamespaceDb,
-    write: &mut OwnedWriteBatch,
-) -> Result<(), StorageError> {
-    for keyspace in [
-        &namespace.identity,
-        &namespace.current_vertex,
-        &namespace.current_edge,
-        &namespace.history,
-        &namespace.adjacency_out,
-        &namespace.adjacency_in,
-        &namespace.temporal_index,
-        &namespace.transaction,
-        &namespace.replica_meta,
-    ] {
-        for key in keyspace_keys(keyspace)? {
-            write.remove(keyspace, key);
-        }
-    }
-    Ok(())
-}
-
-fn keyspace_keys(keyspace: &Keyspace) -> Result<Vec<Vec<u8>>, StorageError> {
-    keyspace
-        .iter()
-        .map(|item| item.key().map(|key| key.to_vec()).map_err(fjall_error))
-        .collect()
-}
-
 fn clean_adjacency(
     namespace: &NamespaceDb,
     write: &mut OwnedWriteBatch,
@@ -869,14 +616,15 @@ fn clean_adjacency(
         return Ok(());
     }
     for keyspace in [&namespace.adjacency_out, &namespace.adjacency_in] {
-        for key in keyspace_keys(keyspace)? {
+        for item in keyspace.iter() {
+            let (key, _) = item.into_inner().map_err(fjall_error)?;
             if key.len() != 48 {
                 return Err(StorageError::Internal(
                     "invalid stored adjacency key".into(),
                 ));
             }
             if key[16..32] == edge_id.get().to_be_bytes() {
-                write.remove(keyspace, key);
+                write.remove(keyspace, key.as_ref());
             }
         }
     }

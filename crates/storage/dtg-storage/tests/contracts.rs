@@ -181,8 +181,20 @@ fn snapshot_manifest_digest_includes_the_complete_source_binding() {
         .build()
         .unwrap();
     let snapshot_id = SnapshotRequest::new(44, 2).unwrap().snapshot_id();
-    let first_header = SnapshotHeader::new(snapshot_id, first_binding, 8, 1).unwrap();
-    let second_header = SnapshotHeader::new(snapshot_id, second_binding, 8, 1).unwrap();
+    let first_header = SnapshotHeader::new(
+        snapshot_id,
+        first_binding,
+        8,
+        SUPPORTED_SNAPSHOT_FORMAT_VERSION,
+    )
+    .unwrap();
+    let second_header = SnapshotHeader::new(
+        snapshot_id,
+        second_binding,
+        8,
+        SUPPORTED_SNAPSHOT_FORMAT_VERSION,
+    )
+    .unwrap();
     let chunks = vec![
         SnapshotChunk::new(
             snapshot_id,
@@ -238,6 +250,16 @@ fn snapshot_manifest_can_be_computed_incrementally_without_retaining_chunks() {
 }
 
 #[test]
+fn snapshot_manifest_builder_has_fixed_memory_independent_of_chunk_count() {
+    assert!(
+        std::mem::size_of::<SnapshotManifestBuilder>()
+            <= std::mem::size_of::<SnapshotHeader>() + 32,
+        "the manifest builder must retain only fixed-size hashing state; actual size is {}",
+        std::mem::size_of::<SnapshotManifestBuilder>()
+    );
+}
+
+#[test]
 fn capability_drift_rejects_read_views_and_snapshots() {
     let factory = TestFactory::new();
     let store_binding = binding("capability-drift", 1);
@@ -284,7 +306,11 @@ fn unknown_snapshot_and_pushdown_versions_fail_closed() {
     let store_binding = binding("unknown-formats", 1);
     let snapshot_id = SnapshotRequest::new(46, 2).unwrap().snapshot_id();
     assert!(matches!(
-        SnapshotHeader::new(snapshot_id, store_binding.clone(), 0, 2),
+        SnapshotHeader::new(snapshot_id, store_binding.clone(), 0, 1),
+        Err(StorageError::CorruptSnapshot(_))
+    ));
+    assert!(matches!(
+        SnapshotHeader::new(snapshot_id, store_binding.clone(), 0, 3),
         Err(StorageError::CorruptSnapshot(_))
     ));
     assert!(matches!(
@@ -304,7 +330,7 @@ fn unknown_snapshot_and_pushdown_versions_fail_closed() {
 
 #[test]
 fn supported_wire_versions_are_explicit_and_consensus_is_enveloped() {
-    assert_eq!(SUPPORTED_SNAPSHOT_FORMAT_VERSION, 1);
+    assert_eq!(SUPPORTED_SNAPSHOT_FORMAT_VERSION, 2);
     assert_eq!(SUPPORTED_PUSHDOWN_CONTRACT_VERSION, 1);
     assert_eq!(SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, 1);
     assert_eq!(SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, 1);
@@ -1359,7 +1385,7 @@ impl LogicalSnapshotSource for TestStore {
                 request.snapshot_id(),
                 self.binding.clone(),
                 state.applied_index,
-                1,
+                SUPPORTED_SNAPSHOT_FORMAT_VERSION,
             )?;
             let mut records = state
                 .history

@@ -6,8 +6,9 @@ use dtg_storage::{
     ConsensusEntry, ConsensusSnapshotInstall, ConsensusSnapshotMetadata, Digest32, EdgeId,
     EdgeTombstone, EdgeVersion, LogicalMutation, LogicalSnapshotCandidateReceipt, ProviderKind,
     RaftHardState, RaftMembership, ReplicaBinding, ReplicaMetadata, SnapshotHeader, SnapshotId,
-    SnapshotManifest, StorageError, TransactionId, TransactionRecord, TransactionState,
-    TransactionTime, ValidInterval, Value, Version, VertexId, VertexTombstone, VertexVersion,
+    SnapshotManifest, SnapshotRecord, SnapshotReplayRecord, StorageError, TransactionId,
+    TransactionRecord, TransactionState, TransactionTime, ValidInterval, Value, Version, VertexId,
+    VertexTombstone, VertexVersion,
 };
 
 const CODEC_VERSION: u32 = 1;
@@ -352,6 +353,154 @@ pub(crate) fn decode_mutation(bytes: &[u8]) -> Result<LogicalMutation, StorageEr
         )),
         WireMutation::PutReplicaMetadata(metadata) => Ok(LogicalMutation::PutReplicaMetadata(
             ReplicaMetadata::new(metadata.name, Value::from(metadata.value))?,
+        )),
+    }
+}
+
+#[derive(Encode, Decode)]
+struct VersionedSnapshotRecord {
+    version: u32,
+    kind: u8,
+    mutation: Vec<u8>,
+    raft_index: u64,
+    raft_term_or_ordinal: u64,
+    command_id: u128,
+    digest: [u8; 32],
+}
+
+pub(crate) fn encode_snapshot_record(record: &SnapshotRecord) -> Result<Vec<u8>, StorageError> {
+    let (kind, mutation, raft_index, raft_term_or_ordinal, command_id, digest) = match record {
+        SnapshotRecord::Vertex(value) => (
+            1,
+            encode_mutation(&LogicalMutation::PutVertex(value.clone()))?,
+            0,
+            0,
+            0,
+            [0; 32],
+        ),
+        SnapshotRecord::VertexTombstone(value) => (
+            2,
+            encode_mutation(&LogicalMutation::DeleteVertex(value.clone()))?,
+            0,
+            0,
+            0,
+            [0; 32],
+        ),
+        SnapshotRecord::Edge(value) => (
+            3,
+            encode_mutation(&LogicalMutation::PutEdge(value.clone()))?,
+            0,
+            0,
+            0,
+            [0; 32],
+        ),
+        SnapshotRecord::EdgeTombstone(value) => (
+            4,
+            encode_mutation(&LogicalMutation::DeleteEdge(value.clone()))?,
+            0,
+            0,
+            0,
+            [0; 32],
+        ),
+        SnapshotRecord::Transaction(value) => (
+            5,
+            encode_mutation(&LogicalMutation::PutTransaction(value.clone()))?,
+            0,
+            0,
+            0,
+            [0; 32],
+        ),
+        SnapshotRecord::ReplicaMetadata(value) => (
+            6,
+            encode_mutation(&LogicalMutation::PutReplicaMetadata(value.clone()))?,
+            0,
+            0,
+            0,
+            [0; 32],
+        ),
+        SnapshotRecord::Replay(value) => (
+            7,
+            Vec::new(),
+            value.raft_index(),
+            value.raft_term(),
+            value.command_id().get(),
+            value.mutation_digest().get(),
+        ),
+        SnapshotRecord::Change(value) => (
+            8,
+            encode_mutation(value.mutation())?,
+            value.raft_index(),
+            value.mutation_ordinal(),
+            0,
+            [0; 32],
+        ),
+    };
+    encode(&VersionedSnapshotRecord {
+        version: CODEC_VERSION,
+        kind,
+        mutation,
+        raft_index,
+        raft_term_or_ordinal,
+        command_id,
+        digest,
+    })
+}
+
+pub(crate) fn decode_snapshot_record(bytes: &[u8]) -> Result<SnapshotRecord, StorageError> {
+    let wire: VersionedSnapshotRecord = decode(bytes)?;
+    require_version(wire.version, "snapshot record")?;
+    let mutation = || decode_mutation(&wire.mutation);
+    match wire.kind {
+        1 => match mutation()? {
+            LogicalMutation::PutVertex(value) => Ok(SnapshotRecord::Vertex(value)),
+            _ => Err(StorageError::CorruptSnapshot(
+                "invalid Fjall vertex snapshot record".into(),
+            )),
+        },
+        2 => match mutation()? {
+            LogicalMutation::DeleteVertex(value) => Ok(SnapshotRecord::VertexTombstone(value)),
+            _ => Err(StorageError::CorruptSnapshot(
+                "invalid Fjall vertex tombstone record".into(),
+            )),
+        },
+        3 => match mutation()? {
+            LogicalMutation::PutEdge(value) => Ok(SnapshotRecord::Edge(value)),
+            _ => Err(StorageError::CorruptSnapshot(
+                "invalid Fjall edge snapshot record".into(),
+            )),
+        },
+        4 => match mutation()? {
+            LogicalMutation::DeleteEdge(value) => Ok(SnapshotRecord::EdgeTombstone(value)),
+            _ => Err(StorageError::CorruptSnapshot(
+                "invalid Fjall edge tombstone record".into(),
+            )),
+        },
+        5 => match mutation()? {
+            LogicalMutation::PutTransaction(value) => Ok(SnapshotRecord::Transaction(value)),
+            _ => Err(StorageError::CorruptSnapshot(
+                "invalid Fjall transaction snapshot record".into(),
+            )),
+        },
+        6 => match mutation()? {
+            LogicalMutation::PutReplicaMetadata(value) => {
+                Ok(SnapshotRecord::ReplicaMetadata(value))
+            }
+            _ => Err(StorageError::CorruptSnapshot(
+                "invalid Fjall metadata snapshot record".into(),
+            )),
+        },
+        7 if wire.mutation.is_empty() => Ok(SnapshotRecord::Replay(SnapshotReplayRecord::new(
+            wire.raft_index,
+            wire.raft_term_or_ordinal,
+            CommandId::new(wire.command_id)?,
+            Digest32::new(wire.digest),
+        )?)),
+        8 => Ok(SnapshotRecord::Change(dtg_storage::ChangeRecord::new(
+            dtg_storage::ChangeCursor::new(wire.raft_index, wire.raft_term_or_ordinal),
+            mutation()?,
+        ))),
+        _ => Err(StorageError::CorruptSnapshot(
+            "unknown Fjall snapshot record kind".into(),
         )),
     }
 }

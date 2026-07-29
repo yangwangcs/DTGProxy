@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use dtg_storage::{
     AdjacencyRead, ChangeCursor, ChangePage, ChangeRecord, ChangesRead, EdgeHistoryRead, EdgeId,
-    EdgeRead, EdgeScan, EdgeVersion, LogicalMutation, ReadFence, ScanPage, SnapshotReplayRecord,
-    StorageError, StoreFuture, TemporalReadView, TransactionRecord, VertexHistoryRead, VertexId,
-    VertexRead, VertexScan, VertexVersion,
+    EdgeRead, EdgeScan, EdgeVersion, LogicalMutation, ReadFence, ScanPage, StorageError,
+    StoreFuture, TemporalReadView, VertexHistoryRead, VertexId, VertexRead, VertexScan,
+    VertexVersion,
 };
 use fjall::Readable;
 
@@ -14,9 +14,6 @@ pub(crate) struct FjallReadView {
     fence: ReadFence,
     history: Vec<LogicalMutation>,
     changes: Vec<ChangeRecord>,
-    replay: Vec<SnapshotReplayRecord>,
-    transactions: Vec<TransactionRecord>,
-    metadata: Vec<dtg_storage::ReplicaMetadata>,
 }
 
 impl FjallReadView {
@@ -57,106 +54,11 @@ impl FjallReadView {
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let replay = snapshot
-            .iter(&store.namespace().identity)
-            .map(|item| {
-                let (key, value) = item.into_inner().map_err(fjall_error)?;
-                let raft_index = u64::from_be_bytes(
-                    key.as_ref()
-                        .try_into()
-                        .map_err(|_| StorageError::Internal("invalid replay index key".into()))?,
-                );
-                let replay = crate::codec::decode_replay_identity(&value)?;
-                SnapshotReplayRecord::new(
-                    raft_index,
-                    replay.term,
-                    replay.command_id,
-                    replay.mutation_digest,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let transactions = snapshot
-            .iter(&store.namespace().transaction)
-            .map(|item| {
-                let (_, value) = item.into_inner().map_err(fjall_error)?;
-                match decode_mutation(&value)? {
-                    LogicalMutation::PutTransaction(record) => Ok(record),
-                    _ => Err(StorageError::Internal(
-                        "non-transaction value in transaction partition".into(),
-                    )),
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let metadata = snapshot
-            .prefix(&store.namespace().replica_meta, b"user/")
-            .map(|item| {
-                let (_, value) = item.into_inner().map_err(fjall_error)?;
-                match decode_mutation(&value)? {
-                    LogicalMutation::PutReplicaMetadata(record) => Ok(record),
-                    _ => Err(StorageError::Internal(
-                        "non-metadata value in replica metadata partition".into(),
-                    )),
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             fence,
             history,
             changes,
-            replay,
-            transactions,
-            metadata,
         })
-    }
-
-    pub(crate) fn snapshot_records(&self) -> Vec<dtg_storage::SnapshotRecord> {
-        let mut records = Vec::new();
-        for mutation in &self.history {
-            match mutation {
-                LogicalMutation::PutVertex(vertex) => {
-                    records.push(dtg_storage::SnapshotRecord::Vertex(vertex.clone()));
-                }
-                LogicalMutation::DeleteVertex(tombstone) => {
-                    records.push(dtg_storage::SnapshotRecord::VertexTombstone(
-                        tombstone.clone(),
-                    ));
-                }
-                LogicalMutation::PutEdge(edge) => {
-                    records.push(dtg_storage::SnapshotRecord::Edge(edge.clone()));
-                }
-                LogicalMutation::DeleteEdge(tombstone) => {
-                    records.push(dtg_storage::SnapshotRecord::EdgeTombstone(
-                        tombstone.clone(),
-                    ));
-                }
-                LogicalMutation::PutTransaction(_) | LogicalMutation::PutReplicaMetadata(_) => {}
-            }
-        }
-        records.extend(
-            self.transactions
-                .iter()
-                .cloned()
-                .map(dtg_storage::SnapshotRecord::Transaction),
-        );
-        records.extend(
-            self.metadata
-                .iter()
-                .cloned()
-                .map(dtg_storage::SnapshotRecord::ReplicaMetadata),
-        );
-        records.extend(
-            self.replay
-                .iter()
-                .cloned()
-                .map(dtg_storage::SnapshotRecord::Replay),
-        );
-        records.extend(
-            self.changes
-                .iter()
-                .cloned()
-                .map(dtg_storage::SnapshotRecord::Change),
-        );
-        records
     }
 
     fn visible_vertex(&self, request: &VertexRead) -> Option<VertexVersion> {

@@ -7,7 +7,7 @@ use crate::{
     mutation::{encode_edge, encode_metadata, encode_mutation, encode_transaction, encode_vertex},
 };
 
-pub const SUPPORTED_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub const SUPPORTED_SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub struct SnapshotId(u128);
@@ -276,16 +276,18 @@ pub struct SnapshotManifestBuilder {
     header: SnapshotHeader,
     next_ordinal: u64,
     record_count: u64,
-    chunk_digests: Vec<Digest32>,
+    chunk_digest_hasher: Box<blake3::Hasher>,
 }
 
 impl SnapshotManifestBuilder {
-    pub const fn new(header: SnapshotHeader) -> Self {
+    pub fn new(header: SnapshotHeader) -> Self {
+        let mut chunk_digest_hasher = blake3::Hasher::new();
+        chunk_digest_hasher.update(b"dtg-logical-snapshot-manifest-chunks-v2");
         Self {
             header,
             next_ordinal: 0,
             record_count: 0,
-            chunk_digests: Vec::new(),
+            chunk_digest_hasher: Box::new(chunk_digest_hasher),
         }
     }
 
@@ -301,7 +303,7 @@ impl SnapshotManifestBuilder {
             .record_count
             .checked_add(chunk.records().len() as u64)
             .ok_or_else(|| StorageError::CorruptSnapshot("record count overflow".into()))?;
-        self.chunk_digests.push(chunk.digest);
+        self.chunk_digest_hasher.update(&chunk.digest.get());
         self.next_ordinal += 1;
         Ok(())
     }
@@ -311,11 +313,12 @@ impl SnapshotManifestBuilder {
     }
 
     pub fn finish(self) -> SnapshotManifest {
+        let chunk_digest = Digest32::new(*self.chunk_digest_hasher.finalize().as_bytes());
         SnapshotManifest {
             snapshot_id: self.header.snapshot_id(),
             chunk_count: self.next_ordinal,
             record_count: self.record_count,
-            content_digest: digest_manifest_digests(&self.header, &self.chunk_digests),
+            content_digest: digest_manifest_summary(&self.header, self.next_ordinal, chunk_digest),
         }
     }
 }
@@ -578,17 +581,19 @@ fn digest_chunk(snapshot_id: SnapshotId, ordinal: u64, records: &[SnapshotRecord
     Digest32::new(*hasher.finalize().as_bytes())
 }
 
-fn digest_manifest_digests(header: &SnapshotHeader, digests: &[Digest32]) -> Digest32 {
+fn digest_manifest_summary(
+    header: &SnapshotHeader,
+    chunk_count: u64,
+    chunk_digest: Digest32,
+) -> Digest32 {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"dtg-logical-snapshot-manifest-v1");
+    hasher.update(b"dtg-logical-snapshot-manifest-v2");
     hasher.update(&header.snapshot_id.get().to_be_bytes());
     hasher.update(&header.source_binding.identity_digest().get());
     hasher.update(&header.applied_index.to_be_bytes());
     hasher.update(&header.format_version.to_be_bytes());
-    hasher.update(&(digests.len() as u64).to_be_bytes());
-    for digest in digests {
-        hasher.update(&digest.get());
-    }
+    hasher.update(&chunk_count.to_be_bytes());
+    hasher.update(&chunk_digest.get());
     Digest32::new(*hasher.finalize().as_bytes())
 }
 
