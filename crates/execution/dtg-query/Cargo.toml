@@ -5,5 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+dtg-kernel = { path = "../../kernel/dtg-kernel" }
+dtg-language-ir = { path = "../../language/dtg-language-ir" }
+dtg-storage = { path = "../../storage/dtg-storage" }
+
 [lints]
 workspace = true
