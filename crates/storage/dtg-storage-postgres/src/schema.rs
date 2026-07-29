@@ -151,7 +151,20 @@ pub(crate) async fn verify_owner(
     }
 }
 
-async fn load_owner(client: &Client, lock: bool) -> Result<ReplicaBinding, StorageError> {
+pub(crate) fn ensure_serving_binding(binding: &ReplicaBinding) -> Result<(), StorageError> {
+    if binding.role() == BindingRole::Active {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidBinding(
+            "PostgreSQL candidate and retiring replicas are non-serving".into(),
+        ))
+    }
+}
+
+pub(crate) async fn load_owner(
+    client: &Client,
+    lock: bool,
+) -> Result<ReplicaBinding, StorageError> {
     let suffix = if lock { " FOR UPDATE" } else { "" };
     let row = client
         .query_opt(
@@ -268,7 +281,7 @@ pub(crate) fn decode_digest(bytes: &[u8]) -> Result<Digest32, StorageError> {
     })?))
 }
 
-fn role_tag(role: BindingRole) -> i16 {
+pub(crate) fn role_tag(role: BindingRole) -> i16 {
     match role {
         BindingRole::Candidate => 1,
         BindingRole::Active => 2,

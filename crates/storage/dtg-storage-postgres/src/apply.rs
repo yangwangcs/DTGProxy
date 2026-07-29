@@ -8,8 +8,8 @@ use crate::{
     codec::{encode_mutation, encode_properties, encode_value, mutation_kind},
     config::postgres_error,
     schema::{
-        decode_digest, decode_u64, decode_u128, finish_transaction, read_applied_index, u64_bytes,
-        u128_bytes, verify_owner,
+        decode_digest, decode_u64, decode_u128, ensure_serving_binding, finish_transaction,
+        read_applied_index, u64_bytes, u128_bytes, verify_owner,
     },
 };
 
@@ -44,6 +44,7 @@ async fn apply_in_transaction(
     failure_after: Option<usize>,
 ) -> Result<ApplyReceipt, StorageError> {
     verify_owner(client, store.binding_ref(), true).await?;
+    ensure_serving_binding(store.binding_ref())?;
     let applied = read_applied_index(client).await?;
     if batch.raft_index() <= applied {
         return verify_replay(client, batch).await;

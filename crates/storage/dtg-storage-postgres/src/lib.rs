@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use dtg_storage::{
     ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommittedShardBatch,
+    LogicalReplicaActivation, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,
     LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
     ProviderKind, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest, ReadFence,
     ReplicaBinding, ReplicaMetadata, ReplicaStateStore, SnapshotHeader, SnapshotRecord,
@@ -23,8 +24,9 @@ use tokio_postgres::Client;
 pub use config::PostgresConfig;
 use read_view::PostgresReadView;
 use schema::{
-    POSTGRES_CONTRACT_VERSION, POSTGRES_LAYOUT_VERSION, initialize_namespace,
-    postgres_capabilities, read_applied_index, validate_postgres_binding, verify_owner,
+    POSTGRES_CONTRACT_VERSION, POSTGRES_LAYOUT_VERSION, ensure_serving_binding,
+    initialize_namespace, postgres_capabilities, read_applied_index, validate_postgres_binding,
+    verify_owner,
 };
 
 pub const CLEAN_BREAK_ARCHITECTURE_VERSION: u32 = 1;
@@ -109,6 +111,7 @@ impl PostgresReplicaStore {
             .map_err(config::postgres_error)?;
         let result = async {
             verify_owner(&client, self.binding_ref(), false).await?;
+            ensure_serving_binding(self.binding_ref())?;
             let applied = read_applied_index(&client).await?;
             if applied != fence.applied_index() {
                 return Err(StorageError::ReadFenceUnavailable {
@@ -138,6 +141,7 @@ impl ReplicaStateStore for PostgresReplicaStore {
         Box::pin(async move {
             let client = self.connect().await?;
             verify_owner(&client, self.binding_ref(), false).await?;
+            ensure_serving_binding(self.binding_ref())?;
             read_applied_index(&client).await
         })
     }
@@ -146,6 +150,7 @@ impl ReplicaStateStore for PostgresReplicaStore {
         Box::pin(async move {
             let client = self.connect().await?;
             verify_owner(&client, self.binding_ref(), false).await?;
+            ensure_serving_binding(self.binding_ref())?;
             let row = client
                 .query_opt(
                     "SELECT value FROM replica_metadata WHERE name = $1",
@@ -191,6 +196,16 @@ impl LogicalSnapshotSink for PostgresReplicaStore {
         header: SnapshotHeader,
     ) -> StoreFuture<'_, Box<dyn LogicalSnapshotWriter>> {
         Box::pin(async move { snapshot::snapshot_writer(self, binding, header).await })
+    }
+}
+
+impl LogicalReplicaActivation for PostgresReplicaStore {
+    fn activate_candidate(
+        &self,
+        candidate: LogicalSnapshotCandidateReceipt,
+        active_binding: ReplicaBinding,
+    ) -> StoreFuture<'_, LogicalReplicaActivationReceipt> {
+        Box::pin(async move { snapshot::activate_candidate(self, candidate, active_binding).await })
     }
 }
 

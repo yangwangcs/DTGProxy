@@ -139,3 +139,26 @@ CREATE TABLE IF NOT EXISTS snapshot_stage (
     record_count BIGINT NOT NULL CHECK (record_count > 0),
     PRIMARY KEY (snapshot_id, chunk_ordinal)
 );
+
+CREATE TABLE IF NOT EXISTS snapshot_install (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    candidate_binding_digest BYTEA NOT NULL CHECK (octet_length(candidate_binding_digest) = 32),
+    snapshot_id BYTEA NOT NULL CHECK (octet_length(snapshot_id) = 16),
+    applied_index BYTEA NOT NULL CHECK (octet_length(applied_index) = 8),
+    format_version INTEGER NOT NULL CHECK (format_version > 0),
+    chunk_count BYTEA NOT NULL CHECK (octet_length(chunk_count) = 8),
+    record_count BYTEA NOT NULL CHECK (octet_length(record_count) = 8),
+    content_digest BYTEA NOT NULL CHECK (octet_length(content_digest) = 32)
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_activation (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    candidate_binding_digest BYTEA NOT NULL CHECK (octet_length(candidate_binding_digest) = 32),
+    active_binding_digest BYTEA NOT NULL CHECK (octet_length(active_binding_digest) = 32),
+    snapshot_id BYTEA NOT NULL CHECK (octet_length(snapshot_id) = 16),
+    applied_index BYTEA NOT NULL CHECK (octet_length(applied_index) = 8),
+    format_version INTEGER NOT NULL CHECK (format_version > 0),
+    chunk_count BYTEA NOT NULL CHECK (octet_length(chunk_count) = 8),
+    record_count BYTEA NOT NULL CHECK (octet_length(record_count) = 8),
+    content_digest BYTEA NOT NULL CHECK (octet_length(content_digest) = 32)
+);

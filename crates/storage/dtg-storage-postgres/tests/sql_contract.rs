@@ -101,3 +101,53 @@ fn provider_queries_are_parameterized_and_do_not_materialize_the_namespace() {
     assert!(read_view.contains("limit $4") || read_view.contains("limit $5"));
     assert!(!read_view.contains("load_all_entries"));
 }
+
+#[test]
+fn schema_persists_complete_candidate_install_and_activation_fences() {
+    let normalized = SCHEMA.to_ascii_lowercase();
+    for table in ["snapshot_install", "snapshot_activation"] {
+        assert!(
+            normalized.contains(&format!("create table if not exists {table}")),
+            "native schema is missing {table}"
+        );
+    }
+    for column in [
+        "candidate_binding_digest",
+        "active_binding_digest",
+        "snapshot_id",
+        "applied_index",
+        "format_version",
+        "chunk_count",
+        "record_count",
+        "content_digest",
+    ] {
+        assert!(
+            normalized.contains(column),
+            "activation schema is missing {column}"
+        );
+    }
+}
+
+#[test]
+fn candidate_commit_persists_marker_in_the_restore_transaction() {
+    let snapshot = include_str!("../src/snapshot.rs").to_ascii_lowercase();
+    assert!(snapshot.contains("bindingrole::candidate"));
+    assert!(snapshot.contains("insert into snapshot_install"));
+    assert!(snapshot.contains("manifest.chunk_count()"));
+    assert!(snapshot.contains("manifest.record_count()"));
+    assert!(snapshot.contains("manifest.content_digest()"));
+    assert!(snapshot.contains("verify_staged_chunks"));
+}
+
+#[test]
+fn activation_is_serializable_durable_locked_and_consumes_the_install_marker() {
+    let store = include_str!("../src/lib.rs").to_ascii_lowercase();
+    let snapshot = include_str!("../src/snapshot.rs").to_ascii_lowercase();
+    assert!(store.contains("impl logicalreplicaactivation for postgresreplicastore"));
+    assert!(snapshot.contains("begin isolation level serializable"));
+    assert!(snapshot.contains("set local synchronous_commit = on"));
+    assert!(snapshot.contains("load_owner(&client, true)"));
+    assert!(snapshot.contains("update replica_owner"));
+    assert!(snapshot.contains("delete from snapshot_install"));
+    assert!(snapshot.contains("insert into snapshot_activation"));
+}

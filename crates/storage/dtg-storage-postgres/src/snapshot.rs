@@ -1,18 +1,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dtg_storage::{
-    ChangeRecord, CommittedShardBatch, LogicalMutation, LogicalSnapshotReader,
+    BindingRole, ChangeRecord, CommittedShardBatch, Digest32, LogicalMutation,
+    LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, LogicalSnapshotReader,
     LogicalSnapshotWriter, ReadFence, ReplicaBinding, ReplicaMetadata, SnapshotChunk,
     SnapshotHeader, SnapshotManifest, SnapshotRecord, SnapshotReplayRecord, SnapshotRequest,
     SnapshotRestoreReceipt, StorageError, StoreFuture, TransactionId, TransactionRecord,
 };
+use tokio_postgres::{Client, Row};
 
 use crate::{
     PostgresReplicaStore,
     apply::{insert_replay, stage_mutation},
     codec::encode_mutation,
     config::postgres_error,
-    schema::{finish_transaction, u64_bytes, u128_bytes, verify_owner},
+    schema::{
+        decode_digest, decode_u64, finish_transaction, load_owner, read_applied_index, role_tag,
+        u64_bytes, u128_bytes, verify_owner,
+    },
 };
 
 pub(crate) async fn snapshot_reader(
@@ -88,6 +93,8 @@ pub(crate) async fn snapshot_writer(
     if !same_logical_identity(store.binding_ref(), header.source_binding()) {
         return Err(StorageError::SnapshotIdentityMismatch);
     }
+    let client = store.connect().await?;
+    verify_owner(&client, store.binding_ref(), false).await?;
     Ok(Box::new(PostgresSnapshotWriter {
         store: store.clone(),
         target_binding: store.binding_ref().clone(),
@@ -188,6 +195,7 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
                 .map_err(postgres_error)?;
             let result = async {
                 verify_owner(&client, self.store.binding_ref(), true).await?;
+                verify_staged_chunks(&client, &self.header, &self.chunks).await?;
                 clear_logical_state(&client).await?;
                 for batch in &batches {
                     for (ordinal, mutation) in batch.mutations().iter().enumerate() {
@@ -203,6 +211,18 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
                     )
                     .await
                     .map_err(postgres_error)?;
+                if self.target_binding.role() == BindingRole::Candidate {
+                    persist_install_marker(
+                        &client,
+                        &SnapshotInstallMarker::new(&self.target_binding, &self.header, &manifest)?,
+                    )
+                    .await?;
+                } else {
+                    client
+                        .execute("DELETE FROM snapshot_install WHERE singleton = TRUE", &[])
+                        .await
+                        .map_err(postgres_error)?;
+                }
                 client
                     .execute(
                         "DELETE FROM snapshot_stage WHERE snapshot_id = $1",
@@ -225,15 +245,373 @@ impl LogicalSnapshotWriter for PostgresSnapshotWriter {
         Box::pin(async move {
             let client = self.store.connect().await?;
             client
-                .execute(
-                    "DELETE FROM snapshot_stage WHERE snapshot_id = $1",
-                    &[&u128_bytes(self.header.snapshot_id().get())],
+                .batch_execute(
+                    "BEGIN ISOLATION LEVEL SERIALIZABLE;
+                     SET LOCAL synchronous_commit = on",
                 )
                 .await
                 .map_err(postgres_error)?;
-            Ok(())
+            let result = async {
+                verify_owner(&client, self.store.binding_ref(), true).await?;
+                client
+                    .execute(
+                        "DELETE FROM snapshot_stage WHERE snapshot_id = $1",
+                        &[&u128_bytes(self.header.snapshot_id().get())],
+                    )
+                    .await
+                    .map_err(postgres_error)?;
+                Ok(())
+            }
+            .await;
+            finish_transaction(&client, result).await
         })
     }
+}
+
+pub(crate) async fn activate_candidate(
+    store: &PostgresReplicaStore,
+    candidate: LogicalSnapshotCandidateReceipt,
+    active_binding: ReplicaBinding,
+) -> Result<LogicalReplicaActivationReceipt, StorageError> {
+    let receipt = LogicalReplicaActivationReceipt::new(&candidate, active_binding.clone())?;
+    if candidate.candidate_binding() != store.binding_ref() {
+        return Err(StorageError::SnapshotIdentityMismatch);
+    }
+    let expected_install = SnapshotInstallMarker::new(
+        candidate.candidate_binding(),
+        candidate.header(),
+        candidate.manifest(),
+    )?;
+    let expected_activation = SnapshotActivationMarker::new(&candidate, &receipt)?;
+    let client = store.connect().await?;
+    client
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL SERIALIZABLE;
+             SET LOCAL synchronous_commit = on",
+        )
+        .await
+        .map_err(postgres_error)?;
+    let result = async {
+        let owner = load_owner(&client, true).await?;
+        if owner == active_binding {
+            let stored = load_activation_marker(&client, true)
+                .await?
+                .ok_or_else(|| {
+                    StorageError::CorruptSnapshot(
+                        "activated PostgreSQL namespace has no activation receipt".into(),
+                    )
+                })?;
+            if stored == expected_activation {
+                return Ok(receipt);
+            }
+            return Err(StorageError::SnapshotIdentityMismatch);
+        }
+        if owner != *candidate.candidate_binding() {
+            return Err(StorageError::SnapshotIdentityMismatch);
+        }
+        if load_activation_marker(&client, true).await?.is_some() {
+            return Err(StorageError::CorruptSnapshot(
+                "candidate PostgreSQL namespace already has an activation receipt".into(),
+            ));
+        }
+        let installed = load_install_marker(&client, true).await?.ok_or_else(|| {
+            StorageError::CorruptSnapshot(
+                "candidate PostgreSQL namespace has no complete install marker".into(),
+            )
+        })?;
+        if installed != expected_install {
+            return Err(StorageError::SnapshotIdentityMismatch);
+        }
+        if read_applied_index(&client).await? != candidate.header().applied_index() {
+            return Err(StorageError::CorruptSnapshot(
+                "candidate PostgreSQL applied index differs from its install marker".into(),
+            ));
+        }
+        let updated = client
+            .execute(
+                "UPDATE replica_owner
+                 SET binding_role = $1, binding_digest = $2
+                 WHERE singleton = TRUE AND binding_digest = $3",
+                &[
+                    &role_tag(BindingRole::Active),
+                    &active_binding.identity_digest().get().to_vec(),
+                    &candidate
+                        .candidate_binding()
+                        .identity_digest()
+                        .get()
+                        .to_vec(),
+                ],
+            )
+            .await
+            .map_err(postgres_error)?;
+        if updated != 1 {
+            return Err(StorageError::SnapshotIdentityMismatch);
+        }
+        let removed = client
+            .execute("DELETE FROM snapshot_install WHERE singleton = TRUE", &[])
+            .await
+            .map_err(postgres_error)?;
+        if removed != 1 {
+            return Err(StorageError::CorruptSnapshot(
+                "candidate PostgreSQL install marker disappeared during activation".into(),
+            ));
+        }
+        persist_activation_marker(&client, &expected_activation).await?;
+        Ok(receipt)
+    }
+    .await;
+    finish_transaction(&client, result).await
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SnapshotInstallMarker {
+    candidate_binding_digest: Digest32,
+    snapshot_id: u128,
+    applied_index: u64,
+    format_version: u32,
+    chunk_count: u64,
+    record_count: u64,
+    content_digest: Digest32,
+}
+
+impl SnapshotInstallMarker {
+    fn new(
+        candidate_binding: &ReplicaBinding,
+        header: &SnapshotHeader,
+        manifest: &SnapshotManifest,
+    ) -> Result<Self, StorageError> {
+        if candidate_binding.role() != BindingRole::Candidate
+            || header.snapshot_id() != manifest.snapshot_id()
+            || header.format_version() != dtg_storage::SUPPORTED_SNAPSHOT_FORMAT_VERSION
+        {
+            return Err(StorageError::SnapshotIdentityMismatch);
+        }
+        Ok(Self {
+            candidate_binding_digest: candidate_binding.identity_digest(),
+            snapshot_id: header.snapshot_id().get(),
+            applied_index: header.applied_index(),
+            format_version: header.format_version(),
+            chunk_count: manifest.chunk_count(),
+            record_count: manifest.record_count(),
+            content_digest: manifest.content_digest(),
+        })
+    }
+
+    fn decode(row: &Row) -> Result<Self, StorageError> {
+        Ok(Self {
+            candidate_binding_digest: marker_digest(row.get::<_, Vec<u8>>(0).as_slice())?,
+            snapshot_id: marker_u128(row.get::<_, Vec<u8>>(1).as_slice())?,
+            applied_index: marker_u64(row.get::<_, Vec<u8>>(2).as_slice())?,
+            format_version: marker_format(row.get(3))?,
+            chunk_count: marker_u64(row.get::<_, Vec<u8>>(4).as_slice())?,
+            record_count: marker_u64(row.get::<_, Vec<u8>>(5).as_slice())?,
+            content_digest: marker_digest(row.get::<_, Vec<u8>>(6).as_slice())?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SnapshotActivationMarker {
+    install: SnapshotInstallMarker,
+    active_binding_digest: Digest32,
+}
+
+impl SnapshotActivationMarker {
+    fn new(
+        candidate: &LogicalSnapshotCandidateReceipt,
+        receipt: &LogicalReplicaActivationReceipt,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            install: SnapshotInstallMarker::new(
+                candidate.candidate_binding(),
+                candidate.header(),
+                candidate.manifest(),
+            )?,
+            active_binding_digest: receipt.active_binding().identity_digest(),
+        })
+    }
+
+    fn decode(row: &Row) -> Result<Self, StorageError> {
+        Ok(Self {
+            install: SnapshotInstallMarker {
+                candidate_binding_digest: marker_digest(row.get::<_, Vec<u8>>(0).as_slice())?,
+                snapshot_id: marker_u128(row.get::<_, Vec<u8>>(2).as_slice())?,
+                applied_index: marker_u64(row.get::<_, Vec<u8>>(3).as_slice())?,
+                format_version: marker_format(row.get(4))?,
+                chunk_count: marker_u64(row.get::<_, Vec<u8>>(5).as_slice())?,
+                record_count: marker_u64(row.get::<_, Vec<u8>>(6).as_slice())?,
+                content_digest: marker_digest(row.get::<_, Vec<u8>>(7).as_slice())?,
+            },
+            active_binding_digest: marker_digest(row.get::<_, Vec<u8>>(1).as_slice())?,
+        })
+    }
+}
+
+async fn verify_staged_chunks(
+    client: &Client,
+    header: &SnapshotHeader,
+    chunks: &[SnapshotChunk],
+) -> Result<(), StorageError> {
+    let rows = client
+        .query(
+            "SELECT chunk_ordinal, chunk_digest, record_count
+             FROM snapshot_stage WHERE snapshot_id = $1
+             ORDER BY chunk_ordinal FOR UPDATE",
+            &[&u128_bytes(header.snapshot_id().get())],
+        )
+        .await
+        .map_err(postgres_error)?;
+    if rows.len() != chunks.len() {
+        return Err(StorageError::CorruptSnapshot(
+            "PostgreSQL snapshot staging is incomplete".into(),
+        ));
+    }
+    for (row, chunk) in rows.iter().zip(chunks) {
+        let ordinal = marker_u64(row.get::<_, Vec<u8>>(0).as_slice())?;
+        let digest = marker_digest(row.get::<_, Vec<u8>>(1).as_slice())?;
+        let record_count: i64 = row.get(2);
+        if ordinal != chunk.ordinal()
+            || digest != chunk.digest
+            || u64::try_from(record_count).ok() != Some(chunk.records().len() as u64)
+        {
+            return Err(StorageError::CorruptSnapshot(
+                "PostgreSQL snapshot staging does not match submitted chunks".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn persist_install_marker(
+    client: &Client,
+    marker: &SnapshotInstallMarker,
+) -> Result<(), StorageError> {
+    client
+        .execute(
+            "INSERT INTO snapshot_install (
+                singleton, candidate_binding_digest, snapshot_id, applied_index,
+                format_version, chunk_count, record_count, content_digest
+             ) VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (singleton) DO UPDATE SET
+                candidate_binding_digest = EXCLUDED.candidate_binding_digest,
+                snapshot_id = EXCLUDED.snapshot_id,
+                applied_index = EXCLUDED.applied_index,
+                format_version = EXCLUDED.format_version,
+                chunk_count = EXCLUDED.chunk_count,
+                record_count = EXCLUDED.record_count,
+                content_digest = EXCLUDED.content_digest",
+            &[
+                &marker.candidate_binding_digest.get().to_vec(),
+                &u128_bytes(marker.snapshot_id),
+                &u64_bytes(marker.applied_index),
+                &i32::try_from(marker.format_version).map_err(|_| {
+                    StorageError::CorruptSnapshot(
+                        "snapshot format exceeds PostgreSQL INTEGER".into(),
+                    )
+                })?,
+                &u64_bytes(marker.chunk_count),
+                &u64_bytes(marker.record_count),
+                &marker.content_digest.get().to_vec(),
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn load_install_marker(
+    client: &Client,
+    lock: bool,
+) -> Result<Option<SnapshotInstallMarker>, StorageError> {
+    let suffix = if lock { " FOR UPDATE" } else { "" };
+    client
+        .query_opt(
+            &format!(
+                "SELECT candidate_binding_digest, snapshot_id, applied_index, format_version,
+                        chunk_count, record_count, content_digest
+                 FROM snapshot_install WHERE singleton = TRUE{suffix}"
+            ),
+            &[],
+        )
+        .await
+        .map_err(postgres_error)?
+        .map(|row| SnapshotInstallMarker::decode(&row))
+        .transpose()
+}
+
+async fn persist_activation_marker(
+    client: &Client,
+    marker: &SnapshotActivationMarker,
+) -> Result<(), StorageError> {
+    client
+        .execute(
+            "INSERT INTO snapshot_activation (
+                singleton, candidate_binding_digest, active_binding_digest, snapshot_id,
+                applied_index, format_version, chunk_count, record_count, content_digest
+             ) VALUES (TRUE, $1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &marker.install.candidate_binding_digest.get().to_vec(),
+                &marker.active_binding_digest.get().to_vec(),
+                &u128_bytes(marker.install.snapshot_id),
+                &u64_bytes(marker.install.applied_index),
+                &i32::try_from(marker.install.format_version).map_err(|_| {
+                    StorageError::CorruptSnapshot(
+                        "snapshot format exceeds PostgreSQL INTEGER".into(),
+                    )
+                })?,
+                &u64_bytes(marker.install.chunk_count),
+                &u64_bytes(marker.install.record_count),
+                &marker.install.content_digest.get().to_vec(),
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn load_activation_marker(
+    client: &Client,
+    lock: bool,
+) -> Result<Option<SnapshotActivationMarker>, StorageError> {
+    let suffix = if lock { " FOR UPDATE" } else { "" };
+    client
+        .query_opt(
+            &format!(
+                "SELECT candidate_binding_digest, active_binding_digest, snapshot_id,
+                        applied_index, format_version, chunk_count, record_count, content_digest
+                 FROM snapshot_activation WHERE singleton = TRUE{suffix}"
+            ),
+            &[],
+        )
+        .await
+        .map_err(postgres_error)?
+        .map(|row| SnapshotActivationMarker::decode(&row))
+        .transpose()
+}
+
+fn marker_u64(bytes: &[u8]) -> Result<u64, StorageError> {
+    decode_u64(bytes)
+        .map_err(|_| StorageError::CorruptSnapshot("invalid PostgreSQL marker u64".into()))
+}
+
+fn marker_u128(bytes: &[u8]) -> Result<u128, StorageError> {
+    Ok(u128::from_be_bytes(bytes.try_into().map_err(|_| {
+        StorageError::CorruptSnapshot("invalid PostgreSQL marker u128".into())
+    })?))
+}
+
+fn marker_digest(bytes: &[u8]) -> Result<Digest32, StorageError> {
+    decode_digest(bytes)
+        .map_err(|_| StorageError::CorruptSnapshot("invalid PostgreSQL marker digest".into()))
+}
+
+fn marker_format(value: i32) -> Result<u32, StorageError> {
+    u32::try_from(value)
+        .ok()
+        .filter(|value| *value == dtg_storage::SUPPORTED_SNAPSHOT_FORMAT_VERSION)
+        .ok_or_else(|| {
+            StorageError::CorruptSnapshot("invalid PostgreSQL marker snapshot format".into())
+        })
 }
 
 async fn clear_logical_state(client: &tokio_postgres::Client) -> Result<(), StorageError> {

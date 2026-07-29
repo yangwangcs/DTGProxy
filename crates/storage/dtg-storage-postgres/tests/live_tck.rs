@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 use dtg_storage::{
-    CommandId, CommittedShardBatch, LogicalMutation, ReplicaMetadata, StorageTckFactory, Value,
-    run_storage_tck,
+    BindingRole, CommandId, CommittedShardBatch, LogicalMutation, LogicalReplicaActivation,
+    LogicalSnapshotCandidateReceipt, LogicalSnapshotSink, LogicalSnapshotSource, ReadFence,
+    ReplicaMetadata, ReplicaStateStore, SUPPORTED_SNAPSHOT_FORMAT_VERSION, SnapshotHeader,
+    SnapshotManifest, SnapshotRequest, StorageError, StorageTckFactory, Value, run_storage_tck,
 };
-use dtg_storage_postgres::PostgresStorageTckFactory;
+use dtg_storage_postgres::{PostgresReplicaStore, PostgresStorageTckFactory};
 
 fn database_url() -> String {
     std::env::var("DTG_POSTGRES_URL")
@@ -107,6 +109,187 @@ async fn typed_value_variants_round_trip_losslessly() {
         .unwrap();
     assert_eq!(
         store.replica_metadata("dtg.test.values").await.unwrap(),
+        Some(metadata)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable PostgreSQL 17 service"]
+async fn candidate_restore_activation_is_atomic_fenced_and_exactly_retryable() {
+    let factory = PostgresStorageTckFactory::new(database_url());
+    let namespace = format!("postgres-activation-{}", std::process::id());
+    let source_binding = factory.binding(&format!("{namespace}-source"), 1).unwrap();
+    let candidate_binding = factory
+        .binding(&format!("{namespace}-candidate"), 2)
+        .unwrap()
+        .to_builder()
+        .role(BindingRole::Candidate)
+        .build()
+        .unwrap();
+    let active_binding = candidate_binding
+        .to_builder()
+        .role(BindingRole::Active)
+        .build()
+        .unwrap();
+    let source = PostgresReplicaStore::open(database_url(), source_binding.clone())
+        .await
+        .unwrap();
+    let metadata = ReplicaMetadata::new(
+        "dtg.test.activation",
+        Value::String("candidate-state".into()),
+    )
+    .unwrap();
+    source
+        .apply(
+            CommittedShardBatch::new(
+                source_binding.clone(),
+                1,
+                1,
+                CommandId::new(8301).unwrap(),
+                vec![LogicalMutation::PutReplicaMetadata(metadata.clone())],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut reader = source
+        .begin_snapshot(
+            ReadFence::new(source_binding, 1),
+            SnapshotRequest::new(9301, 1).unwrap(),
+        )
+        .await
+        .unwrap();
+    let header = reader.header().clone();
+    let mut chunks = Vec::new();
+    while let Some(chunk) = reader.next_chunk().await.unwrap() {
+        chunks.push(chunk);
+    }
+    let manifest = reader.finish().await.unwrap();
+    let candidate_receipt = LogicalSnapshotCandidateReceipt::new(
+        candidate_binding.clone(),
+        header.clone(),
+        manifest.clone(),
+    )
+    .unwrap();
+    let candidate = PostgresReplicaStore::open(database_url(), candidate_binding.clone())
+        .await
+        .unwrap();
+
+    assert!(candidate.applied_index().await.is_err());
+    assert!(matches!(
+        candidate
+            .activate_candidate(candidate_receipt.clone(), active_binding.clone())
+            .await,
+        Err(StorageError::CorruptSnapshot(_))
+    ));
+    let mut writer = candidate
+        .begin_restore(candidate_binding.clone(), header.clone())
+        .await
+        .unwrap();
+    writer.write_chunk(chunks[0].clone()).await.unwrap();
+    assert!(matches!(
+        candidate
+            .activate_candidate(candidate_receipt.clone(), active_binding.clone())
+            .await,
+        Err(StorageError::CorruptSnapshot(_))
+    ));
+    for chunk in chunks.into_iter().skip(1) {
+        writer.write_chunk(chunk).await.unwrap();
+    }
+    writer.commit(manifest.clone()).await.unwrap();
+
+    let receipt = candidate
+        .activate_candidate(candidate_receipt.clone(), active_binding.clone())
+        .await
+        .unwrap();
+    assert_eq!(receipt.active_binding(), &active_binding);
+    assert_eq!(receipt.snapshot_id(), header.snapshot_id());
+    assert_eq!(receipt.applied_index(), header.applied_index());
+    assert_eq!(receipt.content_digest(), manifest.content_digest());
+    assert_eq!(receipt.format_version(), SUPPORTED_SNAPSHOT_FORMAT_VERSION);
+    assert_eq!(
+        candidate
+            .activate_candidate(candidate_receipt.clone(), active_binding.clone())
+            .await
+            .unwrap(),
+        receipt
+    );
+
+    assert!(candidate.applied_index().await.is_err());
+    assert!(
+        candidate
+            .begin_snapshot(
+                ReadFence::new(candidate_binding.clone(), 1),
+                SnapshotRequest::new(9302, 1).unwrap(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        candidate
+            .begin_restore(candidate_binding.clone(), header.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        candidate
+            .apply(
+                CommittedShardBatch::new(
+                    candidate_binding,
+                    1,
+                    2,
+                    CommandId::new(8302).unwrap(),
+                    vec![LogicalMutation::PutReplicaMetadata(
+                        ReplicaMetadata::new("dtg.test.fenced", Value::Boolean(true)).unwrap(),
+                    )],
+                )
+                .unwrap(),
+            )
+            .await
+            .is_err()
+    );
+
+    let drifted_active = active_binding
+        .to_builder()
+        .endpoint_profile_ref("postgres-drifted-endpoint")
+        .build()
+        .unwrap();
+    assert!(matches!(
+        candidate
+            .activate_candidate(candidate_receipt.clone(), drifted_active)
+            .await,
+        Err(StorageError::SnapshotIdentityMismatch)
+    ));
+    let drifted_header = SnapshotHeader::new(
+        dtg_storage::SnapshotId::new(9303).unwrap(),
+        header.source_binding().clone(),
+        header.applied_index(),
+        SUPPORTED_SNAPSHOT_FORMAT_VERSION,
+    )
+    .unwrap();
+    let drifted_manifest = SnapshotManifest::new(&drifted_header, &[]).unwrap();
+    let drifted_candidate = LogicalSnapshotCandidateReceipt::new(
+        candidate_receipt.candidate_binding().clone(),
+        drifted_header,
+        drifted_manifest,
+    )
+    .unwrap();
+    assert!(matches!(
+        candidate
+            .activate_candidate(drifted_candidate, active_binding.clone())
+            .await,
+        Err(StorageError::SnapshotIdentityMismatch)
+    ));
+
+    let active = PostgresReplicaStore::open(database_url(), active_binding)
+        .await
+        .unwrap();
+    assert_eq!(active.applied_index().await.unwrap(), 1);
+    assert_eq!(
+        active
+            .replica_metadata("dtg.test.activation")
+            .await
+            .unwrap(),
         Some(metadata)
     );
 }
