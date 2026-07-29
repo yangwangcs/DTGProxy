@@ -4,19 +4,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use dtg_cluster_v2::proto::data_service_server::DataService;
-use dtg_cluster_v2::proto::{
+use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
+use dtg_execution::cluster_protocol::proto::{
     ColumnBatch, ExecutionFragment, LogicalReplicaSnapshot, RaftEnvelope, TransactionRequest,
     TypedStatus,
 };
-use dtg_cluster_v2::{
+use dtg_execution::cluster_protocol::{
     PROTOCOL_MAJOR, ProtocolError, validate_execution_fragment, validate_raft_envelope,
     validate_replica_snapshot, validate_transaction_request,
 };
+use dtg_execution::storage::{BackendClass, BindingRole, CapabilityManifest, StorageError};
 use dtg_execution::{
     DataExecution, DataExecutionBuilder, ProviderKind, ProviderResolver, ReplicaBinding,
 };
-use dtg_storage::{BackendClass, BindingRole, CapabilityManifest, StorageError};
 use dtg_storage_fjall::FjallConsensusStore;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};

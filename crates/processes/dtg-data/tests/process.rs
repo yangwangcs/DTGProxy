@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use dtg_cluster_v2::PROTOCOL_MAJOR;
-use dtg_cluster_v2::proto::RaftEnvelope;
-use dtg_cluster_v2::proto::data_service_server::DataService;
 use dtg_data::{
     CredentialProfile, DataNodeBuilder, DataProcessConfig, EndpointProfile, LifecycleState,
 };
 use dtg_execution::ProviderKind;
-use dtg_storage::StorageTckFactory;
+use dtg_execution::cluster_protocol::PROTOCOL_MAJOR;
+use dtg_execution::cluster_protocol::proto::RaftEnvelope;
+use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
+use dtg_execution::storage::StorageTckFactory;
 use dtg_storage_fjall::FjallStorageTckFactory;
 use dtg_storage_remote::{ReferenceServerConfig, ReferenceStorageServer};
 use tonic::{Code, Request};

@@ -1,5 +1,5 @@
-use dtg_cluster_v2::proto::data_service_server::DataServiceServer;
 use dtg_data::{DataNodeBuilder, DataProcessConfig};
+use dtg_execution::cluster_protocol::proto::data_service_server::DataServiceServer;
 use tonic::transport::Server;
 
 #[tokio::main]

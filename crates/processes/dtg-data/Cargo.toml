@@ -13,9 +13,7 @@ name = "dtgproxy-data"
 path = "src/main.rs"
 
 [dependencies]
-dtg-cluster-protocol = { path = "../../execution/dtg-cluster-protocol" }
 dtg-execution = { path = "../../execution/dtg-execution" }
-dtg-storage = { path = "../../storage/dtg-storage" }
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
 dtg-storage-neo4j = { path = "../../storage/dtg-storage-neo4j" }
 dtg-storage-postgres = { path = "../../storage/dtg-storage-postgres" }

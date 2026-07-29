@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use dtg_data::DataNodeBuilder;
-use dtg_execution::{
-    ProviderKind, ProviderResolver, ReplicaBinding, ReplicaStateStore, StorageError, StoreFuture,
-};
-use dtg_storage::{
+use dtg_execution::storage::{
     ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommittedShardBatch, ReadFence,
     ReplicaMetadata, TemporalReadView,
+};
+use dtg_execution::{
+    ProviderKind, ProviderResolver, ReplicaBinding, ReplicaStateStore, StorageError, StoreFuture,
 };
 
 struct FixtureResolver {

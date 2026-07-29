@@ -749,9 +749,7 @@ dependencies = [
 name = "dtg-data"
 version = "1.0.0"
 dependencies = [
- "dtg-cluster-protocol",
  "dtg-execution",
- "dtg-storage",
  "dtg-storage-fjall",
  "dtg-storage-neo4j",
  "dtg-storage-postgres",

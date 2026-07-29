@@ -1,6 +1,6 @@
 use dtg_data::{DataNodeBuilder, FjallResolver};
+use dtg_execution::storage::{BackendClass, BindingRole, CapabilityManifest};
 use dtg_execution::{ProviderKind, ReplicaBinding};
-use dtg_storage::{BackendClass, BindingRole, CapabilityManifest};
 
 fn fjall_binding(namespace: &str, placement_epoch: u64, generation: u64) -> ReplicaBinding {
     let capabilities = CapabilityManifest::from_names([
