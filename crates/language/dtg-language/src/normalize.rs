@@ -5,8 +5,8 @@ use dtg_language_ir::{
     AnalyticsExecutionMode, AnalyticsSubmission, BuiltInAlgorithmId, Expand, ExpandDirection,
     Field, GraphScope, LogicalExpr, LogicalMutation, LogicalNode, LogicalNodeId, LogicalNodeKind,
     LogicalPlan, LogicalProgram, LogicalStatement, LogicalType, LogicalWrite, NodeScan, Projection,
-    ReadScope, RowSchema, TemporalScope, TimeExpr, ValidIntervalExpr, ValidTimeExpr,
-    ValidTimePredicate,
+    ReadScope, RowSchema, Sort, SortDirection, SortKey, TemporalScope, TimeExpr, ValidIntervalExpr,
+    ValidTimeExpr, ValidTimePredicate,
 };
 
 use crate::{
@@ -141,6 +141,27 @@ fn normalize_query(query: &crate::ast::Query) -> Result<(LogicalPlan, RowSchema)
     let bindings = query_bindings(query);
     let (projections, result_schema) = normalize_projections(&query.returns, &bindings);
     let mut plan = normalize_selection(&query.scopes, &query.matches, query.where_clause.as_ref())?;
+    if !query.order_by.is_empty() {
+        let id = LogicalNodeId::new(plan.nodes.len() as u32);
+        plan.nodes.push(LogicalNode {
+            id,
+            kind: LogicalNodeKind::Sort(Sort {
+                input: plan.root,
+                keys: query
+                    .order_by
+                    .iter()
+                    .map(|key| SortKey {
+                        expression: logical_expr(&key.expression),
+                        direction: match key.direction {
+                            crate::ast::OrderDirection::Ascending => SortDirection::Ascending,
+                            crate::ast::OrderDirection::Descending => SortDirection::Descending,
+                        },
+                    })
+                    .collect(),
+            }),
+        });
+        plan.root = id;
+    }
     if !projections.is_empty() {
         let id = LogicalNodeId::new(plan.nodes.len() as u32);
         plan.nodes.push(LogicalNode {

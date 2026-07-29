@@ -126,11 +126,32 @@ impl Parser<'_> {
                 break;
             }
         }
+        let mut order_by = Vec::new();
+        if self.take_word("ORDER") {
+            self.expect_word("BY")?;
+            loop {
+                let expression = self.expr()?;
+                let direction = if self.take_word("DESC") {
+                    crate::ast::OrderDirection::Descending
+                } else {
+                    let _ = self.take_word("ASC");
+                    crate::ast::OrderDirection::Ascending
+                };
+                order_by.push(crate::ast::OrderKey {
+                    expression,
+                    direction,
+                });
+                if !self.take_symbol(',') {
+                    break;
+                }
+            }
+        }
         Ok(crate::ast::Query {
             scopes,
             matches,
             where_clause,
             returns,
+            order_by,
         })
     }
     fn create_write(&mut self, matches: Vec<Match>) -> Result<Statement, LanguageError> {

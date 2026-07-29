@@ -774,11 +774,16 @@ dependencies = [
  "dtg-shard",
  "dtg-storage",
  "dtg-transaction",
+ "tonic",
 ]
 
 [[package]]
 name = "dtg-gateway"
 version = "1.0.0"
+dependencies = [
+ "dtg-execution",
+ "tokio",
+]
 
 [[package]]
 name = "dtg-kernel"

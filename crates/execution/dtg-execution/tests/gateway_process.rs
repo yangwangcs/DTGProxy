@@ -1,0 +1,200 @@
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use dtg_cluster_v2::{checksum_bytes, proto};
+use dtg_execution::{
+    GatewayCancellationToken, GatewayExecution, GatewayExecutionError, GatewayFuture,
+    GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
+    GatewayValue,
+};
+
+#[derive(Default)]
+struct RecordingProtocolClient {
+    requests: Mutex<Vec<proto::GatewayRequest>>,
+}
+
+impl GatewayProtocolV2Client for RecordingProtocolClient {
+    fn execute(
+        &self,
+        request: proto::GatewayRequest,
+    ) -> GatewayFuture<'_, Result<Vec<proto::GatewayResponse>, GatewayExecutionError>> {
+        let status = proto::TypedStatus {
+            request: request.request.clone(),
+            code: 1,
+            retry: 1,
+            message: "ok".into(),
+            idempotency_key: Vec::new(),
+            details: (request.execution_request.as_ref().unwrap().body[0] == 3).then(|| {
+                let mut body = vec![1];
+                body.extend_from_slice(&23_u128.to_be_bytes());
+                proto::BoundedPayload {
+                    format_version: 1,
+                    declared_len: body.len() as u64,
+                    item_count: 1,
+                    checksum: checksum_bytes(&body).to_vec(),
+                    body,
+                }
+            }),
+        };
+        let batch = (request.execution_request.as_ref().unwrap().body[0] == 1).then(|| {
+            let body = encoded_rows();
+            proto::ColumnBatch {
+                request: request.request.clone(),
+                fragment_id: 1_u128.to_be_bytes().to_vec(),
+                sequence: 1,
+                row_count: 2,
+                payload: Some(proto::BoundedPayload {
+                    format_version: 1,
+                    declared_len: body.len() as u64,
+                    item_count: 2,
+                    checksum: checksum_bytes(&body).to_vec(),
+                    body,
+                }),
+            }
+        });
+        self.requests.lock().unwrap().push(request);
+        Box::pin(async move {
+            Ok(vec![proto::GatewayResponse {
+                status: Some(status),
+                batch,
+            }])
+        })
+    }
+}
+
+struct ThreadWake;
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        std::thread::current().unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadWake));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+#[test]
+fn process_execution_encodes_normalized_requests_on_protocol_v2() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let transport = Arc::new(GatewayProtocolV2Transport::new(client.clone()));
+    let execution = GatewayExecution::for_process(transport);
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+    let context = GatewayRequestContext::new(7, 9, deadline, vec![1, 2]).unwrap();
+    let response = block_on(execution.execute_statement(
+        context,
+        "CREATE (n {id: $id}) VALID FROM 40".into(),
+        BTreeMap::from([("id".into(), GatewayValue::Integer(1))]),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    assert_eq!(response, GatewayResponse::Acknowledged);
+    let requests = client.requests.lock().unwrap();
+    let request = &requests[0];
+    assert_eq!(request.request.as_ref().unwrap().protocol_major, 2);
+    let payload = request.execution_request.as_ref().unwrap();
+    assert_eq!(payload.format_version, 1);
+    assert_eq!(payload.declared_len as usize, payload.body.len());
+    assert_eq!(payload.checksum, checksum_bytes(&payload.body));
+    assert_eq!(payload.body[0], 2);
+}
+
+#[test]
+fn process_execution_decodes_protocol_v2_typed_rows() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let transport = Arc::new(GatewayProtocolV2Transport::new(client));
+    let execution = GatewayExecution::for_process(transport);
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+    let context = GatewayRequestContext::new(7, 10, deadline, Vec::new()).unwrap();
+    let response = block_on(execution.execute_statement(
+        context,
+        "MATCH (n) RETURN n.id ORDER BY n.id".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    assert_eq!(
+        response,
+        GatewayResponse::Rows(
+            dtg_execution::GatewayRows::new(
+                vec!["n.id".into()],
+                vec![
+                    vec![GatewayValue::Integer(1)],
+                    vec![GatewayValue::Integer(2)],
+                ],
+            )
+            .unwrap()
+        )
+    );
+}
+
+#[test]
+fn process_execution_decodes_protocol_v2_transaction_boundaries() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let transport = Arc::new(GatewayProtocolV2Transport::new(client));
+    let execution = GatewayExecution::for_process(transport);
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+    let context = GatewayRequestContext::new(7, 11, deadline, Vec::new()).unwrap();
+    let response = block_on(execution.execute_statement(
+        context,
+        "BEGIN".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    assert_eq!(
+        response,
+        GatewayResponse::Transaction { transaction_id: 23 }
+    );
+}
+
+fn encoded_rows() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&4_u32.to_be_bytes());
+    body.extend_from_slice(b"n.id");
+    body.extend_from_slice(&2_u32.to_be_bytes());
+    body.push(2);
+    body.extend_from_slice(&1_i64.to_be_bytes());
+    body.push(2);
+    body.extend_from_slice(&2_i64.to_be_bytes());
+    body
+}

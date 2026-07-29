@@ -90,6 +90,9 @@ fn validate_statement(statement: &Statement) -> Result<(), LanguageError> {
             for expression in &query.returns {
                 validate_expr(expression, &bindings)?;
             }
+            for key in &query.order_by {
+                validate_expr(&key.expression, &bindings)?;
+            }
             Ok(())
         }
         Statement::Write(write) => validate_write(write),
@@ -465,6 +468,9 @@ fn collect_statement_parameters(statement: &Statement, output: &mut BTreeSet<Str
             collect_matches(&query.matches, output);
             for value in &query.returns {
                 collect_expr(value, output);
+            }
+            for key in &query.order_by {
+                collect_expr(&key.expression, output);
             }
             if let Some((left, right)) = &query.where_clause {
                 collect_expr(left, output);

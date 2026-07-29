@@ -12,6 +12,7 @@ workspace = true
 dtg-analytics = { path = "../dtg-analytics" }
 dtg-cluster-protocol = { path = "../dtg-cluster-protocol" }
 dtg-control = { path = "../dtg-control" }
+dtg-cluster-protocol = { path = "../dtg-cluster-protocol" }
 dtg-language = { path = "../../language/dtg-language" }
 dtg-language-ir = { path = "../../language/dtg-language-ir" }
 dtg-plan = { path = "../dtg-plan" }
@@ -19,3 +20,4 @@ dtg-query = { path = "../dtg-query" }
 dtg-shard = { path = "../dtg-shard" }
 dtg-storage = { path = "../../storage/dtg-storage" }
 dtg-transaction = { path = "../dtg-transaction" }
+tonic = { version = "=0.14.6", features = ["transport"] }

@@ -1,8 +1,8 @@
 use dtg_language::{EmptySchemaCatalog, SchemaCatalog, compile};
 use dtg_language_ir::{
     BinaryOperator, ExpandDirection, Field, GraphId, GraphScope, LogicalExpr, LogicalMutation,
-    LogicalNodeKind, LogicalStatement, LogicalType, TemporalScope, TimeExpr, ValidInterval,
-    ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate, Value,
+    LogicalNodeKind, LogicalStatement, LogicalType, SortDirection, TemporalScope, TimeExpr,
+    ValidInterval, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate, Value,
 };
 
 struct Catalog;
@@ -23,6 +23,63 @@ fn as_of_query_normalizes_to_explicit_scope() {
         panic!("expected query");
     };
     assert!(plan.contains_scope(TemporalScope::AsOf(TimeExpr::Parameter("t".into()))));
+}
+
+#[test]
+fn order_by_normalizes_to_an_ascending_sort() {
+    let program = compile(
+        "MATCH (n) FOR SYSTEM_TIME AS OF $t RETURN n.id ORDER BY n.id",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = program.statement else {
+        panic!("expected query");
+    };
+    let LogicalNodeKind::Project { input, .. } = plan.nodes[plan.root.get() as usize].kind else {
+        panic!("expected projection root");
+    };
+    let LogicalNodeKind::Sort(sort) = &plan.nodes[input.get() as usize].kind else {
+        panic!("expected sort below projection");
+    };
+
+    assert_eq!(sort.keys.len(), 1);
+    assert_eq!(sort.keys[0].direction, SortDirection::Ascending);
+    assert_eq!(
+        sort.keys[0].expression,
+        LogicalExpr::Property {
+            input: Box::new(LogicalExpr::Column("n".into())),
+            name: "id".into(),
+        }
+    );
+}
+
+#[test]
+fn order_by_preserves_key_order_and_explicit_directions() {
+    let program = compile(
+        "MATCH (n) RETURN n.id, n.name ORDER BY n.id DESC, n.name ASC",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = program.statement else {
+        panic!("expected query");
+    };
+    let LogicalNodeKind::Project { input, .. } = plan.nodes[plan.root.get() as usize].kind else {
+        panic!("expected projection root");
+    };
+    let LogicalNodeKind::Sort(sort) = &plan.nodes[input.get() as usize].kind else {
+        panic!("expected sort below projection");
+    };
+
+    assert_eq!(sort.keys.len(), 2);
+    assert_eq!(sort.keys[0].direction, SortDirection::Descending);
+    assert_eq!(sort.keys[1].direction, SortDirection::Ascending);
+}
+
+#[test]
+fn malformed_order_by_has_a_stable_parse_error() {
+    let error = compile("MATCH (n) RETURN n ORDER n.id", &EmptySchemaCatalog).unwrap_err();
+
+    assert_eq!(error.code(), "DTG-LANG-PARSE");
 }
 
 #[test]

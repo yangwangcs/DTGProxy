@@ -25,6 +25,17 @@ pub(crate) struct Query {
     pub(crate) matches: Vec<Match>,
     pub(crate) where_clause: Option<(Expr, Expr)>,
     pub(crate) returns: Vec<Expr>,
+    pub(crate) order_by: Vec<OrderKey>,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct OrderKey {
+    pub(crate) expression: Expr,
+    pub(crate) direction: OrderDirection,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OrderDirection {
+    Ascending,
+    Descending,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Match {
