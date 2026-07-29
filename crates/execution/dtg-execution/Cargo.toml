@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 dtg-analytics = { path = "../dtg-analytics" }
+dtg-cluster-protocol = { path = "../dtg-cluster-protocol" }
 dtg-control = { path = "../dtg-control" }
 dtg-language = { path = "../../language/dtg-language" }
 dtg-language-ir = { path = "../../language/dtg-language-ir" }

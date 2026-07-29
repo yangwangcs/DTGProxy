@@ -6,6 +6,7 @@ mod overlay;
 mod participant;
 mod recovery;
 mod snapshot;
+mod timestamp;
 
 pub use conflict::{EntityIdentity, IntervalWrite, detect_conflict};
 pub use coordinator::{
@@ -28,6 +29,7 @@ pub use participant::{
     SubmissionReceipt, TransactionHistory, TxnFuture,
 };
 pub use snapshot::{ShardSnapshotFence, SnapshotToken};
+pub use timestamp::{DurableTimestampAuthority, TimestampCommandLog, TimestampLogFuture};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TxnError {

@@ -1,0 +1,37 @@
+use std::error::Error;
+use std::path::PathBuf;
+
+use dtg_controller::{ControllerConfig, ControllerProcess};
+use dtg_execution::control::CatalogState;
+
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("dtgproxy-controller: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
+    let config_path = config_path()?;
+    let _ = tracing_subscriber::fmt().with_target(false).try_init();
+    ControllerProcess::open(ControllerConfig::load(config_path)?, CatalogState::new())
+        .await?
+        .serve()
+        .await?;
+    Ok(())
+}
+
+fn config_path() -> Result<PathBuf, Box<dyn Error>> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
+        return Err("usage: dtgproxy-controller --config PATH".into());
+    }
+    let path = arguments
+        .next()
+        .ok_or("usage: dtgproxy-controller --config PATH")?;
+    if arguments.next().is_some() {
+        return Err("usage: dtgproxy-controller --config PATH".into());
+    }
+    Ok(path.into())
+}

@@ -498,6 +498,15 @@ fn every_stable_facade_has_a_builder_entry_point() {
 }
 
 #[test]
+fn execution_exposes_thin_process_composition_contracts() {
+    let _ = dtg_execution::analytics::AnalyticsLedger::new(1).unwrap();
+    let _ = dtg_execution::control::CatalogState::new();
+    let _ = dtg_execution::storage::ProviderKind::Fjall;
+    let _: Option<&dyn dtg_execution::transaction::TimestampAuthority> = None;
+    assert_eq!(dtg_execution::cluster_protocol::PROTOCOL_MAJOR, 2);
+}
+
+#[test]
 fn gateway_composition_lowers_every_execution_fence_without_drift() {
     let mut gateway = gateway();
     let capabilities = CapabilityManifest::from_names(EXACT_VERTEX_SCAN_CAPABILITIES).unwrap();

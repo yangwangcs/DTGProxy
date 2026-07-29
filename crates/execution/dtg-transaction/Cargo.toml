@@ -12,8 +12,10 @@ workspace = true
 blake3 = "1"
 dtg-kernel = { path = "../../kernel/dtg-kernel" }
 dtg-storage = { path = "../../storage/dtg-storage" }
+tokio = { version = "=1.53.0", features = ["sync"] }
 
 [dev-dependencies]
 dtg-shard = { path = "../dtg-shard" }
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
 tempfile = "3"
+tokio = { version = "=1.53.0", features = ["macros", "rt", "sync"] }

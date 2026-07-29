@@ -99,8 +99,8 @@ allowed_new_dependencies = {
         "dtg-storage-neo4j",
         "dtg-storage-remote",
     },
-    "dtg-meta": {"dtg-execution"},
-    "dtg-controller": {"dtg-execution"},
+    "dtg-meta": {"dtg-execution", "dtg-storage-fjall"},
+    "dtg-controller": {"dtg-execution", "dtg-storage-fjall"},
 }
 legacy_runtime_packages = {
     "storage-api",

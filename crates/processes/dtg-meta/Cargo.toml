@@ -5,5 +5,26 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+dtg-execution = { path = "../../execution/dtg-execution" }
+dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+tokio = { version = "=1.53.0", features = ["fs", "macros", "rt-multi-thread", "signal", "sync"] }
+tonic = { version = "=0.14.6", features = ["transport", "tls-ring"] }
+tracing = "=0.1.44"
+tracing-subscriber = "=0.3.22"
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+dtg-control = { path = "../../execution/dtg-control" }
+dtg-storage = { path = "../../storage/dtg-storage" }
+dtg-transaction = { path = "../../execution/dtg-transaction" }
+tempfile = "3"
+tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "dtgproxy-meta"
+path = "src/main.rs"
