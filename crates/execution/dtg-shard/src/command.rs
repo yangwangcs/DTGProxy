@@ -1,0 +1,917 @@
+use std::collections::BTreeMap;
+
+use dtg_kernel::{
+    BackendGeneration, Digest32, PlacementEpoch, TransactionId, TransactionTime, ValidInterval,
+    Value, Version,
+};
+use dtg_storage::{
+    CommandId, EdgeId, EdgeTombstone, EdgeVersion, LogicalMutation, Properties, ReplicaMetadata,
+    TransactionRecord, TransactionState, VertexId, VertexTombstone, VertexVersion,
+};
+
+use crate::ShardError;
+
+pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandHeader {
+    command_id: CommandId,
+    placement_epoch: PlacementEpoch,
+    backend_generation: BackendGeneration,
+}
+
+impl CommandHeader {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+    ) -> Result<Self, ShardError> {
+        Ok(Self {
+            command_id,
+            placement_epoch: PlacementEpoch::new(placement_epoch).map_err(|_| {
+                ShardError::InvalidCommand("placement epoch must be nonzero".into())
+            })?,
+            backend_generation: BackendGeneration::new(backend_generation).map_err(|_| {
+                ShardError::InvalidCommand("backend generation must be nonzero".into())
+            })?,
+        })
+    }
+
+    pub const fn command_id(self) -> CommandId {
+        self.command_id
+    }
+
+    pub const fn placement_epoch(self) -> PlacementEpoch {
+        self.placement_epoch
+    }
+
+    pub const fn backend_generation(self) -> BackendGeneration {
+        self.backend_generation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitSingleShard {
+    header: CommandHeader,
+    mutations: Vec<LogicalMutation>,
+}
+
+impl CommitSingleShard {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        mutations: Vec<LogicalMutation>,
+    ) -> Result<Self, ShardError> {
+        if mutations.is_empty() {
+            return Err(ShardError::InvalidCommand(
+                "single-Shard commit must contain mutations".into(),
+            ));
+        }
+        Ok(Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            mutations,
+        })
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub fn mutations(&self) -> &[LogicalMutation] {
+        &self.mutations
+    }
+}
+
+macro_rules! mutation_command {
+    ($name:ident, $validator:ident) => {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub struct $name {
+            header: CommandHeader,
+            mutations: Vec<LogicalMutation>,
+        }
+
+        impl $name {
+            pub fn new(
+                command_id: CommandId,
+                placement_epoch: u64,
+                backend_generation: u64,
+                mutations: Vec<LogicalMutation>,
+            ) -> Result<Self, ShardError> {
+                if mutations.is_empty() {
+                    return Err(ShardError::InvalidCommand(
+                        concat!(stringify!($name), " must contain mutations").into(),
+                    ));
+                }
+                $validator(&mutations)?;
+                Ok(Self {
+                    header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+                    mutations,
+                })
+            }
+
+            pub const fn header(&self) -> CommandHeader {
+                self.header
+            }
+
+            pub fn mutations(&self) -> &[LogicalMutation] {
+                &self.mutations
+            }
+        }
+    };
+}
+
+mutation_command!(PrewriteIntent, validate_prewrite_intent);
+mutation_command!(RecordHomeDecision, validate_home_decision);
+mutation_command!(FinalizeParticipant, validate_participant_finalization);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvanceClosedTimestamp {
+    header: CommandHeader,
+    closed_timestamp: TransactionTime,
+}
+
+impl AdvanceClosedTimestamp {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        closed_timestamp: TransactionTime,
+    ) -> Result<Self, ShardError> {
+        Ok(Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            closed_timestamp,
+        })
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub const fn closed_timestamp(&self) -> TransactionTime {
+        self.closed_timestamp
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallSnapshot {
+    header: CommandHeader,
+    snapshot_id: u128,
+    content_digest: Digest32,
+}
+
+impl InstallSnapshot {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        snapshot_id: u128,
+        content_digest: Digest32,
+    ) -> Result<Self, ShardError> {
+        if snapshot_id == 0 || content_digest.get() == [0; 32] {
+            return Err(ShardError::InvalidCommand(
+                "snapshot identity must be complete".into(),
+            ));
+        }
+        Ok(Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            snapshot_id,
+            content_digest,
+        })
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub const fn snapshot_id(&self) -> u128 {
+        self.snapshot_id
+    }
+
+    pub const fn content_digest(&self) -> Digest32 {
+        self.content_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MigrationPhase {
+    Prepare,
+    Activate,
+    Retire,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCommand {
+    header: CommandHeader,
+    phase: MigrationPhase,
+}
+
+impl MigrationCommand {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        phase: MigrationPhase,
+    ) -> Result<Self, ShardError> {
+        Ok(Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            phase,
+        })
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub const fn phase(&self) -> MigrationPhase {
+        self.phase
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShardCommand {
+    CommitSingleShard(CommitSingleShard),
+    PrewriteIntent(PrewriteIntent),
+    RecordHomeDecision(RecordHomeDecision),
+    FinalizeParticipant(FinalizeParticipant),
+    AdvanceClosedTimestamp(AdvanceClosedTimestamp),
+    InstallSnapshot(InstallSnapshot),
+    Migration(MigrationCommand),
+}
+
+impl ShardCommand {
+    pub const fn header(&self) -> CommandHeader {
+        match self {
+            Self::CommitSingleShard(command) => command.header(),
+            Self::PrewriteIntent(command) => command.header(),
+            Self::RecordHomeDecision(command) => command.header(),
+            Self::FinalizeParticipant(command) => command.header(),
+            Self::AdvanceClosedTimestamp(command) => command.header(),
+            Self::InstallSnapshot(command) => command.header(),
+            Self::Migration(command) => command.header(),
+        }
+    }
+
+    pub(crate) fn mutations(&self) -> Result<Vec<LogicalMutation>, ShardError> {
+        match self {
+            Self::CommitSingleShard(command) => Ok(command.mutations.clone()),
+            Self::PrewriteIntent(command) => {
+                validate_prewrite_intent(&command.mutations)?;
+                Ok(command.mutations.clone())
+            }
+            Self::RecordHomeDecision(command) => {
+                validate_home_decision(&command.mutations)?;
+                Ok(command.mutations.clone())
+            }
+            Self::FinalizeParticipant(command) => {
+                validate_participant_finalization(&command.mutations)?;
+                Ok(command.mutations.clone())
+            }
+            Self::AdvanceClosedTimestamp(command) => Ok(vec![LogicalMutation::PutReplicaMetadata(
+                ReplicaMetadata::new(
+                    "dtg.closed_timestamp",
+                    Value::Integer(command.closed_timestamp().get()),
+                )?,
+            )]),
+            Self::InstallSnapshot(command) => {
+                let mut metadata = BTreeMap::new();
+                metadata.insert(
+                    "snapshot_id".into(),
+                    Value::Bytes(command.snapshot_id().to_be_bytes().to_vec()),
+                );
+                metadata.insert(
+                    "content_digest".into(),
+                    Value::Bytes(command.content_digest().get().to_vec()),
+                );
+                Ok(vec![LogicalMutation::PutReplicaMetadata(
+                    ReplicaMetadata::new("dtg.installed_snapshot", Value::Map(metadata))?,
+                )])
+            }
+            Self::Migration(command) => Ok(vec![LogicalMutation::PutReplicaMetadata(
+                ReplicaMetadata::new(
+                    "dtg.migration_phase",
+                    Value::String(
+                        match command.phase() {
+                            MigrationPhase::Prepare => "prepare",
+                            MigrationPhase::Activate => "activate",
+                            MigrationPhase::Retire => "retire",
+                        }
+                        .into(),
+                    ),
+                )?,
+            )]),
+        }
+    }
+
+    pub fn encode_current(&self) -> Result<Vec<u8>, ShardError> {
+        let mut encoder = Encoder::default();
+        encoder.u32(SUPPORTED_SHARD_COMMAND_FORMAT_VERSION);
+        match self {
+            Self::CommitSingleShard(command) => {
+                encoder.u8(1);
+                encoder.header(command.header());
+                encoder.mutations(command.mutations())?;
+            }
+            Self::PrewriteIntent(command) => {
+                encoder.u8(2);
+                encoder.header(command.header());
+                encoder.mutations(command.mutations())?;
+            }
+            Self::RecordHomeDecision(command) => {
+                encoder.u8(3);
+                encoder.header(command.header());
+                encoder.mutations(command.mutations())?;
+            }
+            Self::FinalizeParticipant(command) => {
+                encoder.u8(4);
+                encoder.header(command.header());
+                encoder.mutations(command.mutations())?;
+            }
+            Self::AdvanceClosedTimestamp(command) => {
+                encoder.u8(5);
+                encoder.header(command.header());
+                encoder.i64(command.closed_timestamp().get());
+            }
+            Self::InstallSnapshot(command) => {
+                encoder.u8(6);
+                encoder.header(command.header());
+                encoder.u128(command.snapshot_id());
+                encoder.bytes(&command.content_digest().get())?;
+            }
+            Self::Migration(command) => {
+                encoder.u8(7);
+                encoder.header(command.header());
+                encoder.u8(match command.phase() {
+                    MigrationPhase::Prepare => 1,
+                    MigrationPhase::Activate => 2,
+                    MigrationPhase::Retire => 3,
+                });
+            }
+        }
+        encoder.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ShardError> {
+        let mut decoder = Decoder::new(bytes)?;
+        let version = decoder.u32()?;
+        if version != SUPPORTED_SHARD_COMMAND_FORMAT_VERSION {
+            return Err(ShardError::UnsupportedCommandVersion(version));
+        }
+        let tag = decoder.u8()?;
+        let header = decoder.header()?;
+        let command = match tag {
+            1 => Self::CommitSingleShard(CommitSingleShard {
+                header,
+                mutations: decoder.mutations()?,
+            }),
+            2 => Self::PrewriteIntent(PrewriteIntent {
+                header,
+                mutations: decoder.mutations()?,
+            }),
+            3 => Self::RecordHomeDecision(RecordHomeDecision {
+                header,
+                mutations: decoder.mutations()?,
+            }),
+            4 => Self::FinalizeParticipant(FinalizeParticipant {
+                header,
+                mutations: decoder.mutations()?,
+            }),
+            5 => Self::AdvanceClosedTimestamp(AdvanceClosedTimestamp {
+                header,
+                closed_timestamp: TransactionTime::new(decoder.i64()?)
+                    .map_err(|error| ShardError::InvalidCommand(error.to_string()))?,
+            }),
+            6 => {
+                let snapshot_id = decoder.u128()?;
+                let digest = decoder.fixed_32()?;
+                Self::InstallSnapshot(InstallSnapshot::new(
+                    header.command_id(),
+                    header.placement_epoch().get(),
+                    header.backend_generation().get(),
+                    snapshot_id,
+                    Digest32::new(digest),
+                )?)
+            }
+            7 => Self::Migration(MigrationCommand {
+                header,
+                phase: match decoder.u8()? {
+                    1 => MigrationPhase::Prepare,
+                    2 => MigrationPhase::Activate,
+                    3 => MigrationPhase::Retire,
+                    _ => return Err(invalid("unknown migration phase")),
+                },
+            }),
+            _ => return Err(invalid("unknown command tag")),
+        };
+        decoder.finish()?;
+        if matches!(
+            &command,
+            Self::CommitSingleShard(CommitSingleShard { mutations, .. })
+                | Self::PrewriteIntent(PrewriteIntent { mutations, .. })
+                | Self::RecordHomeDecision(RecordHomeDecision { mutations, .. })
+                | Self::FinalizeParticipant(FinalizeParticipant { mutations, .. })
+                if mutations.is_empty()
+        ) {
+            return Err(invalid("mutation command must not be empty"));
+        }
+        Ok(command)
+    }
+}
+
+fn validate_prewrite_intent(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
+    let prepared = mutations
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation,
+                LogicalMutation::PutTransaction(transaction)
+                    if transaction.state() == TransactionState::Prepared
+            )
+        })
+        .count();
+    let invalid = mutations.iter().any(|mutation| {
+        matches!(mutation, LogicalMutation::PutReplicaMetadata(_))
+            || matches!(
+                mutation,
+                LogicalMutation::PutTransaction(transaction)
+                    if transaction.state() != TransactionState::Prepared
+            )
+    });
+    if prepared == 1 && !invalid {
+        Ok(())
+    } else {
+        Err(invalid_command_shape(
+            "prewrite intent requires exactly one prepared transaction record",
+        ))
+    }
+}
+
+fn validate_home_decision(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
+    if mutations.len() == 1
+        && matches!(
+            &mutations[0],
+            LogicalMutation::PutTransaction(transaction)
+                if matches!(
+                    transaction.state(),
+                    TransactionState::Committed | TransactionState::Aborted
+                )
+        )
+    {
+        Ok(())
+    } else {
+        Err(invalid_command_shape(
+            "home decision requires one terminal transaction record",
+        ))
+    }
+}
+
+fn validate_participant_finalization(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
+    let terminal = mutations
+        .iter()
+        .filter(|mutation| {
+            matches!(
+                mutation,
+                LogicalMutation::PutTransaction(transaction)
+                    if matches!(
+                        transaction.state(),
+                        TransactionState::Committed | TransactionState::Aborted
+                    )
+            )
+        })
+        .count();
+    let invalid = mutations.iter().any(|mutation| {
+        matches!(mutation, LogicalMutation::PutReplicaMetadata(_))
+            || matches!(
+                mutation,
+                LogicalMutation::PutTransaction(transaction)
+                    if transaction.state() == TransactionState::Prepared
+            )
+    });
+    if terminal == 1 && !invalid {
+        Ok(())
+    } else {
+        Err(invalid_command_shape(
+            "participant finalization requires exactly one terminal transaction record",
+        ))
+    }
+}
+
+fn invalid_command_shape(message: &str) -> ShardError {
+    ShardError::InvalidCommand(message.into())
+}
+
+const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COLLECTION_ITEMS: usize = 1_000_000;
+
+fn invalid(message: impl Into<String>) -> ShardError {
+    ShardError::InvalidCommand(message.into())
+}
+
+#[derive(Default)]
+struct Encoder {
+    bytes: Vec<u8>,
+}
+
+impl Encoder {
+    fn finish(self) -> Result<Vec<u8>, ShardError> {
+        if self.bytes.len() > MAX_COMMAND_BYTES {
+            Err(invalid("command exceeds maximum encoded size"))
+        } else {
+            Ok(self.bytes)
+        }
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn u128(&mut self, value: u128) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn bytes(&mut self, value: &[u8]) -> Result<(), ShardError> {
+        self.u32(
+            value
+                .len()
+                .try_into()
+                .map_err(|_| invalid("command field exceeds u32 length"))?,
+        );
+        self.bytes.extend_from_slice(value);
+        if self.bytes.len() > MAX_COMMAND_BYTES {
+            return Err(invalid("command exceeds maximum encoded size"));
+        }
+        Ok(())
+    }
+
+    fn string(&mut self, value: &str) -> Result<(), ShardError> {
+        self.bytes(value.as_bytes())
+    }
+
+    fn header(&mut self, header: CommandHeader) {
+        self.u128(header.command_id().get());
+        self.u64(header.placement_epoch().get());
+        self.u64(header.backend_generation().get());
+    }
+
+    fn mutations(&mut self, mutations: &[LogicalMutation]) -> Result<(), ShardError> {
+        if mutations.len() > MAX_COLLECTION_ITEMS {
+            return Err(invalid("too many logical mutations"));
+        }
+        self.u32(
+            mutations
+                .len()
+                .try_into()
+                .map_err(|_| invalid("too many logical mutations"))?,
+        );
+        for mutation in mutations {
+            self.mutation(mutation)?;
+        }
+        Ok(())
+    }
+
+    fn mutation(&mut self, mutation: &LogicalMutation) -> Result<(), ShardError> {
+        match mutation {
+            LogicalMutation::PutVertex(vertex) => {
+                self.u8(1);
+                self.u128(vertex.id().get());
+                self.u64(vertex.version().get());
+                self.interval(vertex.valid_time());
+                self.i64(vertex.transaction_time().get());
+                self.properties(vertex.properties())?;
+            }
+            LogicalMutation::DeleteVertex(vertex) => {
+                self.u8(2);
+                self.u128(vertex.id().get());
+                self.u64(vertex.version().get());
+                self.i64(vertex.transaction_time().get());
+            }
+            LogicalMutation::PutEdge(edge) => {
+                self.u8(3);
+                self.u128(edge.id().get());
+                self.u128(edge.source().get());
+                self.u128(edge.target().get());
+                self.string(edge.edge_type())?;
+                self.u64(edge.version().get());
+                self.interval(edge.valid_time());
+                self.i64(edge.transaction_time().get());
+                self.properties(edge.properties())?;
+            }
+            LogicalMutation::DeleteEdge(edge) => {
+                self.u8(4);
+                self.u128(edge.id().get());
+                self.u64(edge.version().get());
+                self.i64(edge.transaction_time().get());
+            }
+            LogicalMutation::PutTransaction(transaction) => {
+                self.u8(5);
+                self.u128(transaction.id().get());
+                self.u8(match transaction.state() {
+                    TransactionState::Prepared => 1,
+                    TransactionState::Committed => 2,
+                    TransactionState::Aborted => 3,
+                });
+                self.i64(transaction.transaction_time().get());
+                self.bytes(&transaction.record_digest().get())?;
+            }
+            LogicalMutation::PutReplicaMetadata(metadata) => {
+                self.u8(6);
+                self.string(metadata.name())?;
+                self.value(metadata.value())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn interval(&mut self, interval: ValidInterval) {
+        self.i64(interval.start());
+        self.i64(interval.end());
+    }
+
+    fn properties(&mut self, properties: &Properties) -> Result<(), ShardError> {
+        if properties.len() > MAX_COLLECTION_ITEMS {
+            return Err(invalid("too many properties"));
+        }
+        self.u32(
+            properties
+                .len()
+                .try_into()
+                .map_err(|_| invalid("too many properties"))?,
+        );
+        for (name, value) in properties {
+            self.string(name)?;
+            self.value(value)?;
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, value: &Value) -> Result<(), ShardError> {
+        match value {
+            Value::Null => self.u8(0),
+            Value::Boolean(value) => {
+                self.u8(1);
+                self.u8(u8::from(*value));
+            }
+            Value::Integer(value) => {
+                self.u8(2);
+                self.i64(*value);
+            }
+            Value::FloatBits(value) => {
+                self.u8(3);
+                self.u64(*value);
+            }
+            Value::Bytes(value) => {
+                self.u8(4);
+                self.bytes(value)?;
+            }
+            Value::String(value) => {
+                self.u8(5);
+                self.string(value)?;
+            }
+            Value::List(values) => {
+                if values.len() > MAX_COLLECTION_ITEMS {
+                    return Err(invalid("value list is too large"));
+                }
+                self.u8(6);
+                self.u32(
+                    values
+                        .len()
+                        .try_into()
+                        .map_err(|_| invalid("value list is too large"))?,
+                );
+                for value in values {
+                    self.value(value)?;
+                }
+            }
+            Value::Map(values) => {
+                if values.len() > MAX_COLLECTION_ITEMS {
+                    return Err(invalid("value map is too large"));
+                }
+                self.u8(7);
+                self.u32(
+                    values
+                        .len()
+                        .try_into()
+                        .map_err(|_| invalid("value map is too large"))?,
+                );
+                for (key, value) in values {
+                    self.string(key)?;
+                    self.value(value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Decoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Decoder<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, ShardError> {
+        if bytes.is_empty() || bytes.len() > MAX_COMMAND_BYTES {
+            return Err(invalid("command bytes are empty or oversized"));
+        }
+        Ok(Self { bytes, offset: 0 })
+    }
+
+    fn finish(self) -> Result<(), ShardError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(invalid("command contains trailing bytes"))
+        }
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], ShardError> {
+        let end = self
+            .offset
+            .checked_add(count)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| invalid("truncated command"))?;
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, ShardError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, ShardError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64, ShardError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn u128(&mut self) -> Result<u128, ShardError> {
+        Ok(u128::from_be_bytes(self.take(16)?.try_into().unwrap()))
+    }
+
+    fn i64(&mut self) -> Result<i64, ShardError> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], ShardError> {
+        let length = self.u32()? as usize;
+        self.take(length)
+    }
+
+    fn string(&mut self) -> Result<String, ShardError> {
+        String::from_utf8(self.bytes()?.to_vec())
+            .map_err(|_| invalid("command string is not UTF-8"))
+    }
+
+    fn fixed_32(&mut self) -> Result<[u8; 32], ShardError> {
+        let value = self.bytes()?;
+        value
+            .try_into()
+            .map_err(|_| invalid("digest must contain exactly 32 bytes"))
+    }
+
+    fn header(&mut self) -> Result<CommandHeader, ShardError> {
+        CommandHeader::new(
+            CommandId::new(self.u128()?).map_err(ShardError::Storage)?,
+            self.u64()?,
+            self.u64()?,
+        )
+    }
+
+    fn count(&mut self) -> Result<usize, ShardError> {
+        let count = self.u32()? as usize;
+        if count > MAX_COLLECTION_ITEMS {
+            Err(invalid("command collection exceeds item limit"))
+        } else {
+            Ok(count)
+        }
+    }
+
+    fn mutations(&mut self) -> Result<Vec<LogicalMutation>, ShardError> {
+        let count = self.count()?;
+        let mut mutations = Vec::with_capacity(count);
+        for _ in 0..count {
+            mutations.push(self.mutation()?);
+        }
+        Ok(mutations)
+    }
+
+    fn mutation(&mut self) -> Result<LogicalMutation, ShardError> {
+        match self.u8()? {
+            1 => Ok(LogicalMutation::PutVertex(VertexVersion::new(
+                VertexId::new(self.u128()?)?,
+                Version::new(self.u64()?),
+                self.interval()?,
+                TransactionTime::new(self.i64()?)?,
+                self.properties()?,
+            )?)),
+            2 => Ok(LogicalMutation::DeleteVertex(VertexTombstone::new(
+                VertexId::new(self.u128()?)?,
+                Version::new(self.u64()?),
+                TransactionTime::new(self.i64()?)?,
+            ))),
+            3 => Ok(LogicalMutation::PutEdge(EdgeVersion::new(
+                EdgeId::new(self.u128()?)?,
+                VertexId::new(self.u128()?)?,
+                VertexId::new(self.u128()?)?,
+                self.string()?,
+                Version::new(self.u64()?),
+                self.interval()?,
+                TransactionTime::new(self.i64()?)?,
+                self.properties()?,
+            )?)),
+            4 => Ok(LogicalMutation::DeleteEdge(EdgeTombstone::new(
+                EdgeId::new(self.u128()?)?,
+                Version::new(self.u64()?),
+                TransactionTime::new(self.i64()?)?,
+            ))),
+            5 => {
+                let id = TransactionId::new(self.u128()?)?;
+                let state = match self.u8()? {
+                    1 => TransactionState::Prepared,
+                    2 => TransactionState::Committed,
+                    3 => TransactionState::Aborted,
+                    _ => return Err(invalid("unknown transaction state")),
+                };
+                let transaction_time = TransactionTime::new(self.i64()?)?;
+                let digest = Digest32::new(self.fixed_32()?);
+                Ok(LogicalMutation::PutTransaction(TransactionRecord::new(
+                    id,
+                    state,
+                    transaction_time,
+                    digest,
+                )?))
+            }
+            6 => Ok(LogicalMutation::PutReplicaMetadata(ReplicaMetadata::new(
+                self.string()?,
+                self.value()?,
+            )?)),
+            _ => Err(invalid("unknown logical mutation tag")),
+        }
+    }
+
+    fn interval(&mut self) -> Result<ValidInterval, ShardError> {
+        Ok(ValidInterval::new(self.i64()?, self.i64()?)?)
+    }
+
+    fn properties(&mut self) -> Result<Properties, ShardError> {
+        let count = self.count()?;
+        let mut properties = BTreeMap::new();
+        for _ in 0..count {
+            let name = self.string()?;
+            if properties.insert(name, self.value()?).is_some() {
+                return Err(invalid("duplicate property name"));
+            }
+        }
+        Ok(properties)
+    }
+
+    fn value(&mut self) -> Result<Value, ShardError> {
+        match self.u8()? {
+            0 => Ok(Value::Null),
+            1 => match self.u8()? {
+                0 => Ok(Value::Boolean(false)),
+                1 => Ok(Value::Boolean(true)),
+                _ => Err(invalid("invalid Boolean value")),
+            },
+            2 => Ok(Value::Integer(self.i64()?)),
+            3 => Ok(Value::FloatBits(self.u64()?)),
+            4 => Ok(Value::Bytes(self.bytes()?.to_vec())),
+            5 => Ok(Value::String(self.string()?)),
+            6 => {
+                let count = self.count()?;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    values.push(self.value()?);
+                }
+                Ok(Value::List(values))
+            }
+            7 => {
+                let count = self.count()?;
+                let mut values = BTreeMap::new();
+                for _ in 0..count {
+                    let key = self.string()?;
+                    if values.insert(key, self.value()?).is_some() {
+                        return Err(invalid("duplicate value-map key"));
+                    }
+                }
+                Ok(Value::Map(values))
+            }
+            _ => Err(invalid("unknown value tag")),
+        }
+    }
+}

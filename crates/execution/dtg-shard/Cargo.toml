@@ -7,3 +7,13 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+dtg-kernel = { path = "../../kernel/dtg-kernel" }
+dtg-storage = { path = "../../storage/dtg-storage" }
+raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
+slog = "2"
+
+[dev-dependencies]
+dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
+tempfile = "3"
