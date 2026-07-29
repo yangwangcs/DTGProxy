@@ -17,6 +17,10 @@ pub enum PlanError {
     NoBoundedAccess {
         node: LogicalNodeId,
     },
+    UnsupportedNode {
+        node: LogicalNodeId,
+        reason: String,
+    },
     CapabilityDrift {
         shard_id: ShardId,
         expected: Digest32,
@@ -44,6 +48,11 @@ impl fmt::Display for PlanError {
             Self::NoBoundedAccess { node } => write!(
                 formatter,
                 "logical node {} has no bounded storage access",
+                node.get()
+            ),
+            Self::UnsupportedNode { node, reason } => write!(
+                formatter,
+                "logical node {} cannot be lowered: {reason}",
                 node.get()
             ),
             Self::CapabilityDrift { shard_id, .. } => write!(

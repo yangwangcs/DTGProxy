@@ -8,6 +8,7 @@ use dtg_execution::{
     GatewayFuture, GatewayOperation, GatewayResponse, GatewayRetry,
 };
 use dtg_gateway::{GatewayConfig, GatewayService};
+use support::planning_context;
 
 #[derive(Default)]
 struct TransactionTransport {
@@ -56,7 +57,7 @@ impl GatewayExecutionTransport for TransactionTransport {
 }
 
 fn gateway(transport: Arc<TransactionTransport>) -> GatewayService {
-    let execution = GatewayExecution::for_process(transport);
+    let execution = GatewayExecution::for_process(transport, planning_context());
     let config = GatewayConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7687),
         7,
@@ -107,3 +108,4 @@ async fn single_and_multi_shard_transactions_share_execution_coordinator_boundar
                 && commit_two.transaction_id() == Some(2)
     ));
 }
+mod support;

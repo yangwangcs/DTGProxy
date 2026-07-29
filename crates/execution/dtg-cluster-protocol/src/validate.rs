@@ -36,6 +36,11 @@ pub enum ProtocolError {
     ZeroEpoch,
     ZeroGeneration,
     ZeroCatalog,
+    ZeroSchema,
+    CapabilityDigestLength,
+    ZeroAppliedIndex,
+    ZeroTransactionTime,
+    MutableSnapshot,
     MissingPayload,
     FormatVersion,
     PayloadLimit,
@@ -65,6 +70,11 @@ impl ProtocolError {
             Self::ZeroEpoch => "DTG-PROTOCOL-ZERO-EPOCH",
             Self::ZeroGeneration => "DTG-PROTOCOL-ZERO-GENERATION",
             Self::ZeroCatalog => "DTG-PROTOCOL-ZERO-CATALOG",
+            Self::ZeroSchema => "DTG-PROTOCOL-ZERO-SCHEMA",
+            Self::CapabilityDigestLength => "DTG-PROTOCOL-CAPABILITY-DIGEST-LENGTH",
+            Self::ZeroAppliedIndex => "DTG-PROTOCOL-ZERO-APPLIED-INDEX",
+            Self::ZeroTransactionTime => "DTG-PROTOCOL-ZERO-TRANSACTION-TIME",
+            Self::MutableSnapshot => "DTG-PROTOCOL-MUTABLE-SNAPSHOT",
             Self::MissingPayload => "DTG-PROTOCOL-MISSING-PAYLOAD",
             Self::FormatVersion => "DTG-PROTOCOL-FORMAT-VERSION",
             Self::PayloadLimit => "DTG-PROTOCOL-PAYLOAD-LIMIT",
@@ -154,6 +164,21 @@ pub fn validate_execution_fragment(
         .ok_or(ProtocolError::MissingContext)?
         .try_into()?;
     require_nonzero_id(&wire.fragment_id)?;
+    if wire.schema_version == 0 {
+        return Err(ProtocolError::ZeroSchema);
+    }
+    if wire.capability_digest.len() != 32 {
+        return Err(ProtocolError::CapabilityDigestLength);
+    }
+    if wire.applied_index == 0 {
+        return Err(ProtocolError::ZeroAppliedIndex);
+    }
+    if wire.transaction_time <= 0 {
+        return Err(ProtocolError::ZeroTransactionTime);
+    }
+    if !wire.snapshot_immutable {
+        return Err(ProtocolError::MutableSnapshot);
+    }
     validate_payload(wire.payload, MAX_FRAGMENT_BYTES, MAX_FRAGMENT_ITEMS)
 }
 

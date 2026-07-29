@@ -1,5 +1,5 @@
 use dtg_language_ir::{
-    GraphScope, LogicalExpr, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
+    GraphScope, Limit, LogicalExpr, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
     LogicalProgram, LogicalStatement, NodeScan, ReadScope, RowSchema, Value, VertexLookup,
 };
 use dtg_plan::{
@@ -7,8 +7,8 @@ use dtg_plan::{
     plan,
 };
 use dtg_storage::{
-    BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
-    Version,
+    BackendClass, BindingRole, CapabilityManifest, ProviderKind, PushdownOperation, ReplicaBinding,
+    TransactionTime, Version,
 };
 
 fn binding(capabilities: &CapabilityManifest) -> ReplicaBinding {
@@ -88,11 +88,33 @@ fn scan_query() -> LogicalProgram {
     }))
 }
 
+fn skipped_scan_query() -> LogicalProgram {
+    let mut program = scan_query();
+    let LogicalStatement::Query(plan) = &mut program.statement else {
+        unreachable!()
+    };
+    plan.nodes.push(LogicalNode {
+        id: LogicalNodeId::new(2),
+        kind: LogicalNodeKind::Limit(Limit {
+            input: LogicalNodeId::new(1),
+            skip: Some(LogicalExpr::Literal(Value::Integer(5))),
+            limit: Some(LogicalExpr::Literal(Value::Integer(2))),
+        }),
+    });
+    plan.root = LogicalNodeId::new(2);
+    program
+}
+
 #[test]
 fn exact_pushdown_removes_the_execution_residual() {
     let capabilities =
         CapabilityManifest::from_names(dtg_plan::EXACT_VERTEX_POINT_CAPABILITIES).unwrap();
     let plan = plan(&point_query(), &context(capabilities, None)).unwrap();
+
+    assert_eq!(
+        plan.fragments()[0].storage_accesses()[0].node(),
+        LogicalNodeId::new(1)
+    );
 
     match &plan.fragments()[0].storage_accesses()[0] {
         StorageAccess::Pushdown {
@@ -105,6 +127,21 @@ fn exact_pushdown_removes_the_execution_residual() {
         }
         StorageAccess::Logical(_) => panic!("exact provider capability must use pushdown"),
     }
+}
+
+#[test]
+fn scan_pushdown_bound_includes_rows_consumed_by_skip() {
+    let capabilities =
+        CapabilityManifest::from_names(dtg_plan::EXACT_VERTEX_SCAN_CAPABILITIES).unwrap();
+    let plan = plan(&skipped_scan_query(), &context(capabilities, None)).unwrap();
+
+    let StorageAccess::Pushdown { request, .. } = &plan.fragments()[0].storage_accesses()[0] else {
+        panic!("exact scan capability must use pushdown");
+    };
+    let PushdownOperation::VertexScan(scan) = request.operation() else {
+        panic!("scan query must lower to a vertex scan");
+    };
+    assert_eq!(scan.limit(), 7);
 }
 
 #[test]

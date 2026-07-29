@@ -184,7 +184,13 @@ pub struct HashJoinOperator {
     left_key: usize,
     right_key: usize,
     schema: RowSchema,
-    emitted: bool,
+    batch_size: usize,
+    initialized: bool,
+    left_rows: Vec<Vec<QueryValue>>,
+    table: BTreeMap<ScalarKey, Vec<Vec<QueryValue>>>,
+    left_index: usize,
+    match_index: usize,
+    done: bool,
 }
 
 impl HashJoinOperator {
@@ -194,16 +200,38 @@ impl HashJoinOperator {
         left_key: usize,
         right_key: usize,
     ) -> Self {
+        Self::with_batch_size(left, right, left_key, right_key, 1024)
+            .expect("default HashJoin batch size is nonzero")
+    }
+
+    pub fn with_batch_size(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        left_key: usize,
+        right_key: usize,
+        batch_size: usize,
+    ) -> Result<Self, QueryError> {
+        if batch_size == 0 {
+            return Err(QueryError::InvalidPlan(
+                "HashJoin output batch size must be nonzero".into(),
+            ));
+        }
         let mut fields = left.schema().fields.clone();
         fields.extend(right.schema().fields.clone());
-        Self {
+        Ok(Self {
             left,
             right,
             left_key,
             right_key,
             schema: RowSchema { fields },
-            emitted: false,
-        }
+            batch_size,
+            initialized: false,
+            left_rows: Vec::new(),
+            table: BTreeMap::new(),
+            left_index: 0,
+            match_index: 0,
+            done: false,
+        })
     }
 }
 
@@ -218,33 +246,62 @@ impl Operator for HashJoinOperator {
     ) -> QueryFuture<'a, Option<ColumnBatch>> {
         Box::pin(async move {
             context.checkpoint()?;
-            if self.emitted {
+            if self.done {
                 return Ok(None);
             }
-            self.emitted = true;
-            let (_, left_rows) = collect_rows(&mut self.left, context).await?;
-            let (_, right_rows) = collect_rows(&mut self.right, context).await?;
-            let mut table: BTreeMap<ScalarKey, Vec<Vec<QueryValue>>> = BTreeMap::new();
-            for row in right_rows {
-                context.checkpoint()?;
-                let key = scalar_key(row.get(self.right_key))?;
-                table.entry(key).or_default().push(row);
-            }
-            context.charge_memory(estimate_rows(table.values().flatten()))?;
-            let mut output = Vec::new();
-            for left in left_rows {
-                context.checkpoint()?;
-                let key = scalar_key(left.get(self.left_key))?;
-                if let Some(matches) = table.get(&key) {
-                    for right in matches {
-                        context.checkpoint()?;
-                        let mut row = left.clone();
-                        row.extend(right.clone());
-                        output.push(row);
+            if !self.initialized {
+                let (_, left_rows) = collect_rows(&mut self.left, context).await?;
+                let (_, right_rows) = collect_rows(&mut self.right, context).await?;
+                for row in right_rows {
+                    context.checkpoint()?;
+                    let key_bytes = scalar_key_owned_bytes(row.get(self.right_key))?;
+                    context.charge_memory(key_bytes.saturating_add(32).saturating_add(8))?;
+                    let key = scalar_key(row.get(self.right_key))?;
+                    let new_key = !self.table.contains_key(&key);
+                    self.table.entry(key).or_default().push(row);
+                    if !new_key {
+                        context.release_memory(key_bytes.saturating_add(32));
                     }
                 }
+                self.left_rows = left_rows;
+                self.initialized = true;
             }
-            ColumnBatch::from_rows(self.schema.clone(), output).map(Some)
+            let mut output = Vec::new();
+            while output.len() < self.batch_size && self.left_index < self.left_rows.len() {
+                context.checkpoint()?;
+                let left = &self.left_rows[self.left_index];
+                let key_bytes = scalar_key_owned_bytes(left.get(self.left_key))?;
+                context.charge_memory(key_bytes)?;
+                let key = scalar_key(left.get(self.left_key))?;
+                let matches = self.table.get(&key);
+                drop(key);
+                context.release_memory(key_bytes);
+                let Some(matches) = matches else {
+                    self.left_index += 1;
+                    self.match_index = 0;
+                    continue;
+                };
+                if self.match_index >= matches.len() {
+                    self.left_index += 1;
+                    self.match_index = 0;
+                    continue;
+                }
+                let right = &matches[self.match_index];
+                let output_bytes = estimate_row(left).saturating_add(estimate_row(right));
+                context.charge_memory(output_bytes)?;
+                let mut row = left.clone();
+                row.extend(right.clone());
+                output.push(row);
+                self.match_index += 1;
+            }
+            if self.left_index >= self.left_rows.len() {
+                self.done = true;
+            }
+            if output.is_empty() {
+                Ok(None)
+            } else {
+                ColumnBatch::from_rows(self.schema.clone(), output).map(Some)
+            }
         })
     }
 }
@@ -367,7 +424,6 @@ impl Operator for SortOperator {
             }
             self.emitted = true;
             let (_, mut rows) = collect_rows(&mut self.input, context).await?;
-            context.charge_memory(estimate_rows(rows.iter()))?;
             rows.sort_by(|left, right| {
                 let ordering = compare_row_column(left, right, self.column);
                 match self.direction {
@@ -669,6 +725,7 @@ pub(crate) async fn collect_rows(
         let Some(batch) = input.next_batch(context).await? else {
             break;
         };
+        context.charge_memory(batch.estimated_bytes())?;
         rows.extend(batch.rows());
     }
     Ok((schema, rows))
@@ -701,6 +758,22 @@ fn scalar_key(value: Option<&QueryValue>) -> Result<ScalarKey, QueryError> {
     }
 }
 
+fn scalar_key_owned_bytes(value: Option<&QueryValue>) -> Result<u64, QueryError> {
+    match value {
+        Some(QueryValue::Null)
+        | Some(QueryValue::Boolean(_))
+        | Some(QueryValue::Integer(_))
+        | Some(QueryValue::FloatBits(_))
+        | Some(QueryValue::Vertex(_)) => Ok(0),
+        Some(QueryValue::Bytes(value)) => Ok(value.len() as u64),
+        Some(QueryValue::String(value)) => Ok(value.len() as u64),
+        Some(QueryValue::List(_) | QueryValue::Map(_) | QueryValue::Relationship(_)) => Err(
+            QueryError::Unsupported("join/aggregate key is not scalar".into()),
+        ),
+        None => Err(QueryError::InvalidPlan("key column is absent".into())),
+    }
+}
+
 fn compare_row_column(
     left: &[QueryValue],
     right: &[QueryValue],
@@ -724,9 +797,6 @@ pub(crate) fn compare_rows(left: &[QueryValue], right: &[QueryValue]) -> std::cm
         .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
-fn estimate_rows<'a>(rows: impl IntoIterator<Item = &'a Vec<QueryValue>>) -> u64 {
-    rows.into_iter()
-        .flatten()
-        .map(QueryValue::estimated_bytes)
-        .sum()
+fn estimate_row(row: &[QueryValue]) -> u64 {
+    row.iter().map(QueryValue::estimated_bytes).sum()
 }

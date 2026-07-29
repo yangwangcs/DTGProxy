@@ -10,6 +10,11 @@ use dtg_execution::{
     GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
     GatewayValue,
 };
+use dtg_plan::{CatalogShard, CatalogSnapshot, PlanningContext, SnapshotRequirements};
+use dtg_storage::{
+    BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
+    Version,
+};
 
 #[derive(Default)]
 struct RecordingProtocolClient {
@@ -85,11 +90,107 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+fn planning_context() -> PlanningContext {
+    let capabilities =
+        CapabilityManifest::from_names(dtg_plan::EXACT_VERTEX_SCAN_CAPABILITIES).unwrap();
+    let class = BackendClass::new(
+        ProviderKind::Fjall,
+        1,
+        1,
+        capabilities.names().map(str::to_owned),
+    )
+    .unwrap();
+    let binding = ReplicaBinding::builder()
+        .cluster_id(7)
+        .graph_id(1)
+        .shard_id(13)
+        .placement_epoch(17)
+        .replica_id(19)
+        .backend_generation(23)
+        .backend_class_digest(class.digest())
+        .provider_kind(ProviderKind::Fjall)
+        .contract_version(1)
+        .layout_version(1)
+        .capability_digest(capabilities.digest())
+        .namespace_id("gateway-wire-fixture")
+        .endpoint_profile_ref("fixture-endpoint")
+        .credential_ref("fixture-credential")
+        .role(BindingRole::Active)
+        .build()
+        .unwrap();
+    PlanningContext::new(
+        CatalogSnapshot::new(
+            Version::new(29),
+            Version::new(31),
+            vec![CatalogShard::new(binding, 37)],
+        )
+        .unwrap(),
+        capabilities,
+        SnapshotRequirements::fixed(TransactionTime::new(41).unwrap(), 43),
+        Some(128),
+    )
+    .unwrap()
+}
+
+#[test]
+fn query_wire_carries_versioned_physical_fragments_and_every_planning_fence() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let transport = Arc::new(GatewayProtocolV2Transport::new(client.clone()));
+    let execution = GatewayExecution::for_process(transport, planning_context());
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+    let context = GatewayRequestContext::new(7, 8, deadline, Vec::new()).unwrap();
+    let source = "MATCH (n) RETURN n.id ORDER BY n.id";
+
+    block_on(execution.execute_statement(
+        context,
+        source.into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    let requests = client.requests.lock().unwrap();
+    let request = &requests[0];
+    assert_eq!(request.fragments.len(), 1);
+    let fragment = &request.fragments[0];
+    let shard = fragment.context.as_ref().unwrap();
+    assert_eq!(shard.graph_id, 1);
+    assert_eq!(shard.shard_id, 13);
+    assert_eq!(shard.placement_epoch, 17);
+    assert_eq!(shard.backend_generation, 23);
+    assert_eq!(shard.catalog_version, 29);
+    assert_eq!(fragment.schema_version, 31);
+    assert_eq!(
+        fragment.capability_digest,
+        planning_context().capability_digest().get()
+    );
+    assert_eq!(fragment.applied_index, 37);
+    assert_eq!(fragment.transaction_time, 41);
+    assert_eq!(fragment.valid_at, 43);
+    assert!(fragment.snapshot_immutable);
+    let payload = fragment.payload.as_ref().unwrap();
+    assert_eq!(payload.format_version, 1);
+    assert!(
+        !payload
+            .body
+            .windows(source.len())
+            .any(|window| window == source.as_bytes())
+    );
+}
+
 #[test]
 fn process_execution_encodes_normalized_requests_on_protocol_v2() {
     let client = Arc::new(RecordingProtocolClient::default());
     let transport = Arc::new(GatewayProtocolV2Transport::new(client.clone()));
-    let execution = GatewayExecution::for_process(transport);
+    let execution = GatewayExecution::for_process(transport, planning_context());
     let deadline = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -123,7 +224,7 @@ fn process_execution_encodes_normalized_requests_on_protocol_v2() {
 fn process_execution_decodes_protocol_v2_typed_rows() {
     let client = Arc::new(RecordingProtocolClient::default());
     let transport = Arc::new(GatewayProtocolV2Transport::new(client));
-    let execution = GatewayExecution::for_process(transport);
+    let execution = GatewayExecution::for_process(transport, planning_context());
     let deadline = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -161,7 +262,7 @@ fn process_execution_decodes_protocol_v2_typed_rows() {
 fn process_execution_decodes_protocol_v2_transaction_boundaries() {
     let client = Arc::new(RecordingProtocolClient::default());
     let transport = Arc::new(GatewayProtocolV2Transport::new(client));
-    let execution = GatewayExecution::for_process(transport);
+    let execution = GatewayExecution::for_process(transport, planning_context());
     let deadline = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

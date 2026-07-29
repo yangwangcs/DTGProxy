@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use dtg_language_ir::{ExpandDirection, Field, LogicalType, RowSchema};
+use dtg_language_ir::{
+    AggregateKind, ExpandDirection, Field, JoinKind, LogicalType, RowSchema, SortDirection,
+};
 use dtg_storage::{
     AdjacencyDirection, AdjacencyRead, BackendGeneration, Digest32, EdgeRead, EdgeScan,
     PlacementEpoch, PushdownExecutor, PushdownOperation, PushdownOutcome, PushdownRequest,
@@ -172,6 +174,7 @@ pub struct ExecutableFragment {
     id: u32,
     fence: ExecutionFence,
     accesses: Vec<ExecutableAccess>,
+    access_nodes: Vec<u32>,
 }
 
 impl ExecutableFragment {
@@ -180,15 +183,35 @@ impl ExecutableFragment {
         fence: ExecutionFence,
         accesses: Vec<ExecutableAccess>,
     ) -> Result<Self, QueryError> {
+        let access_nodes = (1..=accesses.len())
+            .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
+            .collect();
+        Self::with_access_nodes(id, fence, accesses, access_nodes)
+    }
+
+    pub fn with_access_nodes(
+        id: u32,
+        fence: ExecutionFence,
+        accesses: Vec<ExecutableAccess>,
+        access_nodes: Vec<u32>,
+    ) -> Result<Self, QueryError> {
         if id == 0 || accesses.is_empty() {
             return Err(QueryError::InvalidPlan(
                 "executable fragment identity and access set must be nonempty".into(),
+            ));
+        }
+        if accesses.len() != access_nodes.len()
+            || access_nodes.iter().copied().collect::<BTreeSet<_>>().len() != access_nodes.len()
+        {
+            return Err(QueryError::InvalidPlan(
+                "executable fragment access identities must be unique".into(),
             ));
         }
         Ok(Self {
             id,
             fence,
             accesses,
+            access_nodes,
         })
     }
 
@@ -203,19 +226,146 @@ impl ExecutableFragment {
     pub fn accesses(&self) -> &[ExecutableAccess] {
         &self.accesses
     }
+
+    pub fn access(&self, logical_node: u32) -> Option<&ExecutableAccess> {
+        self.access_nodes
+            .iter()
+            .position(|node| *node == logical_node)
+            .and_then(|index| self.accesses.get(index))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableProjection {
+    alias: String,
+    expression: Expression,
+}
+
+impl ExecutableProjection {
+    pub fn new(alias: impl Into<String>, expression: Expression) -> Self {
+        Self {
+            alias: alias.into(),
+            expression,
+        }
+    }
+
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub const fn expression(&self) -> &Expression {
+        &self.expression
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableAggregate {
+    pub function: AggregateKind,
+    pub argument: Option<Expression>,
+    pub alias: String,
+    pub distinct: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableSortKey {
+    pub expression: Expression,
+    pub direction: SortDirection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableOperator {
+    id: u32,
+    kind: ExecutableOperatorKind,
+}
+
+impl ExecutableOperator {
+    pub fn new(id: u32, kind: ExecutableOperatorKind) -> Result<Self, QueryError> {
+        Ok(Self { id, kind })
+    }
+
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub const fn kind(&self) -> &ExecutableOperatorKind {
+        &self.kind
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutableOperatorKind {
+    Source {
+        logical_node: u32,
+        fragments: Vec<u32>,
+        output: String,
+    },
+    Filter {
+        input: u32,
+        predicate: Expression,
+    },
+    Project {
+        input: u32,
+        projections: Vec<ExecutableProjection>,
+    },
+    Join {
+        left: u32,
+        right: u32,
+        kind: JoinKind,
+        predicate: Option<Expression>,
+    },
+    Aggregate {
+        input: u32,
+        groups: Vec<ExecutableProjection>,
+        aggregates: Vec<ExecutableAggregate>,
+    },
+    Sort {
+        input: u32,
+        keys: Vec<ExecutableSortKey>,
+    },
+    Limit {
+        input: u32,
+        skip: u64,
+        limit: Option<u64>,
+    },
+    Unwind {
+        input: u32,
+        expression: Expression,
+        alias: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutablePlan {
     version: Version,
     fragments: Vec<ExecutableFragment>,
+    root_operator: u32,
+    operators: Vec<ExecutableOperator>,
     result_schema: RowSchema,
 }
 
 impl ExecutablePlan {
     pub fn new(
         version: Version,
+        fragments: Vec<ExecutableFragment>,
+        result_schema: RowSchema,
+    ) -> Result<Self, QueryError> {
+        let fragment_ids = fragments.iter().map(ExecutableFragment::id).collect();
+        let operator = ExecutableOperator::new(
+            1,
+            ExecutableOperatorKind::Source {
+                logical_node: 1,
+                fragments: fragment_ids,
+                output: "vertex".into(),
+            },
+        )?;
+        Self::with_operators(version, fragments, 1, vec![operator], result_schema)
+    }
+
+    pub fn with_operators(
+        version: Version,
         mut fragments: Vec<ExecutableFragment>,
+        root_operator: u32,
+        operators: Vec<ExecutableOperator>,
         result_schema: RowSchema,
     ) -> Result<Self, QueryError> {
         if version.get() == 0 || fragments.is_empty() {
@@ -232,10 +382,24 @@ impl ExecutablePlan {
                 ));
             }
         }
+        let operator_ids = operators
+            .iter()
+            .map(ExecutableOperator::id)
+            .collect::<BTreeSet<_>>();
+        if operators.is_empty()
+            || operator_ids.len() != operators.len()
+            || !operator_ids.contains(&root_operator)
+        {
+            return Err(QueryError::InvalidPlan(
+                "executable operator DAG must have unique identities and a valid root".into(),
+            ));
+        }
         fragments.sort_unstable_by_key(|fragment| fragment.fence().shard_id());
         Ok(Self {
             version,
             fragments,
+            root_operator,
+            operators,
             result_schema,
         })
     }
@@ -246,6 +410,14 @@ impl ExecutablePlan {
 
     pub fn fragments(&self) -> &[ExecutableFragment] {
         &self.fragments
+    }
+
+    pub const fn root_operator(&self) -> u32 {
+        self.root_operator
+    }
+
+    pub fn operators(&self) -> &[ExecutableOperator] {
+        &self.operators
     }
 
     pub const fn result_schema(&self) -> &RowSchema {

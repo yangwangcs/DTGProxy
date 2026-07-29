@@ -8,6 +8,7 @@ use dtg_execution::{
     GatewayRows, GatewayTemporalMode, GatewayTime, GatewayValue,
 };
 use dtg_gateway::{GatewayConfig, GatewayService};
+use support::planning_context;
 
 #[derive(Default)]
 struct CleanBreakTransport {
@@ -20,8 +21,9 @@ impl GatewayExecutionTransport for CleanBreakTransport {
         request: GatewayClusterRequest,
     ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
         let response = if request
-            .statement()
-            .is_some_and(|source| source.contains("fail"))
+            .result_fields()
+            .iter()
+            .any(|field| field.contains("fail"))
         {
             Err(GatewayExecutionError::new(
                 "DTG-CLUSTER-UNAVAILABLE",
@@ -51,7 +53,7 @@ impl GatewayExecutionTransport for CleanBreakTransport {
 #[tokio::test]
 async fn bolt_query_uses_new_language_and_execution_path() {
     let transport = Arc::new(CleanBreakTransport::default());
-    let execution = GatewayExecution::for_process(transport.clone());
+    let execution = GatewayExecution::for_process(transport.clone(), planning_context());
     let config = GatewayConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7687),
         7,
@@ -85,7 +87,7 @@ async fn bolt_query_uses_new_language_and_execution_path() {
 #[tokio::test]
 async fn bolt_dispatches_normalized_temporal_queries_and_writes() {
     let transport = Arc::new(CleanBreakTransport::default());
-    let execution = GatewayExecution::for_process(transport.clone());
+    let execution = GatewayExecution::for_process(transport.clone(), planning_context());
     let config = GatewayConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7687),
         7,
@@ -146,7 +148,7 @@ async fn bolt_dispatches_normalized_temporal_queries_and_writes() {
 #[tokio::test]
 async fn cancellation_and_deadline_stop_before_cluster_dispatch() {
     let transport = Arc::new(CleanBreakTransport::default());
-    let execution = GatewayExecution::for_process(transport.clone());
+    let execution = GatewayExecution::for_process(transport.clone(), planning_context());
     let config = GatewayConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7687),
         7,
@@ -180,7 +182,7 @@ async fn cancellation_and_deadline_stop_before_cluster_dispatch() {
 #[tokio::test]
 async fn language_and_cluster_errors_keep_stable_codes() {
     let transport = Arc::new(CleanBreakTransport::default());
-    let execution = GatewayExecution::for_process(transport.clone());
+    let execution = GatewayExecution::for_process(transport.clone(), planning_context());
     let config = GatewayConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7687),
         7,
@@ -211,3 +213,4 @@ async fn language_and_cluster_errors_keep_stable_codes() {
 fn gateway_binary_is_published_under_the_cutover_name() {
     assert!(std::path::Path::new(env!("CARGO_BIN_EXE_dtgproxy-gateway")).exists());
 }
+mod support;

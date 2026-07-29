@@ -13,6 +13,7 @@ use dtg_execution::{
 use dtg_gateway::{GatewayConfig, GatewayService};
 use dtg_meta::MetaConfig;
 use serde_json::Value;
+use support::planning_context;
 
 const FIXTURE_ROOT: &str = "../../../config/examples/clean-break-cluster";
 
@@ -165,7 +166,7 @@ async fn four_role_composition_uses_only_clean_break_process_contracts() {
             std::time::Duration::from_secs(5),
         )
         .unwrap(),
-        GatewayExecution::for_process(Arc::new(CertifiedTransport)),
+        GatewayExecution::for_process(Arc::new(CertifiedTransport), planning_context()),
     );
     let rows = gateway
         .bolt()
@@ -179,3 +180,4 @@ async fn four_role_composition_uses_only_clean_break_process_contracts() {
     data.stop();
     assert_eq!(data.lifecycle(), LifecycleState::Stopped);
 }
+mod support;

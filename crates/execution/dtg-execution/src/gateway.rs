@@ -24,10 +24,11 @@ use dtg_plan::{
     PlanningContext, SemanticRequirements, StorageAccess,
 };
 use dtg_query::{
-    CancellationToken as QueryCancellationToken, ExecutableAccess, ExecutableFragment,
-    ExecutablePlan, ExecutionFence, LogicalRead, QueryBudget, QueryError, QueryOverlay,
-    QueryRuntime, QueryStorage, QueryStream, ReadOperation, ResidualPredicate, SnapshotGuard,
-    SnapshotShardFence,
+    CancellationToken as QueryCancellationToken, ExecutableAccess, ExecutableAggregate,
+    ExecutableFragment, ExecutableOperator, ExecutableOperatorKind, ExecutablePlan,
+    ExecutableProjection, ExecutableSortKey, ExecutionFence, Expression, LogicalRead, QueryBudget,
+    QueryError, QueryOverlay, QueryRuntime, QueryStorage, QueryStream, ReadOperation,
+    ResidualPredicate, SnapshotGuard, SnapshotShardFence,
 };
 use dtg_storage::{PushdownOperation, ShardId, TransactionId, Version};
 use dtg_transaction::{
@@ -235,7 +236,7 @@ pub enum GatewayTemporalMode {
 pub struct GatewayClusterRequest {
     context: GatewayRequestContext,
     operation: GatewayOperation,
-    statement: Option<String>,
+    physical_plan: Option<PhysicalPlan>,
     parameters: BTreeMap<String, GatewayValue>,
     transaction_id: Option<u128>,
     result_fields: Vec<String>,
@@ -251,8 +252,8 @@ impl GatewayClusterRequest {
         &self.operation
     }
 
-    pub fn statement(&self) -> Option<&str> {
-        self.statement.as_deref()
+    pub const fn physical_plan(&self) -> Option<&PhysicalPlan> {
+        self.physical_plan.as_ref()
     }
 
     pub const fn parameters(&self) -> &BTreeMap<String, GatewayValue> {
@@ -481,6 +482,8 @@ enum GatewayExecutionMode {
         analytics: Box<dyn AnalyticsRuntime>,
     },
     Process {
+        planner: Planner,
+        planning_context: PlanningContext,
         transport: Arc<dyn GatewayExecutionTransport>,
     },
 }
@@ -495,10 +498,17 @@ impl GatewayExecution {
         GatewayExecutionBuilder::default()
     }
 
-    pub fn for_process(transport: Arc<dyn GatewayExecutionTransport>) -> Self {
+    pub fn for_process(
+        transport: Arc<dyn GatewayExecutionTransport>,
+        planning_context: PlanningContext,
+    ) -> Self {
         Self {
             language: Language::new(Arc::new(EmptySchemaCatalog)),
-            mode: GatewayExecutionMode::Process { transport },
+            mode: GatewayExecutionMode::Process {
+                planner: Planner,
+                planning_context,
+                transport,
+            },
         }
     }
 
@@ -524,7 +534,18 @@ impl GatewayExecution {
             .iter()
             .map(lower_fragment)
             .collect::<Result<Vec<_>, _>>()?;
-        ExecutablePlan::new(plan.version, fragments, plan.result_schema().clone())
+        let operators = plan
+            .operators()
+            .iter()
+            .map(lower_operator)
+            .collect::<Result<Vec<_>, _>>()?;
+        ExecutablePlan::with_operators(
+            plan.version,
+            fragments,
+            plan.root_operator().get(),
+            operators,
+            plan.result_schema().clone(),
+        )
     }
 
     pub fn tick_analytics(
@@ -678,16 +699,40 @@ impl GatewayExecution {
                 .iter()
                 .map(|field| field.name.clone())
                 .collect();
+            let physical_plan = match &program.statement {
+                LogicalStatement::Query(_) => {
+                    let GatewayExecutionMode::Process {
+                        planner,
+                        planning_context,
+                        ..
+                    } = &self.mode
+                    else {
+                        return Err(GatewayExecutionError::new(
+                            "DTG-EXECUTION-PROCESS-TRANSPORT",
+                            "GatewayExecution was not constructed for process execution",
+                            GatewayRetry::Never,
+                        ));
+                    };
+                    Some(planner.plan(&program, planning_context).map_err(|error| {
+                        GatewayExecutionError::new(
+                            "DTG-EXECUTION-PLAN",
+                            error.to_string(),
+                            GatewayRetry::Never,
+                        )
+                    })?)
+                }
+                _ => None,
+            };
             let request = GatewayClusterRequest {
                 context,
                 operation,
-                statement: Some(statement),
+                physical_plan,
                 parameters,
                 transaction_id,
                 result_fields,
                 temporal_mode,
             };
-            let GatewayExecutionMode::Process { transport } = &self.mode else {
+            let GatewayExecutionMode::Process { transport, .. } = &self.mode else {
                 return Err(GatewayExecutionError::new(
                     "DTG-EXECUTION-PROCESS-TRANSPORT",
                     "GatewayExecution was not constructed for process execution",
@@ -712,13 +757,13 @@ impl GatewayExecution {
             let request = GatewayClusterRequest {
                 context,
                 operation,
-                statement: None,
+                physical_plan: None,
                 parameters: BTreeMap::new(),
                 transaction_id,
                 result_fields: Vec::new(),
                 temporal_mode: GatewayTemporalMode::Current,
             };
-            let GatewayExecutionMode::Process { transport } = &self.mode else {
+            let GatewayExecutionMode::Process { transport, .. } = &self.mode else {
                 return Err(GatewayExecutionError::new(
                     "DTG-EXECUTION-PROCESS-TRANSPORT",
                     "GatewayExecution was not constructed for process execution",
@@ -946,6 +991,15 @@ fn encode_protocol_v2_request(request: &GatewayClusterRequest) -> proto::Gateway
     let item_count = u32::try_from(request.parameters.len())
         .unwrap_or(u32::MAX)
         .saturating_add(1);
+    let fragments = request
+        .physical_plan()
+        .map(|plan| {
+            plan.fragments()
+                .iter()
+                .map(|fragment| encode_physical_fragment(&context, plan, fragment))
+                .collect()
+        })
+        .unwrap_or_default();
     proto::GatewayRequest {
         request: Some(context),
         execution_request: Some(proto::BoundedPayload {
@@ -955,6 +1009,7 @@ fn encode_protocol_v2_request(request: &GatewayClusterRequest) -> proto::Gateway
             checksum: checksum_bytes(&body).to_vec(),
             body,
         }),
+        fragments,
     }
 }
 
@@ -969,7 +1024,6 @@ fn encode_cluster_request_body(request: &GatewayClusterRequest) -> Vec<u8> {
         None => body.push(0),
     }
     encode_temporal_mode(&request.temporal_mode, &mut body);
-    encode_optional_string(request.statement.as_deref(), &mut body);
     encode_u32(request.parameters.len(), &mut body);
     for (name, value) in &request.parameters {
         encode_string(name, &mut body);
@@ -980,6 +1034,517 @@ fn encode_cluster_request_body(request: &GatewayClusterRequest) -> Vec<u8> {
         encode_string(field, &mut body);
     }
     body
+}
+
+fn encode_physical_fragment(
+    request: &proto::RequestContext,
+    plan: &PhysicalPlan,
+    fragment: &dtg_plan::PlanFragment,
+) -> proto::ExecutionFragment {
+    let fence = fragment.fence();
+    let snapshot = fence.snapshot_requirements();
+    let body = encode_physical_fragment_body(plan, fragment);
+    let format_version = u32::try_from(plan.version.get()).unwrap_or(u32::MAX);
+    let item_count = u32::try_from(
+        plan.operators()
+            .len()
+            .saturating_add(fragment.storage_accesses().len()),
+    )
+    .unwrap_or(u32::MAX);
+    proto::ExecutionFragment {
+        context: Some(proto::ShardContext {
+            request: Some(request.clone()),
+            graph_id: fence.read_fence().binding().graph_id().get(),
+            shard_id: u32::try_from(fence.shard_id().get()).unwrap_or(u32::MAX),
+            placement_epoch: fence.placement_epoch().get(),
+            backend_generation: fence.backend_generation().get(),
+            catalog_version: fence.catalog_version().get(),
+        }),
+        fragment_id: u128::from(fragment.id().get()).to_be_bytes().to_vec(),
+        payload: Some(proto::BoundedPayload {
+            format_version,
+            declared_len: body.len() as u64,
+            item_count,
+            checksum: checksum_bytes(&body).to_vec(),
+            body,
+        }),
+        schema_version: fence.schema_version().get(),
+        capability_digest: fence.capability_digest().get().to_vec(),
+        applied_index: fence.applied_index(),
+        transaction_time: snapshot.transaction_time().get(),
+        valid_at: snapshot.valid_at(),
+        snapshot_immutable: snapshot.immutable(),
+    }
+}
+
+fn encode_physical_fragment_body(
+    plan: &PhysicalPlan,
+    fragment: &dtg_plan::PlanFragment,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&plan.version.get().to_be_bytes());
+    body.extend_from_slice(&plan.root_operator().get().to_be_bytes());
+    encode_row_schema(plan.result_schema(), &mut body);
+    encode_u32(fragment.storage_accesses().len(), &mut body);
+    for access in fragment.storage_accesses() {
+        encode_storage_access(access, &mut body);
+    }
+    encode_u32(plan.operators().len(), &mut body);
+    for operator in plan.operators() {
+        encode_physical_operator(operator, &mut body);
+    }
+    body
+}
+
+fn encode_storage_access(access: &StorageAccess, output: &mut Vec<u8>) {
+    output.extend_from_slice(&access.node().get().to_be_bytes());
+    match access {
+        StorageAccess::Logical(request) => {
+            output.push(0);
+            encode_logical_read_operation(request.operation(), output);
+            encode_read_scope(request.read_scope(), output);
+            output.extend_from_slice(&request.row_bound().to_be_bytes());
+        }
+        StorageAccess::Pushdown {
+            request,
+            guarantee,
+            residual,
+            ..
+        } => {
+            output.push(1);
+            output.extend_from_slice(&request.contract_version().to_be_bytes());
+            let capabilities = request.required_capabilities().names().collect::<Vec<_>>();
+            encode_u32(capabilities.len(), output);
+            for capability in capabilities {
+                encode_string(capability, output);
+            }
+            match request.operation() {
+                PushdownOperation::Vertex(read) => {
+                    output.push(0);
+                    output.extend_from_slice(&read.id().get().to_be_bytes());
+                    output.extend_from_slice(&read.valid_at().to_be_bytes());
+                    output.extend_from_slice(&read.transaction_at().get().to_be_bytes());
+                }
+                PushdownOperation::VertexScan(scan) => {
+                    output.push(1);
+                    output.extend_from_slice(&scan.valid_at().to_be_bytes());
+                    output.extend_from_slice(&scan.transaction_at().get().to_be_bytes());
+                    match scan.after() {
+                        Some(after) => {
+                            output.push(1);
+                            output.extend_from_slice(&after.get().to_be_bytes());
+                        }
+                        None => output.push(0),
+                    }
+                    output.extend_from_slice(&scan.limit().to_be_bytes());
+                }
+            }
+            output.push(semantic_flags(*guarantee));
+            match residual {
+                Some(residual) => {
+                    output.push(1);
+                    encode_physical_expr(residual, output);
+                }
+                None => output.push(0),
+            }
+        }
+    }
+}
+
+fn semantic_flags(guarantee: dtg_plan::PushdownGuarantee) -> u8 {
+    u8::from(guarantee.temporal())
+        | (u8::from(guarantee.nulls()) << 1)
+        | (u8::from(guarantee.duplicates()) << 2)
+        | (u8::from(guarantee.order()) << 3)
+        | (u8::from(guarantee.snapshot()) << 4)
+}
+
+fn encode_logical_read_operation(operation: &LogicalReadOperation, output: &mut Vec<u8>) {
+    match operation {
+        LogicalReadOperation::VertexPoint(id) => {
+            output.push(0);
+            output.extend_from_slice(&id.get().to_be_bytes());
+        }
+        LogicalReadOperation::VertexScan => output.push(1),
+        LogicalReadOperation::EdgePoint(id) => {
+            output.push(2);
+            output.extend_from_slice(&id.get().to_be_bytes());
+        }
+        LogicalReadOperation::EdgeScan => output.push(3),
+        LogicalReadOperation::Adjacency { direction } => {
+            output.push(4);
+            output.push(match direction {
+                dtg_language_ir::ExpandDirection::Outgoing => 0,
+                dtg_language_ir::ExpandDirection::Incoming => 1,
+                dtg_language_ir::ExpandDirection::Either => 2,
+            });
+        }
+    }
+}
+
+fn encode_read_scope(scope: &dtg_language_ir::ReadScope, output: &mut Vec<u8>) {
+    encode_temporal_scope(&scope.transaction_time, output);
+    match &scope.valid_time {
+        None => output.push(0),
+        Some(dtg_language_ir::ValidTimePredicate::At(value)) => {
+            output.push(1);
+            encode_valid_time_expr(value, output);
+        }
+        Some(dtg_language_ir::ValidTimePredicate::Overlaps(interval)) => {
+            output.push(2);
+            match interval {
+                dtg_language_ir::ValidIntervalExpr::Literal(value) => {
+                    output.push(0);
+                    output.extend_from_slice(&value.start().to_be_bytes());
+                    output.extend_from_slice(&value.end().to_be_bytes());
+                }
+                dtg_language_ir::ValidIntervalExpr::Parameter(name) => {
+                    output.push(1);
+                    encode_string(name, output);
+                }
+                dtg_language_ir::ValidIntervalExpr::Bounds { start, end } => {
+                    output.push(2);
+                    encode_valid_time_expr(start, output);
+                    encode_valid_time_expr(end, output);
+                }
+            }
+        }
+        Some(dtg_language_ir::ValidTimePredicate::Changes { from, to }) => {
+            output.push(3);
+            encode_valid_time_expr(from, output);
+            encode_valid_time_expr(to, output);
+        }
+    }
+}
+
+fn encode_temporal_scope(scope: &TemporalScope, output: &mut Vec<u8>) {
+    match scope {
+        TemporalScope::Current => output.push(0),
+        TemporalScope::AsOf(time) => {
+            output.push(1);
+            encode_time_expr(time, output);
+        }
+        TemporalScope::Changes { from, to } => {
+            output.push(2);
+            encode_time_expr(from, output);
+            encode_time_expr(to, output);
+        }
+    }
+}
+
+fn encode_time_expr(time: &TimeExpr, output: &mut Vec<u8>) {
+    match time {
+        TimeExpr::Literal(value) => {
+            output.push(0);
+            output.extend_from_slice(&value.get().to_be_bytes());
+        }
+        TimeExpr::Parameter(name) => {
+            output.push(1);
+            encode_string(name, output);
+        }
+    }
+}
+
+fn encode_valid_time_expr(time: &ValidTimeExpr, output: &mut Vec<u8>) {
+    match time {
+        ValidTimeExpr::Literal(value) => {
+            output.push(0);
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        ValidTimeExpr::Parameter(name) => {
+            output.push(1);
+            encode_string(name, output);
+        }
+    }
+}
+
+fn encode_physical_operator(operator: &dtg_plan::PhysicalOperator, output: &mut Vec<u8>) {
+    use dtg_plan::PhysicalOperatorKind;
+
+    output.extend_from_slice(&operator.id().get().to_be_bytes());
+    match operator.kind() {
+        PhysicalOperatorKind::Source {
+            logical_node,
+            fragments,
+            output: source_output,
+        } => {
+            output.push(0);
+            output.extend_from_slice(&logical_node.get().to_be_bytes());
+            encode_u32(fragments.len(), output);
+            for fragment in fragments {
+                output.extend_from_slice(&fragment.get().to_be_bytes());
+            }
+            encode_string(source_output, output);
+        }
+        PhysicalOperatorKind::Filter { input, predicate } => {
+            output.push(1);
+            output.extend_from_slice(&input.get().to_be_bytes());
+            encode_physical_expr(predicate, output);
+        }
+        PhysicalOperatorKind::Project { input, projections } => {
+            output.push(2);
+            output.extend_from_slice(&input.get().to_be_bytes());
+            encode_projections(projections, output);
+        }
+        PhysicalOperatorKind::Join {
+            left,
+            right,
+            kind,
+            predicate,
+        } => {
+            output.push(3);
+            output.extend_from_slice(&left.get().to_be_bytes());
+            output.extend_from_slice(&right.get().to_be_bytes());
+            output.push(match kind {
+                dtg_language_ir::JoinKind::Inner => 0,
+                dtg_language_ir::JoinKind::Left => 1,
+                dtg_language_ir::JoinKind::Semi => 2,
+                dtg_language_ir::JoinKind::Anti => 3,
+            });
+            match predicate {
+                Some(predicate) => {
+                    output.push(1);
+                    encode_physical_expr(predicate, output);
+                }
+                None => output.push(0),
+            }
+        }
+        PhysicalOperatorKind::Aggregate {
+            input,
+            groups,
+            aggregates,
+        } => {
+            output.push(4);
+            output.extend_from_slice(&input.get().to_be_bytes());
+            encode_projections(groups, output);
+            encode_u32(aggregates.len(), output);
+            for aggregate in aggregates {
+                output.push(match aggregate.function {
+                    dtg_language_ir::AggregateKind::Count => 0,
+                    dtg_language_ir::AggregateKind::Sum => 1,
+                    dtg_language_ir::AggregateKind::Average => 2,
+                    dtg_language_ir::AggregateKind::Minimum => 3,
+                    dtg_language_ir::AggregateKind::Maximum => 4,
+                    dtg_language_ir::AggregateKind::Collect => 5,
+                });
+                match &aggregate.argument {
+                    Some(argument) => {
+                        output.push(1);
+                        encode_logical_expr(argument, output);
+                    }
+                    None => output.push(0),
+                }
+                encode_string(&aggregate.alias, output);
+                output.push(u8::from(aggregate.distinct));
+            }
+        }
+        PhysicalOperatorKind::Sort { input, keys } => {
+            output.push(5);
+            output.extend_from_slice(&input.get().to_be_bytes());
+            encode_u32(keys.len(), output);
+            for key in keys {
+                encode_logical_expr(&key.expression, output);
+                output.push(match key.direction {
+                    dtg_language_ir::SortDirection::Ascending => 0,
+                    dtg_language_ir::SortDirection::Descending => 1,
+                });
+            }
+        }
+        PhysicalOperatorKind::Limit { input, skip, limit } => {
+            output.push(6);
+            output.extend_from_slice(&input.get().to_be_bytes());
+            output.extend_from_slice(&skip.to_be_bytes());
+            match limit {
+                Some(limit) => {
+                    output.push(1);
+                    output.extend_from_slice(&limit.to_be_bytes());
+                }
+                None => output.push(0),
+            }
+        }
+        PhysicalOperatorKind::Unwind {
+            input,
+            expression,
+            alias,
+        } => {
+            output.push(7);
+            output.extend_from_slice(&input.get().to_be_bytes());
+            encode_physical_expr(expression, output);
+            encode_string(alias, output);
+        }
+    }
+}
+
+fn encode_projections(projections: &[dtg_language_ir::Projection], output: &mut Vec<u8>) {
+    encode_u32(projections.len(), output);
+    for projection in projections {
+        encode_logical_expr(&projection.expression, output);
+        encode_string(&projection.alias, output);
+    }
+}
+
+fn encode_physical_expr(expression: &PhysicalExpr, output: &mut Vec<u8>) {
+    match expression {
+        PhysicalExpr::Evaluate(expression) => {
+            output.push(0);
+            encode_logical_expr(expression, output);
+        }
+        PhysicalExpr::VerifyStorageSemantics { node, requirements } => {
+            output.push(1);
+            output.extend_from_slice(&node.get().to_be_bytes());
+            output.push(
+                u8::from(requirements.temporal())
+                    | (u8::from(requirements.nulls()) << 1)
+                    | (u8::from(requirements.duplicates()) << 2)
+                    | (u8::from(requirements.order()) << 3)
+                    | (u8::from(requirements.snapshot()) << 4),
+            );
+        }
+    }
+}
+
+fn encode_logical_expr(expression: &dtg_language_ir::LogicalExpr, output: &mut Vec<u8>) {
+    use dtg_language_ir::LogicalExpr;
+
+    match expression {
+        LogicalExpr::Literal(value) => {
+            output.push(0);
+            encode_kernel_value(value, output);
+        }
+        LogicalExpr::Parameter(name) => {
+            output.push(1);
+            encode_string(name, output);
+        }
+        LogicalExpr::Column(name) => {
+            output.push(2);
+            encode_string(name, output);
+        }
+        LogicalExpr::Property { input, name } => {
+            output.push(3);
+            encode_logical_expr(input, output);
+            encode_string(name, output);
+        }
+        LogicalExpr::Unary { operator, input } => {
+            output.push(4);
+            output.push(match operator {
+                dtg_language_ir::UnaryOperator::Not => 0,
+                dtg_language_ir::UnaryOperator::Negate => 1,
+                dtg_language_ir::UnaryOperator::IsNull => 2,
+            });
+            encode_logical_expr(input, output);
+        }
+        LogicalExpr::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            output.push(5);
+            output.push(match operator {
+                dtg_language_ir::BinaryOperator::Add => 0,
+                dtg_language_ir::BinaryOperator::Subtract => 1,
+                dtg_language_ir::BinaryOperator::Multiply => 2,
+                dtg_language_ir::BinaryOperator::Divide => 3,
+                dtg_language_ir::BinaryOperator::Equal => 4,
+                dtg_language_ir::BinaryOperator::NotEqual => 5,
+                dtg_language_ir::BinaryOperator::LessThan => 6,
+                dtg_language_ir::BinaryOperator::LessThanOrEqual => 7,
+                dtg_language_ir::BinaryOperator::GreaterThan => 8,
+                dtg_language_ir::BinaryOperator::GreaterThanOrEqual => 9,
+                dtg_language_ir::BinaryOperator::And => 10,
+                dtg_language_ir::BinaryOperator::Or => 11,
+                dtg_language_ir::BinaryOperator::Contains => 12,
+            });
+            encode_logical_expr(left, output);
+            encode_logical_expr(right, output);
+        }
+        LogicalExpr::List(values) => {
+            output.push(6);
+            encode_u32(values.len(), output);
+            for value in values {
+                encode_logical_expr(value, output);
+            }
+        }
+        LogicalExpr::Map(values) => {
+            output.push(7);
+            encode_u32(values.len(), output);
+            for (name, value) in values {
+                encode_string(name, output);
+                encode_logical_expr(value, output);
+            }
+        }
+    }
+}
+
+fn encode_kernel_value(value: &dtg_storage::Value, output: &mut Vec<u8>) {
+    match value {
+        dtg_storage::Value::Null => output.push(0),
+        dtg_storage::Value::Boolean(value) => {
+            output.push(1);
+            output.push(u8::from(*value));
+        }
+        dtg_storage::Value::Integer(value) => {
+            output.push(2);
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        dtg_storage::Value::FloatBits(value) => {
+            output.push(3);
+            output.extend_from_slice(&value.to_be_bytes());
+        }
+        dtg_storage::Value::Bytes(value) => {
+            output.push(4);
+            encode_u32(value.len(), output);
+            output.extend_from_slice(value);
+        }
+        dtg_storage::Value::String(value) => {
+            output.push(5);
+            encode_string(value, output);
+        }
+        dtg_storage::Value::List(values) => {
+            output.push(6);
+            encode_u32(values.len(), output);
+            for value in values {
+                encode_kernel_value(value, output);
+            }
+        }
+        dtg_storage::Value::Map(values) => {
+            output.push(7);
+            encode_u32(values.len(), output);
+            for (name, value) in values {
+                encode_string(name, output);
+                encode_kernel_value(value, output);
+            }
+        }
+    }
+}
+
+fn encode_row_schema(schema: &dtg_language_ir::RowSchema, output: &mut Vec<u8>) {
+    encode_u32(schema.fields.len(), output);
+    for field in &schema.fields {
+        encode_string(&field.name, output);
+        encode_logical_type(&field.data_type, output);
+        output.push(u8::from(field.nullable));
+    }
+}
+
+fn encode_logical_type(data_type: &dtg_language_ir::LogicalType, output: &mut Vec<u8>) {
+    use dtg_language_ir::LogicalType;
+
+    match data_type {
+        LogicalType::Null => output.push(0),
+        LogicalType::Boolean => output.push(1),
+        LogicalType::Integer => output.push(2),
+        LogicalType::Float => output.push(3),
+        LogicalType::Bytes => output.push(4),
+        LogicalType::String => output.push(5),
+        LogicalType::List(element) => {
+            output.push(6);
+            encode_logical_type(element, output);
+        }
+        LogicalType::Map => output.push(7),
+        LogicalType::Vertex => output.push(8),
+        LogicalType::Relationship => output.push(9),
+        LogicalType::Any => output.push(10),
+    }
 }
 
 fn operation_tag(operation: &GatewayOperation) -> u8 {
@@ -1021,16 +1586,6 @@ fn encode_gateway_time(time: &GatewayTime, output: &mut Vec<u8>) {
             output.push(1);
             encode_string(name, output);
         }
-    }
-}
-
-fn encode_optional_string(value: Option<&str>, output: &mut Vec<u8>) {
-    match value {
-        Some(value) => {
-            output.push(1);
-            encode_string(value, output);
-        }
-        None => output.push(0),
     }
 }
 
@@ -1420,7 +1975,115 @@ fn lower_fragment(fragment: &dtg_plan::PlanFragment) -> Result<ExecutableFragmen
         .iter()
         .map(|access| lower_access(access, planned_fence))
         .collect::<Result<Vec<_>, _>>()?;
-    ExecutableFragment::new(fragment.id().get(), fence, accesses)
+    let access_nodes = fragment
+        .storage_accesses()
+        .iter()
+        .map(|access| access.node().get())
+        .collect();
+    ExecutableFragment::with_access_nodes(fragment.id().get(), fence, accesses, access_nodes)
+}
+
+fn lower_operator(operator: &dtg_plan::PhysicalOperator) -> Result<ExecutableOperator, QueryError> {
+    use dtg_plan::PhysicalOperatorKind;
+
+    let kind = match operator.kind() {
+        PhysicalOperatorKind::Source {
+            logical_node,
+            fragments,
+            output,
+        } => ExecutableOperatorKind::Source {
+            logical_node: logical_node.get(),
+            fragments: fragments.iter().map(|fragment| fragment.get()).collect(),
+            output: output.clone(),
+        },
+        PhysicalOperatorKind::Filter { input, predicate } => ExecutableOperatorKind::Filter {
+            input: input.get(),
+            predicate: lower_expression(predicate)?,
+        },
+        PhysicalOperatorKind::Project { input, projections } => ExecutableOperatorKind::Project {
+            input: input.get(),
+            projections: projections
+                .iter()
+                .map(|projection| {
+                    ExecutableProjection::new(
+                        projection.alias.clone(),
+                        Expression::new(projection.expression.clone()),
+                    )
+                })
+                .collect(),
+        },
+        PhysicalOperatorKind::Join {
+            left,
+            right,
+            kind,
+            predicate,
+        } => ExecutableOperatorKind::Join {
+            left: left.get(),
+            right: right.get(),
+            kind: *kind,
+            predicate: predicate.as_ref().map(lower_expression).transpose()?,
+        },
+        PhysicalOperatorKind::Aggregate {
+            input,
+            groups,
+            aggregates,
+        } => ExecutableOperatorKind::Aggregate {
+            input: input.get(),
+            groups: groups
+                .iter()
+                .map(|projection| {
+                    ExecutableProjection::new(
+                        projection.alias.clone(),
+                        Expression::new(projection.expression.clone()),
+                    )
+                })
+                .collect(),
+            aggregates: aggregates
+                .iter()
+                .map(|aggregate| ExecutableAggregate {
+                    function: aggregate.function,
+                    argument: aggregate.argument.clone().map(Expression::new),
+                    alias: aggregate.alias.clone(),
+                    distinct: aggregate.distinct,
+                })
+                .collect(),
+        },
+        PhysicalOperatorKind::Sort { input, keys } => ExecutableOperatorKind::Sort {
+            input: input.get(),
+            keys: keys
+                .iter()
+                .map(|key| ExecutableSortKey {
+                    expression: Expression::new(key.expression.clone()),
+                    direction: key.direction,
+                })
+                .collect(),
+        },
+        PhysicalOperatorKind::Limit { input, skip, limit } => ExecutableOperatorKind::Limit {
+            input: input.get(),
+            skip: *skip,
+            limit: *limit,
+        },
+        PhysicalOperatorKind::Unwind {
+            input,
+            expression,
+            alias,
+        } => ExecutableOperatorKind::Unwind {
+            input: input.get(),
+            expression: lower_expression(expression)?,
+            alias: alias.clone(),
+        },
+    };
+    ExecutableOperator::new(operator.id().get(), kind)
+}
+
+fn lower_expression(expression: &PhysicalExpr) -> Result<Expression, QueryError> {
+    match expression {
+        PhysicalExpr::Evaluate(expression) => Ok(Expression::new(expression.clone())),
+        PhysicalExpr::VerifyStorageSemantics { .. } => Err(QueryError::InvalidPlan(
+            "storage verification expression cannot be used as a physical operator expression"
+                .into(),
+        )),
+    }
 }
 
 fn lower_access(
@@ -1433,6 +2096,7 @@ fn lower_access(
             request,
             guarantee,
             residual,
+            ..
         } => lower_pushdown(request, *guarantee, residual.as_ref(), fence),
     }
 }

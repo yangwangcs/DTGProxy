@@ -1,9 +1,12 @@
 use dtg_language_ir::{
-    GraphScope, LogicalExpr, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
-    LogicalProgram, LogicalStatement, ReadScope, RowSchema, Value, VertexLookup,
+    Aggregate, AggregateFunction, AggregateKind, GraphScope, Join, JoinKind, Limit, LogicalExpr,
+    LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement,
+    Projection, ReadScope, RowSchema, Sort, SortDirection, SortKey, Subquery, Unwind, Value,
+    VertexLookup,
 };
 use dtg_plan::{
-    CatalogShard, CatalogSnapshot, PlanError, PlanningContext, SnapshotRequirements, plan,
+    CatalogShard, CatalogSnapshot, PhysicalOperatorKind, PlanError, PlanningContext,
+    SnapshotRequirements, plan,
 };
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
@@ -63,6 +66,110 @@ fn point_query() -> LogicalProgram {
                     read_scope: ReadScope::current(),
                 }),
             }],
+        }),
+        result_schema: RowSchema::empty(),
+    }
+}
+
+fn operator_query() -> LogicalProgram {
+    let column = |name: &str| LogicalExpr::Column(name.into());
+    LogicalProgram {
+        version: dtg_language_ir::IrVersion::CURRENT,
+        graph_scope: GraphScope::Explicit(dtg_storage::GraphId::new(9).unwrap()),
+        parameters: Vec::new(),
+        statement: LogicalStatement::Query(LogicalPlan {
+            root: LogicalNodeId::new(9),
+            nodes: vec![
+                LogicalNode {
+                    id: LogicalNodeId::new(1),
+                    kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                        variable: "left".into(),
+                        id: LogicalExpr::Literal(Value::Integer(41)),
+                        labels: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(2),
+                    kind: LogicalNodeKind::Filter {
+                        input: LogicalNodeId::new(1),
+                        predicate: LogicalExpr::Literal(Value::Boolean(true)),
+                    },
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(3),
+                    kind: LogicalNodeKind::Project {
+                        input: LogicalNodeId::new(2),
+                        projections: vec![Projection {
+                            expression: column("left"),
+                            alias: "left_id".into(),
+                        }],
+                    },
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(4),
+                    kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                        variable: "right".into(),
+                        id: LogicalExpr::Literal(Value::Integer(42)),
+                        labels: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(5),
+                    kind: LogicalNodeKind::Join(Join {
+                        left: LogicalNodeId::new(3),
+                        right: LogicalNodeId::new(4),
+                        kind: JoinKind::Inner,
+                        predicate: Some(LogicalExpr::Literal(Value::Boolean(true))),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(6),
+                    kind: LogicalNodeKind::Aggregate(Aggregate {
+                        input: LogicalNodeId::new(5),
+                        groups: vec![Projection {
+                            expression: column("left_id"),
+                            alias: "group".into(),
+                        }],
+                        aggregates: vec![AggregateFunction {
+                            function: AggregateKind::Count,
+                            argument: None,
+                            alias: "count".into(),
+                            distinct: false,
+                        }],
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(7),
+                    kind: LogicalNodeKind::Sort(Sort {
+                        input: LogicalNodeId::new(6),
+                        keys: vec![SortKey {
+                            expression: column("count"),
+                            direction: SortDirection::Descending,
+                        }],
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(8),
+                    kind: LogicalNodeKind::Limit(Limit {
+                        input: LogicalNodeId::new(7),
+                        skip: Some(LogicalExpr::Literal(Value::Integer(1))),
+                        limit: Some(LogicalExpr::Literal(Value::Integer(2))),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(9),
+                    kind: LogicalNodeKind::Unwind(Unwind {
+                        input: LogicalNodeId::new(8),
+                        expression: LogicalExpr::List(vec![
+                            LogicalExpr::Literal(Value::Integer(1)),
+                            LogicalExpr::Literal(Value::Integer(2)),
+                        ]),
+                        alias: "item".into(),
+                    }),
+                },
+            ],
         }),
         result_schema: RowSchema::empty(),
     }
@@ -133,6 +240,132 @@ fn one_fragment_is_created_per_pinned_shard_and_exchanges_are_explicit() {
     assert_eq!(plan.exchanges().len(), 2);
     assert_eq!(plan.fragments()[0].fence().shard_id().get(), 13);
     assert_eq!(plan.fragments()[1].fence().shard_id().get(), 17);
+}
+
+#[test]
+fn planner_preserves_every_normalized_query_operator_in_the_physical_dag() {
+    let plan = plan(&operator_query(), &fixture_context()).unwrap();
+
+    assert_eq!(plan.root_operator().get(), 9);
+    assert!(matches!(
+        plan.operator(LogicalNodeId::new(2)).unwrap().kind(),
+        PhysicalOperatorKind::Filter { .. }
+    ));
+    assert!(matches!(
+        plan.operator(LogicalNodeId::new(3)).unwrap().kind(),
+        PhysicalOperatorKind::Project { .. }
+    ));
+    assert!(matches!(
+        plan.operator(LogicalNodeId::new(5)).unwrap().kind(),
+        PhysicalOperatorKind::Join { .. }
+    ));
+    assert!(matches!(
+        plan.operator(LogicalNodeId::new(6)).unwrap().kind(),
+        PhysicalOperatorKind::Aggregate { .. }
+    ));
+    assert!(matches!(
+        plan.operator(LogicalNodeId::new(7)).unwrap().kind(),
+        PhysicalOperatorKind::Sort { .. }
+    ));
+    assert!(matches!(
+        plan.operator(LogicalNodeId::new(8)).unwrap().kind(),
+        PhysicalOperatorKind::Limit {
+            skip: 1,
+            limit: Some(2),
+            ..
+        }
+    ));
+    assert!(matches!(
+        plan.operator(LogicalNodeId::new(9)).unwrap().kind(),
+        PhysicalOperatorKind::Unwind { .. }
+    ));
+}
+
+#[test]
+fn multi_shard_limit_is_a_single_global_operator_above_all_fragment_sources() {
+    let capabilities = exact_capabilities();
+    let catalog = CatalogSnapshot::new(
+        Version::new(2),
+        Version::new(3),
+        vec![
+            CatalogShard::new(binding(17, 8, 4, &capabilities), 31),
+            CatalogShard::new(binding(13, 7, 3, &capabilities), 29),
+        ],
+    )
+    .unwrap();
+    let context = PlanningContext::new(
+        catalog,
+        capabilities,
+        SnapshotRequirements::fixed(TransactionTime::new(23).unwrap(), 17),
+        Some(128),
+    )
+    .unwrap();
+    let mut query = point_query();
+    let LogicalStatement::Query(logical) = &mut query.statement else {
+        unreachable!()
+    };
+    logical.nodes.push(LogicalNode {
+        id: LogicalNodeId::new(2),
+        kind: LogicalNodeKind::Limit(Limit {
+            input: LogicalNodeId::new(1),
+            skip: None,
+            limit: Some(LogicalExpr::Literal(Value::Integer(1))),
+        }),
+    });
+    logical.root = LogicalNodeId::new(2);
+
+    let plan = plan(&query, &context).unwrap();
+    let sources = plan
+        .operators()
+        .iter()
+        .filter_map(|operator| match operator.kind() {
+            PhysicalOperatorKind::Source { fragments, .. } => Some(fragments),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        plan.operators()
+            .iter()
+            .filter(|operator| matches!(operator.kind(), PhysicalOperatorKind::Limit { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].len(), 2);
+}
+
+#[test]
+fn unsupported_logical_node_fails_closed_instead_of_disappearing() {
+    let mut query = point_query();
+    let LogicalStatement::Query(logical) = &mut query.statement else {
+        unreachable!()
+    };
+    logical.nodes.push(LogicalNode {
+        id: LogicalNodeId::new(2),
+        kind: LogicalNodeKind::Subquery(Subquery {
+            input: Some(LogicalNodeId::new(1)),
+            plan: Box::new(LogicalPlan {
+                root: LogicalNodeId::new(1),
+                nodes: vec![LogicalNode {
+                    id: LogicalNodeId::new(1),
+                    kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                        variable: "nested".into(),
+                        id: LogicalExpr::Literal(Value::Integer(43)),
+                        labels: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                }],
+            }),
+            correlated_variables: Vec::new(),
+        }),
+    });
+    logical.root = LogicalNodeId::new(2);
+
+    assert!(matches!(
+        plan(&query, &fixture_context()),
+        Err(PlanError::UnsupportedNode { node, .. }) if node == LogicalNodeId::new(2)
+    ));
 }
 
 #[test]

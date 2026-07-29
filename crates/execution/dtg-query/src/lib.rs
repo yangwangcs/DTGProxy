@@ -6,6 +6,7 @@ mod exchange;
 mod expression;
 mod operator;
 mod runtime;
+mod spill;
 mod storage_source;
 
 pub use batch::{ColumnBatch, QueryValue};
@@ -18,10 +19,14 @@ pub use operator::{
     QueryOverlay, SortOperator,
 };
 pub use runtime::{QueryRuntime, QueryStream};
+pub(crate) use spill::SpillMergeOperator;
+pub use spill::{SpillConfig, SpillHandle, SpillStore};
 pub(crate) use storage_source::StorageSourceOperator;
 pub use storage_source::{
-    ExecutableAccess, ExecutableFragment, ExecutablePlan, ExecutionFence, LogicalRead,
-    QueryStorage, ReadOperation, ResidualPredicate, SnapshotGuard, SnapshotShardFence,
+    ExecutableAccess, ExecutableAggregate, ExecutableFragment, ExecutableOperator,
+    ExecutableOperatorKind, ExecutablePlan, ExecutableProjection, ExecutableSortKey,
+    ExecutionFence, LogicalRead, QueryStorage, ReadOperation, ResidualPredicate, SnapshotGuard,
+    SnapshotShardFence,
 };
 
 pub const CLEAN_BREAK_ARCHITECTURE_VERSION: u32 = 1;

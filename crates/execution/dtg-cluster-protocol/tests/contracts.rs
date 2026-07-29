@@ -92,20 +92,28 @@ fn common_and_shard_identifiers_are_exact_and_nonzero() {
 
 #[test]
 fn declared_limits_fail_before_checksum_work_or_large_allocation() {
-    let fragment = proto::ExecutionFragment {
-        context: Some(valid_shard_context()),
-        fragment_id: id128(21),
-        payload: Some(proto::BoundedPayload {
-            format_version: 1,
-            declared_len: MAX_FRAGMENT_BYTES as u64 + 1,
-            item_count: 1,
-            checksum: vec![0],
-            body: Vec::new(),
-        }),
-    };
+    let mut fragment = valid_fragment();
+    fragment.payload = Some(proto::BoundedPayload {
+        format_version: 1,
+        declared_len: MAX_FRAGMENT_BYTES as u64 + 1,
+        item_count: 1,
+        checksum: vec![0],
+        body: Vec::new(),
+    });
     assert_eq!(
         validate_execution_fragment(fragment).unwrap_err().code(),
         "DTG-PROTOCOL-PAYLOAD-LIMIT"
+    );
+}
+
+#[test]
+fn execution_fragment_rejects_a_mutable_snapshot_fence() {
+    let mut fragment = valid_fragment();
+    fragment.snapshot_immutable = false;
+
+    assert_eq!(
+        validate_execution_fragment(fragment).unwrap_err().code(),
+        "DTG-PROTOCOL-MUTABLE-SNAPSHOT"
     );
 }
 
@@ -276,6 +284,12 @@ fn valid_fragment() -> proto::ExecutionFragment {
         context: Some(valid_shard_context()),
         fragment_id: id128(21),
         payload: Some(payload(b"abc", 1)),
+        schema_version: 19,
+        capability_digest: vec![7; 32],
+        applied_index: 23,
+        transaction_time: 29,
+        valid_at: 31,
+        snapshot_immutable: true,
     }
 }
 

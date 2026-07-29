@@ -2,6 +2,14 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use dtg_execution::planning::{
+    CatalogShard, CatalogSnapshot, PlanningContext, SnapshotRequirements,
+};
+use dtg_execution::storage::{
+    BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
+    Version,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayConfig {
     bind_addr: SocketAddr,
@@ -82,6 +90,110 @@ impl GatewayConfig {
     pub fn cluster_endpoint(&self) -> &str {
         &self.cluster_endpoint
     }
+
+    pub fn planning_context_from_env(&self) -> Result<PlanningContext, GatewayConfigError> {
+        let graph_id = required_u64("DTG_GATEWAY_GRAPH_ID")?;
+        let catalog_version = required_u64("DTG_GATEWAY_CATALOG_VERSION")?;
+        let schema_version = required_u64("DTG_GATEWAY_SCHEMA_VERSION")?;
+        let transaction_time = required_i64("DTG_GATEWAY_TRANSACTION_TIME")?;
+        let valid_at = required_i64("DTG_GATEWAY_VALID_AT")?;
+        let logical_scan_bound = required_u32("DTG_GATEWAY_LOGICAL_SCAN_BOUND")?;
+        let capability_names = required_env("DTG_GATEWAY_CAPABILITIES")?;
+        let capabilities = CapabilityManifest::from_names(
+            capability_names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty()),
+        )
+        .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))?;
+        let shard_specs = required_env("DTG_GATEWAY_SHARDS")?;
+        let mut shards = Vec::new();
+        for spec in shard_specs
+            .split(',')
+            .map(str::trim)
+            .filter(|spec| !spec.is_empty())
+        {
+            let fields = spec.split(':').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return Err(GatewayConfigError::InvalidPlanning(
+                    "DTG_GATEWAY_SHARDS entries must be shard:epoch:replica:generation:applied:provider:contract:layout:namespace"
+                        .into(),
+                ));
+            }
+            let parse = |index: usize| {
+                fields[index].parse::<u64>().map_err(|error| {
+                    GatewayConfigError::InvalidPlanning(format!(
+                        "invalid DTG_GATEWAY_SHARDS numeric field: {error}"
+                    ))
+                })
+            };
+            let shard_id = parse(0)?;
+            let placement_epoch = parse(1)?;
+            let replica_id = parse(2)?;
+            let backend_generation = parse(3)?;
+            let applied_index = parse(4)?;
+            let provider_kind = match fields[5] {
+                "fjall" => ProviderKind::Fjall,
+                "postgresql" => ProviderKind::PostgreSql,
+                "neo4j" => ProviderKind::Neo4j,
+                provider if provider.starts_with("remote/") => {
+                    ProviderKind::Remote(provider["remote/".len()..].to_owned())
+                }
+                provider => {
+                    return Err(GatewayConfigError::InvalidPlanning(format!(
+                        "unsupported planning provider: {provider}"
+                    )));
+                }
+            };
+            let contract_version = u32::try_from(parse(6)?).map_err(|_| {
+                GatewayConfigError::InvalidPlanning("contract version exceeds u32".into())
+            })?;
+            let layout_version = u32::try_from(parse(7)?).map_err(|_| {
+                GatewayConfigError::InvalidPlanning("layout version exceeds u32".into())
+            })?;
+            let backend_class = BackendClass::new(
+                provider_kind.clone(),
+                contract_version,
+                layout_version,
+                capabilities.names().map(str::to_owned),
+            )
+            .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))?;
+            let binding = ReplicaBinding::builder()
+                .cluster_id(self.cluster_id)
+                .graph_id(graph_id)
+                .shard_id(shard_id)
+                .placement_epoch(placement_epoch)
+                .replica_id(replica_id)
+                .backend_generation(backend_generation)
+                .backend_class_digest(backend_class.digest())
+                .provider_kind(provider_kind)
+                .contract_version(contract_version)
+                .layout_version(layout_version)
+                .capability_digest(capabilities.digest())
+                .namespace_id(fields[8])
+                .endpoint_profile_ref("gateway-catalog")
+                .credential_ref("gateway-catalog")
+                .role(BindingRole::Active)
+                .build()
+                .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))?;
+            shards.push(CatalogShard::new(binding, applied_index));
+        }
+        let transaction_time = TransactionTime::new(transaction_time)
+            .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))?;
+        let catalog = CatalogSnapshot::new(
+            Version::new(catalog_version),
+            Version::new(schema_version),
+            shards,
+        )
+        .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))?;
+        PlanningContext::new(
+            catalog,
+            capabilities,
+            SnapshotRequirements::fixed(transaction_time, valid_at),
+            Some(logical_scan_bound),
+        )
+        .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +204,8 @@ pub enum GatewayConfigError {
     InvalidCluster(String),
     InvalidRequestTimeout(String),
     EmptyClusterEndpoint,
+    MissingPlanning(String),
+    InvalidPlanning(String),
 }
 
 impl GatewayConfigError {
@@ -103,6 +217,8 @@ impl GatewayConfigError {
             Self::InvalidCluster(_) => "DTG-GATEWAY-CONFIG-CLUSTER",
             Self::InvalidRequestTimeout(_) => "DTG-GATEWAY-CONFIG-TIMEOUT",
             Self::EmptyClusterEndpoint => "DTG-GATEWAY-CONFIG-ENDPOINT",
+            Self::MissingPlanning(_) => "DTG-GATEWAY-CONFIG-PLANNING-MISSING",
+            Self::InvalidPlanning(_) => "DTG-GATEWAY-CONFIG-PLANNING",
         }
     }
 }
@@ -112,12 +228,36 @@ impl fmt::Display for GatewayConfigError {
         match self {
             Self::InvalidBind(message)
             | Self::InvalidCluster(message)
-            | Self::InvalidRequestTimeout(message) => {
+            | Self::InvalidRequestTimeout(message)
+            | Self::MissingPlanning(message)
+            | Self::InvalidPlanning(message) => {
                 write!(formatter, "{}: {message}", self.code())
             }
             _ => formatter.write_str(self.code()),
         }
     }
+}
+
+fn required_env(name: &str) -> Result<String, GatewayConfigError> {
+    std::env::var(name).map_err(|_| GatewayConfigError::MissingPlanning(name.into()))
+}
+
+fn required_u64(name: &str) -> Result<u64, GatewayConfigError> {
+    required_env(name)?
+        .parse()
+        .map_err(|error| GatewayConfigError::InvalidPlanning(format!("invalid {name}: {error}")))
+}
+
+fn required_u32(name: &str) -> Result<u32, GatewayConfigError> {
+    required_env(name)?
+        .parse()
+        .map_err(|error| GatewayConfigError::InvalidPlanning(format!("invalid {name}: {error}")))
+}
+
+fn required_i64(name: &str) -> Result<i64, GatewayConfigError> {
+    required_env(name)?
+        .parse()
+        .map_err(|error| GatewayConfigError::InvalidPlanning(format!("invalid {name}: {error}")))
 }
 
 impl std::error::Error for GatewayConfigError {}

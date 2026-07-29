@@ -25,8 +25,8 @@ use dtg_plan::{
     EXACT_VERTEX_SCAN_CAPABILITIES, Planner, PlanningContext, SnapshotRequirements,
 };
 use dtg_query::{
-    CancellationToken as QueryCancellationToken, ExecutableAccess, QueryBudget, QueryRuntime,
-    ReadOperation, ResidualPredicate,
+    CancellationToken as QueryCancellationToken, ExecutableAccess, ExecutableOperatorKind,
+    QueryBudget, QueryRuntime, ReadOperation, ResidualPredicate,
 };
 use dtg_shard::ShardError;
 use dtg_storage::{
@@ -560,6 +560,40 @@ fn gateway_composition_lowers_every_execution_fence_without_drift() {
             )
             .unwrap(),
         AnalyticsSchedulerTick::Idle
+    );
+}
+
+#[test]
+fn gateway_lowering_preserves_the_complete_physical_operator_dag() {
+    let gateway = gateway();
+    let capabilities = CapabilityManifest::from_names(EXACT_VERTEX_SCAN_CAPABILITIES).unwrap();
+    let context = planning_context(capabilities);
+    let program = gateway
+        .compile("MATCH (n) RETURN n.id ORDER BY n.id")
+        .unwrap();
+    let physical = gateway.plan(&program, &context).unwrap();
+
+    let executable = gateway.lower_plan(&physical).unwrap();
+
+    assert_eq!(executable.root_operator(), physical.root_operator().get());
+    assert_eq!(executable.operators().len(), physical.operators().len());
+    assert!(
+        executable
+            .operators()
+            .iter()
+            .any(|operator| matches!(operator.kind(), ExecutableOperatorKind::Source { .. }))
+    );
+    assert!(
+        executable
+            .operators()
+            .iter()
+            .any(|operator| matches!(operator.kind(), ExecutableOperatorKind::Sort { .. }))
+    );
+    assert!(
+        executable
+            .operators()
+            .iter()
+            .any(|operator| matches!(operator.kind(), ExecutableOperatorKind::Project { .. }))
     );
 }
 

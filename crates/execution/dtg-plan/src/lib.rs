@@ -16,7 +16,10 @@ pub use capability::{
 pub use catalog::{CatalogShard, CatalogSnapshot, PlanningContext, SnapshotRequirements};
 pub use fragment::{Exchange, ExchangeKind, FragmentId, PlanFence, PlanFragment};
 pub use logical::{LogicalReadOperation, LogicalReadRequest};
-pub use physical::{PHYSICAL_PLAN_VERSION, PhysicalExpr, PhysicalPlan, StorageAccess};
+pub use physical::{
+    PHYSICAL_PLAN_VERSION, PhysicalExpr, PhysicalOperator, PhysicalOperatorKind, PhysicalPlan,
+    StorageAccess,
+};
 pub use validate::PlanError;
 
 use dtg_language_ir::{LogicalProgram, LogicalStatement};
@@ -69,12 +72,115 @@ pub fn plan(
         fragments.push(PlanFragment::new(id, fence, storage_accesses));
         exchanges.push(Exchange::gather(id));
     }
+    let operators = lower_operators(logical_plan, &fragments)?;
     Ok(PhysicalPlan {
         version: PHYSICAL_PLAN_VERSION,
         fragments,
         exchanges,
+        root_operator: logical_plan.root,
+        operators,
         result_schema: program.result_schema.clone(),
     })
+}
+
+fn lower_operators(
+    logical_plan: &dtg_language_ir::LogicalPlan,
+    fragments: &[PlanFragment],
+) -> Result<Vec<PhysicalOperator>, PlanError> {
+    use dtg_language_ir::LogicalNodeKind;
+
+    let fragment_ids: Vec<FragmentId> = fragments.iter().map(PlanFragment::id).collect();
+    logical_plan
+        .nodes
+        .iter()
+        .map(|node| {
+            let kind = match &node.kind {
+                LogicalNodeKind::NodeScan(scan) => PhysicalOperatorKind::Source {
+                    logical_node: node.id,
+                    fragments: fragment_ids.clone(),
+                    output: scan.variable.clone(),
+                },
+                LogicalNodeKind::RelationshipScan(scan) => PhysicalOperatorKind::Source {
+                    logical_node: node.id,
+                    fragments: fragment_ids.clone(),
+                    output: scan.variable.clone(),
+                },
+                LogicalNodeKind::VertexLookup(lookup) => PhysicalOperatorKind::Source {
+                    logical_node: node.id,
+                    fragments: fragment_ids.clone(),
+                    output: lookup.variable.clone(),
+                },
+                LogicalNodeKind::RelationshipLookup(lookup) => PhysicalOperatorKind::Source {
+                    logical_node: node.id,
+                    fragments: fragment_ids.clone(),
+                    output: lookup.variable.clone(),
+                },
+                LogicalNodeKind::Filter { input, predicate } => PhysicalOperatorKind::Filter {
+                    input: *input,
+                    predicate: PhysicalExpr::Evaluate(predicate.clone()),
+                },
+                LogicalNodeKind::Project { input, projections } => PhysicalOperatorKind::Project {
+                    input: *input,
+                    projections: projections.clone(),
+                },
+                LogicalNodeKind::Join(join) => PhysicalOperatorKind::Join {
+                    left: join.left,
+                    right: join.right,
+                    kind: join.kind,
+                    predicate: join.predicate.clone().map(PhysicalExpr::Evaluate),
+                },
+                LogicalNodeKind::Aggregate(aggregate) => PhysicalOperatorKind::Aggregate {
+                    input: aggregate.input,
+                    groups: aggregate.groups.clone(),
+                    aggregates: aggregate.aggregates.clone(),
+                },
+                LogicalNodeKind::Sort(sort) => PhysicalOperatorKind::Sort {
+                    input: sort.input,
+                    keys: sort.keys.clone(),
+                },
+                LogicalNodeKind::Limit(limit) => PhysicalOperatorKind::Limit {
+                    input: limit.input,
+                    skip: physical_row_count(node.id, limit.skip.as_ref())?.unwrap_or(0),
+                    limit: physical_row_count(node.id, limit.limit.as_ref())?,
+                },
+                LogicalNodeKind::Unwind(unwind) => PhysicalOperatorKind::Unwind {
+                    input: unwind.input,
+                    expression: PhysicalExpr::Evaluate(unwind.expression.clone()),
+                    alias: unwind.alias.clone(),
+                },
+                LogicalNodeKind::Expand(_) | LogicalNodeKind::Subquery(_) => {
+                    return Err(PlanError::UnsupportedNode {
+                        node: node.id,
+                        reason: "logical operator has no bounded physical implementation".into(),
+                    });
+                }
+            };
+            Ok(PhysicalOperator::new(node.id, kind))
+        })
+        .collect()
+}
+
+fn physical_row_count(
+    node: dtg_language_ir::LogicalNodeId,
+    expression: Option<&dtg_language_ir::LogicalExpr>,
+) -> Result<Option<u64>, PlanError> {
+    let Some(expression) = expression else {
+        return Ok(None);
+    };
+    let dtg_language_ir::LogicalExpr::Literal(dtg_language_ir::Value::Integer(value)) = expression
+    else {
+        return Err(PlanError::UnsupportedNode {
+            node,
+            reason: "LIMIT and SKIP must be resolved to non-negative literals before planning"
+                .into(),
+        });
+    };
+    u64::try_from(*value)
+        .map(Some)
+        .map_err(|_| PlanError::UnsupportedNode {
+            node,
+            reason: "LIMIT and SKIP must be non-negative".into(),
+        })
 }
 
 fn storage_access(
@@ -127,6 +233,7 @@ fn storage_access(
         PushdownDecision::Unsupported => unreachable!("unsupported handled before request build"),
     };
     Ok(StorageAccess::Pushdown {
+        node: logical.node(),
         request: Box::new(request),
         guarantee,
         residual,

@@ -184,6 +184,14 @@ impl QueryContext {
         Ok(())
     }
 
+    pub const fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    pub fn release_memory(&mut self, bytes: u64) {
+        self.memory_bytes = self.memory_bytes.saturating_sub(bytes);
+    }
+
     pub fn charge_network(&mut self, bytes: u64) -> Result<(), QueryError> {
         self.network_bytes = charge(
             self.network_bytes,

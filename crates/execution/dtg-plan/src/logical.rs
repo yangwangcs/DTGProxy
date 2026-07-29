@@ -1,5 +1,5 @@
 use dtg_language_ir::{
-    ExpandDirection, LogicalExpr, LogicalNodeId, LogicalNodeKind, LogicalPlan, ReadScope,
+    ExpandDirection, Limit, LogicalExpr, LogicalNodeId, LogicalNodeKind, LogicalPlan, ReadScope,
     RelationshipLookup, TimeExpr, ValidTimeExpr, ValidTimePredicate, Value, VertexLookup,
 };
 use dtg_storage::{EdgeId, TransactionTime, VertexId};
@@ -105,19 +105,9 @@ fn collect_plan_reads(
                 scan.read_scope.clone(),
                 scan_bound(plan, node.id, context)?,
             )),
-            LogicalNodeKind::Expand(expand) => Some(LogicalReadRequest::new(
-                node.id,
-                LogicalReadOperation::Adjacency {
-                    direction: expand.direction,
-                },
-                expand.read_scope.clone(),
-                scan_bound(plan, node.id, context)?,
-            )),
-            LogicalNodeKind::Subquery(subquery) => {
-                collect_plan_reads(&subquery.plan, context, reads)?;
-                None
-            }
-            LogicalNodeKind::Filter { .. }
+            LogicalNodeKind::Expand(_)
+            | LogicalNodeKind::Subquery(_)
+            | LogicalNodeKind::Filter { .. }
             | LogicalNodeKind::Project { .. }
             | LogicalNodeKind::Join(_)
             | LogicalNodeKind::Aggregate(_)
@@ -159,9 +149,7 @@ fn scan_bound(
     plan.nodes
         .iter()
         .filter_map(|node| match &node.kind {
-            LogicalNodeKind::Limit(limit) if limit.input == input => {
-                limit.limit.as_ref().and_then(literal_row_bound)
-            }
+            LogicalNodeKind::Limit(limit) if limit.input == input => literal_limit_bound(limit),
             _ => None,
         })
         .chain(context.logical_scan_bound())
@@ -169,11 +157,20 @@ fn scan_bound(
         .ok_or(PlanError::NoBoundedAccess { node: input })
 }
 
-fn literal_row_bound(expression: &LogicalExpr) -> Option<u32> {
+fn literal_limit_bound(limit: &Limit) -> Option<u32> {
+    let count = literal_nonnegative_row_count(limit.limit.as_ref()?)?;
+    let skip = match limit.skip.as_ref() {
+        Some(skip) => literal_nonnegative_row_count(skip)?,
+        None => 0,
+    };
+    u32::try_from(skip.checked_add(count)?)
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+fn literal_nonnegative_row_count(expression: &LogicalExpr) -> Option<u64> {
     match expression {
-        LogicalExpr::Literal(Value::Integer(value)) => {
-            u32::try_from(*value).ok().filter(|v| *v > 0)
-        }
+        LogicalExpr::Literal(Value::Integer(value)) => u64::try_from(*value).ok(),
         _ => None,
     }
 }

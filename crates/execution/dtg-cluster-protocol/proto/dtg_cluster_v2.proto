@@ -32,6 +32,12 @@ message ExecutionFragment {
   ShardContext context = 1;
   bytes fragment_id = 2;
   BoundedPayload payload = 3;
+  uint64 schema_version = 4;
+  bytes capability_digest = 5;
+  uint64 applied_index = 6;
+  int64 transaction_time = 7;
+  int64 valid_at = 8;
+  bool snapshot_immutable = 9;
 }
 
 message ColumnBatch {
@@ -124,6 +130,7 @@ message TypedStatus {
 message GatewayRequest {
   RequestContext request = 1;
   BoundedPayload execution_request = 2;
+  repeated ExecutionFragment fragments = 3;
 }
 
 message GatewayResponse {

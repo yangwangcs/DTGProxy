@@ -8,6 +8,7 @@ use dtg_execution::{
     GatewayValue,
 };
 use dtg_gateway::{GatewayConfig, GatewayService};
+use support::planning_context;
 
 #[derive(Default)]
 struct AnalyticsTransport {
@@ -49,7 +50,7 @@ impl GatewayExecutionTransport for AnalyticsTransport {
 }
 
 fn gateway(transport: Arc<AnalyticsTransport>) -> GatewayService {
-    let execution = GatewayExecution::for_process(transport);
+    let execution = GatewayExecution::for_process(transport, planning_context());
     let config = GatewayConfig::new(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7687),
         7,
@@ -93,3 +94,4 @@ async fn built_in_analytics_submit_status_result_and_cancel_use_execution_facade
         ]
     );
 }
+mod support;

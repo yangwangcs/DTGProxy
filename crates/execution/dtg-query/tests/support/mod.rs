@@ -72,6 +72,10 @@ pub fn edge(id: u128, source: u128, target: u128) -> EdgeVersion {
 }
 
 pub fn binding(capabilities: &CapabilityManifest) -> ReplicaBinding {
+    binding_for_shard(capabilities, 13)
+}
+
+pub fn binding_for_shard(capabilities: &CapabilityManifest, shard_id: u64) -> ReplicaBinding {
     let class = BackendClass::new(
         ProviderKind::Fjall,
         1,
@@ -82,7 +86,7 @@ pub fn binding(capabilities: &CapabilityManifest) -> ReplicaBinding {
     ReplicaBinding::builder()
         .cluster_id(1)
         .graph_id(9)
-        .shard_id(13)
+        .shard_id(shard_id)
         .placement_epoch(7)
         .replica_id(19)
         .backend_generation(3)
@@ -91,7 +95,7 @@ pub fn binding(capabilities: &CapabilityManifest) -> ReplicaBinding {
         .contract_version(1)
         .layout_version(1)
         .capability_digest(capabilities.digest())
-        .namespace_id("graph-9-shard-13")
+        .namespace_id(format!("graph-9-shard-{shard_id}"))
         .endpoint_profile_ref("fixture-endpoint")
         .credential_ref("fixture-credential")
         .role(BindingRole::Active)
@@ -100,7 +104,14 @@ pub fn binding(capabilities: &CapabilityManifest) -> ReplicaBinding {
 }
 
 fn execution_fence(capabilities: &CapabilityManifest) -> ExecutionFence {
-    let binding = binding(capabilities);
+    execution_fence_for_shard(capabilities, 13)
+}
+
+pub fn execution_fence_for_shard(
+    capabilities: &CapabilityManifest,
+    shard_id: u64,
+) -> ExecutionFence {
+    let binding = binding_for_shard(capabilities, shard_id);
     ExecutionFence::new(
         ReadFence::new(binding, 29),
         Version::new(11),
@@ -217,7 +228,16 @@ impl FixtureStore {
         vertices: Vec<VertexVersion>,
         edges: Vec<EdgeVersion>,
     ) -> Arc<Self> {
-        let binding = binding(&capabilities);
+        Self::new_for_shard(capabilities, 13, vertices, edges)
+    }
+
+    pub fn new_for_shard(
+        capabilities: CapabilityManifest,
+        shard_id: u64,
+        vertices: Vec<VertexVersion>,
+        edges: Vec<EdgeVersion>,
+    ) -> Arc<Self> {
+        let binding = binding_for_shard(&capabilities, shard_id);
         Arc::new(Self {
             fence: ReadFence::new(binding.clone(), 29),
             binding,

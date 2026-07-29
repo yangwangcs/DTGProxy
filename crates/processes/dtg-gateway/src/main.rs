@@ -10,7 +10,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::from_env()?;
     let factory = TonicGatewayProtocolV2TransportFactory;
     let transport = factory.connect(config.cluster_endpoint()).await?;
-    let execution = GatewayExecution::for_process(transport);
+    let planning_context = config.planning_context_from_env()?;
+    let execution = GatewayExecution::for_process(transport, planning_context);
     let _service = GatewayService::new(config, execution);
     tokio::signal::ctrl_c().await?;
     Ok(())

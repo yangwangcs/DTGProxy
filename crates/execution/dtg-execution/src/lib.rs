@@ -8,6 +8,7 @@ mod meta;
 pub use dtg_analytics as analytics;
 pub use dtg_cluster_v2 as cluster_protocol;
 pub use dtg_control as control;
+pub use dtg_plan as planning;
 pub use dtg_storage as storage;
 pub use dtg_transaction as transaction;
 

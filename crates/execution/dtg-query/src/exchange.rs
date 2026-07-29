@@ -1,7 +1,7 @@
 use dtg_language_ir::RowSchema;
 
 use crate::operator::{collect_rows, compare_rows};
-use crate::{ColumnBatch, Operator, QueryContext, QueryFuture, QueryValue};
+use crate::{ColumnBatch, Operator, QueryContext, QueryFuture};
 
 pub struct ExchangeOperator {
     input: Box<dyn Operator>,
@@ -84,7 +84,6 @@ impl Operator for DeterministicMergeOperator {
                 let (_, input_rows) = collect_rows(input, context).await?;
                 rows.extend(input_rows);
             }
-            context.charge_memory(rows.iter().flatten().map(QueryValue::estimated_bytes).sum())?;
             rows.sort_by(|left, right| {
                 match (left.get(self.key_column), right.get(self.key_column)) {
                     (Some(left), Some(right)) => left.total_cmp(right),
