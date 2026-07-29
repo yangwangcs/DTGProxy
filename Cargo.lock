@@ -752,6 +752,11 @@ version = "1.0.0"
 [[package]]
 name = "dtg-plan"
 version = "1.0.0"
+dependencies = [
+ "dtg-kernel",
+ "dtg-language-ir",
+ "dtg-storage",
+]
 
 [[package]]
 name = "dtg-query"
