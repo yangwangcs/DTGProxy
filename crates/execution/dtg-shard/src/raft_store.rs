@@ -11,6 +11,8 @@ use raft::storage::{GetEntriesContext, RaftState, Storage};
 
 use crate::{ShardCommand, ShardError, state_machine::block_on};
 
+const MAX_RAFT_WAL_ENTRY_BYTES: usize = 16 * 1024 * 1024 + 1024;
+
 #[derive(Clone)]
 pub struct RaftStore {
     store: Arc<dyn ConsensusStore>,
@@ -93,6 +95,10 @@ impl RaftStore {
         Ok(block_on(self.store.snapshot_metadata())?)
     }
 
+    pub(crate) fn committed_index(&self) -> Result<u64, ShardError> {
+        Ok(block_on(self.store.hard_state())?.committed_index)
+    }
+
     fn membership(&self) -> Result<RaftMembership, StorageError> {
         block_on(self.store.membership())
     }
@@ -108,6 +114,15 @@ impl RaftStore {
             .map_or(0, |snapshot| snapshot.last_included_index);
         let low = snapshot_index.saturating_add(1);
         let entries = self.all_entries(low, u64::MAX)?;
+        if entries.first().is_some_and(|entry| entry.index() != low)
+            || entries
+                .windows(2)
+                .any(|window| window[0].index().checked_add(1) != Some(window[1].index()))
+        {
+            return Err(StorageError::InvalidConsensus(
+                "retained consensus log is missing or discontiguous after snapshot".into(),
+            ));
+        }
         let first = entries.first().map_or(low, ConsensusEntry::index);
         let last = entries.last().map_or(snapshot_index, ConsensusEntry::index);
         Ok((first, last))
@@ -140,8 +155,13 @@ fn encode_consensus_entry(entry: &Entry) -> Result<ConsensusEntry, ShardError> {
             "Raft WAL entry identity must be nonzero".into(),
         ));
     }
+    let payload_len = 13_usize
+        .checked_add(entry.context.len())
+        .and_then(|length| length.checked_add(entry.data.len()))
+        .filter(|length| *length <= MAX_RAFT_WAL_ENTRY_BYTES)
+        .ok_or_else(|| ShardError::InvalidRaftState("Raft WAL entry is oversized".into()))?;
     let command_id = entry_command_id(entry)?;
-    let mut payload = Vec::with_capacity(13 + entry.context.len() + entry.data.len());
+    let mut payload = Vec::with_capacity(payload_len);
     payload.extend_from_slice(&1_u32.to_be_bytes());
     payload.push(match entry.get_entry_type() {
         EntryType::EntryNormal => 0,
@@ -163,6 +183,11 @@ fn encode_consensus_entry(entry: &Entry) -> Result<ConsensusEntry, ShardError> {
 
 fn decode_raft_entry(entry: ConsensusEntry) -> Result<Entry, ShardError> {
     let payload = entry.command().payload();
+    if payload.len() > MAX_RAFT_WAL_ENTRY_BYTES {
+        return Err(ShardError::InvalidRaftState(
+            "Raft WAL entry is oversized".into(),
+        ));
+    }
     let mut offset = 0;
     let version = take_u32(payload, &mut offset)?;
     if version != 1 {

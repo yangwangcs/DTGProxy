@@ -129,7 +129,7 @@ impl ShardHost {
         self.replica_mut(key)?.seal()
     }
 
-    pub fn sealed_remove(&mut self, key: ReplicaKey) -> Result<RaftReplica, ShardError> {
+    pub fn sealed_remove(&mut self, key: ReplicaKey) -> Result<(), ShardError> {
         if self.replica(key)?.lifecycle() != ReplicaLifecycle::Sealed {
             return Err(ShardError::InvalidLifecycle(
                 "replica must be sealed before removal".into(),
@@ -137,7 +137,8 @@ impl ShardHost {
         }
         self.replicas
             .remove(&key)
-            .ok_or(ShardError::ReplicaNotFound)
+            .ok_or(ShardError::ReplicaNotFound)?;
+        Ok(())
     }
 
     pub fn len(&self) -> usize {

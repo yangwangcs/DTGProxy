@@ -68,6 +68,7 @@ impl CommitSingleShard {
                 "single-Shard commit must contain mutations".into(),
             ));
         }
+        validate_single_shard_mutations(&mutations)?;
         Ok(Self {
             header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
             mutations,
@@ -254,7 +255,10 @@ impl ShardCommand {
 
     pub(crate) fn mutations(&self) -> Result<Vec<LogicalMutation>, ShardError> {
         match self {
-            Self::CommitSingleShard(command) => Ok(command.mutations.clone()),
+            Self::CommitSingleShard(command) => {
+                validate_single_shard_mutations(&command.mutations)?;
+                Ok(command.mutations.clone())
+            }
             Self::PrewriteIntent(command) => {
                 validate_prewrite_intent(&command.mutations)?;
                 Ok(command.mutations.clone())
@@ -304,6 +308,17 @@ impl ShardCommand {
     }
 
     pub fn encode_current(&self) -> Result<Vec<u8>, ShardError> {
+        match self {
+            Self::CommitSingleShard(command) => {
+                validate_single_shard_mutations(command.mutations())?
+            }
+            Self::PrewriteIntent(command) => validate_prewrite_intent(command.mutations())?,
+            Self::RecordHomeDecision(command) => validate_home_decision(command.mutations())?,
+            Self::FinalizeParticipant(command) => {
+                validate_participant_finalization(command.mutations())?
+            }
+            Self::AdvanceClosedTimestamp(_) | Self::InstallSnapshot(_) | Self::Migration(_) => {}
+        }
         let mut encoder = Encoder::default();
         encoder.u32(SUPPORTED_SHARD_COMMAND_FORMAT_VERSION);
         match self {
@@ -414,7 +429,25 @@ impl ShardCommand {
         ) {
             return Err(invalid("mutation command must not be empty"));
         }
+        command.mutations()?;
         Ok(command)
+    }
+}
+
+fn validate_single_shard_mutations(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
+    if mutations.iter().any(|mutation| {
+        matches!(mutation, LogicalMutation::PutTransaction(_))
+            || matches!(
+                mutation,
+                LogicalMutation::PutReplicaMetadata(metadata)
+                    if metadata.name().starts_with("dtg.")
+            )
+    }) {
+        Err(invalid_command_shape(
+            "generic single-Shard commits cannot write transactions or reserved dtg metadata",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -502,6 +535,8 @@ fn invalid_command_shape(message: &str) -> ShardError {
 
 const MAX_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COLLECTION_ITEMS: usize = 1_000_000;
+const MAX_ALLOCATION_ITEMS: usize = 65_536;
+const MAX_VALUE_DEPTH: usize = 64;
 
 fn invalid(message: impl Into<String>) -> ShardError {
     ShardError::InvalidCommand(message.into())
@@ -510,6 +545,26 @@ fn invalid(message: impl Into<String>) -> ShardError {
 #[derive(Default)]
 struct Encoder {
     bytes: Vec<u8>,
+}
+
+struct AllocationBudget {
+    remaining: usize,
+}
+
+impl AllocationBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_ALLOCATION_ITEMS,
+        }
+    }
+
+    fn consume(&mut self, count: usize) -> Result<(), ShardError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(count)
+            .ok_or_else(|| invalid("command collection exceeds allocation budget"))?;
+        Ok(())
+    }
 }
 
 impl Encoder {
@@ -575,13 +630,19 @@ impl Encoder {
                 .try_into()
                 .map_err(|_| invalid("too many logical mutations"))?,
         );
+        let mut budget = AllocationBudget::new();
+        budget.consume(mutations.len())?;
         for mutation in mutations {
-            self.mutation(mutation)?;
+            self.mutation(mutation, &mut budget)?;
         }
         Ok(())
     }
 
-    fn mutation(&mut self, mutation: &LogicalMutation) -> Result<(), ShardError> {
+    fn mutation(
+        &mut self,
+        mutation: &LogicalMutation,
+        budget: &mut AllocationBudget,
+    ) -> Result<(), ShardError> {
         match mutation {
             LogicalMutation::PutVertex(vertex) => {
                 self.u8(1);
@@ -589,7 +650,7 @@ impl Encoder {
                 self.u64(vertex.version().get());
                 self.interval(vertex.valid_time());
                 self.i64(vertex.transaction_time().get());
-                self.properties(vertex.properties())?;
+                self.properties(vertex.properties(), budget)?;
             }
             LogicalMutation::DeleteVertex(vertex) => {
                 self.u8(2);
@@ -606,7 +667,7 @@ impl Encoder {
                 self.u64(edge.version().get());
                 self.interval(edge.valid_time());
                 self.i64(edge.transaction_time().get());
-                self.properties(edge.properties())?;
+                self.properties(edge.properties(), budget)?;
             }
             LogicalMutation::DeleteEdge(edge) => {
                 self.u8(4);
@@ -628,7 +689,7 @@ impl Encoder {
             LogicalMutation::PutReplicaMetadata(metadata) => {
                 self.u8(6);
                 self.string(metadata.name())?;
-                self.value(metadata.value())?;
+                self.value(metadata.value(), 0, budget)?;
             }
         }
         Ok(())
@@ -639,7 +700,11 @@ impl Encoder {
         self.i64(interval.end());
     }
 
-    fn properties(&mut self, properties: &Properties) -> Result<(), ShardError> {
+    fn properties(
+        &mut self,
+        properties: &Properties,
+        budget: &mut AllocationBudget,
+    ) -> Result<(), ShardError> {
         if properties.len() > MAX_COLLECTION_ITEMS {
             return Err(invalid("too many properties"));
         }
@@ -649,14 +714,23 @@ impl Encoder {
                 .try_into()
                 .map_err(|_| invalid("too many properties"))?,
         );
+        budget.consume(properties.len())?;
         for (name, value) in properties {
             self.string(name)?;
-            self.value(value)?;
+            self.value(value, 0, budget)?;
         }
         Ok(())
     }
 
-    fn value(&mut self, value: &Value) -> Result<(), ShardError> {
+    fn value(
+        &mut self,
+        value: &Value,
+        depth: usize,
+        budget: &mut AllocationBudget,
+    ) -> Result<(), ShardError> {
+        if depth > MAX_VALUE_DEPTH {
+            return Err(invalid("command value exceeds nesting depth budget"));
+        }
         match value {
             Value::Null => self.u8(0),
             Value::Boolean(value) => {
@@ -690,8 +764,9 @@ impl Encoder {
                         .try_into()
                         .map_err(|_| invalid("value list is too large"))?,
                 );
+                budget.consume(values.len())?;
                 for value in values {
-                    self.value(value)?;
+                    self.value(value, depth + 1, budget)?;
                 }
             }
             Value::Map(values) => {
@@ -705,9 +780,10 @@ impl Encoder {
                         .try_into()
                         .map_err(|_| invalid("value map is too large"))?,
                 );
+                budget.consume(values.len())?;
                 for (key, value) in values {
                     self.string(key)?;
-                    self.value(value)?;
+                    self.value(value, depth + 1, budget)?;
                 }
             }
         }
@@ -718,6 +794,7 @@ impl Encoder {
 struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,
+    allocation_budget: AllocationBudget,
 }
 
 impl<'a> Decoder<'a> {
@@ -725,7 +802,11 @@ impl<'a> Decoder<'a> {
         if bytes.is_empty() || bytes.len() > MAX_COMMAND_BYTES {
             return Err(invalid("command bytes are empty or oversized"));
         }
-        Ok(Self { bytes, offset: 0 })
+        Ok(Self {
+            bytes,
+            offset: 0,
+            allocation_budget: AllocationBudget::new(),
+        })
     }
 
     fn finish(self) -> Result<(), ShardError> {
@@ -801,9 +882,15 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn mutations(&mut self) -> Result<Vec<LogicalMutation>, ShardError> {
+    fn collection_count(&mut self) -> Result<usize, ShardError> {
         let count = self.count()?;
-        let mut mutations = Vec::with_capacity(count);
+        self.allocation_budget.consume(count)?;
+        Ok(count)
+    }
+
+    fn mutations(&mut self) -> Result<Vec<LogicalMutation>, ShardError> {
+        let count = self.collection_count()?;
+        let mut mutations = Vec::new();
         for _ in 0..count {
             mutations.push(self.mutation()?);
         }
@@ -858,7 +945,7 @@ impl<'a> Decoder<'a> {
             }
             6 => Ok(LogicalMutation::PutReplicaMetadata(ReplicaMetadata::new(
                 self.string()?,
-                self.value()?,
+                self.value(0)?,
             )?)),
             _ => Err(invalid("unknown logical mutation tag")),
         }
@@ -869,18 +956,21 @@ impl<'a> Decoder<'a> {
     }
 
     fn properties(&mut self) -> Result<Properties, ShardError> {
-        let count = self.count()?;
+        let count = self.collection_count()?;
         let mut properties = BTreeMap::new();
         for _ in 0..count {
             let name = self.string()?;
-            if properties.insert(name, self.value()?).is_some() {
+            if properties.insert(name, self.value(0)?).is_some() {
                 return Err(invalid("duplicate property name"));
             }
         }
         Ok(properties)
     }
 
-    fn value(&mut self) -> Result<Value, ShardError> {
+    fn value(&mut self, depth: usize) -> Result<Value, ShardError> {
+        if depth > MAX_VALUE_DEPTH {
+            return Err(invalid("command value exceeds nesting depth budget"));
+        }
         match self.u8()? {
             0 => Ok(Value::Null),
             1 => match self.u8()? {
@@ -893,19 +983,19 @@ impl<'a> Decoder<'a> {
             4 => Ok(Value::Bytes(self.bytes()?.to_vec())),
             5 => Ok(Value::String(self.string()?)),
             6 => {
-                let count = self.count()?;
-                let mut values = Vec::with_capacity(count);
+                let count = self.collection_count()?;
+                let mut values = Vec::new();
                 for _ in 0..count {
-                    values.push(self.value()?);
+                    values.push(self.value(depth + 1)?);
                 }
                 Ok(Value::List(values))
             }
             7 => {
-                let count = self.count()?;
+                let count = self.collection_count()?;
                 let mut values = BTreeMap::new();
                 for _ in 0..count {
                     let key = self.string()?;
-                    if values.insert(key, self.value()?).is_some() {
+                    if values.insert(key, self.value(depth + 1)?).is_some() {
                         return Err(invalid("duplicate value-map key"));
                     }
                 }

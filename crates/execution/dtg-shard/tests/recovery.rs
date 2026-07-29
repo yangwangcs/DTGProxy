@@ -5,17 +5,20 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_shard::{
-    AdvanceClosedTimestamp, CommitSingleShard, RaftReplica, ShardCommand, ShardHost,
+    AdvanceClosedTimestamp, CommitSingleShard, RaftReplica, RaftStore, ShardCommand, ShardHost,
     ShardStateMachine,
 };
 use dtg_storage::{
     ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommandId, CommittedShardBatch,
-    ConsensusSnapshotMetadata, ConsensusStore, Digest32, LogicalMutation, Properties, ProviderKind,
-    RaftHardState, RaftMembership, ReadFence, ReplicaBinding, ReplicaId, ReplicaStateStore,
-    StorageError, StoreFuture, TemporalReadView, TransactionTime, ValidInterval, Version, VertexId,
-    VertexVersion,
+    ConsensusCommandEnvelope, ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, Digest32,
+    LogicalMutation, Properties, ProviderKind, RaftHardState, RaftMembership, ReadFence,
+    ReplicaBinding, ReplicaId, ReplicaStateStore, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
+    SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, StorageError, StoreFuture, TemporalReadView,
+    TransactionTime, ValidInterval, Version, VertexId, VertexVersion,
 };
 use dtg_storage_fjall::{FjallConsensusStore, FjallReplicaStore};
+use raft::Storage;
+use raft::storage::GetEntriesContext;
 
 struct ThreadWaker(std::thread::Thread);
 
@@ -45,14 +48,15 @@ fn block_on<F: Future>(future: F) -> F::Output {
 fn committed_wal_is_replayed_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let binding = fixture_binding(3, 4, ProviderKind::Fjall, "restart");
-    let consensus =
-        Arc::new(FjallConsensusStore::open(dir.path().join("consensus"), binding.clone()).unwrap());
-    initialize_membership(&*consensus, binding.replica_id());
-    let state =
-        Arc::new(FjallReplicaStore::open(dir.path().join("business"), binding.clone()).unwrap());
+    let consensus_path = dir.path().join("consensus");
+    let business_path = dir.path().join("business");
     {
+        let consensus =
+            Arc::new(FjallConsensusStore::open(&consensus_path, binding.clone()).unwrap());
+        initialize_membership(&*consensus, binding.replica_id());
+        let state = Arc::new(FjallReplicaStore::open(&business_path, binding.clone()).unwrap());
         let failing = Arc::new(ToggleStateStore::new(state.clone()));
-        let mut replica = RaftReplica::open(consensus.clone(), failing.clone()).unwrap();
+        let mut replica = RaftReplica::open(consensus, failing.clone()).unwrap();
         replica.start().unwrap();
         replica.campaign().unwrap();
         replica.drive_ready().unwrap();
@@ -61,6 +65,8 @@ fn committed_wal_is_replayed_after_restart() {
         assert!(replica.drive_ready().is_err());
     }
 
+    let consensus = Arc::new(FjallConsensusStore::open(&consensus_path, binding.clone()).unwrap());
+    let state = Arc::new(FjallReplicaStore::open(&business_path, binding).unwrap());
     let mut replica = RaftReplica::open(consensus, state.clone()).unwrap();
     let recovered = replica.recover().unwrap();
 
@@ -73,13 +79,14 @@ fn committed_wal_is_replayed_after_restart() {
 fn closed_timestamp_is_rebuilt_from_committed_wal_on_restart() {
     let dir = tempfile::tempdir().unwrap();
     let binding = fixture_binding(14, 15, ProviderKind::Fjall, "closed-restart");
-    let consensus =
-        Arc::new(FjallConsensusStore::open(dir.path().join("consensus"), binding.clone()).unwrap());
-    initialize_membership(&*consensus, binding.replica_id());
-    let state =
-        Arc::new(FjallReplicaStore::open(dir.path().join("business"), binding.clone()).unwrap());
+    let consensus_path = dir.path().join("consensus");
+    let business_path = dir.path().join("business");
     {
-        let mut replica = RaftReplica::open(consensus.clone(), state.clone()).unwrap();
+        let consensus =
+            Arc::new(FjallConsensusStore::open(&consensus_path, binding.clone()).unwrap());
+        initialize_membership(&*consensus, binding.replica_id());
+        let state = Arc::new(FjallReplicaStore::open(&business_path, binding.clone()).unwrap());
+        let mut replica = RaftReplica::open(consensus, state).unwrap();
         replica.start().unwrap();
         replica.campaign().unwrap();
         replica.drive_ready().unwrap();
@@ -97,6 +104,8 @@ fn closed_timestamp_is_rebuilt_from_committed_wal_on_restart() {
         replica.drive_ready().unwrap();
     }
 
+    let consensus = Arc::new(FjallConsensusStore::open(&consensus_path, binding.clone()).unwrap());
+    let state = Arc::new(FjallReplicaStore::open(&business_path, binding).unwrap());
     let mut restarted = RaftReplica::open(consensus, state).unwrap();
     restarted.recover().unwrap();
 
@@ -230,6 +239,57 @@ fn one_host_runs_independent_shards_with_heterogeneous_providers() {
 }
 
 #[test]
+fn two_raft_groups_commit_and_survive_independent_disruption() {
+    let root = tempfile::tempdir().unwrap();
+    let first_binding = fixture_binding(40, 41, ProviderKind::Fjall, "multi-first");
+    let second_binding = fixture_binding(42, 43, ProviderKind::Fjall, "multi-second");
+    let first_consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("first-consensus"), first_binding.clone())
+            .unwrap(),
+    );
+    let second_consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("second-consensus"), second_binding.clone())
+            .unwrap(),
+    );
+    initialize_membership(&*first_consensus, first_binding.replica_id());
+    initialize_membership(&*second_consensus, second_binding.replica_id());
+    let first_state = Arc::new(
+        FjallReplicaStore::open(root.path().join("first-business"), first_binding).unwrap(),
+    );
+    let second_state = Arc::new(
+        FjallReplicaStore::open(root.path().join("second-business"), second_binding).unwrap(),
+    );
+    let mut host = ShardHost::new();
+    let first = host.add(first_consensus, first_state.clone()).unwrap();
+    let second = host.add(second_consensus, second_state.clone()).unwrap();
+    for key in [first, second] {
+        host.start(key).unwrap();
+        host.campaign(key).unwrap();
+        host.drive_ready(key).unwrap();
+    }
+    host.propose(first, committed_vertex_command(1, 7, 10))
+        .unwrap();
+    host.propose(second, committed_vertex_command(2, 7, 10))
+        .unwrap();
+    host.drive_ready(first).unwrap();
+    host.drive_ready(second).unwrap();
+    assert_eq!(block_on(first_state.applied_index()).unwrap(), 2);
+    assert_eq!(block_on(second_state.applied_index()).unwrap(), 2);
+
+    host.stop(first).unwrap();
+    host.seal(first).unwrap();
+    let removed: () = host.sealed_remove(first).unwrap();
+    assert_eq!(removed, ());
+    host.propose(second, committed_vertex_command(3, 7, 10))
+        .unwrap();
+    host.drive_ready(second).unwrap();
+
+    assert_eq!(block_on(first_state.applied_index()).unwrap(), 2);
+    assert_eq!(block_on(second_state.applied_index()).unwrap(), 3);
+    assert!(host.observe(second).unwrap().is_running());
+}
+
+#[test]
 fn single_replica_proposal_is_applied_from_raft_ready() {
     let root = tempfile::tempdir().unwrap();
     let binding = fixture_binding(9, 10, ProviderKind::Fjall, "raft-ready");
@@ -251,6 +311,96 @@ fn single_replica_proposal_is_applied_from_raft_ready() {
     assert_eq!(progress.receipts().len(), 1);
     assert_eq!(progress.receipts()[0].command_id(), 77);
     assert_eq!(state.applied_indices(), vec![1, 2]);
+}
+
+#[test]
+fn transient_apply_failure_is_retried_in_process() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fixture_binding(30, 31, ProviderKind::Fjall, "pending-retry");
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("consensus"), binding.clone()).unwrap(),
+    );
+    initialize_membership(&*consensus, binding.replica_id());
+    let state = Arc::new(RecordingStateStore::with_applied(binding, 0));
+    let toggled = Arc::new(ToggleStateStore::new(state.clone()));
+    let mut replica = RaftReplica::open(consensus, toggled.clone()).unwrap();
+    replica.start().unwrap();
+    replica.campaign().unwrap();
+    replica.drive_ready().unwrap();
+    toggled.set_failing(true);
+    replica
+        .propose(committed_vertex_command(88, 7, 10))
+        .unwrap();
+    assert!(replica.drive_ready().is_err());
+
+    toggled.set_failing(false);
+    let retried = replica.drive_ready().unwrap();
+
+    assert_eq!(retried.receipts().len(), 1);
+    assert_eq!(retried.receipts()[0].command_id(), 88);
+    assert_eq!(state.applied_indices(), vec![1, 2]);
+    assert!(replica.observe().is_running());
+}
+
+#[test]
+fn sealed_replica_is_terminal_and_cannot_recover() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fixture_binding(32, 33, ProviderKind::Fjall, "sealed-terminal");
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("consensus"), binding.clone()).unwrap(),
+    );
+    let state = Arc::new(RecordingStateStore::with_applied(binding, 0));
+    let mut replica = RaftReplica::open(consensus, state).unwrap();
+    replica.seal().unwrap();
+
+    let error = replica.recover().unwrap_err();
+
+    assert_eq!(error.code(), "DTG-SHARD-LIFECYCLE");
+}
+
+#[test]
+fn sealing_rejects_pending_committed_apply() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fixture_binding(34, 35, ProviderKind::Fjall, "sealed-pending");
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("consensus"), binding.clone()).unwrap(),
+    );
+    initialize_membership(&*consensus, binding.replica_id());
+    let state = Arc::new(RecordingStateStore::with_applied(binding, 0));
+    let toggled = Arc::new(ToggleStateStore::new(state));
+    let mut replica = RaftReplica::open(consensus, toggled.clone()).unwrap();
+    replica.start().unwrap();
+    replica.campaign().unwrap();
+    replica.drive_ready().unwrap();
+    toggled.set_failing(true);
+    replica
+        .propose(committed_vertex_command(89, 7, 10))
+        .unwrap();
+    assert!(replica.drive_ready().is_err());
+    replica.stop().unwrap();
+
+    let error = replica.seal().unwrap_err();
+
+    assert_eq!(error.code(), "DTG-SHARD-LIFECYCLE");
+}
+
+#[test]
+fn stopping_rejects_unprocessed_ready_work() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fixture_binding(44, 45, ProviderKind::Fjall, "stop-ready");
+    let consensus = Arc::new(
+        FjallConsensusStore::open(root.path().join("consensus"), binding.clone()).unwrap(),
+    );
+    initialize_membership(&*consensus, binding.replica_id());
+    let state = Arc::new(RecordingStateStore::with_applied(binding, 0));
+    let mut replica = RaftReplica::open(consensus, state).unwrap();
+    replica.start().unwrap();
+    replica.campaign().unwrap();
+
+    let error = replica.stop().unwrap_err();
+
+    assert_eq!(error.code(), "DTG-SHARD-LIFECYCLE");
+    assert!(replica.observe().is_running());
 }
 
 #[test]
@@ -322,6 +472,55 @@ fn unknown_command_versions_fail_closed() {
     encoded[..4].copy_from_slice(&2_u32.to_be_bytes());
     let error = ShardCommand::decode(&encoded).unwrap_err();
     assert_eq!(error.code(), "DTG-SHARD-COMMAND-VERSION");
+}
+
+#[test]
+fn retained_log_gap_after_snapshot_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fixture_binding(36, 37, ProviderKind::Fjall, "retained-gap");
+    let consensus =
+        Arc::new(FjallConsensusStore::open(root.path().join("consensus"), binding).unwrap());
+    block_on(consensus.set_snapshot_metadata(ConsensusSnapshotMetadata {
+        snapshot_id: 1,
+        last_included_term: 2,
+        last_included_index: 2,
+        content_digest: Digest32::new([3; 32]),
+    }))
+    .unwrap();
+    block_on(consensus.append(vec![internal_noop_entry(3, 4, 0)])).unwrap();
+    let wal = RaftStore::new(consensus).unwrap();
+
+    assert!(Storage::first_index(&wal).is_err());
+}
+
+#[test]
+fn oversized_internal_wal_entry_fails_before_materialization() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fixture_binding(38, 39, ProviderKind::Fjall, "oversized-wal");
+    let consensus =
+        Arc::new(FjallConsensusStore::open(root.path().join("consensus"), binding).unwrap());
+    block_on(consensus.append(vec![internal_noop_entry(1, 1, 17 * 1024 * 1024)])).unwrap();
+    let wal = RaftStore::new(consensus).unwrap();
+
+    let result = Storage::entries(&wal, 1, 2, None, GetEntriesContext::empty(false));
+    assert!(result.is_err());
+}
+
+fn internal_noop_entry(term: u64, index: u64, context_len: usize) -> ConsensusEntry {
+    let mut payload = Vec::with_capacity(13 + context_len);
+    payload.extend_from_slice(&1_u32.to_be_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&(context_len as u32).to_be_bytes());
+    payload.resize(payload.len() + context_len, 0);
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    ConsensusEntry::new(
+        SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION,
+        term,
+        index,
+        CommandId::new((u128::from(term) << 64) | u128::from(index)).unwrap(),
+        ConsensusCommandEnvelope::new(SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, payload).unwrap(),
+    )
+    .unwrap()
 }
 
 fn initialize_membership(store: &dyn ConsensusStore, replica_id: ReplicaId) {

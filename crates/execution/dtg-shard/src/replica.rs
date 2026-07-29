@@ -112,6 +112,8 @@ pub struct RaftReplica {
     machine: ShardStateMachine,
     node: Option<RawNode<RaftStore>>,
     lifecycle: ReplicaLifecycle,
+    pending_apply: Vec<Entry>,
+    pending_messages: Vec<Message>,
 }
 
 impl RaftReplica {
@@ -131,18 +133,25 @@ impl RaftReplica {
             machine,
             node: None,
             lifecycle: ReplicaLifecycle::Added,
+            pending_apply: Vec::new(),
+            pending_messages: Vec::new(),
         })
     }
 
     pub fn recover(&mut self) -> Result<Vec<ApplyOutcome>, ShardError> {
-        if self.lifecycle == ReplicaLifecycle::Running {
+        if matches!(
+            self.lifecycle,
+            ReplicaLifecycle::Running | ReplicaLifecycle::Sealed
+        ) {
             return Err(ShardError::InvalidLifecycle(
-                "recovery requires a stopped replica".into(),
+                "recovery requires a non-running, unsealed replica".into(),
             ));
         }
         let previously_applied = self.machine.applied_index();
-        let entries = self.wal.recovery_entries(previously_applied)?;
-        let (_, outcomes) = self.apply_entries(entries)?;
+        self.pending_apply = self.wal.recovery_entries(previously_applied)?;
+        let (_, outcomes) = self.apply_entries(self.pending_apply.clone())?;
+        self.pending_apply.clear();
+        self.pending_messages.clear();
         Ok(outcomes
             .into_iter()
             .filter(|outcome| outcome.applied_index() > previously_applied)
@@ -206,6 +215,11 @@ impl RaftReplica {
                 "sealed replica is already terminal".into(),
             ));
         }
+        if self.node.as_ref().is_some_and(RawNode::has_ready) {
+            return Err(ShardError::InvalidLifecycle(
+                "replica has unprocessed Ready work".into(),
+            ));
+        }
         self.node = None;
         self.lifecycle = ReplicaLifecycle::Stopped;
         Ok(())
@@ -223,6 +237,17 @@ impl RaftReplica {
         if self.lifecycle == ReplicaLifecycle::Running {
             return Err(ShardError::InvalidLifecycle(
                 "running replica must be stopped before sealing".into(),
+            ));
+        }
+        if !self.pending_apply.is_empty() || !self.pending_messages.is_empty() {
+            return Err(ShardError::InvalidLifecycle(
+                "replica has pending committed apply or outbound messages".into(),
+            ));
+        }
+        let committed_index = self.wal.committed_index()?;
+        if committed_index > self.machine.applied_index() {
+            return Err(ShardError::InvalidLifecycle(
+                "replica has committed WAL entries that are not applied".into(),
             ));
         }
         self.node = None;
@@ -260,6 +285,9 @@ impl RaftReplica {
 
     fn drive_node(&mut self, node: &mut RawNode<RaftStore>) -> Result<RaftProgress, ShardError> {
         let mut progress = RaftProgress::default();
+        if !node.has_ready() {
+            self.retry_pending(node, &mut progress)?;
+        }
         while node.has_ready() {
             let mut ready = node.ready();
             if !ready.snapshot().is_empty() {
@@ -272,23 +300,37 @@ impl RaftReplica {
                 self.wal.persist_hard_state(hard_state)?;
             }
             let mut committed = ready.take_committed_entries();
-            progress.messages.extend(ready.take_messages());
-            progress.messages.extend(ready.take_persisted_messages());
+            self.pending_messages.extend(ready.take_messages());
+            self.pending_messages
+                .extend(ready.take_persisted_messages());
 
             let mut light = node.advance_append(ready);
             if light.commit_index().is_some() {
                 self.wal.persist_hard_state(&node.status().hs)?;
             }
             committed.extend(light.take_committed_entries());
-            progress.messages.extend(light.take_messages());
+            self.pending_messages.extend(light.take_messages());
+            self.pending_apply.extend(committed);
+            self.retry_pending(node, &mut progress)?;
+        }
+        Ok(progress)
+    }
 
-            let (mut receipts, outcomes) = self.apply_entries(committed)?;
-            progress.receipts.append(&mut receipts);
+    fn retry_pending(
+        &mut self,
+        node: &mut RawNode<RaftStore>,
+        progress: &mut RaftProgress,
+    ) -> Result<(), ShardError> {
+        if !self.pending_apply.is_empty() {
+            let (mut receipts, outcomes) = self.apply_entries(self.pending_apply.clone())?;
             if let Some(last) = outcomes.last() {
                 node.advance_apply_to(last.applied_index());
             }
+            self.pending_apply.clear();
+            progress.receipts.append(&mut receipts);
         }
-        Ok(progress)
+        progress.messages.append(&mut self.pending_messages);
+        Ok(())
     }
 
     fn apply_entries(

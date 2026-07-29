@@ -5,9 +5,9 @@ use dtg_shard::{
 };
 use dtg_storage::{
     ApplyReceipt, BindingRole, CommandId, CommittedShardBatch, Digest32, LogicalMutation,
-    Properties, ProviderKind, ReadFence, ReplicaBinding, ReplicaStateStore, StorageError,
-    StoreFuture, TemporalReadView, TransactionTime, ValidInterval, Version, VertexId,
-    VertexVersion,
+    Properties, ProviderKind, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore,
+    StorageError, StoreFuture, TemporalReadView, TransactionId, TransactionRecord,
+    TransactionState, TransactionTime, ValidInterval, Value, Version, VertexId, VertexVersion,
 };
 
 #[test]
@@ -71,6 +71,80 @@ fn home_decision_rejects_non_transaction_mutations() {
     .unwrap_err();
 
     assert_eq!(error.code(), "DTG-SHARD-COMMAND");
+}
+
+#[test]
+fn generic_commit_rejects_transaction_and_reserved_metadata_mutations() {
+    let transaction = TransactionRecord::new(
+        TransactionId::new(9).unwrap(),
+        TransactionState::Prepared,
+        TransactionTime::new(10).unwrap(),
+        Digest32::new([7; 32]),
+    )
+    .unwrap();
+    let transaction_error = CommitSingleShard::new(
+        CommandId::new(9).unwrap(),
+        7,
+        10,
+        vec![LogicalMutation::PutTransaction(transaction)],
+    )
+    .unwrap_err();
+    assert_eq!(transaction_error.code(), "DTG-SHARD-COMMAND");
+
+    for reserved in [
+        "dtg.closed_timestamp",
+        "dtg.installed_snapshot",
+        "dtg.migration_phase",
+        "dtg.raft_noop",
+    ] {
+        let metadata = ReplicaMetadata::new(reserved, Value::Integer(1)).unwrap();
+        let error = CommitSingleShard::new(
+            CommandId::new(10).unwrap(),
+            7,
+            10,
+            vec![LogicalMutation::PutReplicaMetadata(metadata)],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "DTG-SHARD-COMMAND");
+    }
+}
+
+#[test]
+fn command_value_nesting_and_allocation_budgets_fail_closed() {
+    let mut nested = Value::Integer(1);
+    for _ in 0..65 {
+        nested = Value::List(vec![nested]);
+    }
+    let mut properties = Properties::new();
+    properties.insert("nested".into(), nested);
+    let vertex = VertexVersion::new(
+        VertexId::new(100).unwrap(),
+        Version::new(1),
+        ValidInterval::new(0, 100).unwrap(),
+        TransactionTime::new(10).unwrap(),
+        properties,
+    )
+    .unwrap();
+    let nested_command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(100).unwrap(),
+            7,
+            10,
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .unwrap(),
+    );
+    assert!(nested_command.encode_current().is_err());
+
+    let mut truncated = Vec::new();
+    truncated.extend_from_slice(&1_u32.to_be_bytes());
+    truncated.push(1);
+    truncated.extend_from_slice(&101_u128.to_be_bytes());
+    truncated.extend_from_slice(&7_u64.to_be_bytes());
+    truncated.extend_from_slice(&10_u64.to_be_bytes());
+    truncated.extend_from_slice(&65_537_u32.to_be_bytes());
+    let error = ShardCommand::decode(&truncated).unwrap_err();
+    assert!(error.to_string().contains("allocation budget"));
 }
 
 fn fixture_machine() -> ShardStateMachine {
