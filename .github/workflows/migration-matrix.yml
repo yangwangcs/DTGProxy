@@ -1,0 +1,23 @@
+name: generational migration matrix
+
+on:
+  push:
+    paths:
+      - "crates/execution/dtg-control/**"
+      - "crates/execution/dtg-shard/**"
+      - "crates/storage/**"
+  pull_request:
+    paths:
+      - "crates/execution/dtg-control/**"
+      - "crates/execution/dtg-shard/**"
+      - "crates/storage/**"
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p dtg-control --test six_provider_directions
+      - run: cargo test --locked -p dtg-shard --test migration

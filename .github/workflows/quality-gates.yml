@@ -1,166 +1,19 @@
-name: DTGProxy 1.1 Quality Gates
+name: clean-break quality gates
 
 on:
   push:
   pull_request:
 
 jobs:
-  macos-rocksdb-toolchain:
-    runs-on: macos-14
+  workspace:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-      - name: Install Protocol Buffers compiler
-        run: brew install protobuf
-      - name: Probe SDK libc++ headers through the repository wrapper
-        run: |
-          printf '#include <cstdint>\n#include <vector>\nint main() { std::vector<std::uint64_t> values{1}; return values[0] == 1 ? 0 : 1; }\n' > "$RUNNER_TEMP/cstdint.cc"
-          scripts/macos-cxx "$RUNNER_TEMP/cstdint.cc" -o "$RUNNER_TEMP/cstdint"
-      - name: Test default RocksDB temporal roundtrip
-        run: >-
-          cargo test --locked -p temporal-storage --features rocksdb-tests
-          --test rocksdb_roundtrip -- --test-threads=1
-      - name: Test RocksDB adapter contract
-        run: >-
-          cargo test --locked -p adapter-rocksdb --test adapter_contract
-          -- --test-threads=1
-
-  default-and-rocksdb:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-          components: clippy
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes clang libclang-dev llvm-dev cmake protobuf-compiler
-          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
-      - name: Test default workspace targets
-        run: >-
-          cargo test --locked --workspace --all-targets
-          --exclude adapter-postgres --exclude adapter-neo4j
-          -- --test-threads=1
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-      - name: Test RocksDB temporal roundtrip
-        run: >-
-          cargo test --locked -p temporal-storage --features rocksdb-tests
-          --test rocksdb_roundtrip -- --test-threads=1
-      - name: Test RocksDB randomized temporal contract
-        run: >-
-          cargo test --locked -p temporal-storage --features rocksdb-tests
-          --test randomized_tck -- --test-threads=1
-      - name: Test RocksDB transaction contract
-        run: >-
-          cargo test --locked -p temporal-storage --features rocksdb-tests
-          --test transaction_adapter_tck -- --test-threads=1
-      - name: Test deterministic data-plane performance regressions
-        run: >-
-          cargo test --locked -p distributed-query --features test-support
-          --test performance_regressions -- --test-threads=1
-      - name: Test true CandidateScan page pulls and early LIMIT stop
-        run: >-
-          cargo test --locked -p query-executor --no-default-features
-          --test temporal_scan candidate_morsel -- --test-threads=1
-      - name: Gate paired direct and proxy execution semantics
-        run: >-
-          cargo test --locked -p cypher-engine --test direct_proxy_gate
-          -- --test-threads=1
-      - name: Gate release performance threshold calculations
-        run: >-
-          cargo test --locked -p cypher-engine --test system_performance_gate
-          -- --test-threads=1
-      - name: Smoke real process scale-out certification
-        run: |
-          cargo build --locked -p meta-node -p data-node -p gateway-node -p bolt-server --bins
-          scripts/certify-scale-out.sh --smoke \
-            --report-dir "$RUNNER_TEMP/dtgproxy-scale-out" \
-            --meta-node-bin target/debug/dtgproxy-meta \
-            --data-node-bin target/debug/dtgproxy-data \
-            --gateway-bin target/debug/dtgproxy-gateway \
-            --bolt-loadgen-bin target/debug/dtgproxy-bolt-loadgen
-      - name: Test Sidecar CanonicalScan protocol and snapshot contract
-        run: >-
-          cargo test --locked -p adapter-sidecar
-          --test protocol --test client --test snapshot_protocol
-          --test stateful_snapshot --test tcp
-          -- --test-threads=1
-      - name: Test PostgreSQL canonical scan SQL contract
-        run: >-
-          cargo test --locked -p adapter-postgres --test sql_contract
-          -- --test-threads=1
-      - name: Test clean-break checker fixtures
-        run: scripts/tests/check-tcypher-clean-break.sh
-      - name: Enforce backend-neutral language and SPI boundary
-        run: scripts/check-tcypher-clean-break.sh
-      - name: Lint every supported feature and target
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-
-  postgres-live:
-    runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: dtgproxy
-          POSTGRES_PASSWORD: dtgproxy-ci-password
-          POSTGRES_DB: dtgproxy
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U dtgproxy -d dtgproxy"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    env:
-      DTGPROXY_POSTGRES_URL: host=127.0.0.1 port=5432 user=dtgproxy password=dtgproxy-ci-password dbname=dtgproxy sslmode=disable
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes clang libclang-dev llvm-dev cmake protobuf-compiler
-          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
-      - name: Verify complete PostgreSQL adapter contract
-        run: cargo test --locked -p adapter-postgres -- --test-threads=1
-
-  neo4j-live:
-    runs-on: ubuntu-24.04
-    services:
-      neo4j:
-        image: neo4j:5.26-community
-        env:
-          NEO4J_AUTH: neo4j/dtgproxy-ci-password
-        ports:
-          - 7474:7474
-          - 7687:7687
-        options: >-
-          --health-cmd "wget --quiet --spider http://localhost:7474 || exit 1"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 30
-    env:
-      DTGPROXY_NEO4J_ENDPOINT: http://127.0.0.1:7474
-      DTGPROXY_NEO4J_PASSWORD: dtgproxy-ci-password
-      DTGPROXY_NEO4J_USERNAME: neo4j
-      DTGPROXY_NEO4J_DATABASE: neo4j
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes clang libclang-dev llvm-dev cmake protobuf-compiler
-          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
-      - name: Verify complete Neo4j adapter contract
-        run: cargo test --locked -p adapter-neo4j -- --test-threads=1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: bash scripts/check-layered-architecture.sh
+      - run: bash scripts/check-clean-break-removal.sh
+      - run: bash scripts/tests/certify-clean-break-contract.sh

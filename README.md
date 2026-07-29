@@ -1,188 +1,71 @@
 # DTGProxy
 
-DTGProxy is a distributed bitemporal property-graph middleware written in Rust. It owns valid-time and transaction-time semantics above pluggable ordinary KV and graph database backends.
+DTGProxy is a distributed temporal property-graph middleware with a clean-break layered
+architecture. The workspace contains a minimal kernel, a language layer that stops at normalized
+logical IR, an execution layer, a storage layer, and four thin process assemblies.
 
-The 1.0 prototype implements the complete main path:
-
-- bitemporal Current/History storage, bounded Anchor+Delta reconstruction, `AS OF`, `CHANGES`, and
-  double adjacency;
-- independent Raft groups with durable WAL, checkpoint/suffix recovery, epoch fencing, ReadIndex,
-  and follower safe-time reads;
-- durable timestamp allocation and distributed temporal transactions with Home decisions,
-  participant intents, 2PC recovery metadata, and a single-Shard fast path;
-- `PrimaryReplica` and rendezvous-routed `SharedNothing` deployment modes, including
-  cross-partition edge projections;
-- one Adapter SPI over Memory, RocksDB, PostgreSQL, Neo4j transactional Query API, and remote
-  Sidecar backends;
-- logical snapshots, stateful Sidecar export/restore, online dual-apply backend migration, and
-  generation-based catalog publication;
-- typed Temporal IR, interval-preserving temporal rows, distributed fragments, and Cypher
-  compilation;
-- Cypher/Bolt execution through `gateway-node`, plus a `dtgproxy` CLI for initialization,
-  serving, transaction submission, backend verification, and migration.
-
-The durable layout has eight stable RocksDB Column Families: `meta`, `identity`, `current`,
-`adj_out`, `adj_in`, `history`, `temporal_index`, and `txn`. The RocksDB `default` Column
-Family is also present because RocksDB requires it, but DTGProxy does not place logical data
-there.
-
-The current architecture and implementation scope are defined by the
-[Cedar T-Cypher clean-break design](docs/superpowers/specs/2026-07-23-dtgproxy-cedar-tcypher-clean-break-design.md).
-Protocol specifications for Raft commands, state-machine recovery, snapshots, transactions,
-control-plane state, Adapter SPI, and Sidecar transport are under [`docs/`](docs/).
-
-The independently deployable cluster path consists of `dtgproxy-meta`, `dtgproxy-data`,
-`dtgproxy-gateway`, and `dtgproxy-controller`. A loopback two-Data-node configuration set is under
-[`config/examples/cluster-dev`](config/examples/cluster-dev/README.md). The cluster Controller can
-move a live Shard with resumable snapshot transfer, learner catch-up, joint consensus, epoch
-lineage, and cleanup pins; see the [P0 verification record](docs/verification/dtgproxy-p0-cluster-runtime.md).
-
-## Explicit backend selection
-
-Every normal `dtgproxy-data` startup must declare exactly one logical `backend`: `rocksdb`,
-`postgresql`, or `neo4j`. Startup validates the selection before opening the service and initializes
-only the selected path:
+## Architecture
 
 ```text
-rocksdb    -> embedded rocksdb
-postgresql -> sidecar(target_provider=postgresql)
-neo4j      -> sidecar(target_provider=neo4j)
+dtg-kernel
+  ├─ dtg-language-ir <- dtg-language
+  ├─ dtg-storage <- native and remote providers
+  └─ execution capabilities <- dtg-execution
+                               ├─ dtg-gateway
+                               ├─ dtg-data
+                               ├─ dtg-meta
+                               └─ dtg-controller
 ```
 
-The two Sidecar-backed choices remain distinct logical backends even though the Data Node provider
-name is `sidecar`. The selected backend, actual provider, active generation, and loaded backend set
-are exposed as lifecycle evidence. During ordinary operation the loaded set contains one backend.
-Online migration may load the declared target on demand, temporarily making the set contain the
-source and target; completion or abort releases the old or target backend and returns to one.
-Missing, unknown, or profile-mismatched selections fail before the Data Node becomes ready.
+- Language owns parsing, semantic validation, and deterministic normalized logical IR only.
+- Execution owns planning, bounded query execution, temporal snapshot-isolation transactions,
+  Shard/Raft, consistent reads, logical replica snapshots, Snapshot CSR algorithms, durable
+  asynchronous analytics, the control plane, and generational online migration.
+- Storage exposes one logical replica contract with capability-controlled pushdown. Fjall,
+  PostgreSQL, and Neo4j are native in-process providers. Third-party providers use the versioned
+  Remote protocol.
+- Gateway, Data, Meta, and Controller are thin process composition roots, not service copies of the
+  three logical layers.
 
-## Temporal persistence slice
+## Invariants
 
-`TemporalStore` accepts a `TemporalTransaction` containing typed vertex and edge mutations with
-valid-time intervals plus one transaction context. It validates immutable identity, interval-level
-write conflicts, and temporal referential integrity; rewrites all changes into disjoint valid-time
-segments; and sends exactly one deterministic `CommittedMutationBatch` to the selected adapter.
-Single-vertex and single-edge methods are wrappers around this transaction API. The batch
-atomically contains:
+- One placement epoch has exactly one active backend generation.
+- Every replica in one Raft group and generation uses the same backend class.
+- Every replica owns a distinct physical namespace.
+- One Data process may host independent Shards backed by different provider classes.
+- Follower reads require an authenticated proof and a real quorum ReadIndex.
+- Only the closed built-in algorithm catalog is executable; arbitrary user code is rejected.
 
-- the graph-scoped identity record;
-- the latest Current projection;
-- immutable transaction-time History Anchor/Delta entries;
-- both source- and destination-oriented adjacency records for edges;
-- adapter replay metadata and the applied log index.
-
-The same backend-neutral API reads Current vertices/edges, transaction-time `AS OF` views,
-valid-time-filtered incoming/outgoing adjacency, and immutable `CHANGES` events. Durable records have explicit tags, magic, format versions, big-endian fixed-width
-fields, length-delimited canonical payloads, and checksums. The randomized TCK drives the same
-fixed-seed corrections through the semantic model, Memory Adapter, and RocksDB after every
-commit.
-
-Operations are normalized by graph, partition, kind, and element before mutation sequence numbers
-are assigned. A transaction may create both endpoints and their edge together. Every edge valid
-interval must be fully covered by both endpoint projections after all staged vertex changes.
-Conversely, deleting part of a vertex lifetime is rejected if an incident edge would become
-dangling, unless that edge is coordinately rewritten in the same transaction. Validation failure,
-log-order failure, or replay mismatch leaves Current, History, both adjacency directions, and the
-applied log index unchanged. Memory and RocksDB execute the same transaction contract tests.
-
-History starts with an Anchor, writes at most 15 bounded Deltas, and forces a new Anchor when
-either the replay count or a 64 KiB encoded-delta budget would be exceeded. Readers seek directly
-to the requested transaction time and replay backward only to the nearest Anchor. Missing,
-over-limit, or obsolete record formats fail closed.
-
-## Temporal Cypher execution
-
-The only query surface is Temporal Cypher through the Cypher/Bolt gateway. Compilation lowers
-queries into the current typed Temporal IR, then into bounded distributed physical fragments.
-Point reads produce ordinary Cypher rows; interval reads retain valid-time and transaction-time
-regions through temporal joins until projection.
-
-## Prototype 1.0 isolation and deployment boundary
-
-The transaction contract is Temporal Snapshot Isolation for written element/valid-time intervals:
-overlapping intervening writes conflict while disjoint valid-time corrections may commit. A durable
-timestamp oracle assigns transaction time; multi-Shard transactions prewrite epoch-fenced intents,
-persist their final decision on the Home Shard, and then resolve every participant. Single-Shard
-transactions use one replicated command. Vertex/edge identity and lifetime validation includes
-cross-partition OUT/IN edge projections.
-
-This prototype does not claim predicate-level Temporal Serializable isolation. Historical
-expansion is semantically complete but still uses an edge-identity scan; global scans fan out and
-merge in the middleware rather than pushing a distributed plan into every backend. PostgreSQL and
-Neo4j have environment-gated live integration tests because the default workspace test does not
-provision external services. Production hardening findings are recorded separately after the main
-path acceptance run.
-
-## Performance probe
-
-Run the release-mode RocksDB microbenchmark with:
+## Build and test
 
 ```bash
-CXX=/opt/homebrew/opt/llvm/bin/clang++ \
-LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib \
-DTGPROXY_BENCH_ITERS=200 \
-cargo bench -p temporal-storage --bench roundtrip
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+bash scripts/check-layered-architecture.sh
+bash scripts/check-clean-break-removal.sh
 ```
 
-With 1,008 commits on one element, the Anchor+Delta benchmark measured 5,684 ns/op at replay
-depth 1, 20,457 ns/op at the maximum replay depth 16, and 13,528 ns/op for a snapshot 1,000
-versions behind the current state. Actual History values occupied 100,827 bytes (100 bytes/record)
-Current lookup measured 3,095 ns/op, synchronous correction 131,046 ns/op, and degree-32
-expansion 29,456 ns/op. These results are development-host microbenchmarks, not service SLOs.
-
-The current acceptance run on the same development host and toolchain, after adding local
-transactions and query execution, measured:
-
-| Operation | Acceptance dataset | Nanoseconds/op |
-|---|---:|---:|
-| Current vertex point lookup | 1,016 versions | 2,797 |
-| AS OF replay depth 1 | 1,008-version history | 5,005 |
-| AS OF replay depth 16 | maximum configured chain | 24,360 |
-| AS OF snapshot age 1,000 | bounded seek | 15,600 |
-| Retroactive correction, sync WAL | 8 commits | 153,562 |
-| Current outgoing expansion | degree 32 | 35,193 |
-| Historical outgoing expansion | 32 edge identities | 163,302 |
-| Atomic two-vertex/one-edge transaction | 11 mutations, sync WAL | 182,671 |
-
-History values remained 100,827 bytes versus 148,077 hypothetical all-anchor bytes. The final
-database occupied 1,164,438 bytes because this acceptance probe additionally persists 200 atomic
-three-element transactions. Historical expansion's 163 µs result quantifies the documented
-identity-scan fallback and is a future indexing target. Differences from earlier micro-runs are
-treated as host/run variance unless reproduced by a dedicated benchmark harness; none of these
-numbers are service SLOs.
-
-## Development
-
-The RocksDB binding compiles native C++ and bindgen code, so a C++17-capable Clang and
-libclang are required. On macOS, Cargo automatically uses `scripts/macos-cxx`, which resolves
-the active SDK and its libc++ headers through `xcrun`; no machine-local SDK path is committed.
-Homebrew LLVM remains an optional source of `libclang`. The repository's target-specific Cargo
-configuration intentionally keeps `scripts/macos-cxx` as the C++ driver, so setting a generic
-`CXX` does not override it:
+Run the repeatable local certification:
 
 ```bash
-brew install llvm
-export LIBCLANG_PATH=/opt/homebrew/opt/llvm/lib
+scripts/certify-clean-break.sh --local
 ```
 
-For short local development checks, an already installed RocksDB library can skip rebuilding the
-vendored C++ source. The library ABI/version used by a formal paper run must still be recorded in
-its environment fingerprint; do not silently mix this development shortcut with formal evidence:
+It writes a versioned JSON evidence manifest under `target/clean-break-certification/`.
 
-```bash
-export ROCKSDB_LIB_DIR=/opt/homebrew/opt/rocksdb/lib
-cargo check -p paper-benchmark --lib --bins
-```
+## Process fixtures
 
-Run the durable adapter tests explicitly with:
+The deployment descriptors in `config/examples/clean-break-cluster/` define one Meta process, one
+Controller process, one Gateway process, and two Data processes. See [deployment](docs/deployment.md)
+for process configuration and [storage](docs/storage.md) for provider setup.
 
-```bash
-cargo test -p adapter-rocksdb
-```
+## Documentation
 
-For the complete workspace:
+- [Architecture](docs/architecture.md)
+- [Deployment](docs/deployment.md)
+- [Storage providers](docs/storage.md)
+- [Online migration](docs/migration.md)
 
-```bash
-cargo test --workspace
-cargo run -p dtgproxy -- --version
-```
+Historical design and execution records remain under `docs/superpowers/` and `docs/audit/`; they are
+not current runtime instructions.

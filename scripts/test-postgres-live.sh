@@ -15,18 +15,18 @@ run_tests() {
   (
     cd "$workspace_root"
     CXX="$cxx_bin" LIBCLANG_PATH="$libclang_dir" \
-      cargo test -p adapter-postgres -- --test-threads=1
+      cargo test --locked -p dtg-storage-postgres --test live_tck -- --ignored --test-threads=1
   )
 }
 
-if [[ -n "${DTGPROXY_POSTGRES_URL:-}" ]]; then
+if [[ -n "${DTG_POSTGRES_URL:-}" ]]; then
   run_tests
   exit 0
 fi
 
 for tool in initdb pg_ctl createdb pg_isready; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    printf 'DTGPROXY_POSTGRES_URL is unset and required PostgreSQL tool %s is unavailable\n' "$tool" >&2
+    printf 'DTG_POSTGRES_URL is unset and required PostgreSQL tool %s is unavailable\n' "$tool" >&2
     exit 78
   fi
 done
@@ -40,7 +40,7 @@ printf '%s\n' "$postgres_password" >"$password_file"
 
 cleanup() {
   pg_ctl -D "$postgres_data" -m fast stop >/dev/null 2>&1 || true
-  rm -rf "$postgres_root"
+  find "$postgres_root" -depth -delete 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -72,5 +72,5 @@ PGPASSWORD="$postgres_password" createdb \
   -U dtgproxy \
   dtgproxy
 
-export DTGPROXY_POSTGRES_URL="host=127.0.0.1 port=$postgres_port user=dtgproxy password=$postgres_password dbname=dtgproxy sslmode=disable"
+export DTG_POSTGRES_URL="host=127.0.0.1 port=$postgres_port user=dtgproxy password=$postgres_password dbname=dtgproxy sslmode=disable"
 run_tests

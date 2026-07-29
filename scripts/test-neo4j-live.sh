@@ -44,8 +44,7 @@ for ((attempt = 1; attempt <= readiness_attempts; attempt++)); do
   sleep 1
 done
 
-DTGPROXY_NEO4J_ENDPOINT="http://127.0.0.1:$port" \
-DTGPROXY_NEO4J_USERNAME=neo4j \
-DTGPROXY_NEO4J_PASSWORD=dtgproxy-point-history-password \
-DTGPROXY_NEO4J_DATABASE=neo4j \
-cargo test --locked -p adapter-neo4j -- --test-threads=1
+DTG_NEO4J_URL="http://127.0.0.1:$port" \
+DTG_NEO4J_USER=neo4j \
+DTG_NEO4J_PASSWORD=dtgproxy-point-history-password \
+cargo test --locked -p dtg-storage-neo4j --test live_tck -- --ignored --test-threads=1

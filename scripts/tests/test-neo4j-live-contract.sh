@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 launcher="$root/scripts/test-neo4j-live.sh"
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/dtgproxy-neo4j-launcher-contract.XXXXXX")
-trap 'rm -rf "$temporary"' EXIT
+trap 'find "$temporary" -depth -delete 2>/dev/null || true' EXIT
 
 [[ -f "$launcher" ]] || {
   echo 'missing Neo4j live-test launcher' >&2
@@ -20,8 +20,8 @@ for required in \
   'docker rm -f' \
   '--connect-timeout 1' \
   '--max-time 1' \
-  'DTGPROXY_NEO4J_ENDPOINT=' \
-  'cargo test --locked -p adapter-neo4j -- --test-threads=1'
+  'DTG_NEO4J_URL=' \
+  'cargo test --locked -p dtg-storage-neo4j --test live_tck -- --ignored --test-threads=1'
 do
   rg -F -- "$required" "$launcher" >/dev/null || {
     echo "launcher is missing required contract: $required" >&2
@@ -64,7 +64,7 @@ printf '%s\n' '#!/bin/bash' \
   'if [[ "${MOCK_CURL_MODE:-success}" == slow ]]; then /bin/sleep 1; fi' \
   '[[ "${MOCK_CURL_MODE:-success}" == success ]]' >"$mock_bin/curl"
 printf '%s\n' '#!/bin/bash' \
-  'printf "cargo endpoint=%s username=%s password=%s database=%s args=%s\n" "${DTGPROXY_NEO4J_ENDPOINT:-}" "${DTGPROXY_NEO4J_USERNAME:-}" "${DTGPROXY_NEO4J_PASSWORD:-}" "${DTGPROXY_NEO4J_DATABASE:-}" "$*" >>"$MOCK_LOG"' \
+  'printf "cargo endpoint=%s username=%s password=%s args=%s\n" "${DTG_NEO4J_URL:-}" "${DTG_NEO4J_USER:-}" "${DTG_NEO4J_PASSWORD:-}" "$*" >>"$MOCK_LOG"' \
   'exit "${MOCK_CARGO_STATUS:-0}"' >"$mock_bin/cargo"
 printf '#!/bin/bash\nexit 0\n' >"$mock_bin/sleep"
 chmod +x "$mock_bin/docker" "$mock_bin/curl" "$mock_bin/cargo" "$mock_bin/sleep"
@@ -79,7 +79,7 @@ set -e
 rg -F 'docker-run run --detach --rm --name dtgproxy-neo4j-point-history-' "$mock_log" >/dev/null
 rg -F -- '--publish 127.0.0.1::7474' "$mock_log" >/dev/null
 rg -F 'curl --fail --silent --show-error --connect-timeout 1 --max-time 1 http://127.0.0.1:49123' "$mock_log" >/dev/null
-rg -F 'cargo endpoint=http://127.0.0.1:49123 username=neo4j password=dtgproxy-point-history-password database=neo4j args=test --locked -p adapter-neo4j -- --test-threads=1' "$mock_log" >/dev/null
+rg -F 'cargo endpoint=http://127.0.0.1:49123 username=neo4j password=dtgproxy-point-history-password args=test --locked -p dtg-storage-neo4j --test live_tck -- --ignored --test-threads=1' "$mock_log" >/dev/null
 rg -F 'docker-cleanup rm -f dtgproxy-neo4j-point-history-' "$mock_log" >/dev/null
 
 : >"$mock_log"
