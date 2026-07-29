@@ -5,6 +5,7 @@ mod data;
 mod gateway;
 mod meta;
 mod meta_raft;
+mod write;
 
 pub use dtg_analytics as analytics;
 pub use dtg_cluster_v2 as cluster_protocol;
@@ -30,6 +31,10 @@ pub use gateway::{
 pub use meta::{MetaExecution, MetaExecutionBuilder};
 pub use meta_raft::{
     MetaCommittedEntry, MetaRaftError, MetaRaftHost, MetaRaftProgress, MetaRaftRole,
+};
+pub use write::{
+    PHYSICAL_WRITE_VERSION, PhysicalWriteError, PhysicalWriteFragment, PhysicalWritePlan,
+    PhysicalWritePlanner, RoutedWriteMutation, WritePlanningContext, WriteShardTarget,
 };
 
 pub const CLEAN_BREAK_ARCHITECTURE_VERSION: u32 = 1;

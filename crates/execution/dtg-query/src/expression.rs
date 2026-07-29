@@ -12,6 +12,10 @@ impl Expression {
         Self { logical }
     }
 
+    pub(crate) const fn logical(&self) -> &LogicalExpr {
+        &self.logical
+    }
+
     pub fn evaluate(
         &self,
         schema: &dtg_language_ir::RowSchema,

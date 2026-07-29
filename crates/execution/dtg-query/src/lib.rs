@@ -4,6 +4,7 @@ mod batch;
 mod budget;
 mod exchange;
 mod expression;
+mod file_spill;
 mod operator;
 mod runtime;
 mod spill;
@@ -13,10 +14,11 @@ pub use batch::{ColumnBatch, QueryValue};
 pub use budget::{CancellationToken, QueryBudget, QueryContext, QueryError};
 pub use exchange::{DeterministicMergeOperator, ExchangeOperator};
 pub use expression::Expression;
+pub use file_spill::{BuiltInSpillPolicy, FileSpillLimits, FileSpillStore};
 pub use operator::{
     AggregateOperator, BatchOperator, ExpandOperator, FilterOperator, HashJoinOperator,
     LimitOperator, Operator, OverlayOperator, ProjectOperator, ProjectionExpr, QueryFuture,
-    QueryOverlay, SortOperator,
+    QueryOverlay, SortOperator, UnwindOperator,
 };
 pub use runtime::{QueryRuntime, QueryStream};
 pub(crate) use spill::SpillMergeOperator;

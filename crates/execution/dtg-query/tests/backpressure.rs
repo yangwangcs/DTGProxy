@@ -1,16 +1,18 @@
 mod support;
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dtg_language_ir::{Field, LogicalType, RowSchema, SortDirection};
 use dtg_query::{
-    BatchOperator, CancellationToken, ColumnBatch, ExchangeOperator, ExecutableAccess,
-    ExecutableFragment, ExecutableOperator, ExecutableOperatorKind, ExecutablePlan,
-    HashJoinOperator, LogicalRead, Operator, QueryBudget, QueryContext, QueryError, QueryFuture,
-    QueryRuntime, QueryStream, QueryValue, ReadOperation, SnapshotGuard, SnapshotShardFence,
-    SortOperator, SpillConfig, SpillHandle, SpillStore,
+    BatchOperator, BuiltInSpillPolicy, CancellationToken, ColumnBatch, ExchangeOperator,
+    ExecutableAccess, ExecutableFragment, ExecutableOperator, ExecutableOperatorKind,
+    ExecutablePlan, FileSpillLimits, HashJoinOperator, LogicalRead, Operator, QueryBudget,
+    QueryContext, QueryError, QueryFuture, QueryRuntime, QueryStream, QueryValue, ReadOperation,
+    SnapshotGuard, SnapshotShardFence, SortOperator, SpillConfig, SpillHandle, SpillStore,
 };
 use dtg_storage::{CapabilityManifest, ShardId, TransactionTime, Version};
 
@@ -396,4 +398,131 @@ fn configured_query_runtime_selects_spill_for_production_multi_shard_merge() {
     .unwrap();
     assert_eq!(block_on(stream.collect()).unwrap().row_count(), 2);
     assert!(spill.writes.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn builtin_spill_is_query_private_and_cleans_up_after_cancellation() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragments = [13_u64, 17_u64]
+        .into_iter()
+        .enumerate()
+        .map(|(index, shard_id)| {
+            ExecutableFragment::with_access_nodes(
+                u32::try_from(index + 1).unwrap(),
+                execution_fence_for_shard(&capabilities, shard_id),
+                vec![ExecutableAccess::Logical(
+                    LogicalRead::new(
+                        ReadOperation::VertexScan,
+                        8,
+                        TransactionTime::new(23).unwrap(),
+                        17,
+                    )
+                    .unwrap(),
+                )],
+                vec![1],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        fragments,
+        1,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1, 2],
+                    output: "vertex".into(),
+                },
+            )
+            .unwrap(),
+        ],
+        RowSchema::empty(),
+    )
+    .unwrap();
+    let left =
+        FixtureStore::new_for_shard(capabilities.clone(), 13, vec![vertex(1, 10)], Vec::new());
+    let right = FixtureStore::new_for_shard(capabilities, 17, vec![vertex(2, 20)], Vec::new());
+    let storage = std::collections::BTreeMap::from([
+        (ShardId::new(13).unwrap(), left.storage(false)),
+        (ShardId::new(17).unwrap(), right.storage(false)),
+    ]);
+    let snapshot = SnapshotGuard::new(
+        TransactionTime::new(23).unwrap(),
+        Version::new(11),
+        vec![
+            (
+                ShardId::new(13).unwrap(),
+                SnapshotShardFence {
+                    placement_epoch: dtg_storage::PlacementEpoch::new(7).unwrap(),
+                    backend_generation: dtg_storage::BackendGeneration::new(3).unwrap(),
+                    applied_index: 29,
+                },
+            ),
+            (
+                ShardId::new(17).unwrap(),
+                SnapshotShardFence {
+                    placement_epoch: dtg_storage::PlacementEpoch::new(7).unwrap(),
+                    backend_generation: dtg_storage::BackendGeneration::new(3).unwrap(),
+                    applied_index: 29,
+                },
+            ),
+        ],
+    )
+    .unwrap();
+    let root = temporary_spill_root("runtime-cancel");
+    let policy = BuiltInSpillPolicy::new(
+        &root,
+        1,
+        FileSpillLimits::default(),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let runtime = QueryRuntime::new(1).with_builtin_spill(policy);
+    let cancellation = CancellationToken::new();
+    let mut stream = block_on(runtime.execute(
+        &plan,
+        storage,
+        &snapshot,
+        QueryBudget::unlimited(),
+        cancellation.clone(),
+        None,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        block_on(stream.next_batch()).unwrap().unwrap().row_count(),
+        1
+    );
+    assert_eq!(spill_namespaces(&root), 1);
+    cancellation.cancel();
+    assert_eq!(
+        block_on(stream.next_batch()).unwrap_err(),
+        QueryError::Cancelled
+    );
+    drop(stream);
+    assert_eq!(spill_namespaces(&root), 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+fn temporary_spill_root(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("dtg-query-{name}-{}-{nonce}", std::process::id()))
+}
+
+fn spill_namespaces(root: &PathBuf) -> usize {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("query-"))
+                .count()
+        })
+        .unwrap_or(0)
 }

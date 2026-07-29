@@ -447,6 +447,114 @@ pub struct LimitOperator {
     done: bool,
 }
 
+pub struct UnwindOperator {
+    input: Box<dyn Operator>,
+    expression: Expression,
+    input_schema: RowSchema,
+    schema: RowSchema,
+    batch_size: usize,
+    pending_rows: VecDeque<Vec<QueryValue>>,
+    current_row: Option<Vec<QueryValue>>,
+    current_values: VecDeque<QueryValue>,
+    input_done: bool,
+}
+
+impl UnwindOperator {
+    pub fn new(
+        input: Box<dyn Operator>,
+        expression: Expression,
+        alias: impl Into<String>,
+        batch_size: usize,
+    ) -> Result<Self, QueryError> {
+        if batch_size == 0 {
+            return Err(QueryError::InvalidPlan(
+                "UNWIND output batch size must be nonzero".into(),
+            ));
+        }
+        let alias = alias.into();
+        let input_schema = input.schema().clone();
+        if alias.is_empty() || input_schema.fields.iter().any(|field| field.name == alias) {
+            return Err(QueryError::InvalidPlan(
+                "UNWIND alias must be nonempty and unique".into(),
+            ));
+        }
+        let mut fields = input_schema.fields.clone();
+        fields.push(Field {
+            name: alias,
+            data_type: LogicalType::Any,
+            nullable: true,
+        });
+        Ok(Self {
+            input,
+            expression,
+            input_schema,
+            schema: RowSchema { fields },
+            batch_size,
+            pending_rows: VecDeque::new(),
+            current_row: None,
+            current_values: VecDeque::new(),
+            input_done: false,
+        })
+    }
+}
+
+impl Operator for UnwindOperator {
+    fn schema(&self) -> &RowSchema {
+        &self.schema
+    }
+
+    fn next_batch<'a>(
+        &'a mut self,
+        context: &'a mut QueryContext,
+    ) -> QueryFuture<'a, Option<ColumnBatch>> {
+        Box::pin(async move {
+            context.checkpoint()?;
+            let mut output = Vec::with_capacity(self.batch_size);
+            while output.len() < self.batch_size {
+                if let Some(value) = self.current_values.pop_front() {
+                    let mut row = self
+                        .current_row
+                        .as_ref()
+                        .expect("UNWIND values retain their source row")
+                        .clone();
+                    row.push(value);
+                    output.push(row);
+                    continue;
+                }
+                self.current_row = None;
+                if let Some(row) = self.pending_rows.pop_front() {
+                    context.checkpoint()?;
+                    match self.expression.evaluate(&self.input_schema, &row)? {
+                        QueryValue::List(values) => {
+                            self.current_row = Some(row);
+                            self.current_values = values.into();
+                        }
+                        QueryValue::Null => {}
+                        _ => {
+                            return Err(QueryError::InvalidPlan(
+                                "UNWIND expression must evaluate to a list or null".into(),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                if self.input_done {
+                    break;
+                }
+                match self.input.next_batch(context).await? {
+                    Some(batch) => self.pending_rows = batch.rows().into(),
+                    None => self.input_done = true,
+                }
+            }
+            if output.is_empty() {
+                Ok(None)
+            } else {
+                ColumnBatch::from_rows(self.schema.clone(), output).map(Some)
+            }
+        })
+    }
+}
+
 impl LimitOperator {
     pub fn new(input: Box<dyn Operator>, skip: usize, limit: usize) -> Self {
         let schema = input.schema().clone();

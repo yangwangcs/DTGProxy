@@ -486,6 +486,7 @@ dependencies = [
 name = "dtg-query"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "dtg-kernel",
  "dtg-language-ir",
  "dtg-storage",

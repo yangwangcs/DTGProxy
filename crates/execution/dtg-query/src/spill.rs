@@ -19,6 +19,10 @@ impl SpillHandle {
 }
 
 pub trait SpillStore: Send + Sync {
+    fn reserved_write_bytes(&self, batch: &ColumnBatch) -> Result<u64, QueryError> {
+        Ok(batch.estimated_bytes())
+    }
+
     fn write_run(
         &self,
         schema: &RowSchema,
@@ -213,13 +217,20 @@ impl SpillMergeOperator {
                     }
                 };
                 if spill {
-                    context.charge_spill(estimated)?;
+                    let reserved = self.config.store().reserved_write_bytes(&batch)?;
+                    context.charge_spill(reserved)?;
                 }
-                let mut rows = batch.rows();
+                let mut rows = batch.into_rows();
                 rows.sort_by(|left, right| compare_for_merge(left, right, self.key_column));
                 if spill {
                     let handle = self.config.store().write_run(&self.schema, rows)?;
-                    let row_count = self.config.store().row_count(handle)?;
+                    let row_count = match self.config.store().row_count(handle) {
+                        Ok(row_count) => row_count,
+                        Err(error) => {
+                            let _ = self.config.store().remove_run(handle);
+                            return Err(error);
+                        }
+                    };
                     self.runs.push(MergeRun::Spilled {
                         handle,
                         row_count,

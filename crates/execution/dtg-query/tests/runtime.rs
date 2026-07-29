@@ -1,15 +1,16 @@
 mod support;
 
 use dtg_language_ir::{
-    BinaryOperator, Field, LogicalExpr, LogicalType, RowSchema, SortDirection, Value,
+    AggregateKind, BinaryOperator, Field, JoinKind, LogicalExpr, LogicalType, RowSchema,
+    SortDirection, Value,
 };
 use dtg_query::{
     AggregateOperator, BatchOperator, CancellationToken, ColumnBatch, DeterministicMergeOperator,
-    ExecutableAccess, ExecutableFragment, ExecutableOperator, ExecutableOperatorKind,
-    ExecutablePlan, ExpandOperator, Expression, FilterOperator, HashJoinOperator, LimitOperator,
-    LogicalRead, OverlayOperator, ProjectOperator, ProjectionExpr, QueryBudget, QueryOverlay,
-    QueryRuntime, QueryStream, QueryValue, ReadOperation, SnapshotGuard, SnapshotShardFence,
-    SortOperator,
+    ExecutableAccess, ExecutableAggregate, ExecutableFragment, ExecutableOperator,
+    ExecutableOperatorKind, ExecutablePlan, ExecutableProjection, ExecutableSortKey,
+    ExpandOperator, Expression, FilterOperator, HashJoinOperator, LimitOperator, LogicalRead,
+    OverlayOperator, ProjectOperator, ProjectionExpr, QueryBudget, QueryOverlay, QueryRuntime,
+    QueryStream, QueryValue, ReadOperation, SnapshotGuard, SnapshotShardFence, SortOperator,
 };
 use dtg_storage::{
     AdjacencyDirection, CapabilityManifest, LogicalMutation, ShardId, SnapshotRecord,
@@ -334,4 +335,206 @@ fn runtime_applies_limit_once_after_merging_all_shard_sources() {
     let rows = block_on(stream.collect()).unwrap();
 
     assert_eq!(rows.row_count(), 1);
+}
+
+#[test]
+fn runtime_builds_every_operator_kind_from_an_unordered_physical_dag() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![
+            ExecutableAccess::Logical(
+                LogicalRead::new(
+                    ReadOperation::VertexScan,
+                    8,
+                    TransactionTime::new(23).unwrap(),
+                    17,
+                )
+                .unwrap(),
+            ),
+            ExecutableAccess::Logical(
+                LogicalRead::new(
+                    ReadOperation::VertexScan,
+                    8,
+                    TransactionTime::new(23).unwrap(),
+                    17,
+                )
+                .unwrap(),
+            ),
+        ],
+        vec![1, 2],
+    )
+    .unwrap();
+    let operators = vec![
+        ExecutableOperator::new(
+            10,
+            ExecutableOperatorKind::Limit {
+                input: 9,
+                skip: 0,
+                limit: Some(1),
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            9,
+            ExecutableOperatorKind::Sort {
+                input: 8,
+                keys: vec![ExecutableSortKey {
+                    expression: Expression::new(LogicalExpr::Column("item".into())),
+                    direction: SortDirection::Descending,
+                }],
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            8,
+            ExecutableOperatorKind::Aggregate {
+                input: 7,
+                groups: vec![ExecutableProjection::new(
+                    "item",
+                    Expression::new(LogicalExpr::Column("item".into())),
+                )],
+                aggregates: vec![ExecutableAggregate {
+                    function: AggregateKind::Count,
+                    argument: None,
+                    alias: "matches".into(),
+                    distinct: false,
+                }],
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            7,
+            ExecutableOperatorKind::Join {
+                left: 4,
+                right: 6,
+                kind: JoinKind::Inner,
+                predicate: Some(Expression::new(LogicalExpr::Binary {
+                    left: Box::new(LogicalExpr::Column("left_id".into())),
+                    operator: BinaryOperator::Equal,
+                    right: Box::new(LogicalExpr::Column("right_id".into())),
+                })),
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            6,
+            ExecutableOperatorKind::Project {
+                input: 5,
+                projections: vec![ExecutableProjection::new(
+                    "right_id",
+                    Expression::new(LogicalExpr::Property {
+                        input: Box::new(LogicalExpr::Column("right_vertex".into())),
+                        name: "score".into(),
+                    }),
+                )],
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            5,
+            ExecutableOperatorKind::Source {
+                logical_node: 2,
+                fragments: vec![1],
+                output: "right_vertex".into(),
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            4,
+            ExecutableOperatorKind::Unwind {
+                input: 3,
+                expression: Expression::new(LogicalExpr::Column("items".into())),
+                alias: "item".into(),
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            3,
+            ExecutableOperatorKind::Project {
+                input: 2,
+                projections: vec![
+                    ExecutableProjection::new(
+                        "left_id",
+                        Expression::new(LogicalExpr::Property {
+                            input: Box::new(LogicalExpr::Column("left_vertex".into())),
+                            name: "score".into(),
+                        }),
+                    ),
+                    ExecutableProjection::new(
+                        "items",
+                        Expression::new(LogicalExpr::List(vec![
+                            LogicalExpr::Literal(Value::Integer(1)),
+                            LogicalExpr::Literal(Value::Integer(2)),
+                        ])),
+                    ),
+                ],
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            2,
+            ExecutableOperatorKind::Filter {
+                input: 1,
+                predicate: Expression::new(LogicalExpr::Binary {
+                    left: Box::new(LogicalExpr::Property {
+                        input: Box::new(LogicalExpr::Column("left_vertex".into())),
+                        name: "score".into(),
+                    }),
+                    operator: BinaryOperator::GreaterThan,
+                    right: Box::new(LogicalExpr::Literal(Value::Integer(0))),
+                }),
+            },
+        )
+        .unwrap(),
+        ExecutableOperator::new(
+            1,
+            ExecutableOperatorKind::Source {
+                logical_node: 1,
+                fragments: vec![1],
+                output: "left_vertex".into(),
+            },
+        )
+        .unwrap(),
+    ];
+    let result_schema = RowSchema {
+        fields: vec![
+            Field {
+                name: "item".into(),
+                data_type: LogicalType::Any,
+                nullable: true,
+            },
+            Field {
+                name: "matches".into(),
+                data_type: LogicalType::Integer,
+                nullable: false,
+            },
+        ],
+    };
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        10,
+        operators,
+        result_schema,
+    )
+    .unwrap();
+    let store = FixtureStore::new(capabilities, vec![vertex(1, 1), vertex(2, 2)], Vec::new());
+
+    let mut stream = block_on(QueryRuntime::new(1).execute(
+        &plan,
+        storage_map(store.storage(false)),
+        &snapshot(),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+        None,
+    ))
+    .unwrap();
+    let rows = block_on(stream.collect()).unwrap();
+
+    assert_eq!(
+        rows.rows(),
+        vec![vec![QueryValue::Integer(2), QueryValue::Integer(2)]]
+    );
 }
