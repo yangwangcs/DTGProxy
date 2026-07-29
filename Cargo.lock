@@ -819,6 +819,12 @@ version = "1.0.0"
 [[package]]
 name = "dtg-storage-postgres"
 version = "1.0.0"
+dependencies = [
+ "dtg-kernel",
+ "dtg-storage",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "dtg-storage-remote"

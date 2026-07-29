@@ -1613,3 +1613,40 @@ fn export_snapshot(
         .collect();
     (header, chunks, manifest, records)
 }
+
+#[test]
+fn bounded_read_requests_expose_provider_neutral_query_parameters() {
+    let vertex_id = VertexId::new(41).unwrap();
+    let edge_id = EdgeId::new(43).unwrap();
+    let transaction_from = TransactionTime::new(5).unwrap();
+    let transaction_through = TransactionTime::new(17).unwrap();
+
+    let vertex_history =
+        VertexHistoryRead::new(vertex_id, transaction_from, transaction_through, 19).unwrap();
+    assert_eq!(vertex_history.transaction_from(), transaction_from);
+    assert_eq!(vertex_history.transaction_through(), transaction_through);
+
+    let edge_history =
+        EdgeHistoryRead::new(edge_id, transaction_from, transaction_through, 23).unwrap();
+    assert_eq!(edge_history.transaction_from(), transaction_from);
+    assert_eq!(edge_history.transaction_through(), transaction_through);
+
+    let adjacency = AdjacencyRead::new(
+        vertex_id,
+        dtg_storage::AdjacencyDirection::Incoming,
+        29,
+        transaction_through,
+        31,
+    )
+    .unwrap();
+    assert_eq!(adjacency.vertex_id(), vertex_id);
+    assert_eq!(
+        adjacency.direction(),
+        dtg_storage::AdjacencyDirection::Incoming
+    );
+
+    let cursor = ChangeCursor::new(37, 41);
+    let changes = ChangesRead::new(Some(cursor), 43, 47).unwrap();
+    assert_eq!(changes.after(), Some(cursor));
+    assert_eq!(changes.through_index(), 43);
+}

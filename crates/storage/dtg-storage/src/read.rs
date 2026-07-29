@@ -144,6 +144,14 @@ macro_rules! history_request {
                 self.id
             }
 
+            pub const fn transaction_from(&self) -> TransactionTime {
+                self.transaction_from
+            }
+
+            pub const fn transaction_through(&self) -> TransactionTime {
+                self.transaction_through
+            }
+
             pub const fn limit(&self) -> u32 {
                 self.limit
             }
@@ -211,6 +219,14 @@ impl AdjacencyRead {
             && edge.transaction_time() <= self.transaction_at
     }
 
+    pub const fn vertex_id(&self) -> VertexId {
+        self.vertex_id
+    }
+
+    pub const fn direction(&self) -> AdjacencyDirection {
+        self.direction
+    }
+
     pub const fn valid_at(&self) -> i64 {
         self.valid_at
     }
@@ -258,6 +274,14 @@ impl ChangesRead {
             }
             None => true,
         }) && cursor.raft_index <= self.through_index
+    }
+
+    pub const fn after(&self) -> Option<ChangeCursor> {
+        self.after
+    }
+
+    pub const fn through_index(&self) -> u64 {
+        self.through_index
     }
 
     pub const fn limit(&self) -> u32 {

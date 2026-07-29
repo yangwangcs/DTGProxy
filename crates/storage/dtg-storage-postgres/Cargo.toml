@@ -7,3 +7,12 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+dtg-kernel = { path = "../../kernel/dtg-kernel" }
+dtg-storage = { path = "../dtg-storage" }
+tokio = { version = "=1.53.0", features = ["rt", "sync"] }
+tokio-postgres = "=0.7.18"
+
+[dev-dependencies]
+tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }
