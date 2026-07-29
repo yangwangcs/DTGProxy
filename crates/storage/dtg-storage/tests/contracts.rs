@@ -856,6 +856,19 @@ impl ReplicaStateStore for TestStore {
         Box::pin(async move { Ok(self.state.lock().unwrap().applied_index) })
     }
 
+    fn replica_metadata<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .iter()
+                .find(|metadata| metadata.name() == name)
+                .cloned())
+        })
+    }
+
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
         Box::pin(async move {
             batch.validate()?;

@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 use dtg_shard::{
     CommitSingleShardTransaction, FinalizeParticipant, ParticipantIntent, PrewriteIntent,
@@ -10,7 +11,7 @@ use dtg_shard::{
     decode_single_shard_transaction_metadata,
 };
 use dtg_storage::{
-    BackendClass, BindingRole, CapabilityManifest, ChangesRead, ProviderKind, ReadFence,
+    BackendClass, BindingRole, CapabilityManifest, ChangesRead, CommandId, ProviderKind, ReadFence,
     ReplicaBinding, ReplicaStateStore, VertexRead,
 };
 use dtg_storage_fjall::FjallReplicaStore;
@@ -159,6 +160,54 @@ fn definitive_single_shard_rejection_aborts_while_ambiguous_apply_replays() {
         Ok(TransactionOutcome::Committed(transaction_time(50)))
     );
     assert_eq!(shards.graph_mutation_count(), 1);
+}
+
+#[test]
+fn single_shard_recovery_preserves_submission_failure_classification() {
+    for (failure, expected_resolution) in [
+        (
+            SubmissionFailure::Definitive(TxnError::StalePlacementEpoch),
+            Some(CommitResolution::Aborted),
+        ),
+        (SubmissionFailure::Ambiguous(TxnError::InjectedCrash), None),
+    ] {
+        let timestamps = Arc::new(FakeTimestamps::default());
+        let context = context(&[7]);
+        block_on(timestamps.reserve_commit_time(context.snapshot().transaction_id)).unwrap();
+        let shards = Arc::new(ClassifiedFailureShards::new(failure.clone()));
+        let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+
+        assert_eq!(
+            block_on(coordinator.recover(&context)),
+            Err(failure.into_error())
+        );
+        assert_eq!(
+            block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+            Ok(Some(CommitTimeReservation::new(
+                transaction_time(50),
+                expected_resolution
+            )))
+        );
+        assert_eq!(*shards.submit_count.lock().unwrap(), 1);
+    }
+
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let context = context(&[7]);
+    block_on(timestamps.reserve_commit_time(context.snapshot().transaction_id)).unwrap();
+    timestamps.fail_publish(PublishFailure::Before);
+    let shards = Arc::new(ClassifiedFailureShards::definitive(
+        TxnError::StalePlacementEpoch,
+    ));
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards);
+
+    assert_eq!(
+        block_on(coordinator.recover(&context)),
+        Ok(TransactionOutcome::Unresolved)
+    );
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(transaction_time(50), None)))
+    );
 }
 
 #[test]
@@ -535,6 +584,135 @@ fn abort_recovery_validates_reservation_authority_before_finalizing_participants
             "authority case {authority:?} mutated participant history"
         );
     }
+}
+
+#[test]
+fn public_abort_obeys_existing_reservation_before_mutating_participants() {
+    for (resolution, expected) in [
+        (
+            CommitResolution::Committed,
+            TransactionOutcome::Committed(transaction_time(50)),
+        ),
+        (CommitResolution::Aborted, TransactionOutcome::Aborted),
+    ] {
+        let timestamps = Arc::new(FakeTimestamps::default());
+        let shards = Arc::new(FakeShards::default());
+        let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+        let (context, participants) =
+            one_shard_transaction_with(TransactionId::new(601).unwrap(), 11, 1);
+        let commit_time =
+            block_on(timestamps.reserve_commit_time(context.snapshot().transaction_id)).unwrap();
+        block_on(timestamps.resolve_commit_time(
+            context.snapshot().transaction_id,
+            commit_time,
+            resolution,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            block_on(coordinator.abort(&context, participants)),
+            Ok(expected)
+        );
+        assert!(shards.commands.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn public_abort_recovers_durable_single_shard_commit_before_mutation() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    timestamps.fail_publish(PublishFailure::Before);
+    let shards = Arc::new(FakeShards::default());
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let (context, participants) =
+        one_shard_transaction_with(TransactionId::new(602).unwrap(), 11, 1);
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, participants.clone())),
+        Err(TxnError::InjectedCrash)
+    );
+    let request = shards.commands.lock().unwrap()[0].1.clone();
+    let request_digest = request.digest();
+    let ShardRequest::CommitSingleShard {
+        header,
+        transaction_id,
+        start_time,
+        snapshot_applied_index,
+        ..
+    } = request
+    else {
+        unreachable!();
+    };
+    shards.histories.lock().unwrap().insert(
+        (ShardId::new(3).unwrap(), transaction_id.get()),
+        TransactionHistory::default().with_single_shard_commit(RecoveredSingleShardCommit::new(
+            header.command_id(),
+            transaction_id,
+            start_time,
+            snapshot_applied_index,
+            transaction_time(50),
+            request_digest,
+        )),
+    );
+    timestamps.clear_publish_failure();
+    let applied_before = shards.commands.lock().unwrap().len();
+    assert_eq!(
+        block_on(coordinator.abort(&context, participants)),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    assert_eq!(shards.commands.lock().unwrap().len(), applied_before);
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(
+            transaction_time(50),
+            Some(CommitResolution::Committed)
+        )))
+    );
+}
+
+#[test]
+fn successful_abort_resolves_an_existing_pending_reservation() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(DurableShards::default());
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards);
+    let (context, participants) = two_shard_transaction();
+    block_on(timestamps.reserve_commit_time(context.snapshot().transaction_id)).unwrap();
+
+    assert_eq!(
+        block_on(coordinator.abort(&context, participants)),
+        Ok(TransactionOutcome::Aborted)
+    );
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(
+            transaction_time(50),
+            Some(CommitResolution::Aborted)
+        )))
+    );
+    assert_eq!(timestamps.published.lock().unwrap().as_slice(), &[50]);
+}
+
+#[test]
+fn failed_prewrite_checks_committed_authority_before_recording_abort() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(ClassifiedFailureShards::definitive(
+        TxnError::StalePlacementEpoch,
+    ));
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let (context, participants) = two_shard_transaction();
+    let commit_time =
+        block_on(timestamps.reserve_commit_time(context.snapshot().transaction_id)).unwrap();
+    block_on(timestamps.resolve_commit_time(
+        context.snapshot().transaction_id,
+        commit_time,
+        CommitResolution::Committed,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, participants)),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    assert_eq!(*shards.submit_count.lock().unwrap(), 1);
 }
 
 #[test]
@@ -966,27 +1144,70 @@ fn concurrent_prechecks_cannot_admit_two_overlapping_single_or_prepared_writers(
         ),
     ]);
     let prepared_timestamps = Arc::new(FakeTimestamps::default());
-    let prepared_shards = Arc::new(BarrierShards::new(
+    let prepared_shards = Arc::new(BarrierShards::with_prepared_pause(
         FjallShards::open(&prepared_paths, &bindings),
         2,
+        ShardId::new(9).unwrap(),
     ));
     let prepared = TemporalTxnCoordinator::new(prepared_timestamps, prepared_shards.clone());
     let first = two_shard_transaction_with(TransactionId::new(401).unwrap(), 7, 8);
     let second = two_shard_transaction_with(TransactionId::new(402).unwrap(), 7, 9);
     let first_coordinator = prepared.clone();
     let second_coordinator = prepared;
-    let first_thread =
-        std::thread::spawn(move || block_on(first_coordinator.commit(&first.0, first.1)));
-    let second_thread =
-        std::thread::spawn(move || block_on(second_coordinator.commit(&second.0, second.1)));
-    let prepared_outcomes = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+    let (outcomes, received) = mpsc::channel();
+    let first_outcomes = outcomes.clone();
+    let first_thread = std::thread::spawn(move || {
+        first_outcomes
+            .send(block_on(first_coordinator.commit(&first.0, first.1)))
+            .unwrap();
+    });
+    let second_thread = std::thread::spawn(move || {
+        outcomes
+            .send(block_on(second_coordinator.commit(&second.0, second.1)))
+            .unwrap();
+    });
+
+    prepared_shards.wait_until_prepared();
     assert_eq!(
-        prepared_outcomes
-            .iter()
-            .filter(|outcome| matches!(outcome, Ok(TransactionOutcome::Committed(_))))
-            .count(),
-        1
+        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Ok(TransactionOutcome::Aborted)
     );
+    prepared_shards.inner.reopen_shard(ShardId::new(9).unwrap());
+    let competing = ShardRequest::PrewriteIntent {
+        header: dtg_transaction::ShardRequestHeader::new(
+            CommandId::new(9_001).unwrap(),
+            PlacementEpoch::new(7).unwrap(),
+            BackendGeneration::new(10).unwrap(),
+        ),
+        transaction_id: TransactionId::new(403).unwrap(),
+        start_time: transaction_time(40),
+        snapshot_applied_index: 0,
+        mutations: vec![LogicalMutation::PutVertex(
+            VertexVersion::new(
+                VertexId::new(7).unwrap(),
+                Version::new(99),
+                ValidInterval::new(0, 100).unwrap(),
+                transaction_time(70),
+                Default::default(),
+            )
+            .unwrap(),
+        )],
+    };
+    assert!(matches!(
+        block_on(
+            prepared_shards
+                .inner
+                .submit(ShardId::new(9).unwrap(), competing)
+        ),
+        Err(SubmissionFailure::Definitive(_))
+    ));
+    prepared_shards.release_prepared();
+    assert!(matches!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Ok(TransactionOutcome::Committed(_))
+    ));
+    first_thread.join().unwrap();
+    second_thread.join().unwrap();
 }
 
 #[test]
@@ -1004,7 +1225,7 @@ fn fjall_single_shard_crash_after_apply_recovers_from_receipt_without_new_apply(
         shards.crash_after(1);
         let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
         assert_eq!(
-            block_on(coordinator.commit(&context, participants)),
+            block_on(coordinator.commit(&context, participants.clone())),
             Err(TxnError::InjectedCrash)
         );
         assert_eq!(shards.applied_index(shard_id), 1);
@@ -1014,11 +1235,18 @@ fn fjall_single_shard_crash_after_apply_recovers_from_receipt_without_new_apply(
     let reopened = Arc::new(FjallShards::open(&paths, &bindings));
     let recovery = TemporalTxnCoordinator::new(timestamps.clone(), reopened.clone());
     assert_eq!(
-        block_on(recovery.recover(&context)),
+        block_on(recovery.commit(&context, participants)),
         Ok(TransactionOutcome::Committed(transaction_time(50)))
     );
-    assert_eq!(reopened.applied_index(shard_id), 1);
+    assert_eq!(reopened.applied_index(shard_id), 2);
     assert_eq!(reopened.graph_mutation_count(), 1);
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(
+            transaction_time(50),
+            Some(CommitResolution::Committed)
+        )))
+    );
 }
 
 fn two_shard_transaction() -> (TransactionContext, Vec<ParticipantWrite>) {
@@ -1256,16 +1484,20 @@ struct FakeShards {
 }
 
 struct ClassifiedFailureShards {
-    failure: TxnError,
+    failure: SubmissionFailure,
     submit_count: Mutex<usize>,
 }
 
 impl ClassifiedFailureShards {
-    fn definitive(failure: TxnError) -> Self {
+    fn new(failure: SubmissionFailure) -> Self {
         Self {
             failure,
             submit_count: Mutex::new(0),
         }
+    }
+
+    fn definitive(failure: TxnError) -> Self {
+        Self::new(SubmissionFailure::Definitive(failure))
     }
 }
 
@@ -1273,7 +1505,7 @@ impl ShardCommandExecutor for ClassifiedFailureShards {
     fn submit(&self, _shard_id: ShardId, _request: ShardRequest) -> SubmissionFuture<'_> {
         Box::pin(async move {
             *self.submit_count.lock().unwrap() += 1;
-            Err(SubmissionFailure::Definitive(self.failure.clone()))
+            Err(self.failure.clone())
         })
     }
 
@@ -1837,7 +2069,9 @@ fn transaction_history_from_changes(
                 }
             }
             LogicalMutation::PutReplicaMetadata(metadata)
-                if metadata.name() == dtg_shard::SINGLE_SHARD_TRANSACTION_METADATA_NAME =>
+                if metadata
+                    .name()
+                    .starts_with(dtg_shard::SINGLE_SHARD_TRANSACTION_METADATA_NAME) =>
             {
                 let receipt = decode_single_shard_transaction_metadata(metadata)
                     .map_err(|_| TxnError::CorruptRecovery)?;
@@ -1906,6 +2140,14 @@ impl FjallShards {
         *self.crash_after.lock().unwrap() = Some(boundary);
     }
 
+    fn reopen_shard(&self, shard_id: ShardId) {
+        let mut replicas = self.replicas.lock().unwrap();
+        let store = replicas[&shard_id].store.clone();
+        let machine =
+            ShardStateMachine::new(store.binding().clone(), Arc::new(store.clone())).unwrap();
+        replicas.insert(shard_id, FjallReplica { store, machine });
+    }
+
     fn vertex_is_visible(&self, shard_id: ShardId, vertex_id: u128) -> bool {
         let store = self.replicas.lock().unwrap()[&shard_id].store.clone();
         let applied = block_on(store.applied_index()).unwrap();
@@ -1972,6 +2214,16 @@ impl FjallShards {
 struct BarrierShards {
     inner: FjallShards,
     prechecks: Barrier,
+    prewrite_submissions: Barrier,
+    pause_shard: Option<ShardId>,
+    prepared_pause: Mutex<PreparedPause>,
+    prepared_changed: Condvar,
+}
+
+#[derive(Default)]
+struct PreparedPause {
+    reached: bool,
+    released: bool,
 }
 
 impl BarrierShards {
@@ -1979,13 +2231,52 @@ impl BarrierShards {
         Self {
             inner,
             prechecks: Barrier::new(parties),
+            prewrite_submissions: Barrier::new(parties),
+            pause_shard: None,
+            prepared_pause: Mutex::new(PreparedPause::default()),
+            prepared_changed: Condvar::new(),
         }
+    }
+
+    fn with_prepared_pause(inner: FjallShards, parties: usize, pause_shard: ShardId) -> Self {
+        Self {
+            pause_shard: Some(pause_shard),
+            ..Self::new(inner, parties)
+        }
+    }
+
+    fn wait_until_prepared(&self) {
+        let mut pause = self.prepared_pause.lock().unwrap();
+        while !pause.reached {
+            pause = self.prepared_changed.wait(pause).unwrap();
+        }
+    }
+
+    fn release_prepared(&self) {
+        let mut pause = self.prepared_pause.lock().unwrap();
+        pause.released = true;
+        self.prepared_changed.notify_all();
     }
 }
 
 impl ShardCommandExecutor for BarrierShards {
     fn submit(&self, shard_id: ShardId, request: ShardRequest) -> SubmissionFuture<'_> {
-        self.inner.submit(shard_id, request)
+        let prewrite = matches!(request, ShardRequest::PrewriteIntent { .. });
+        Box::pin(async move {
+            let result = self.inner.submit(shard_id, request).await;
+            if prewrite {
+                self.prewrite_submissions.wait();
+                if self.pause_shard == Some(shard_id) && result.is_ok() {
+                    let mut pause = self.prepared_pause.lock().unwrap();
+                    pause.reached = true;
+                    self.prepared_changed.notify_all();
+                    while !pause.released {
+                        pause = self.prepared_changed.wait(pause).unwrap();
+                    }
+                }
+            }
+            result
+        })
     }
 
     fn changes_after(
@@ -1994,8 +2285,9 @@ impl ShardCommandExecutor for BarrierShards {
         applied_index: u64,
     ) -> TxnFuture<'_, Vec<ChangeRecord>> {
         Box::pin(async move {
+            let changes = self.inner.changes_after(shard_id, applied_index).await?;
             self.prechecks.wait();
-            self.inner.changes_after(shard_id, applied_index).await
+            Ok(changes)
         })
     }
 

@@ -13,7 +13,7 @@ use dtg_storage::{
     ChangesRead, CommandId, CommittedShardBatch, ConsensusCommandEnvelope, ConsensusEntry,
     ConsensusSnapshotMetadata, ConsensusStore, Digest32, EdgeHistoryRead, EdgeId, EdgeRead,
     EdgeScan, EdgeVersion, LogicalMutation, Properties, ProviderKind, RaftHardState,
-    RaftMembership, ReadFence, ReplicaBinding, ReplicaId, ReplicaStateStore,
+    RaftMembership, ReadFence, ReplicaBinding, ReplicaId, ReplicaMetadata, ReplicaStateStore,
     SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, ScanPage,
     StorageError, StoreFuture, TemporalReadView, TransactionTime, ValidInterval, Version,
     VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexVersion,
@@ -661,6 +661,10 @@ impl<S: ReplicaStateStore> ReplicaStateStore for ToggleStateStore<S> {
         self.inner.applied_index()
     }
 
+    fn replica_metadata<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
+        self.inner.replica_metadata(name)
+    }
+
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
         Box::pin(async move {
             if self.failing.load(Ordering::SeqCst) {
@@ -704,6 +708,10 @@ impl ReplicaStateStore for RecordingStateStore {
 
     fn applied_index(&self) -> StoreFuture<'_, u64> {
         Box::pin(async move { Ok(self.state.lock().unwrap().applied_index) })
+    }
+
+    fn replica_metadata<'a>(&'a self, _name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
+        Box::pin(async { Ok(None) })
     }
 
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {

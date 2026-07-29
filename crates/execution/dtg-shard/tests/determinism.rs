@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -8,11 +9,11 @@ use dtg_shard::{
     ShardCommand, ShardStateMachine, decode_single_shard_transaction_metadata,
 };
 use dtg_storage::{
-    ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommandId, CommittedShardBatch,
-    Digest32, LogicalMutation, Properties, ProviderKind, ReadFence, ReplicaBinding,
-    ReplicaMetadata, ReplicaStateStore, StorageError, StoreFuture, TemporalReadView, TransactionId,
-    TransactionRecord, TransactionState, TransactionTime, ValidInterval, Value, Version, VertexId,
-    VertexVersion,
+    ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, ChangesRead, CommandId,
+    CommittedShardBatch, Digest32, LogicalMutation, Properties, ProviderKind, ReadFence,
+    ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError, StoreFuture,
+    TemporalReadView, TransactionId, TransactionRecord, TransactionState, TransactionTime,
+    ValidInterval, Value, Version, VertexId, VertexVersion,
 };
 use dtg_storage_fjall::FjallReplicaStore;
 
@@ -24,6 +25,49 @@ fn replaying_one_command_is_idempotent() {
     let second = machine.apply_committed(11, 7, command).unwrap();
     assert_eq!(first.digest(), second.digest());
     assert_eq!(machine.applied_index(), 7);
+}
+
+#[test]
+fn exact_single_shard_transaction_replay_at_a_new_index_is_metadata_only() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let path = root.path().join("single-replay");
+    let command = ShardCommand::CommitSingleShardTransaction(
+        CommitSingleShardTransaction::new(
+            CommandId::new(501).unwrap(),
+            7,
+            10,
+            TransactionId::new(502).unwrap(),
+            TransactionTime::new(40).unwrap(),
+            0,
+            Digest32::new([5; 32]),
+            vec![vertex_mutation_at(50, 1, 0, 100, 50)],
+        )
+        .unwrap(),
+    );
+
+    {
+        let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+        let mut machine = ShardStateMachine::new(binding.clone(), store).unwrap();
+        let first = machine.apply_committed(11, 1, command.clone()).unwrap();
+        assert!(!first.replayed());
+    }
+
+    let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut reopened = ShardStateMachine::new(binding.clone(), store.clone()).unwrap();
+    let replay = reopened.apply_committed(11, 2, command).unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.applied_index(), 2);
+    let view = block_on(store.begin_read_view(ReadFence::new(binding, 2))).unwrap();
+    let changes = block_on(view.changes(ChangesRead::new(None, 2, 32).unwrap())).unwrap();
+    assert_eq!(
+        changes
+            .rows()
+            .iter()
+            .filter(|change| matches!(change.mutation(), LogicalMutation::PutVertex(_)))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -94,7 +138,7 @@ fn transaction_encodings_reject_commit_times_at_or_before_start() {
     receipt.extend_from_slice(&20_i64.to_be_bytes());
     receipt.extend_from_slice(&[7; 32]);
     let metadata = ReplicaMetadata::new(
-        SINGLE_SHARD_TRANSACTION_METADATA_NAME,
+        format!("{SINGLE_SHARD_TRANSACTION_METADATA_NAME}{:032x}", 701_u128),
         Value::Bytes(receipt),
     )
     .unwrap();
@@ -233,7 +277,7 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
 
     let state = store.state.lock().unwrap();
     let mutations = state.batch.as_ref().unwrap().mutations();
-    assert_eq!(mutations.len(), 2);
+    assert_eq!(mutations.len(), 4);
     assert!(mutations.iter().any(|mutation| matches!(
         mutation,
         LogicalMutation::PutTransaction(record) if record.state() == TransactionState::Prepared
@@ -244,6 +288,16 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
             if metadata.name() == dtg_shard::TRANSACTION_INTENT_METADATA_NAME
                 && matches!(metadata.value(), Value::Bytes(bytes) if ParticipantIntent::decode_current(bytes).is_ok())
     )));
+    assert!(mutations.iter().any(|mutation| matches!(
+        mutation,
+        LogicalMutation::PutReplicaMetadata(metadata)
+            if metadata.name() == dtg_shard::ACTIVE_TRANSACTION_INTENTS_METADATA_NAME
+    )));
+    assert!(mutations.iter().any(|mutation| matches!(
+        mutation,
+        LogicalMutation::PutReplicaMetadata(metadata)
+            if metadata.name().starts_with(dtg_shard::TRANSACTION_STATE_METADATA_PREFIX)
+    )));
     assert!(!mutations.iter().any(|mutation| matches!(
         mutation,
         LogicalMutation::PutVertex(_)
@@ -252,9 +306,6 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
             | LogicalMutation::DeleteEdge(_)
     )));
 
-    let binding = fixture_binding();
-    let commit_store = Arc::new(RecordingStore::new(binding.clone()));
-    let mut commit_machine = ShardStateMachine::new(binding, commit_store.clone()).unwrap();
     let committed = TransactionRecord::new(
         transaction_id,
         TransactionState::Committed,
@@ -262,34 +313,29 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
         intent.digest(),
     )
     .unwrap();
-    commit_machine
-        .apply_committed(
-            11,
-            2,
-            ShardCommand::FinalizeParticipant(
-                FinalizeParticipant::new(
-                    CommandId::new(902).unwrap(),
-                    7,
-                    10,
-                    committed,
-                    Some(intent.clone()),
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
-    let state = commit_store.state.lock().unwrap();
-    let mutations = state.batch.as_ref().unwrap().mutations();
-    assert_eq!(mutations.len(), 2);
-    assert!(
-        mutations
-            .iter()
-            .any(|mutation| matches!(mutation, LogicalMutation::PutVertex(_)))
+    let binding = fixture_binding();
+    let commit_store = Arc::new(RecordingStore::new(binding.clone()));
+    let mut commit_machine = ShardStateMachine::new(binding, commit_store).unwrap();
+    assert_eq!(
+        commit_machine
+            .apply_committed(
+                11,
+                2,
+                ShardCommand::FinalizeParticipant(
+                    FinalizeParticipant::new(
+                        CommandId::new(902).unwrap(),
+                        7,
+                        10,
+                        committed,
+                        Some(intent.clone()),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap_err()
+            .code(),
+        "DTG-SHARD-INTENT-HISTORY"
     );
-    assert!(mutations.iter().any(|mutation| matches!(
-        mutation,
-        LogicalMutation::PutTransaction(record) if record.state() == TransactionState::Committed
-    )));
 
     let binding = fixture_binding();
     let abort_store = Arc::new(RecordingStore::new(binding.clone()));
@@ -301,22 +347,241 @@ fn prewrite_hides_graph_mutations_until_commit_finalization() {
         intent.digest(),
     )
     .unwrap();
-    abort_machine
+    assert_eq!(
+        abort_machine
+            .apply_committed(
+                11,
+                2,
+                ShardCommand::FinalizeParticipant(
+                    FinalizeParticipant::new(CommandId::new(903).unwrap(), 7, 10, aborted, None)
+                        .unwrap(),
+                ),
+            )
+            .unwrap_err()
+            .code(),
+        "DTG-SHARD-INTENT-HISTORY"
+    );
+}
+
+#[test]
+fn exact_finalize_replay_after_prewrite_is_metadata_only_and_survives_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let path = root.path().join("finalize-replay");
+    let intent = ParticipantIntent::new(
+        TransactionId::new(601).unwrap(),
+        binding.shard_id(),
+        TransactionTime::new(40).unwrap(),
+        0,
+        vec![vertex_mutation_at(60, 1, 0, 100, 50)],
+    )
+    .unwrap();
+    let prepared = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Prepared,
+        intent.start_time(),
+        intent.digest(),
+    )
+    .unwrap();
+    let terminal = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Committed,
+        TransactionTime::new(50).unwrap(),
+        intent.digest(),
+    )
+    .unwrap();
+    let finalize = ShardCommand::FinalizeParticipant(
+        FinalizeParticipant::new(
+            CommandId::new(6_002).unwrap(),
+            7,
+            10,
+            terminal,
+            Some(intent.clone()),
+        )
+        .unwrap(),
+    );
+
+    {
+        let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+        let mut machine = ShardStateMachine::new(binding.clone(), store).unwrap();
+        let prewrite = ShardCommand::PrewriteIntent(
+            PrewriteIntent::new(CommandId::new(6_001).unwrap(), 7, 10, prepared, intent).unwrap(),
+        );
+        machine.apply_committed(11, 1, prewrite.clone()).unwrap();
+        assert!(machine.apply_committed(11, 1, prewrite).unwrap().replayed());
+        assert!(
+            !machine
+                .apply_committed(11, 2, finalize.clone())
+                .unwrap()
+                .replayed()
+        );
+        assert!(
+            machine
+                .apply_committed(11, 2, finalize.clone())
+                .unwrap()
+                .replayed()
+        );
+    }
+
+    let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut reopened = ShardStateMachine::new(binding.clone(), store.clone()).unwrap();
+    let replay = reopened.apply_committed(11, 3, finalize).unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.applied_index(), 3);
+    let view = block_on(store.begin_read_view(ReadFence::new(binding, 3))).unwrap();
+    let changes = block_on(view.changes(ChangesRead::new(None, 3, 64).unwrap())).unwrap();
+    assert_eq!(
+        changes
+            .rows()
+            .iter()
+            .filter(|change| matches!(change.mutation(), LogicalMutation::PutVertex(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        changes
+            .rows()
+            .iter()
+            .filter(|change| matches!(
+                change.mutation(),
+                LogicalMutation::PutTransaction(record)
+                    if record.state() == TransactionState::Committed
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn exact_abort_finalize_replay_after_prewrite_is_metadata_only() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let path = root.path().join("abort-replay");
+    let intent = ParticipantIntent::new(
+        TransactionId::new(602).unwrap(),
+        binding.shard_id(),
+        TransactionTime::new(40).unwrap(),
+        0,
+        vec![vertex_mutation_at(61, 1, 0, 100, 50)],
+    )
+    .unwrap();
+    let prepared = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Prepared,
+        intent.start_time(),
+        intent.digest(),
+    )
+    .unwrap();
+    let terminal = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Aborted,
+        intent.start_time(),
+        intent.digest(),
+    )
+    .unwrap();
+    let finalize = ShardCommand::FinalizeParticipant(
+        FinalizeParticipant::new(CommandId::new(6_102).unwrap(), 7, 10, terminal, None).unwrap(),
+    );
+    let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding.clone(), store.clone()).unwrap();
+    machine
         .apply_committed(
             11,
-            2,
-            ShardCommand::FinalizeParticipant(
-                FinalizeParticipant::new(CommandId::new(903).unwrap(), 7, 10, aborted, None)
+            1,
+            ShardCommand::PrewriteIntent(
+                PrewriteIntent::new(CommandId::new(6_101).unwrap(), 7, 10, prepared, intent)
                     .unwrap(),
             ),
         )
         .unwrap();
-    let state = abort_store.state.lock().unwrap();
-    assert_eq!(state.batch.as_ref().unwrap().mutations().len(), 1);
-    assert!(matches!(
-        &state.batch.as_ref().unwrap().mutations()[0],
-        LogicalMutation::PutTransaction(record) if record.state() == TransactionState::Aborted
-    ));
+    machine.apply_committed(11, 2, finalize.clone()).unwrap();
+    drop(machine);
+
+    let mut reopened = ShardStateMachine::new(binding.clone(), store.clone()).unwrap();
+    let replay = reopened.apply_committed(11, 3, finalize).unwrap();
+    assert!(replay.replayed());
+    let view = block_on(store.begin_read_view(ReadFence::new(binding, 3))).unwrap();
+    let changes = block_on(view.changes(ChangesRead::new(None, 3, 64).unwrap())).unwrap();
+    assert_eq!(
+        changes
+            .rows()
+            .iter()
+            .filter(|change| matches!(
+                change.mutation(),
+                LogicalMutation::PutTransaction(record)
+                    if record.state() == TransactionState::Aborted
+            ))
+            .count(),
+        1
+    );
+    assert!(!changes.rows().iter().any(|change| matches!(
+        change.mutation(),
+        LogicalMutation::PutVertex(_)
+            | LogicalMutation::DeleteVertex(_)
+            | LogicalMutation::PutEdge(_)
+            | LogicalMutation::DeleteEdge(_)
+    )));
+}
+
+#[test]
+fn old_index_prewrite_and_finalize_replays_reconstruct_original_batches() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let path = root.path().join("old-index-transaction-replay");
+    let intent = ParticipantIntent::new(
+        TransactionId::new(603).unwrap(),
+        binding.shard_id(),
+        TransactionTime::new(40).unwrap(),
+        0,
+        vec![vertex_mutation_at(62, 1, 0, 100, 50)],
+    )
+    .unwrap();
+    let prepared = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Prepared,
+        intent.start_time(),
+        intent.digest(),
+    )
+    .unwrap();
+    let committed = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Committed,
+        TransactionTime::new(50).unwrap(),
+        intent.digest(),
+    )
+    .unwrap();
+    let prewrite = ShardCommand::PrewriteIntent(
+        PrewriteIntent::new(
+            CommandId::new(6_201).unwrap(),
+            7,
+            10,
+            prepared,
+            intent.clone(),
+        )
+        .unwrap(),
+    );
+    let finalize = ShardCommand::FinalizeParticipant(
+        FinalizeParticipant::new(
+            CommandId::new(6_202).unwrap(),
+            7,
+            10,
+            committed,
+            Some(intent),
+        )
+        .unwrap(),
+    );
+    let store = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding.clone(), store).unwrap();
+
+    machine.apply_committed(11, 1, prewrite.clone()).unwrap();
+    machine.apply_committed(11, 2, finalize.clone()).unwrap();
+
+    assert!(machine.apply_committed(11, 1, prewrite).unwrap().replayed());
+    assert!(machine.apply_committed(11, 2, finalize).unwrap().replayed());
+    drop(machine);
+
+    let reopened = Arc::new(FjallReplicaStore::open(&path, binding.clone()).unwrap());
+    ShardStateMachine::new(binding, reopened).unwrap();
 }
 
 #[test]
@@ -702,7 +967,106 @@ fn serialized_acceptance_rejects_committed_and_prepared_interval_conflicts_after
 }
 
 #[test]
-fn reopen_fails_closed_on_contradictory_or_unbounded_intent_history() {
+fn committed_conflict_scan_starts_strictly_after_the_snapshot_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let store = Arc::new(FjallReplicaStore::open(root.path(), binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding, store).unwrap();
+    machine
+        .apply_committed(
+            11,
+            1,
+            ShardCommand::CommitSingleShardTransaction(
+                CommitSingleShardTransaction::new(
+                    CommandId::new(7_001).unwrap(),
+                    7,
+                    10,
+                    TransactionId::new(701).unwrap(),
+                    TransactionTime::new(40).unwrap(),
+                    0,
+                    Digest32::new([1; 32]),
+                    vec![vertex_mutation_at(70, 1, 0, 100, 50)],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+
+    machine
+        .apply_committed(
+            11,
+            2,
+            ShardCommand::CommitSingleShardTransaction(
+                CommitSingleShardTransaction::new(
+                    CommandId::new(7_002).unwrap(),
+                    7,
+                    10,
+                    TransactionId::new(702).unwrap(),
+                    TransactionTime::new(40).unwrap(),
+                    1,
+                    Digest32::new([2; 32]),
+                    vec![vertex_mutation_at(70, 2, 50, 150, 60)],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+}
+
+#[test]
+fn committed_conflict_scan_fails_closed_when_history_budget_is_exceeded() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let store = Arc::new(FjallReplicaStore::open(root.path(), binding.clone()).unwrap());
+    let mutations = (0..=65_536_u64)
+        .map(|value| {
+            LogicalMutation::PutReplicaMetadata(
+                ReplicaMetadata::new(format!("test.history.{value}"), Value::Integer(1)).unwrap(),
+            )
+        })
+        .collect();
+    block_on(
+        store.apply(
+            CommittedShardBatch::new(
+                binding.clone(),
+                11,
+                1,
+                CommandId::new(8_001).unwrap(),
+                mutations,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let mut machine = ShardStateMachine::new(binding, store).unwrap();
+
+    assert_eq!(
+        machine
+            .apply_committed(
+                11,
+                2,
+                ShardCommand::CommitSingleShardTransaction(
+                    CommitSingleShardTransaction::new(
+                        CommandId::new(8_002).unwrap(),
+                        7,
+                        10,
+                        TransactionId::new(801).unwrap(),
+                        TransactionTime::new(40).unwrap(),
+                        0,
+                        Digest32::new([8; 32]),
+                        vec![vertex_mutation_at(80, 1, 0, 100, 50)],
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap_err()
+            .code(),
+        "DTG-SHARD-INTENT-HISTORY"
+    );
+}
+
+#[test]
+fn reopen_fails_closed_on_contradictory_current_intent_state() {
     let root = tempfile::tempdir().unwrap();
     let binding = fjall_fixture_binding();
     let contradictory_store = Arc::new(
@@ -723,44 +1087,59 @@ fn reopen_fails_closed_on_contradictory_or_unbounded_intent_history() {
         intent.digest(),
     )
     .unwrap();
-    block_on(
-        contradictory_store.apply(
-            CommittedShardBatch::new(
-                binding.clone(),
-                11,
-                1,
-                CommandId::new(3_001).unwrap(),
-                vec![
-                    LogicalMutation::PutTransaction(prepared),
-                    LogicalMutation::PutReplicaMetadata(
-                        ReplicaMetadata::new(
-                            dtg_shard::TRANSACTION_INTENT_METADATA_NAME,
-                            Value::Bytes(intent.encode_current().unwrap()),
-                        )
-                        .unwrap(),
-                    ),
-                ],
-            )
-            .unwrap(),
-        ),
+    let mut machine = ShardStateMachine::new(binding.clone(), contradictory_store.clone()).unwrap();
+    machine
+        .apply_committed(
+            11,
+            1,
+            ShardCommand::PrewriteIntent(
+                PrewriteIntent::new(
+                    CommandId::new(3_001).unwrap(),
+                    7,
+                    10,
+                    prepared,
+                    intent.clone(),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let stale_active = block_on(
+        contradictory_store.replica_metadata(dtg_shard::ACTIVE_TRANSACTION_INTENTS_METADATA_NAME),
+    )
+    .unwrap()
+    .unwrap();
+    let committed = TransactionRecord::new(
+        intent.transaction_id(),
+        TransactionState::Committed,
+        TransactionTime::new(50).unwrap(),
+        intent.digest(),
     )
     .unwrap();
+    machine
+        .apply_committed(
+            11,
+            2,
+            ShardCommand::FinalizeParticipant(
+                FinalizeParticipant::new(
+                    CommandId::new(3_002).unwrap(),
+                    7,
+                    10,
+                    committed,
+                    Some(intent),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
     block_on(
         contradictory_store.apply(
             CommittedShardBatch::new(
                 binding.clone(),
                 11,
-                2,
-                CommandId::new(3_002).unwrap(),
-                vec![LogicalMutation::PutTransaction(
-                    TransactionRecord::new(
-                        intent.transaction_id(),
-                        TransactionState::Committed,
-                        TransactionTime::new(50).unwrap(),
-                        Digest32::new([9; 32]),
-                    )
-                    .unwrap(),
-                )],
+                3,
+                CommandId::new(3_003).unwrap(),
+                vec![LogicalMutation::PutReplicaMetadata(stale_active)],
             )
             .unwrap(),
         ),
@@ -770,11 +1149,14 @@ fn reopen_fails_closed_on_contradictory_or_unbounded_intent_history() {
         ShardStateMachine::new(binding.clone(), contradictory_store),
         Err(error) if error.code() == "DTG-SHARD-INTENT-HISTORY"
     ));
+}
 
-    let unbounded_store =
-        Arc::new(FjallReplicaStore::open(root.path().join("unbounded"), binding.clone()).unwrap());
-    let mut mutations = Vec::with_capacity(4_097 * 2);
-    for value in 1..=4_097_u128 {
+#[test]
+fn live_prewrite_enforces_the_reopen_active_intent_bound() {
+    let binding = fixture_binding();
+    let mut intents = BTreeMap::new();
+    let mut metadata = BTreeMap::new();
+    for value in 1..=4_096_u128 {
         let intent = ParticipantIntent::new(
             TransactionId::new(10_000 + value).unwrap(),
             binding.shard_id(),
@@ -783,40 +1165,84 @@ fn reopen_fails_closed_on_contradictory_or_unbounded_intent_history() {
             vec![vertex_mutation_at(10_000 + value, 1, 0, 100, 50)],
         )
         .unwrap();
-        mutations.push(LogicalMutation::PutTransaction(
-            TransactionRecord::new(
-                intent.transaction_id(),
-                TransactionState::Prepared,
-                intent.start_time(),
-                intent.digest(),
-            )
-            .unwrap(),
-        ));
-        mutations.push(LogicalMutation::PutReplicaMetadata(
-            ReplicaMetadata::new(
-                dtg_shard::TRANSACTION_INTENT_METADATA_NAME,
-                Value::Bytes(intent.encode_current().unwrap()),
-            )
-            .unwrap(),
-        ));
+        let state = transaction_state_metadata_for_test(&intent);
+        metadata.insert(state.name().to_owned(), state);
+        intents.insert(intent.transaction_id(), intent);
     }
-    block_on(
-        unbounded_store.apply(
-            CommittedShardBatch::new(
-                binding.clone(),
-                11,
-                1,
-                CommandId::new(3_003).unwrap(),
-                mutations,
-            )
-            .unwrap(),
-        ),
+    let aggregate = active_intents_metadata_for_test(&intents);
+    metadata.insert(aggregate.name().to_owned(), aggregate);
+    let store = Arc::new(RecordingStore::with_metadata(binding.clone(), metadata));
+    let mut machine = ShardStateMachine::new(binding.clone(), store).unwrap();
+    let competing = ParticipantIntent::new(
+        TransactionId::new(20_000).unwrap(),
+        binding.shard_id(),
+        TransactionTime::new(40).unwrap(),
+        0,
+        vec![vertex_mutation_at(20_000, 1, 0, 100, 50)],
     )
     .unwrap();
-    assert!(matches!(
-        ShardStateMachine::new(binding, unbounded_store),
-        Err(error) if error.code() == "DTG-SHARD-INTENT-HISTORY"
-    ));
+    let prepared = TransactionRecord::new(
+        competing.transaction_id(),
+        TransactionState::Prepared,
+        competing.start_time(),
+        competing.digest(),
+    )
+    .unwrap();
+    assert_eq!(
+        machine
+            .apply_committed(
+                11,
+                1,
+                ShardCommand::PrewriteIntent(
+                    PrewriteIntent::new(
+                        CommandId::new(4_097).unwrap(),
+                        7,
+                        10,
+                        prepared,
+                        competing,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap_err()
+            .code(),
+        "DTG-SHARD-COMMAND"
+    );
+}
+
+fn transaction_state_metadata_for_test(intent: &ParticipantIntent) -> ReplicaMetadata {
+    let encoded = intent.encode_current().unwrap();
+    let mut bytes = Vec::with_capacity(9 + encoded.len());
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.push(1);
+    bytes.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&encoded);
+    ReplicaMetadata::new(
+        format!(
+            "{}{:032x}",
+            dtg_shard::TRANSACTION_STATE_METADATA_PREFIX,
+            intent.transaction_id().get()
+        ),
+        Value::Bytes(bytes),
+    )
+    .unwrap()
+}
+
+fn active_intents_metadata_for_test(
+    intents: &BTreeMap<TransactionId, ParticipantIntent>,
+) -> ReplicaMetadata {
+    let mut bytes = Vec::with_capacity(8 + intents.len() * 48);
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.extend_from_slice(&(intents.len() as u32).to_be_bytes());
+    for (transaction_id, intent) in intents {
+        bytes.extend_from_slice(&transaction_id.get().to_be_bytes());
+        bytes.extend_from_slice(&intent.digest().get());
+    }
+    ReplicaMetadata::new(
+        dtg_shard::ACTIVE_TRANSACTION_INTENTS_METADATA_NAME,
+        Value::Bytes(bytes),
+    )
+    .unwrap()
 }
 
 fn fixture_machine() -> ShardStateMachine {
@@ -934,6 +1360,7 @@ fn fjall_fixture_binding() -> ReplicaBinding {
 #[derive(Default)]
 struct RecordedApply {
     batch: Option<CommittedShardBatch>,
+    metadata: BTreeMap<String, ReplicaMetadata>,
 }
 
 struct RecordingStore {
@@ -946,6 +1373,16 @@ impl RecordingStore {
         Self {
             binding,
             state: Mutex::new(RecordedApply::default()),
+        }
+    }
+
+    fn with_metadata(binding: ReplicaBinding, metadata: BTreeMap<String, ReplicaMetadata>) -> Self {
+        Self {
+            binding,
+            state: Mutex::new(RecordedApply {
+                batch: None,
+                metadata,
+            }),
         }
     }
 }
@@ -967,6 +1404,10 @@ impl ReplicaStateStore for RecordingStore {
         })
     }
 
+    fn replica_metadata<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
+        Box::pin(async move { Ok(self.state.lock().unwrap().metadata.get(name).cloned()) })
+    }
+
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
         Box::pin(async move {
             let mut state = self.state.lock().unwrap();
@@ -979,6 +1420,13 @@ impl ReplicaStateStore for RecordingStore {
                 true
             } else {
                 state.batch = Some(batch.clone());
+                for mutation in batch.mutations() {
+                    if let LogicalMutation::PutReplicaMetadata(metadata) = mutation {
+                        state
+                            .metadata
+                            .insert(metadata.name().to_owned(), metadata.clone());
+                    }
+                }
                 false
             };
             Ok(ApplyReceipt::new(&batch, replayed))

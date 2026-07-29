@@ -112,6 +112,51 @@ fn replica_metadata(name: &str, value: &str) -> ReplicaMetadata {
     ReplicaMetadata::new(name, Value::String(value.to_owned())).unwrap()
 }
 
+#[test]
+fn current_replica_metadata_is_available_by_typed_point_read() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = binding("metadata-point-read", 1);
+    let store = FjallReplicaStore::open(root.path(), binding.clone()).unwrap();
+    let first = replica_metadata("dtg.test.current", "first");
+    let second = replica_metadata("dtg.test.current", "second");
+
+    block_on(
+        store.apply(
+            CommittedShardBatch::new(
+                binding.clone(),
+                1,
+                1,
+                CommandId::new(11).unwrap(),
+                vec![LogicalMutation::PutReplicaMetadata(first)],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    block_on(
+        store.apply(
+            CommittedShardBatch::new(
+                binding,
+                1,
+                2,
+                CommandId::new(12).unwrap(),
+                vec![LogicalMutation::PutReplicaMetadata(second.clone())],
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        block_on(store.replica_metadata("dtg.test.current")).unwrap(),
+        Some(second)
+    );
+    assert_eq!(
+        block_on(store.replica_metadata("dtg.test.absent")).unwrap(),
+        None
+    );
+}
+
 fn export(
     store: &FjallReplicaStore,
     binding: &ReplicaBinding,

@@ -5,7 +5,7 @@ use dtg_kernel::{Digest32, TransactionTime};
 
 use crate::{
     ApplyReceipt, CommittedShardBatch, EdgeId, EdgeVersion, LogicalMutation, ReplicaBinding,
-    StorageError, VertexId, VertexVersion,
+    ReplicaMetadata, StorageError, VertexId, VertexVersion,
 };
 
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StorageError>> + Send + 'a>>;
@@ -464,6 +464,7 @@ impl<T, C> ScanPage<T, C> {
 pub trait ReplicaStateStore: Send + Sync {
     fn binding(&self) -> &ReplicaBinding;
     fn applied_index(&self) -> StoreFuture<'_, u64>;
+    fn replica_metadata<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>>;
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt>;
     fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>>;
 }

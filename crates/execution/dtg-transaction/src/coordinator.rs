@@ -10,7 +10,7 @@ use dtg_storage::{
 use crate::{
     BaseGraphSnapshot, ParticipantService, ParticipantWrite, ShardRequest, ShardRequestHeader,
     ShardSnapshotFence, SnapshotToken, SubmissionFailure, TransactionOverlay, TxnError, TxnFuture,
-    conflict::detect_mutation_conflicts,
+    conflict::detect_mutation_conflicts, recovery::AbortPrevalidation,
 };
 
 pub trait TimestampAuthority: Send + Sync {
@@ -250,19 +250,9 @@ impl TemporalTxnCoordinator {
                 {
                     Ok(_) => {}
                     Err(SubmissionFailure::Definitive(error)) => {
-                        if self
-                            .timestamps
-                            .resolve_commit_time(
-                                context.snapshot.transaction_id,
-                                commit_time,
-                                CommitResolution::Aborted,
-                            )
-                            .await
-                            .is_err()
-                        {
-                            return Ok(TransactionOutcome::Unresolved);
-                        }
-                        return Err(error);
+                        return self
+                            .resolve_definitive_single_shard_failure(context, commit_time, error)
+                            .await;
                     }
                     Err(SubmissionFailure::Ambiguous(error)) => return Err(error),
                 }
@@ -383,6 +373,11 @@ impl TemporalTxnCoordinator {
             validate_participants(context, &participants)?;
             participants.sort_by_key(ParticipantWrite::shard_id);
 
+            let pending_commit_time = match self.prevalidate_abort_authority(context).await? {
+                AbortPrevalidation::Proceed(pending_commit_time) => pending_commit_time,
+                AbortPrevalidation::Terminal(outcome) => return Ok(outcome),
+            };
+
             let mut intents = Vec::with_capacity(participants.len());
             for participant in &participants {
                 let fence = context.snapshot.shards[&participant.shard_id()];
@@ -463,6 +458,19 @@ impl TemporalTxnCoordinator {
                     .submit(shard_id, request)
                     .await
                     .map_err(SubmissionFailure::into_error)?;
+            }
+            if let Some(commit_time) = pending_commit_time
+                && self
+                    .timestamps
+                    .resolve_commit_time(
+                        context.snapshot.transaction_id,
+                        commit_time,
+                        CommitResolution::Aborted,
+                    )
+                    .await
+                    .is_err()
+            {
+                return Ok(TransactionOutcome::Unresolved);
             }
             Ok(TransactionOutcome::Aborted)
         })

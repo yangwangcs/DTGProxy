@@ -5,17 +5,21 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_kernel::{Digest32, KernelError, TransactionId, TransactionTime, ValidInterval};
 use dtg_storage::{
-    ChangeRecord, ChangesRead, CommandId, CommittedShardBatch, EdgeId, LogicalMutation, ReadFence,
-    ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError, TransactionRecord,
-    TransactionState, Value, VertexId,
+    ChangeCursor, ChangeRecord, ChangesRead, CommandId, CommittedShardBatch, EdgeId,
+    LogicalMutation, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError,
+    TransactionRecord, TransactionState, Value, VertexId,
 };
 
 use crate::command::MAX_TRANSACTION_INTENT_ITEMS;
-use crate::{ParticipantIntent, ShardCommand, TRANSACTION_INTENT_METADATA_NAME};
+use crate::{ParticipantIntent, ShardCommand};
 
 const HISTORY_PAGE_LIMIT: u32 = 256;
+const HISTORY_PAGE_BUDGET: usize = 256;
+const HISTORY_RECORD_BUDGET: usize = HISTORY_PAGE_LIMIT as usize * HISTORY_PAGE_BUDGET;
 const HOME_DECISION_METADATA_NAME: &str = "dtg.transaction_home_decision.v1";
-pub const SINGLE_SHARD_TRANSACTION_METADATA_NAME: &str = "dtg.single_shard_transaction.v1";
+pub const SINGLE_SHARD_TRANSACTION_METADATA_NAME: &str = "dtg.single_shard_transaction.v1/";
+pub const ACTIVE_TRANSACTION_INTENTS_METADATA_NAME: &str = "dtg.transaction_active_intents.v1";
+pub const TRANSACTION_STATE_METADATA_PREFIX: &str = "dtg.transaction_state.v1/";
 
 struct ThreadWaker(std::thread::Thread);
 
@@ -199,11 +203,17 @@ impl ShardStateMachine {
         command: ShardCommand,
     ) -> Result<ApplyOutcome, ShardError> {
         self.validate_command(&command)?;
-        let intent_transition = if index <= self.applied_index {
-            IntentTransition::None
-        } else {
-            self.validate_transaction_acceptance(&command)?
-        };
+        if index < self.applied_index
+            && matches!(
+                command,
+                ShardCommand::PrewriteIntent(_) | ShardCommand::FinalizeParticipant(_)
+            )
+        {
+            return self.replay_old_transaction_command(term, index, &command);
+        }
+        let new_index = index > self.applied_index;
+        let intent_transition = self.validate_transaction_acceptance(&command)?;
+        let logical_replay = new_index && matches!(intent_transition, IntentTransition::Replay);
         let header = command.header();
 
         let next_closed_timestamp = match &command {
@@ -211,7 +221,22 @@ impl ShardStateMachine {
             _ => None,
         };
 
-        let mut mutations = command.mutations()?;
+        let mut next_active_intents = self.active_intents.clone();
+        match &intent_transition {
+            IntentTransition::Prepare(intent) => {
+                next_active_intents.insert(intent.transaction_id(), intent.clone());
+            }
+            IntentTransition::Finalize { transaction_id, .. } => {
+                next_active_intents.remove(transaction_id);
+            }
+            IntentTransition::None | IntentTransition::Replay => {}
+        }
+
+        let mut mutations = if logical_replay {
+            Vec::new()
+        } else {
+            command.mutations()?
+        };
         if let ShardCommand::RecordHomeDecision(command) = &command {
             let LogicalMutation::PutTransaction(decision) = &command.mutations()[0] else {
                 unreachable!("validated Home decision contains one transaction record");
@@ -224,6 +249,52 @@ impl ShardStateMachine {
             mutations.push(LogicalMutation::PutReplicaMetadata(
                 single_shard_transaction_metadata(command)?,
             ));
+        }
+        match (&command, &intent_transition) {
+            (ShardCommand::PrewriteIntent(command), IntentTransition::Prepare(intent)) => {
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    transaction_state_metadata(intent, None)?,
+                ));
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    active_intents_metadata(&next_active_intents)?,
+                ));
+                debug_assert_eq!(intent, command.intent());
+            }
+            (ShardCommand::PrewriteIntent(command), IntentTransition::Replay) => {
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    transaction_state_metadata(command.intent(), None)?,
+                ));
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    active_intents_metadata(&next_active_intents)?,
+                ));
+            }
+            (
+                ShardCommand::FinalizeParticipant(command),
+                IntentTransition::Finalize { intent, .. },
+            ) => {
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    transaction_state_metadata(intent, Some(command.terminal()))?,
+                ));
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    active_intents_metadata(&next_active_intents)?,
+                ));
+            }
+            (ShardCommand::FinalizeParticipant(command), IntentTransition::Replay) => {
+                let state = self
+                    .durable_transaction_state(command.terminal().id())?
+                    .ok_or_else(|| {
+                        corrupt_intent_history(
+                            "participant finalization replay lost its durable transaction state",
+                        )
+                    })?;
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    transaction_state_metadata(state.intent(), state.terminal())?,
+                ));
+                mutations.push(LogicalMutation::PutReplicaMetadata(
+                    active_intents_metadata(&next_active_intents)?,
+                ));
+            }
+            _ => {}
         }
         let batch = CommittedShardBatch::new(
             self.binding.clone(),
@@ -243,15 +314,45 @@ impl ShardStateMachine {
                 IntentTransition::Prepare(intent) => {
                     self.active_intents.insert(intent.transaction_id(), intent);
                 }
-                IntentTransition::Finalize(transaction_id) => {
+                IntentTransition::Finalize { transaction_id, .. } => {
                     self.active_intents.remove(&transaction_id);
                 }
+                IntentTransition::Replay => {}
             }
         }
         Ok(ApplyOutcome {
             digest: receipt.mutation_digest(),
             applied_index: receipt.raft_index(),
-            replayed: receipt.replayed(),
+            replayed: receipt.replayed() || logical_replay,
+        })
+    }
+
+    fn replay_old_transaction_command(
+        &self,
+        term: u64,
+        index: u64,
+        command: &ShardCommand,
+    ) -> Result<ApplyOutcome, ShardError> {
+        let mutations =
+            mutations_at_index(&self.binding, &self.state_store, self.applied_index, index)?;
+        validate_historical_transaction_batch(command, &mutations)?;
+        let batch = CommittedShardBatch::new(
+            self.binding.clone(),
+            term,
+            index,
+            command.header().command_id(),
+            mutations,
+        )?;
+        let receipt = block_on(self.state_store.apply(batch))?;
+        if !receipt.replayed() {
+            return Err(corrupt_intent_history(
+                "old-index transaction replay unexpectedly applied a new batch",
+            ));
+        }
+        Ok(ApplyOutcome {
+            digest: receipt.mutation_digest(),
+            applied_index: receipt.raft_index(),
+            replayed: true,
         })
     }
 
@@ -334,13 +435,12 @@ impl ShardStateMachine {
         match command {
             ShardCommand::CommitSingleShardTransaction(command) => {
                 if self.single_shard_transaction_is_durable(command)? {
-                    return Err(ShardError::InvalidCommand(
-                        "single-Shard transaction command is already durably applied".into(),
-                    ));
+                    return Ok(IntentTransition::Replay);
                 }
                 self.validate_write_conflicts(
                     command.transaction_id(),
                     command.start_time(),
+                    command.snapshot_applied_index(),
                     command.mutations(),
                 )?;
                 Ok(IntentTransition::None)
@@ -350,31 +450,62 @@ impl ShardStateMachine {
                 let intent = command.intent();
                 if let Some(existing) = self.active_intents.get(&intent.transaction_id()) {
                     return if existing == intent {
-                        Ok(IntentTransition::None)
+                        Ok(IntentTransition::Replay)
                     } else {
                         Err(corrupt_intent_history(
                             "one transaction has contradictory active participant intents",
                         ))
                     };
                 }
+                if self.active_intents.len() == MAX_TRANSACTION_INTENT_ITEMS {
+                    return Err(ShardError::InvalidCommand(
+                        "active transaction intent count exceeds the supported bound".into(),
+                    ));
+                }
+                if self
+                    .durable_transaction_state(intent.transaction_id())?
+                    .is_some()
+                {
+                    return Err(corrupt_intent_history(
+                        "new prewrite contradicts existing durable transaction state",
+                    ));
+                }
                 self.validate_write_conflicts(
                     intent.transaction_id(),
                     intent.start_time(),
+                    intent.snapshot_applied_index(),
                     intent.mutations(),
                 )?;
                 Ok(IntentTransition::Prepare(intent.clone()))
             }
             ShardCommand::FinalizeParticipant(command) => {
                 let transaction_id = command.terminal().id();
-                if let Some(active) = self.active_intents.get(&transaction_id)
-                    && (active.digest() != command.terminal().record_digest()
-                        || command.intent().is_some_and(|intent| intent != active))
-                {
-                    return Err(corrupt_intent_history(
-                        "participant finalization contradicts the active durable intent",
-                    ));
+                if let Some(active) = self.active_intents.get(&transaction_id) {
+                    if active.digest() != command.terminal().record_digest()
+                        || command.intent().is_some_and(|intent| intent != active)
+                    {
+                        return Err(corrupt_intent_history(
+                            "participant finalization contradicts the active durable intent",
+                        ));
+                    }
+                    validate_intent_terminal(active, command.terminal())?;
+                    return Ok(IntentTransition::Finalize {
+                        transaction_id,
+                        intent: active.clone(),
+                    });
                 }
-                Ok(IntentTransition::Finalize(transaction_id))
+                let Some(state) = self.durable_transaction_state(transaction_id)? else {
+                    return Err(corrupt_intent_history(
+                        "participant finalization has no durable Prepared intent",
+                    ));
+                };
+                if state.matches_finalize(command) {
+                    Ok(IntentTransition::Replay)
+                } else {
+                    Err(corrupt_intent_history(
+                        "participant finalization contradicts durable terminal state",
+                    ))
+                }
             }
             ShardCommand::RecordHomeDecision(_)
             | ShardCommand::AdvanceClosedTimestamp(_)
@@ -387,6 +518,7 @@ impl ShardStateMachine {
         &self,
         transaction_id: TransactionId,
         start_time: TransactionTime,
+        snapshot_applied_index: u64,
         candidate: &[LogicalMutation],
     ) -> Result<(), ShardError> {
         for intent in self.active_intents.values() {
@@ -400,6 +532,7 @@ impl ShardStateMachine {
             &self.binding,
             &self.state_store,
             self.applied_index,
+            Some(ChangeCursor::new(snapshot_applied_index, u64::MAX)),
             |change| {
                 let mutation = change.mutation();
                 if graph_mutation_time(mutation).is_some_and(|time| time > start_time)
@@ -417,31 +550,30 @@ impl ShardStateMachine {
         command: &crate::CommitSingleShardTransaction,
     ) -> Result<bool, ShardError> {
         let expected = single_shard_transaction_metadata(command)?;
-        let mut durable = false;
-        for_each_change(
-            &self.binding,
-            &self.state_store,
-            self.applied_index,
-            |change| {
-                let LogicalMutation::PutReplicaMetadata(metadata) = change.mutation() else {
-                    return Ok(());
-                };
-                if metadata.name() != SINGLE_SHARD_TRANSACTION_METADATA_NAME {
-                    return Ok(());
-                }
-                let decoded = decode_single_shard_transaction_metadata(metadata)?;
-                if decoded.command_id == command.header().command_id() {
-                    if metadata != &expected {
-                        return Err(corrupt_intent_history(
-                            "single-Shard transaction command has contradictory durable receipts",
-                        ));
-                    }
-                    durable = true;
-                }
-                Ok(())
-            },
-        )?;
-        Ok(durable)
+        let durable = block_on(self.state_store.replica_metadata(expected.name()))?;
+        match durable {
+            None => Ok(false),
+            Some(metadata) if metadata == expected => {
+                decode_single_shard_transaction_metadata(&metadata)?;
+                Ok(true)
+            }
+            Some(metadata) => {
+                decode_single_shard_transaction_metadata(&metadata)?;
+                Err(corrupt_intent_history(
+                    "single-Shard transaction command has contradictory durable receipts",
+                ))
+            }
+        }
+    }
+
+    fn durable_transaction_state(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<Option<DurableTransactionState>, ShardError> {
+        let name = transaction_state_metadata_name(transaction_id);
+        block_on(self.state_store.replica_metadata(&name))?
+            .map(|metadata| decode_transaction_state_metadata(&metadata))
+            .transpose()
     }
 
     pub(crate) fn apply_raft_noop(
@@ -485,15 +617,11 @@ impl ShardStateMachine {
 enum IntentTransition {
     None,
     Prepare(ParticipantIntent),
-    Finalize(TransactionId),
-}
-
-#[derive(Default)]
-struct RebuildingIntent {
-    prepared: Option<TransactionRecord>,
-    intent: Option<ParticipantIntent>,
-    unmatched_terminal: Option<TransactionRecord>,
-    home_decision: Option<TransactionRecord>,
+    Finalize {
+        transaction_id: TransactionId,
+        intent: ParticipantIntent,
+    },
+    Replay,
 }
 
 fn rebuild_active_intents(
@@ -501,148 +629,146 @@ fn rebuild_active_intents(
     state_store: &Arc<dyn ReplicaStateStore>,
     applied_index: u64,
 ) -> Result<BTreeMap<TransactionId, ParticipantIntent>, ShardError> {
-    let mut rebuilding = BTreeMap::<TransactionId, RebuildingIntent>::new();
-    for_each_change(binding, state_store, applied_index, |change| {
-        match change.mutation() {
-            LogicalMutation::PutTransaction(record)
-                if record.state() == TransactionState::Prepared =>
-            {
-                if !rebuilding.contains_key(&record.id())
-                    && rebuilding.len() == MAX_TRANSACTION_INTENT_ITEMS
-                {
-                    return Err(corrupt_intent_history(
-                        "active transaction intent count exceeds the supported bound",
-                    ));
-                }
-                let entry = rebuilding.entry(record.id()).or_default();
-                if entry
-                    .prepared
-                    .replace(record.clone())
-                    .is_some_and(|existing| existing != *record)
-                {
-                    return Err(corrupt_intent_history(
-                        "transaction has contradictory Prepared records",
-                    ));
-                }
-            }
-            LogicalMutation::PutTransaction(record) => {
-                if let Some(entry) = rebuilding.get_mut(&record.id())
-                    && let Some(intent) = entry.intent.as_ref()
-                {
-                    if record.record_digest() == intent.digest() {
-                        validate_intent_terminal(intent, record)?;
-                        rebuilding.remove(&record.id());
-                    } else {
-                        validate_home_decision_shape(intent, record)?;
-                        if entry
-                            .unmatched_terminal
-                            .replace(record.clone())
-                            .is_some_and(|existing| existing != *record)
-                        {
-                            return Err(corrupt_intent_history(
-                                "transaction has contradictory unmatched terminal records",
-                            ));
-                        }
-                    }
-                }
-            }
-            LogicalMutation::PutReplicaMetadata(metadata)
-                if metadata.name() == TRANSACTION_INTENT_METADATA_NAME =>
-            {
-                let Value::Bytes(bytes) = metadata.value() else {
-                    return Err(corrupt_intent_history(
-                        "transaction intent metadata is not bytes",
-                    ));
-                };
-                let intent = ParticipantIntent::decode_current(bytes).map_err(|error| {
-                    corrupt_intent_history(format!(
-                        "transaction intent metadata is corrupt: {error}"
-                    ))
-                })?;
-                if intent.shard_id() != binding.shard_id()
-                    || intent.snapshot_applied_index() > change.raft_index()
-                {
-                    return Err(corrupt_intent_history(
-                        "transaction intent metadata has inconsistent Shard fences",
-                    ));
-                }
-                if !rebuilding.contains_key(&intent.transaction_id())
-                    && rebuilding.len() == MAX_TRANSACTION_INTENT_ITEMS
-                {
-                    return Err(corrupt_intent_history(
-                        "active transaction intent count exceeds the supported bound",
-                    ));
-                }
-                let entry = rebuilding.entry(intent.transaction_id()).or_default();
-                if entry
-                    .intent
-                    .replace(intent.clone())
-                    .is_some_and(|existing| existing != intent)
-                {
-                    return Err(corrupt_intent_history(
-                        "transaction has contradictory participant intent payloads",
-                    ));
-                }
-            }
-            LogicalMutation::PutReplicaMetadata(metadata)
-                if metadata.name().starts_with("dtg.transaction_intent.") =>
-            {
-                return Err(corrupt_intent_history(
-                    "unsupported transaction intent metadata version",
-                ));
-            }
-            LogicalMutation::PutReplicaMetadata(metadata)
-                if metadata.name() == HOME_DECISION_METADATA_NAME =>
-            {
-                let decision = decode_home_decision_metadata(metadata)?;
-                if let Some(entry) = rebuilding.get_mut(&decision.id())
-                    && entry
-                        .home_decision
-                        .replace(decision.clone())
-                        .is_some_and(|existing| existing != decision)
-                {
-                    return Err(corrupt_intent_history(
-                        "transaction has contradictory Home decision metadata",
-                    ));
-                }
-            }
-            LogicalMutation::PutReplicaMetadata(metadata)
-                if metadata.name() == SINGLE_SHARD_TRANSACTION_METADATA_NAME =>
-            {
-                decode_single_shard_transaction_metadata(metadata)?;
-            }
-            LogicalMutation::PutVertex(_)
-            | LogicalMutation::DeleteVertex(_)
-            | LogicalMutation::PutEdge(_)
-            | LogicalMutation::DeleteEdge(_)
-            | LogicalMutation::PutReplicaMetadata(_) => {}
-        }
-        Ok(())
-    })?;
-
+    let Some(metadata) =
+        block_on(state_store.replica_metadata(ACTIVE_TRANSACTION_INTENTS_METADATA_NAME))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let indexed = decode_active_intents_metadata(&metadata)?;
     let mut active = BTreeMap::new();
-    for (transaction_id, entry) in rebuilding {
-        let (Some(prepared), Some(intent)) = (entry.prepared, entry.intent) else {
+    for (transaction_id, digest) in indexed {
+        let name = transaction_state_metadata_name(transaction_id);
+        let Some(metadata) = block_on(state_store.replica_metadata(&name))? else {
             return Err(corrupt_intent_history(
-                "durable Prepared record and participant intent are incomplete",
+                "active transaction index references missing durable state",
             ));
         };
-        if prepared.id() != transaction_id
-            || prepared.transaction_time() != intent.start_time()
-            || prepared.record_digest() != intent.digest()
+        let state = decode_transaction_state_metadata(&metadata)?;
+        if state.terminal().is_some()
+            || state.intent().transaction_id() != transaction_id
+            || state.intent().shard_id() != binding.shard_id()
+            || state.intent().snapshot_applied_index() > applied_index
+            || state.intent().digest() != digest
         {
             return Err(corrupt_intent_history(
-                "durable Prepared record does not match its participant intent",
+                "active transaction index contradicts its durable Prepared state",
             ));
         }
-        if entry.unmatched_terminal != entry.home_decision {
-            return Err(corrupt_intent_history(
-                "unmatched transaction terminal lacks an exact Home decision marker",
-            ));
-        }
-        active.insert(transaction_id, intent);
+        active.insert(transaction_id, state.intent().clone());
     }
     Ok(active)
+}
+
+fn mutations_at_index(
+    binding: &ReplicaBinding,
+    state_store: &Arc<dyn ReplicaStateStore>,
+    applied_index: u64,
+    index: u64,
+) -> Result<Vec<LogicalMutation>, ShardError> {
+    if index == 0 || index >= applied_index {
+        return Err(corrupt_intent_history(
+            "old-index transaction replay is outside durable history",
+        ));
+    }
+    let view =
+        block_on(state_store.begin_read_view(ReadFence::new(binding.clone(), applied_index)))?;
+    let mut after = Some(ChangeCursor::new(index - 1, u64::MAX));
+    let mut mutations = Vec::new();
+    let mut pages = 0_usize;
+    loop {
+        if pages == HISTORY_PAGE_BUDGET {
+            return Err(corrupt_intent_history(
+                "old-index transaction batch exceeded the page budget",
+            ));
+        }
+        pages += 1;
+        let page = block_on(view.changes(ChangesRead::new(after, index, HISTORY_PAGE_LIMIT)?))?;
+        if mutations.len().saturating_add(page.rows().len()) > HISTORY_RECORD_BUDGET {
+            return Err(corrupt_intent_history(
+                "old-index transaction batch exceeded the record budget",
+            ));
+        }
+        for change in page.rows() {
+            if change.raft_index() != index || change.mutation_ordinal() != mutations.len() as u64 {
+                return Err(corrupt_intent_history(
+                    "old-index transaction batch history is missing or out of order",
+                ));
+            }
+            mutations.push(change.mutation().clone());
+        }
+        match page.next_after() {
+            Some(next)
+                if page.rows().last().is_some_and(|row| row.cursor() == next)
+                    && after.is_some_and(|previous| previous < next)
+                    && next.raft_index() == index =>
+            {
+                after = Some(next);
+            }
+            Some(_) => {
+                return Err(corrupt_intent_history(
+                    "old-index transaction batch pagination did not make progress",
+                ));
+            }
+            None => break,
+        }
+    }
+    if mutations.is_empty() {
+        return Err(corrupt_intent_history(
+            "old-index transaction batch history is missing",
+        ));
+    }
+    Ok(mutations)
+}
+
+fn validate_historical_transaction_batch(
+    command: &ShardCommand,
+    historical: &[LogicalMutation],
+) -> Result<(), ShardError> {
+    let command_mutations = command.mutations()?;
+    if historical.len() != command_mutations.len() + 2
+        || historical[..command_mutations.len()] != command_mutations
+    {
+        return Err(corrupt_intent_history(
+            "old-index transaction batch contradicts the replayed command",
+        ));
+    }
+    let LogicalMutation::PutReplicaMetadata(state_metadata) = &historical[command_mutations.len()]
+    else {
+        return Err(corrupt_intent_history(
+            "old-index transaction batch lacks durable transaction state",
+        ));
+    };
+    let LogicalMutation::PutReplicaMetadata(active_metadata) =
+        &historical[command_mutations.len() + 1]
+    else {
+        return Err(corrupt_intent_history(
+            "old-index transaction batch lacks the active transaction index",
+        ));
+    };
+    let state = decode_transaction_state_metadata(state_metadata)?;
+    let active = decode_active_intents_metadata(active_metadata)?;
+    match command {
+        ShardCommand::PrewriteIntent(command)
+            if state.intent() == command.intent()
+                && state.terminal().is_none()
+                && active.get(&command.intent().transaction_id())
+                    == Some(&command.intent().digest()) =>
+        {
+            Ok(())
+        }
+        ShardCommand::FinalizeParticipant(command)
+            if state.matches_finalize(command)
+                && !active.contains_key(&command.terminal().id()) =>
+        {
+            Ok(())
+        }
+        ShardCommand::PrewriteIntent(_) | ShardCommand::FinalizeParticipant(_) => {
+            Err(corrupt_intent_history(
+                "old-index transaction metadata contradicts the replayed command",
+            ))
+        }
+        _ => unreachable!("only transaction state commands use historical batch replay"),
+    }
 }
 
 fn validate_intent_terminal(
@@ -666,22 +792,213 @@ fn validate_intent_terminal(
     }
 }
 
-fn validate_home_decision_shape(
-    intent: &ParticipantIntent,
-    decision: &TransactionRecord,
-) -> Result<(), ShardError> {
-    let valid_time = match decision.state() {
-        TransactionState::Committed => decision.transaction_time() > intent.start_time(),
-        TransactionState::Aborted => decision.transaction_time() == intent.start_time(),
-        TransactionState::Prepared => false,
-    };
-    if decision.id() == intent.transaction_id() && valid_time {
-        Ok(())
-    } else {
-        Err(corrupt_intent_history(
-            "unmatched terminal record cannot be a valid Home decision",
-        ))
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DurableTransactionState {
+    intent: ParticipantIntent,
+    terminal: Option<TransactionRecord>,
+}
+
+impl DurableTransactionState {
+    const fn intent(&self) -> &ParticipantIntent {
+        &self.intent
     }
+
+    const fn terminal(&self) -> Option<&TransactionRecord> {
+        self.terminal.as_ref()
+    }
+
+    fn matches_finalize(&self, command: &crate::FinalizeParticipant) -> bool {
+        self.terminal.as_ref() == Some(command.terminal())
+            && match command.terminal().state() {
+                TransactionState::Committed => command.intent() == Some(&self.intent),
+                TransactionState::Aborted => command.intent().is_none(),
+                TransactionState::Prepared => false,
+            }
+    }
+}
+
+fn active_intents_metadata(
+    active: &BTreeMap<TransactionId, ParticipantIntent>,
+) -> Result<ReplicaMetadata, ShardError> {
+    if active.len() > MAX_TRANSACTION_INTENT_ITEMS {
+        return Err(ShardError::InvalidCommand(
+            "active transaction intent count exceeds the supported bound".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(8 + active.len() * 48);
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.extend_from_slice(&(active.len() as u32).to_be_bytes());
+    for (transaction_id, intent) in active {
+        bytes.extend_from_slice(&transaction_id.get().to_be_bytes());
+        bytes.extend_from_slice(&intent.digest().get());
+    }
+    Ok(ReplicaMetadata::new(
+        ACTIVE_TRANSACTION_INTENTS_METADATA_NAME,
+        Value::Bytes(bytes),
+    )?)
+}
+
+fn decode_active_intents_metadata(
+    metadata: &ReplicaMetadata,
+) -> Result<BTreeMap<TransactionId, Digest32>, ShardError> {
+    if metadata.name() != ACTIVE_TRANSACTION_INTENTS_METADATA_NAME {
+        return Err(corrupt_intent_history(
+            "metadata is not the active transaction intent index",
+        ));
+    }
+    let Value::Bytes(bytes) = metadata.value() else {
+        return Err(corrupt_intent_history(
+            "active transaction intent index is not bytes",
+        ));
+    };
+    if bytes.len() < 8 || u32::from_be_bytes(bytes[..4].try_into().unwrap()) != 1 {
+        return Err(corrupt_intent_history(
+            "active transaction intent index has an unsupported encoding",
+        ));
+    }
+    let count = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if count > MAX_TRANSACTION_INTENT_ITEMS || bytes.len() != 8 + count * 48 {
+        return Err(corrupt_intent_history(
+            "active transaction intent index exceeds its bound or is truncated",
+        ));
+    }
+    let mut indexed = BTreeMap::new();
+    let mut previous = None;
+    for chunk in bytes[8..].chunks_exact(48) {
+        let transaction_id =
+            TransactionId::new(u128::from_be_bytes(chunk[..16].try_into().unwrap()))?;
+        if previous.is_some_and(|previous| previous >= transaction_id) {
+            return Err(corrupt_intent_history(
+                "active transaction intent index is not strictly ordered",
+            ));
+        }
+        previous = Some(transaction_id);
+        indexed.insert(
+            transaction_id,
+            Digest32::new(chunk[16..48].try_into().unwrap()),
+        );
+    }
+    Ok(indexed)
+}
+
+fn transaction_state_metadata_name(transaction_id: TransactionId) -> String {
+    format!(
+        "{TRANSACTION_STATE_METADATA_PREFIX}{:032x}",
+        transaction_id.get()
+    )
+}
+
+fn transaction_state_metadata(
+    intent: &ParticipantIntent,
+    terminal: Option<&TransactionRecord>,
+) -> Result<ReplicaMetadata, ShardError> {
+    if let Some(terminal) = terminal {
+        validate_intent_terminal(intent, terminal)?;
+    }
+    let encoded_intent = intent.encode_current()?;
+    let mut bytes = Vec::with_capacity(9 + encoded_intent.len() + 40);
+    bytes.extend_from_slice(&1_u32.to_be_bytes());
+    bytes.push(match terminal.map(TransactionRecord::state) {
+        None => 1,
+        Some(TransactionState::Committed) => 2,
+        Some(TransactionState::Aborted) => 3,
+        Some(TransactionState::Prepared) => {
+            return Err(corrupt_intent_history(
+                "durable transaction state cannot store Prepared as a terminal",
+            ));
+        }
+    });
+    bytes.extend_from_slice(&(encoded_intent.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&encoded_intent);
+    if let Some(terminal) = terminal {
+        bytes.extend_from_slice(&terminal.transaction_time().get().to_be_bytes());
+        bytes.extend_from_slice(&terminal.record_digest().get());
+    }
+    Ok(ReplicaMetadata::new(
+        transaction_state_metadata_name(intent.transaction_id()),
+        Value::Bytes(bytes),
+    )?)
+}
+
+fn decode_transaction_state_metadata(
+    metadata: &ReplicaMetadata,
+) -> Result<DurableTransactionState, ShardError> {
+    let transaction_id = transaction_id_from_metadata_name(
+        metadata.name(),
+        TRANSACTION_STATE_METADATA_PREFIX,
+        "durable transaction state",
+    )?;
+    let Value::Bytes(bytes) = metadata.value() else {
+        return Err(corrupt_intent_history(
+            "durable transaction state is not bytes",
+        ));
+    };
+    if bytes.len() < 9 || u32::from_be_bytes(bytes[..4].try_into().unwrap()) != 1 {
+        return Err(corrupt_intent_history(
+            "durable transaction state has an unsupported encoding",
+        ));
+    }
+    let tag = bytes[4];
+    let intent_len = u32::from_be_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let intent_end = 9_usize.saturating_add(intent_len);
+    if intent_end > bytes.len() {
+        return Err(corrupt_intent_history(
+            "durable transaction state intent payload is truncated",
+        ));
+    }
+    let intent = ParticipantIntent::decode_current(&bytes[9..intent_end]).map_err(|error| {
+        corrupt_intent_history(format!(
+            "durable transaction state intent is corrupt: {error}"
+        ))
+    })?;
+    if intent.transaction_id() != transaction_id {
+        return Err(corrupt_intent_history(
+            "durable transaction state name contradicts its transaction ID",
+        ));
+    }
+    let terminal = match tag {
+        1 if intent_end == bytes.len() => None,
+        2 | 3 if bytes.len() == intent_end + 40 => {
+            let state = if tag == 2 {
+                TransactionState::Committed
+            } else {
+                TransactionState::Aborted
+            };
+            let transaction_time = TransactionTime::new(i64::from_be_bytes(
+                bytes[intent_end..intent_end + 8].try_into().unwrap(),
+            ))?;
+            let digest = Digest32::new(bytes[intent_end + 8..].try_into().unwrap());
+            let terminal = TransactionRecord::new(transaction_id, state, transaction_time, digest)?;
+            validate_intent_terminal(&intent, &terminal)?;
+            Some(terminal)
+        }
+        _ => {
+            return Err(corrupt_intent_history(
+                "durable transaction state tag or trailing bytes are invalid",
+            ));
+        }
+    };
+    Ok(DurableTransactionState { intent, terminal })
+}
+
+fn transaction_id_from_metadata_name(
+    name: &str,
+    prefix: &str,
+    description: &str,
+) -> Result<TransactionId, ShardError> {
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return Err(corrupt_intent_history(format!(
+            "metadata is not a {description} record"
+        )));
+    };
+    if suffix.len() != 32 {
+        return Err(corrupt_intent_history(format!(
+            "{description} metadata name is malformed"
+        )));
+    }
+    let value = u128::from_str_radix(suffix, 16)
+        .map_err(|_| corrupt_intent_history(format!("{description} metadata name is malformed")))?;
+    Ok(TransactionId::new(value)?)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -734,7 +1051,10 @@ fn single_shard_transaction_metadata(
     bytes.extend_from_slice(&commit_time.get().to_be_bytes());
     bytes.extend_from_slice(&command.request_digest().get());
     Ok(ReplicaMetadata::new(
-        SINGLE_SHARD_TRANSACTION_METADATA_NAME,
+        format!(
+            "{SINGLE_SHARD_TRANSACTION_METADATA_NAME}{:032x}",
+            command.transaction_id().get()
+        ),
         Value::Bytes(bytes),
     )?)
 }
@@ -742,11 +1062,11 @@ fn single_shard_transaction_metadata(
 pub fn decode_single_shard_transaction_metadata(
     metadata: &ReplicaMetadata,
 ) -> Result<SingleShardTransactionReceipt, ShardError> {
-    if metadata.name() != SINGLE_SHARD_TRANSACTION_METADATA_NAME {
-        return Err(corrupt_intent_history(
-            "metadata is not a single-Shard transaction receipt",
-        ));
-    }
+    let transaction_id = transaction_id_from_metadata_name(
+        metadata.name(),
+        SINGLE_SHARD_TRANSACTION_METADATA_NAME,
+        "single-Shard transaction receipt",
+    )?;
     let Value::Bytes(bytes) = metadata.value() else {
         return Err(corrupt_intent_history(
             "single-Shard transaction receipt is not bytes",
@@ -765,9 +1085,9 @@ pub fn decode_single_shard_transaction_metadata(
         commit_time: TransactionTime::new(i64::from_be_bytes(bytes[52..60].try_into().unwrap()))?,
         request_digest: Digest32::new(bytes[60..92].try_into().unwrap()),
     };
-    if receipt.commit_time <= receipt.start_time {
+    if receipt.transaction_id != transaction_id || receipt.commit_time <= receipt.start_time {
         return Err(corrupt_intent_history(
-            "single-Shard transaction receipt commit time does not follow its start time",
+            "single-Shard transaction receipt name or commit time is inconsistent",
         ));
     }
     Ok(receipt)
@@ -794,39 +1114,11 @@ fn home_decision_metadata(decision: &TransactionRecord) -> Result<ReplicaMetadat
     )?)
 }
 
-fn decode_home_decision_metadata(
-    metadata: &ReplicaMetadata,
-) -> Result<TransactionRecord, ShardError> {
-    let Value::Bytes(bytes) = metadata.value() else {
-        return Err(corrupt_intent_history(
-            "Home decision metadata is not bytes",
-        ));
-    };
-    if bytes.len() != 61 || u32::from_be_bytes(bytes[..4].try_into().unwrap()) != 1 {
-        return Err(corrupt_intent_history(
-            "Home decision metadata has an unsupported encoding",
-        ));
-    }
-    let id = TransactionId::new(u128::from_be_bytes(bytes[4..20].try_into().unwrap()))?;
-    let state = match bytes[20] {
-        1 => TransactionState::Committed,
-        2 => TransactionState::Aborted,
-        _ => {
-            return Err(corrupt_intent_history(
-                "Home decision metadata has an invalid state",
-            ));
-        }
-    };
-    let transaction_time =
-        TransactionTime::new(i64::from_be_bytes(bytes[21..29].try_into().unwrap()))?;
-    let digest = Digest32::new(bytes[29..61].try_into().unwrap());
-    Ok(TransactionRecord::new(id, state, transaction_time, digest)?)
-}
-
 fn for_each_change(
     binding: &ReplicaBinding,
     state_store: &Arc<dyn ReplicaStateStore>,
     applied_index: u64,
+    initial_after: Option<ChangeCursor>,
     mut visit: impl FnMut(&ChangeRecord) -> Result<(), ShardError>,
 ) -> Result<(), ShardError> {
     if applied_index == 0 {
@@ -834,11 +1126,32 @@ fn for_each_change(
     }
     let view =
         block_on(state_store.begin_read_view(ReadFence::new(binding.clone(), applied_index)))?;
-    let mut after = None;
+    let mut after = initial_after;
+    let mut pages = 0_usize;
+    let mut records = 0_usize;
     loop {
+        if pages == HISTORY_PAGE_BUDGET {
+            return Err(corrupt_intent_history(
+                "durable change history exceeded the page budget",
+            ));
+        }
+        pages += 1;
         let page =
             block_on(view.changes(ChangesRead::new(after, applied_index, HISTORY_PAGE_LIMIT)?))?;
+        if records.saturating_add(page.rows().len()) > HISTORY_RECORD_BUDGET {
+            return Err(corrupt_intent_history(
+                "durable change history exceeded the record budget",
+            ));
+        }
+        records += page.rows().len();
         for change in page.rows() {
+            if after.is_some_and(|after| change.cursor() <= after)
+                || change.raft_index() > applied_index
+            {
+                return Err(corrupt_intent_history(
+                    "durable change history row is outside the requested range",
+                ));
+            }
             visit(change)?;
         }
         match page.next_after() {

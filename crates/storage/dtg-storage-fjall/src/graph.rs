@@ -17,7 +17,7 @@ use dtg_storage::{
 use fjall::{Keyspace, OwnedWriteBatch, PersistMode};
 
 use crate::{
-    codec::{decode_replay_identity, encode_mutation, encode_replay_identity},
+    codec::{decode_mutation, decode_replay_identity, encode_mutation, encode_replay_identity},
     namespace::{NamespaceDb, fjall_capabilities, fjall_error},
     read_view::FjallReadView,
 };
@@ -462,6 +462,31 @@ impl ReplicaStateStore for FjallReplicaStore {
 
     fn applied_index(&self) -> StoreFuture<'_, u64> {
         Box::pin(async move { self.applied_index_sync() })
+    }
+
+    fn replica_metadata<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
+        Box::pin(async move {
+            let _guard = self.lock_graph()?;
+            let mut key = b"user/".to_vec();
+            key.extend_from_slice(name.as_bytes());
+            let Some(bytes) = self
+                .inner
+                .namespace
+                .replica_meta
+                .get(key)
+                .map_err(fjall_error)?
+            else {
+                return Ok(None);
+            };
+            match decode_mutation(&bytes)? {
+                LogicalMutation::PutReplicaMetadata(metadata) if metadata.name() == name => {
+                    Ok(Some(metadata))
+                }
+                _ => Err(StorageError::Internal(
+                    "stored replica metadata point value is malformed".into(),
+                )),
+            }
+        })
     }
 
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {

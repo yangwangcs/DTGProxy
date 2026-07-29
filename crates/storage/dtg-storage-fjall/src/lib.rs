@@ -165,6 +165,13 @@ impl ReplicaStateStore for FjallStorageTckStore {
         self.store.applied_index()
     }
 
+    fn replica_metadata<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> StoreFuture<'a, Option<dtg_storage::ReplicaMetadata>> {
+        self.store.replica_metadata(name)
+    }
+
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
         self.store.apply(batch)
     }
