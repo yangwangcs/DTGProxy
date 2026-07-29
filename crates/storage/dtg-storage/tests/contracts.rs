@@ -14,11 +14,11 @@ use dtg_storage::{
     ReplicaBinding, ReplicaMetadata, ReplicaStateStore, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
     SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, SUPPORTED_PUSHDOWN_CONTRACT_VERSION,
     SUPPORTED_SNAPSHOT_FORMAT_VERSION, ScanPage, SnapshotChunk, SnapshotHeader, SnapshotManifest,
-    SnapshotRecord, SnapshotReplayRecord, SnapshotRequest, SnapshotRestoreReceipt, StorageError,
-    StorageTckFactory, StorageTckStore, StoreFuture, TemporalReadView, TransactionId,
-    TransactionRecord, TransactionState, TransactionTime, ValidInterval, Value, Version,
-    VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexTombstone, VertexVersion,
-    run_storage_tck,
+    SnapshotManifestBuilder, SnapshotRecord, SnapshotReplayRecord, SnapshotRequest,
+    SnapshotRestoreReceipt, StorageError, StorageTckFactory, StorageTckStore, StoreFuture,
+    TemporalReadView, TransactionId, TransactionRecord, TransactionState, TransactionTime,
+    ValidInterval, Value, Version, VertexHistoryRead, VertexId, VertexRead, VertexScan,
+    VertexTombstone, VertexVersion, run_storage_tck,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -199,6 +199,42 @@ fn snapshot_manifest_digest_includes_the_complete_source_binding() {
             .unwrap()
             .content_digest()
     );
+}
+
+#[test]
+fn snapshot_manifest_can_be_computed_incrementally_without_retaining_chunks() {
+    let header = SnapshotHeader::new(
+        SnapshotRequest::new(909, 1).unwrap().snapshot_id(),
+        binding("manifest-stream", 1),
+        3,
+        SUPPORTED_SNAPSHOT_FORMAT_VERSION,
+    )
+    .unwrap();
+    let chunks = vec![
+        SnapshotChunk::new(
+            header.snapshot_id(),
+            0,
+            vec![SnapshotRecord::ReplicaMetadata(
+                ReplicaMetadata::new("a", Value::Integer(1)).unwrap(),
+            )],
+        )
+        .unwrap(),
+        SnapshotChunk::new(
+            header.snapshot_id(),
+            1,
+            vec![SnapshotRecord::ReplicaMetadata(
+                ReplicaMetadata::new("b", Value::Integer(2)).unwrap(),
+            )],
+        )
+        .unwrap(),
+    ];
+    let expected = SnapshotManifest::new(&header, &chunks).unwrap();
+    let mut builder = SnapshotManifestBuilder::new(header);
+    for chunk in &chunks {
+        builder.push(chunk).unwrap();
+    }
+
+    assert_eq!(builder.finish(), expected);
 }
 
 #[test]

@@ -43,7 +43,8 @@ pub use snapshot::{
     LogicalReplicaActivation, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,
     LogicalSnapshotReader, LogicalSnapshotSink, LogicalSnapshotSource, LogicalSnapshotWriter,
     SUPPORTED_SNAPSHOT_FORMAT_VERSION, SnapshotChunk, SnapshotHeader, SnapshotId, SnapshotManifest,
-    SnapshotRecord, SnapshotReplayRecord, SnapshotRequest, SnapshotRestoreReceipt,
+    SnapshotManifestBuilder, SnapshotRecord, SnapshotReplayRecord, SnapshotRequest,
+    SnapshotRestoreReceipt,
 };
 pub use tck::{StorageTckFactory, StorageTckStore, run_storage_tck};
 

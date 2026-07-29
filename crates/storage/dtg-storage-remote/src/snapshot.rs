@@ -1,7 +1,7 @@
 use dtg_storage::{
     LogicalSnapshotReader, LogicalSnapshotWriter, ReadFence, ReplicaBinding, SnapshotChunk,
-    SnapshotHeader, SnapshotId, SnapshotManifest, SnapshotRequest, SnapshotRestoreReceipt,
-    StorageError, StoreFuture,
+    SnapshotHeader, SnapshotId, SnapshotManifest, SnapshotManifestBuilder, SnapshotRequest,
+    SnapshotRestoreReceipt, StorageError, StoreFuture,
 };
 use dtg_storage_remote_protocol::{bounded_payload, proto, validate_payload};
 use prost::Message;
@@ -157,7 +157,8 @@ pub(crate) struct RemoteSnapshotReader {
     request: SnapshotRequest,
     header: SnapshotHeader,
     stream: Streaming<proto::SnapshotExportFrame>,
-    chunks: Vec<SnapshotChunk>,
+    manifest_builder: SnapshotManifestBuilder,
+    last_ordinal: Option<u64>,
     manifest: Option<SnapshotManifest>,
     retries: usize,
 }
@@ -179,13 +180,15 @@ impl RemoteSnapshotReader {
         }
         request.validate()?;
         let (header, stream) = open_export(&client, &fence, &request, None).await?;
+        let manifest_builder = SnapshotManifestBuilder::new(header.clone());
         Ok(Self {
             client,
             fence,
             request,
             header,
             stream,
-            chunks: Vec::new(),
+            manifest_builder,
+            last_ordinal: None,
             manifest: None,
             retries: 0,
         })
@@ -198,7 +201,7 @@ impl RemoteSnapshotReader {
             ));
         }
         self.retries += 1;
-        let resume_after = self.chunks.last().map(SnapshotChunk::ordinal);
+        let resume_after = self.last_ordinal;
         let (header, stream) =
             open_export(&self.client, &self.fence, &self.request, resume_after).await?;
         if header != self.header {
@@ -239,12 +242,13 @@ impl LogicalSnapshotReader for RemoteSnapshotReader {
                         let wire: proto::SnapshotChunkPayload = decode_message_payload(payload)?;
                         let chunk = decode_chunk(&wire)?;
                         if chunk.snapshot_id() != self.header.snapshot_id()
-                            || chunk.ordinal() != self.chunks.len() as u64
+                            || chunk.ordinal() != self.manifest_builder.next_ordinal()
                             || frame.sequence != chunk.ordinal() + 1
                         {
                             return Err(corrupt("snapshot export chunk order mismatch"));
                         }
-                        self.chunks.push(chunk.clone());
+                        self.manifest_builder.push(&chunk)?;
+                        self.last_ordinal = Some(chunk.ordinal());
                         return Ok(Some(chunk));
                     }
                     SNAPSHOT_COMMIT_FRAME => {
@@ -253,7 +257,9 @@ impl LogicalSnapshotReader for RemoteSnapshotReader {
                         if frame.sequence != manifest.chunk_count() + 1 {
                             return Err(corrupt("snapshot manifest sequence mismatch"));
                         }
-                        manifest.validate(&self.header, &self.chunks)?;
+                        if manifest != self.manifest_builder.clone().finish() {
+                            return Err(corrupt("snapshot manifest differs from streamed chunks"));
+                        }
                         self.manifest = Some(manifest);
                         return Ok(None);
                     }
@@ -319,7 +325,7 @@ pub(crate) struct RemoteSnapshotWriter {
     sender: Option<mpsc::Sender<proto::SnapshotImportFrame>>,
     stream_id: Vec<u8>,
     next_sequence: u64,
-    chunks: Vec<SnapshotChunk>,
+    manifest_builder: SnapshotManifestBuilder,
     response: tokio::task::JoinHandle<Result<proto::ImportSnapshotResponse, StorageError>>,
 }
 
@@ -348,6 +354,7 @@ impl RemoteSnapshotWriter {
                 })
         });
         let stream_id = client.context().request_id;
+        let manifest_builder = SnapshotManifestBuilder::new(header.clone());
         let mut writer = Self {
             client,
             target_binding,
@@ -355,7 +362,7 @@ impl RemoteSnapshotWriter {
             sender: Some(sender),
             stream_id,
             next_sequence: 0,
-            chunks: Vec::new(),
+            manifest_builder,
             response,
         };
         let wire = encode_header(&writer.header);
@@ -401,14 +408,14 @@ impl LogicalSnapshotWriter for RemoteSnapshotWriter {
         Box::pin(async move {
             chunk.validate()?;
             if chunk.snapshot_id() != self.header.snapshot_id()
-                || chunk.ordinal() != self.chunks.len() as u64
+                || chunk.ordinal() != self.manifest_builder.next_ordinal()
             {
                 return Err(corrupt("snapshot import chunk order mismatch"));
             }
             let wire = encode_chunk(&chunk)?;
             self.send_frame(SNAPSHOT_CHUNK_FRAME, encode_message_payload(&wire)?)
                 .await?;
-            self.chunks.push(chunk);
+            self.manifest_builder.push(&chunk)?;
             Ok(())
         })
     }
@@ -418,7 +425,11 @@ impl LogicalSnapshotWriter for RemoteSnapshotWriter {
         manifest: SnapshotManifest,
     ) -> StoreFuture<'static, SnapshotRestoreReceipt> {
         Box::pin(async move {
-            manifest.validate(&self.header, &self.chunks)?;
+            if manifest != self.manifest_builder.clone().finish() {
+                return Err(corrupt(
+                    "snapshot import manifest differs from streamed chunks",
+                ));
+            }
             let wire = encode_manifest(&manifest);
             self.send_frame(SNAPSHOT_COMMIT_FRAME, encode_message_payload(&wire)?)
                 .await?;

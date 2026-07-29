@@ -9,8 +9,9 @@ use dtg_storage::{
     CommittedShardBatch, Digest32, EdgeHistoryRead, EdgeId, EdgeRead, EdgeScan, LogicalMutation,
     LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt, ProviderKind, ReadFence,
     ReplicaBinding, ReplicaStateStore, SnapshotHeader, SnapshotId, SnapshotManifest,
-    SnapshotRequest, SnapshotRestoreReceipt, StorageError, StorageTckFactory, StorageTckStore,
-    StoreFuture, TemporalReadView, VertexHistoryRead, VertexId, VertexRead, VertexScan,
+    SnapshotManifestBuilder, SnapshotRequest, SnapshotRestoreReceipt, StorageError,
+    StorageTckFactory, StorageTckStore, StoreFuture, TemporalReadView, VertexHistoryRead, VertexId,
+    VertexRead, VertexScan,
 };
 use dtg_storage_remote_protocol::{
     CONTRACT_MAJOR, CONTRACT_MINOR, MAX_MESSAGE_BYTES, MAX_MESSAGE_ITEMS, PROTOCOL_MAJOR,
@@ -746,7 +747,7 @@ impl Storage for ReferenceService {
                     }))
                     .await
                     .map_err(|_| Status::cancelled("snapshot export receiver closed"))?;
-                let mut chunks = Vec::new();
+                let mut manifest_builder = SnapshotManifestBuilder::new(header.clone());
                 while let Some(chunk) = reader.next_chunk().await.map_err(storage_status)? {
                     if fail_after != NO_SNAPSHOT_EXPORT_FAILURE && chunk.ordinal() > fail_after {
                         return Err(Status::unavailable(
@@ -768,10 +769,10 @@ impl Storage for ReferenceService {
                             .await
                             .map_err(|_| Status::cancelled("snapshot export receiver closed"))?;
                     }
-                    chunks.push(chunk);
+                    manifest_builder.push(&chunk).map_err(storage_status)?;
                 }
                 let _ = reader.finish().await.map_err(storage_status)?;
-                let manifest = SnapshotManifest::new(&header, &chunks).map_err(storage_status)?;
+                let manifest = manifest_builder.finish();
                 let wire = encode_manifest(&manifest);
                 sender
                     .send(Ok(proto::SnapshotExportFrame {
@@ -1189,7 +1190,8 @@ async fn import_snapshot_stream(
         .map_err(storage_status)?;
     let stream_id = first.stream_id;
     let mut expected_sequence = 1_u64;
-    let mut chunks = Vec::new();
+    let mut external_manifest_builder = SnapshotManifestBuilder::new(external_header.clone());
+    let mut internal_manifest_builder = SnapshotManifestBuilder::new(internal_header.clone());
     loop {
         let Some(frame) = stream.message().await? else {
             writer.abort().await.map_err(storage_status)?;
@@ -1227,11 +1229,13 @@ async fn import_snapshot_stream(
                     })?)
                     .map_err(storage_status)?;
                 let chunk = decode_chunk(&wire).map_err(storage_status)?;
-                writer
-                    .write_chunk(chunk.clone())
-                    .await
+                external_manifest_builder
+                    .push(&chunk)
                     .map_err(storage_status)?;
-                chunks.push(chunk);
+                internal_manifest_builder
+                    .push(&chunk)
+                    .map_err(storage_status)?;
+                writer.write_chunk(chunk).await.map_err(storage_status)?;
             }
             SNAPSHOT_COMMIT_FRAME => {
                 let wire: proto::SnapshotManifestPayload =
@@ -1240,13 +1244,14 @@ async fn import_snapshot_stream(
                     })?)
                     .map_err(storage_status)?;
                 let external_manifest = decode_manifest(&wire).map_err(storage_status)?;
-                external_manifest
-                    .validate(&external_header, &chunks)
-                    .map_err(storage_status)?;
-                let internal_manifest =
-                    SnapshotManifest::new(&internal_header, &chunks).map_err(storage_status)?;
+                if external_manifest != external_manifest_builder.finish() {
+                    return Err(storage_status(StorageError::CorruptSnapshot(
+                        "snapshot import manifest differs from streamed chunks".into(),
+                    )));
+                }
+                let internal_manifest = internal_manifest_builder.finish();
                 writer
-                    .commit(internal_manifest)
+                    .commit(internal_manifest.clone())
                     .await
                     .map_err(storage_status)?;
                 if external_binding.role() == BindingRole::Candidate {
@@ -1256,8 +1261,7 @@ async fn import_snapshot_stream(
                         external_header: external_header.clone(),
                         external_manifest: external_manifest.clone(),
                         internal_header: internal_header.clone(),
-                        internal_manifest: SnapshotManifest::new(&internal_header, &chunks)
-                            .map_err(storage_status)?,
+                        internal_manifest,
                     });
                 }
                 let receipt =

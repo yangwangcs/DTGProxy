@@ -232,18 +232,11 @@ pub struct SnapshotManifest {
 
 impl SnapshotManifest {
     pub fn new(header: &SnapshotHeader, chunks: &[SnapshotChunk]) -> Result<Self, StorageError> {
-        validate_chunks(header, chunks)?;
-        let record_count = chunks.iter().try_fold(0_u64, |count, chunk| {
-            count
-                .checked_add(chunk.records.len() as u64)
-                .ok_or_else(|| StorageError::CorruptSnapshot("record count overflow".into()))
-        })?;
-        Ok(Self {
-            snapshot_id: header.snapshot_id,
-            chunk_count: chunks.len() as u64,
-            record_count,
-            content_digest: digest_manifest(header, chunks),
-        })
+        let mut builder = SnapshotManifestBuilder::new(header.clone());
+        for chunk in chunks {
+            builder.push(chunk)?;
+        }
+        Ok(builder.finish())
     }
 
     pub fn validate(
@@ -275,6 +268,55 @@ impl SnapshotManifest {
 
     pub const fn content_digest(&self) -> Digest32 {
         self.content_digest
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotManifestBuilder {
+    header: SnapshotHeader,
+    next_ordinal: u64,
+    record_count: u64,
+    chunk_digests: Vec<Digest32>,
+}
+
+impl SnapshotManifestBuilder {
+    pub const fn new(header: SnapshotHeader) -> Self {
+        Self {
+            header,
+            next_ordinal: 0,
+            record_count: 0,
+            chunk_digests: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, chunk: &SnapshotChunk) -> Result<(), StorageError> {
+        chunk.validate()?;
+        if chunk.snapshot_id() != self.header.snapshot_id() || chunk.ordinal() != self.next_ordinal
+        {
+            return Err(StorageError::CorruptSnapshot(
+                "snapshot chunk identity or order mismatch".into(),
+            ));
+        }
+        self.record_count = self
+            .record_count
+            .checked_add(chunk.records().len() as u64)
+            .ok_or_else(|| StorageError::CorruptSnapshot("record count overflow".into()))?;
+        self.chunk_digests.push(chunk.digest);
+        self.next_ordinal += 1;
+        Ok(())
+    }
+
+    pub const fn next_ordinal(&self) -> u64 {
+        self.next_ordinal
+    }
+
+    pub fn finish(self) -> SnapshotManifest {
+        SnapshotManifest {
+            snapshot_id: self.header.snapshot_id(),
+            chunk_count: self.next_ordinal,
+            record_count: self.record_count,
+            content_digest: digest_manifest_digests(&self.header, &self.chunk_digests),
+        }
     }
 }
 
@@ -435,18 +477,6 @@ pub trait LogicalSnapshotWriter: Send {
     fn abort(self: Box<Self>) -> StoreFuture<'static, ()>;
 }
 
-fn validate_chunks(header: &SnapshotHeader, chunks: &[SnapshotChunk]) -> Result<(), StorageError> {
-    for (expected_ordinal, chunk) in chunks.iter().enumerate() {
-        chunk.validate()?;
-        if chunk.snapshot_id != header.snapshot_id || chunk.ordinal != expected_ordinal as u64 {
-            return Err(StorageError::CorruptSnapshot(
-                "snapshot chunk identity or order mismatch".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn same_binding_except_role(left: &ReplicaBinding, right: &ReplicaBinding) -> bool {
     left.to_builder()
         .role(right.role())
@@ -548,16 +578,16 @@ fn digest_chunk(snapshot_id: SnapshotId, ordinal: u64, records: &[SnapshotRecord
     Digest32::new(*hasher.finalize().as_bytes())
 }
 
-fn digest_manifest(header: &SnapshotHeader, chunks: &[SnapshotChunk]) -> Digest32 {
+fn digest_manifest_digests(header: &SnapshotHeader, digests: &[Digest32]) -> Digest32 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"dtg-logical-snapshot-manifest-v1");
     hasher.update(&header.snapshot_id.get().to_be_bytes());
     hasher.update(&header.source_binding.identity_digest().get());
     hasher.update(&header.applied_index.to_be_bytes());
     hasher.update(&header.format_version.to_be_bytes());
-    hasher.update(&(chunks.len() as u64).to_be_bytes());
-    for chunk in chunks {
-        hasher.update(&chunk.digest.get());
+    hasher.update(&(digests.len() as u64).to_be_bytes());
+    for digest in digests {
+        hasher.update(&digest.get());
     }
     Digest32::new(*hasher.finalize().as_bytes())
 }
