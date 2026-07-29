@@ -760,6 +760,14 @@ version = "1.0.0"
 [[package]]
 name = "dtg-shard"
 version = "1.0.0"
+dependencies = [
+ "dtg-kernel",
+ "dtg-storage",
+ "dtg-storage-fjall",
+ "raft",
+ "slog",
+ "tempfile",
+]
 
 [[package]]
 name = "dtg-storage"
