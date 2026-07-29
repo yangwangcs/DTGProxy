@@ -430,9 +430,13 @@ dependencies = [
  "dtg-data",
  "dtg-execution",
  "dtg-meta",
+ "dtg-storage-fjall",
+ "dtg-storage-neo4j",
+ "dtg-storage-postgres",
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

@@ -135,7 +135,7 @@ async fn four_role_composition_uses_only_clean_break_process_contracts() {
         .unwrap();
     assert!(start.get() > 0);
 
-    let controller = dtg_controller::ControllerProcess::open(
+    let controller = dtg_controller::ControllerProcess::open_for_test(
         ControllerConfig::for_test(root.path().join("controller"), 9001, 2).unwrap(),
         CatalogState::new(),
     )

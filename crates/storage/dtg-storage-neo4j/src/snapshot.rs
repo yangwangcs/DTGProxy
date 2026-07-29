@@ -81,6 +81,7 @@ const ACTIVE_SNAPSHOT_PUBLISH_QUERY: &str = "MATCH (owner:DtgOwner {
 const ACTIVATE_CANDIDATE_QUERY: &str = "MATCH (owner:DtgOwner {namespace_id: $namespace_id})
      CALL {
        WITH owner
+       WITH owner
        WHERE owner.backend_generation = $backend_generation
          AND owner.cluster_id = $cluster_id
          AND owner.graph_id = $graph_id
@@ -140,6 +141,7 @@ const ACTIVATE_CANDIDATE_QUERY: &str = "MATCH (owner:DtgOwner {namespace_id: $na
          activation.snapshot_content_digest AS snapshot_content_digest,
          activation.snapshot_format_version AS snapshot_format_version
        UNION
+       WITH owner
        WITH owner
        WHERE owner.backend_generation = $backend_generation
          AND owner.cluster_id = $cluster_id
@@ -661,11 +663,17 @@ async fn validate_staged_state_sets(
             "Neo4j staged snapshot record count mismatch".into(),
         ));
     }
-    for query in [
-        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id}) WHERE supplied.record_kind IN [1,2,3,4] WITH owner, supplied.payload AS payload, count(supplied) AS copies OPTIONAL MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8, payload:payload}) WHERE authenticated.mutation_kind IN [1,2,3,4] WITH copies, count(authenticated) AS actual WHERE copies <> actual RETURN count(*)",
-        "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8}) WHERE authenticated.mutation_kind IN [1,2,3,4] WITH owner, authenticated.payload AS payload, count(authenticated) AS copies OPTIONAL MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, payload:payload}) WHERE supplied.record_kind IN [1,2,3,4] WITH copies, count(supplied) AS actual WHERE copies <> actual RETURN count(*)",
+    for (query, name) in [
+        (
+            "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id}) WHERE supplied.record_kind IN [1,2,3,4] WITH owner, supplied.payload AS payload, count(supplied) AS copies OPTIONAL MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8, payload:payload}) WHERE authenticated.mutation_kind IN [1,2,3,4] WITH payload, copies, count(authenticated) AS actual WHERE copies <> actual RETURN payload, copies, actual LIMIT 1",
+            "graph history supplied-to-changes",
+        ),
+        (
+            "MATCH (owner:DtgOwner {namespace_id:$namespace_id, backend_generation:$backend_generation, binding_digest:$binding_digest}) MATCH (authenticated:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, record_kind:8}) WHERE authenticated.mutation_kind IN [1,2,3,4] WITH owner, authenticated.payload AS payload, count(authenticated) AS copies OPTIONAL MATCH (supplied:DtgSnapshotRecord {namespace_id:$namespace_id, backend_generation:$backend_generation, restore_id:$restore_id, payload:payload}) WHERE supplied.record_kind IN [1,2,3,4] WITH payload, copies, count(supplied) AS actual WHERE copies <> actual RETURN payload, copies, actual LIMIT 1",
+            "graph history changes-to-supplied",
+        ),
     ] {
-        require_zero_count(transaction, query, parameters.clone(), "graph history").await?;
+        require_no_rows(transaction, query, parameters.clone(), name).await?;
     }
     for (record_kind, mutation_kind_value, name) in [
         (5_i64, 5_i64, "transaction state"),
@@ -696,6 +704,23 @@ async fn validate_staged_state_sets(
     Ok(())
 }
 
+async fn require_no_rows(
+    transaction: &QueryApiTransaction,
+    query: &str,
+    parameters: serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<(), StorageError> {
+    let rows = transaction
+        .execute(query, Value::Object(parameters))
+        .await?;
+    if let Some(row) = rows.first() {
+        return Err(StorageError::CorruptSnapshot(format!(
+            "Neo4j staged {name} does not match authenticated changes: {row:?}"
+        )));
+    }
+    Ok(())
+}
+
 async fn require_zero_count(
     transaction: &QueryApiTransaction,
     query: &str,
@@ -714,7 +739,7 @@ async fn require_zero_count(
         })?;
     if count != 0 {
         return Err(StorageError::CorruptSnapshot(format!(
-            "Neo4j staged {name} does not match authenticated changes"
+            "Neo4j staged {name} does not match authenticated changes: {count} mismatched groups"
         )));
     }
     Ok(())

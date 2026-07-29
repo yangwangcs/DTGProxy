@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{collections::BTreeMap, ffi::OsString};
 
 use dtg_data::{
     CredentialProfile, DataNodeBuilder, DataProcessConfig, EndpointProfile, LifecycleState,
@@ -7,9 +8,11 @@ use dtg_execution::ProviderKind;
 use dtg_execution::cluster_protocol::PROTOCOL_MAJOR;
 use dtg_execution::cluster_protocol::checksum_bytes;
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
+use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayService as ClusterGatewayService;
 use dtg_execution::cluster_protocol::proto::{
-    BoundedPayload, ExecutionFragment, LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind,
-    RequestContext, ShardContext, StatusCode, TransactionOperation, TransactionRequest,
+    BoundedPayload, ExecutionFragment, GatewayRequest, LogicalReplicaSnapshot, RaftEnvelope,
+    RaftMessageKind, RequestContext, ShardContext, StatusCode, TransactionOperation,
+    TransactionRequest,
 };
 use dtg_execution::shard::{CommitSingleShard, ShardCommand};
 use dtg_execution::storage::{
@@ -56,6 +59,40 @@ fn fjall_binding(namespace: &str) -> ReplicaBinding {
         .role(BindingRole::Active)
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn environment_bootstrap_assignments_start_a_fenced_replica() {
+    let root = tempfile::tempdir().unwrap();
+    let values = BTreeMap::from([
+        (
+            "DTG_DATA_FJALL_ROOT",
+            root.path().join("business").into_os_string(),
+        ),
+        (
+            "DTG_DATA_CONSENSUS_ROOT",
+            root.path().join("raft").into_os_string(),
+        ),
+        ("DTG_DATA_RPC_ADDR", OsString::from("127.0.0.1:0")),
+        (
+            "DTG_DATA_CAPABILITIES",
+            OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
+        ),
+        (
+            "DTG_DATA_ASSIGNMENTS",
+            OsString::from("7:11:13:17:19:23:fjall:1:1:environment-bootstrap"),
+        ),
+    ]);
+    let config = DataProcessConfig::from_environment(|name| values.get(name).cloned()).unwrap();
+    let node = DataNodeBuilder::from_config(config).start().await.unwrap();
+
+    let observed = node.observed_replicas().await;
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].cluster_id().get(), 7);
+    assert_eq!(observed[0].graph_id().get(), 11);
+    assert_eq!(observed[0].shard_id().get(), 13);
+    assert_eq!(observed[0].provider_kind(), &ProviderKind::Fjall);
+    assert_eq!(observed[0].namespace_id().as_str(), "environment-bootstrap");
 }
 
 fn shard_context(binding: &ReplicaBinding) -> ShardContext {
@@ -302,6 +339,114 @@ async fn execute_fragment_reads_the_fenced_replica_store() {
 
     assert_eq!(batch.row_count, 1);
     assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn gateway_v2_rpc_executes_a_real_fenced_fragment() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("gateway-v2-fragment");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let vertex = VertexVersion::new(
+        VertexId::new(37).unwrap(),
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(41).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(63).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .unwrap(),
+    );
+    let command_body = command.encode_current().unwrap();
+    node.rpc_service()
+        .apply_transaction(Request::new(TransactionRequest {
+            context: Some(shard_context(&binding)),
+            transaction_id: 67_u128.to_be_bytes().to_vec(),
+            operation: TransactionOperation::Commit.into(),
+            idempotency_key: 63_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: command_body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&command_body).to_vec(),
+                body: command_body,
+            }),
+        }))
+        .await
+        .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let fragment_body = scan_fragment_body();
+    let execution_body = vec![1, 0, 0, 0, 0, 0, 0];
+    let mut stream = ClusterGatewayService::execute(
+        &node.rpc_service(),
+        Request::new(GatewayRequest {
+            request: Some(shard_context(&binding).request.unwrap()),
+            execution_request: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: execution_body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&execution_body).to_vec(),
+                body: execution_body,
+            }),
+            fragments: vec![ExecutionFragment {
+                context: Some(shard_context(&binding)),
+                fragment_id: 71_u128.to_be_bytes().to_vec(),
+                payload: Some(BoundedPayload {
+                    format_version: 1,
+                    declared_len: fragment_body.len() as u64,
+                    item_count: 1,
+                    checksum: checksum_bytes(&fragment_body).to_vec(),
+                    body: fragment_body,
+                }),
+                schema_version: 31,
+                capability_digest: binding.capability_digest().get().to_vec(),
+                applied_index,
+                transaction_time: 41,
+                valid_at: 10,
+                snapshot_immutable: true,
+            }],
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let response = stream.next().await.unwrap().unwrap();
+
+    assert_eq!(response.status.unwrap().code, StatusCode::Ok as i32);
+    assert_eq!(response.batch.unwrap().row_count, 1);
+    assert!(stream.next().await.is_none());
+}
+
+fn scan_fragment_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u64.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.push(1);
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.push(1);
+    body.extend_from_slice(&10_i64.to_be_bytes());
+    body.extend_from_slice(&41_i64.to_be_bytes());
+    body.push(0);
+    body.extend_from_slice(&10_u32.to_be_bytes());
+    body.push(0x1f);
+    body.push(0);
+    body
 }
 
 #[tokio::test]

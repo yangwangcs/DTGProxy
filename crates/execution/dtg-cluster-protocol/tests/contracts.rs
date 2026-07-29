@@ -2,8 +2,8 @@ use dtg_cluster_v2::{
     MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_FRAGMENT_BYTES, MAX_STATUS_MESSAGE_BYTES, PROTOCOL_MAJOR,
     SUPPORTED_MINOR_MAX, SUPPORTED_MINOR_MIN, ShardRequestContext, checksum_bytes,
     decode_request_context, proto, validate_column_batch, validate_control_observation,
-    validate_execution_fragment, validate_raft_envelope, validate_replica_snapshot,
-    validate_transaction_request, validate_typed_status,
+    validate_execution_fragment, validate_gateway_request, validate_raft_envelope,
+    validate_replica_snapshot, validate_transaction_request, validate_typed_status,
 };
 use prost::Message;
 
@@ -136,6 +136,9 @@ fn declared_length_and_checksum_must_match_exactly() {
 
 #[test]
 fn all_bounded_v2_message_families_validate() {
+    let gateway = validate_gateway_request(valid_gateway_request()).unwrap();
+    assert_eq!(gateway.execution().len(), 3);
+    assert_eq!(gateway.fragments().len(), 1);
     assert_eq!(
         validate_execution_fragment(valid_fragment()).unwrap().len(),
         3
@@ -165,6 +168,17 @@ fn all_bounded_v2_message_families_validate() {
             .unwrap()
             .len(),
         3
+    );
+}
+
+#[test]
+fn gateway_request_fails_closed_when_its_execution_envelope_is_tampered() {
+    let mut request = valid_gateway_request();
+    request.execution_request.as_mut().unwrap().checksum[0] ^= 1;
+
+    assert_eq!(
+        validate_gateway_request(request).unwrap_err().code(),
+        "DTG-PROTOCOL-CHECKSUM"
     );
 }
 
@@ -298,6 +312,14 @@ fn valid_fragment() -> proto::ExecutionFragment {
         transaction_time: 29,
         valid_at: 31,
         snapshot_immutable: true,
+    }
+}
+
+fn valid_gateway_request() -> proto::GatewayRequest {
+    proto::GatewayRequest {
+        request: Some(valid_request_context()),
+        execution_request: Some(payload(b"abc", 1)),
+        fragments: vec![valid_fragment()],
     }
 }
 

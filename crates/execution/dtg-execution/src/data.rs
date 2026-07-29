@@ -449,9 +449,7 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
     if cursor.u32()? == 0 {
         return Err(data_error("physical fragment has no storage access"));
     }
-    if cursor.u32()? == 0 {
-        return Err(data_error("physical storage access node is zero"));
-    }
+    cursor.u32()?;
     match cursor.u8()? {
         0 => match cursor.u8()? {
             0 => Ok(FragmentRead::VertexPoint(

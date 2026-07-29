@@ -11,6 +11,8 @@ pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_BATCH_ROWS: u32 = 65_536;
 pub const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TRANSACTION_ITEMS: u32 = 4_096;
+pub const MAX_GATEWAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_GATEWAY_FRAGMENTS: usize = 4_096;
 pub const MAX_RAFT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_CHUNKS: u32 = 4_096;
@@ -136,6 +138,22 @@ pub struct ValidatedStatus {
     details: Option<ValidatedPayload>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedGatewayRequest {
+    execution: ValidatedPayload,
+    fragments: Vec<ValidatedPayload>,
+}
+
+impl ValidatedGatewayRequest {
+    pub const fn execution(&self) -> &ValidatedPayload {
+        &self.execution
+    }
+
+    pub fn fragments(&self) -> &[ValidatedPayload] {
+        &self.fragments
+    }
+}
+
 impl ValidatedStatus {
     pub const fn details(&self) -> Option<&ValidatedPayload> {
         self.details.as_ref()
@@ -180,6 +198,37 @@ pub fn validate_execution_fragment(
         return Err(ProtocolError::MutableSnapshot);
     }
     validate_payload(wire.payload, MAX_FRAGMENT_BYTES, MAX_FRAGMENT_ITEMS)
+}
+
+pub fn validate_gateway_request(
+    wire: proto::GatewayRequest,
+) -> Result<ValidatedGatewayRequest, ProtocolError> {
+    let request = wire.request.ok_or(ProtocolError::MissingContext)?;
+    let _: RequestContext = request.clone().try_into()?;
+    let execution = validate_payload(
+        wire.execution_request,
+        MAX_GATEWAY_REQUEST_BYTES,
+        MAX_TRANSACTION_ITEMS,
+    )?;
+    if wire.fragments.len() > MAX_GATEWAY_FRAGMENTS {
+        return Err(ProtocolError::ItemLimit);
+    }
+    let mut fragments = Vec::with_capacity(wire.fragments.len());
+    for fragment in wire.fragments {
+        if fragment
+            .context
+            .as_ref()
+            .and_then(|context| context.request.as_ref())
+            != Some(&request)
+        {
+            return Err(ProtocolError::Malformed);
+        }
+        fragments.push(validate_execution_fragment(fragment)?);
+    }
+    Ok(ValidatedGatewayRequest {
+        execution,
+        fragments,
+    })
 }
 
 pub fn validate_column_batch(wire: proto::ColumnBatch) -> Result<ValidatedPayload, ProtocolError> {

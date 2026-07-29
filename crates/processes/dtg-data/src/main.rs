@@ -1,5 +1,6 @@
 use dtg_data::{DataNodeBuilder, DataProcessConfig};
 use dtg_execution::cluster_protocol::proto::data_service_server::DataServiceServer;
+use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayServiceServer;
 use tonic::transport::Server;
 
 #[tokio::main]
@@ -11,7 +12,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = service.clone();
 
     Server::builder()
-        .add_service(DataServiceServer::new(service))
+        .add_service(DataServiceServer::new(service.clone()))
+        .add_service(GatewayServiceServer::new(service))
         .serve_with_shutdown(rpc_addr, async move {
             let _ = tokio::signal::ctrl_c().await;
             shutdown.begin_draining();

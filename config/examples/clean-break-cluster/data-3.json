@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "cluster_id": 9001,
+  "node_id": 13,
+  "rpc_addr": "127.0.0.1:55106",
+  "fjall_root": "target/clean-break-cluster/data-3/business",
+  "consensus_root": "target/clean-break-cluster/data-3/raft",
+  "provider_classes": ["fjall", "postgresql", "neo4j", "remote"],
+  "shards": [1, 3]
+}

@@ -8,14 +8,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
+use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayService;
 use dtg_execution::cluster_protocol::proto::{
-    ColumnBatch, ExecutionFragment, LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind,
-    RetryDisposition, StatusCode, TransactionRequest, TypedStatus,
+    ColumnBatch, ExecutionFragment, GatewayRequest, GatewayResponse as GatewayWireResponse,
+    LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind, RetryDisposition, StatusCode,
+    TransactionRequest, TypedStatus,
 };
 use dtg_execution::cluster_protocol::{
     PROTOCOL_MAJOR, ProtocolError, ShardRequestContext, checksum_bytes,
-    validate_execution_fragment, validate_raft_envelope, validate_replica_snapshot,
-    validate_transaction_request,
+    validate_execution_fragment, validate_gateway_request, validate_raft_envelope,
+    validate_replica_snapshot, validate_transaction_request,
 };
 use dtg_execution::storage::{
     BackendClass, BindingRole, CapabilityManifest, ConsensusStore, StorageError,
@@ -669,6 +671,58 @@ impl DataRpcService {
         self.state.metrics.record_rpc_failure();
         Status::failed_precondition(error.to_string())
     }
+
+    async fn execute_fragment_wire(
+        &self,
+        wire: ExecutionFragment,
+    ) -> Result<Vec<ColumnBatch>, Status> {
+        let response_context = wire
+            .context
+            .as_ref()
+            .and_then(|context| context.request.clone());
+        let shard_context: ShardRequestContext = wire
+            .context
+            .clone()
+            .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
+            .try_into()
+            .map_err(|error| self.invalid(error))?;
+        let payload =
+            validate_execution_fragment(wire.clone()).map_err(|error| self.invalid(error))?;
+        let key = self
+            .execution
+            .locate_replica(
+                shard_context.request().cluster_id(),
+                shard_context.graph_id(),
+                shard_context.shard_id(),
+                shard_context.placement_epoch(),
+                shard_context.backend_generation(),
+                None,
+            )
+            .map_err(|error| self.execution_failure(error))?;
+        let observation = self
+            .execution
+            .replica_observation(key)
+            .map_err(|error| self.execution_failure(error))?;
+        if observation.binding().capability_digest().get().as_slice()
+            != wire.capability_digest.as_slice()
+        {
+            return Err(self.execution_failure("fragment capability digest drifted"));
+        }
+        let rows = self
+            .execution
+            .execute_fragment(
+                key,
+                wire.applied_index,
+                dtg_execution::storage::TransactionTime::new(wire.transaction_time)
+                    .map_err(|error| self.execution_failure(error))?,
+                wire.valid_at,
+                payload.body(),
+            )
+            .await
+            .map_err(|error| self.execution_failure(error))?;
+        encode_fragment_batches(response_context, wire.fragment_id, rows)
+            .map_err(|error| self.execution_failure(error))
+    }
 }
 
 fn encode_fragment_batches(
@@ -785,52 +839,7 @@ impl DataService for DataRpcService {
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
         self.begin_request()?;
         let wire = request.into_inner();
-        let response_context = wire
-            .context
-            .as_ref()
-            .and_then(|context| context.request.clone());
-        let shard_context: ShardRequestContext = wire
-            .context
-            .clone()
-            .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
-            .try_into()
-            .map_err(|error| self.invalid(error))?;
-        let payload =
-            validate_execution_fragment(wire.clone()).map_err(|error| self.invalid(error))?;
-        let key = self
-            .execution
-            .locate_replica(
-                shard_context.request().cluster_id(),
-                shard_context.graph_id(),
-                shard_context.shard_id(),
-                shard_context.placement_epoch(),
-                shard_context.backend_generation(),
-                None,
-            )
-            .map_err(|error| self.execution_failure(error))?;
-        let observation = self
-            .execution
-            .replica_observation(key)
-            .map_err(|error| self.execution_failure(error))?;
-        if observation.binding().capability_digest().get().as_slice()
-            != wire.capability_digest.as_slice()
-        {
-            return Err(self.execution_failure("fragment capability digest drifted"));
-        }
-        let rows = self
-            .execution
-            .execute_fragment(
-                key,
-                wire.applied_index,
-                dtg_execution::storage::TransactionTime::new(wire.transaction_time)
-                    .map_err(|error| self.execution_failure(error))?,
-                wire.valid_at,
-                payload.body(),
-            )
-            .await
-            .map_err(|error| self.execution_failure(error))?;
-        let batches = encode_fragment_batches(response_context, wire.fragment_id, rows)
-            .map_err(|error| self.execution_failure(error))?;
+        let batches = self.execute_fragment_wire(wire).await?;
         Ok(Response::new(Box::pin(tokio_stream::iter(
             batches.into_iter().map(Ok),
         ))))
@@ -981,5 +990,59 @@ impl DataService for DataRpcService {
             idempotency_key: wire.snapshot_id,
             details: None,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl GatewayService for DataRpcService {
+    type ExecuteStream =
+        Pin<Box<dyn Stream<Item = Result<GatewayWireResponse, Status>> + Send + 'static>>;
+
+    async fn execute(
+        &self,
+        request: Request<GatewayRequest>,
+    ) -> Result<Response<Self::ExecuteStream>, Status> {
+        self.begin_request()?;
+        let wire = request.into_inner();
+        let response_context = wire.request.clone();
+        let validated =
+            validate_gateway_request(wire.clone()).map_err(|error| self.invalid(error))?;
+        if validated.execution().body().first() != Some(&1) || wire.fragments.is_empty() {
+            return Err(Status::failed_precondition(
+                "Data GatewayService currently accepts only planned query fragments",
+            ));
+        }
+        let mut responses = Vec::new();
+        for fragment in wire.fragments {
+            for batch in self.execute_fragment_wire(fragment).await? {
+                responses.push(GatewayWireResponse {
+                    status: Some(TypedStatus {
+                        request: response_context.clone(),
+                        code: StatusCode::Ok.into(),
+                        retry: RetryDisposition::Never.into(),
+                        message: "query fragment executed".into(),
+                        idempotency_key: Vec::new(),
+                        details: None,
+                    }),
+                    batch: Some(batch),
+                });
+            }
+        }
+        if responses.is_empty() {
+            responses.push(GatewayWireResponse {
+                status: Some(TypedStatus {
+                    request: response_context,
+                    code: StatusCode::Ok.into(),
+                    retry: RetryDisposition::Never.into(),
+                    message: "query completed with zero rows".into(),
+                    idempotency_key: Vec::new(),
+                    details: None,
+                }),
+                batch: None,
+            });
+        }
+        Ok(Response::new(Box::pin(tokio_stream::iter(
+            responses.into_iter().map(Ok),
+        ))))
     }
 }

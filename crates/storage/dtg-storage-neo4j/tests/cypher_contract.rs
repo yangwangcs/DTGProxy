@@ -55,6 +55,18 @@ fn candidate_restore_and_activation_are_owner_fenced_atomic_and_exact() {
     assert!(source.contains("owner.binding_digest = $active_binding_digest"));
     assert!(source.contains("DtgSnapshotActivation"));
     assert!(source.contains("LogicalReplicaActivationReceipt::new"));
+    assert_eq!(
+        source
+            .matches("WITH owner\n       WITH owner\n       WHERE owner.backend_generation")
+            .count(),
+        2,
+        "each UNION branch must separate subquery import from its filtered WITH clause"
+    );
+    assert_eq!(
+        source.matches("WITH payload, copies, count(").count(),
+        2,
+        "both graph-history set comparisons must preserve payload as an aggregation key"
+    );
     assert!(source.contains("read_applied_index(&client, store.binding_ref()).await?"));
     assert!(source.contains("Neo4j snapshot abort lost its owner fence"));
     assert!(!source.contains("CanonicalKv"));
