@@ -11,12 +11,12 @@ use dtg_storage::{
 
 use crate::ShardError;
 
-pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 1;
-pub const SUPPORTED_TRANSACTION_INTENT_VERSION: u32 = 2;
+pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 2;
+pub const SUPPORTED_TRANSACTION_INTENT_VERSION: u32 = 3;
 
-pub const TRANSACTION_INTENT_METADATA_NAME: &str = "dtg.transaction_intent.v2";
+pub const TRANSACTION_INTENT_METADATA_NAME: &str = "dtg.transaction_intent.v3";
 const MAX_TRANSACTION_INTENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TRANSACTION_INTENT_ITEMS: usize = 4_096;
+pub(crate) const MAX_TRANSACTION_INTENT_ITEMS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandHeader {
@@ -90,10 +90,79 @@ impl CommitSingleShard {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitSingleShardTransaction {
+    header: CommandHeader,
+    transaction_id: TransactionId,
+    start_time: TransactionTime,
+    snapshot_applied_index: u64,
+    request_digest: Digest32,
+    mutations: Vec<LogicalMutation>,
+}
+
+impl CommitSingleShardTransaction {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        transaction_id: TransactionId,
+        start_time: TransactionTime,
+        snapshot_applied_index: u64,
+        request_digest: Digest32,
+        mutations: Vec<LogicalMutation>,
+    ) -> Result<Self, ShardError> {
+        let command = Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            transaction_id,
+            start_time,
+            snapshot_applied_index,
+            request_digest,
+            mutations,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    pub const fn start_time(&self) -> TransactionTime {
+        self.start_time
+    }
+
+    pub const fn snapshot_applied_index(&self) -> u64 {
+        self.snapshot_applied_index
+    }
+
+    pub const fn request_digest(&self) -> Digest32 {
+        self.request_digest
+    }
+
+    pub fn mutations(&self) -> &[LogicalMutation] {
+        &self.mutations
+    }
+
+    fn validate(&self) -> Result<(), ShardError> {
+        validate_intent_mutations(&self.mutations)?;
+        validate_commit_follows_start(
+            self.start_time,
+            &self.mutations,
+            "single-Shard transaction commit time must follow its start time",
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParticipantIntent {
     transaction_id: TransactionId,
     shard_id: ShardId,
     start_time: TransactionTime,
+    snapshot_applied_index: u64,
     mutations: Vec<LogicalMutation>,
 }
 
@@ -102,6 +171,7 @@ impl ParticipantIntent {
         transaction_id: TransactionId,
         shard_id: ShardId,
         start_time: TransactionTime,
+        snapshot_applied_index: u64,
         mutations: Vec<LogicalMutation>,
     ) -> Result<Self, ShardError> {
         validate_intent_mutations(&mutations)?;
@@ -109,6 +179,7 @@ impl ParticipantIntent {
             transaction_id,
             shard_id,
             start_time,
+            snapshot_applied_index,
             mutations,
         };
         intent.encode_current()?;
@@ -127,6 +198,10 @@ impl ParticipantIntent {
         self.start_time
     }
 
+    pub const fn snapshot_applied_index(&self) -> u64 {
+        self.snapshot_applied_index
+    }
+
     pub fn mutations(&self) -> &[LogicalMutation] {
         &self.mutations
     }
@@ -136,7 +211,7 @@ impl ParticipantIntent {
             .encode_current()
             .expect("validated participant intent remains encodable");
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"dtg-transaction-participant-intent-v2");
+        hasher.update(b"dtg-transaction-participant-intent-v3");
         hasher.update(&encoded);
         Digest32::new(*hasher.finalize().as_bytes())
     }
@@ -148,6 +223,7 @@ impl ParticipantIntent {
         encoder.u128(self.transaction_id.get());
         encoder.u64(self.shard_id.get());
         encoder.i64(self.start_time.get());
+        encoder.u64(self.snapshot_applied_index);
         encoder.mutations(&self.mutations)?;
         let encoded = encoder.finish()?;
         if encoded.len() > MAX_TRANSACTION_INTENT_BYTES {
@@ -168,12 +244,19 @@ impl ParticipantIntent {
         let transaction_id = TransactionId::new(decoder.u128()?)?;
         let shard_id = ShardId::new(decoder.u64()?)?;
         let start_time = TransactionTime::new(decoder.i64()?)?;
+        let snapshot_applied_index = decoder.u64()?;
         let mutations = decoder.mutations_with_limit(
             MAX_TRANSACTION_INTENT_ITEMS,
             "transaction intent mutation count is outside the supported bounds",
         )?;
         decoder.finish()?;
-        Self::new(transaction_id, shard_id, start_time, mutations)
+        Self::new(
+            transaction_id,
+            shard_id,
+            start_time,
+            snapshot_applied_index,
+            mutations,
+        )
     }
 
     fn metadata(&self) -> Result<ReplicaMetadata, ShardError> {
@@ -466,6 +549,7 @@ impl MigrationCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShardCommand {
     CommitSingleShard(CommitSingleShard),
+    CommitSingleShardTransaction(CommitSingleShardTransaction),
     PrewriteIntent(PrewriteIntent),
     RecordHomeDecision(RecordHomeDecision),
     FinalizeParticipant(FinalizeParticipant),
@@ -478,6 +562,7 @@ impl ShardCommand {
     pub const fn header(&self) -> CommandHeader {
         match self {
             Self::CommitSingleShard(command) => command.header(),
+            Self::CommitSingleShardTransaction(command) => command.header(),
             Self::PrewriteIntent(command) => command.header(),
             Self::RecordHomeDecision(command) => command.header(),
             Self::FinalizeParticipant(command) => command.header(),
@@ -491,6 +576,10 @@ impl ShardCommand {
         match self {
             Self::CommitSingleShard(command) => {
                 validate_single_shard_mutations(&command.mutations)?;
+                Ok(command.mutations.clone())
+            }
+            Self::CommitSingleShardTransaction(command) => {
+                command.validate()?;
                 Ok(command.mutations.clone())
             }
             Self::PrewriteIntent(command) => command.mutations(),
@@ -540,6 +629,7 @@ impl ShardCommand {
             Self::CommitSingleShard(command) => {
                 validate_single_shard_mutations(command.mutations())?
             }
+            Self::CommitSingleShardTransaction(command) => command.validate()?,
             Self::PrewriteIntent(command) => command.validate()?,
             Self::RecordHomeDecision(command) => validate_home_decision(command.mutations())?,
             Self::FinalizeParticipant(command) => command.validate()?,
@@ -551,6 +641,15 @@ impl ShardCommand {
             Self::CommitSingleShard(command) => {
                 encoder.u8(1);
                 encoder.header(command.header());
+                encoder.mutations(command.mutations())?;
+            }
+            Self::CommitSingleShardTransaction(command) => {
+                encoder.u8(8);
+                encoder.header(command.header());
+                encoder.u128(command.transaction_id().get());
+                encoder.i64(command.start_time().get());
+                encoder.u64(command.snapshot_applied_index());
+                encoder.bytes(&command.request_digest().get())?;
                 encoder.mutations(command.mutations())?;
             }
             Self::PrewriteIntent(command) => {
@@ -613,6 +712,14 @@ impl ShardCommand {
                 header,
                 mutations: decoder.mutations()?,
             }),
+            8 => Self::CommitSingleShardTransaction(CommitSingleShardTransaction {
+                header,
+                transaction_id: TransactionId::new(decoder.u128()?)?,
+                start_time: TransactionTime::new(decoder.i64()?)?,
+                snapshot_applied_index: decoder.u64()?,
+                request_digest: Digest32::new(decoder.fixed_32()?),
+                mutations: decoder.mutations()?,
+            }),
             2 => Self::PrewriteIntent(PrewriteIntent {
                 header,
                 prepared: decoder.transaction()?,
@@ -662,6 +769,10 @@ impl ShardCommand {
         if matches!(
             &command,
             Self::CommitSingleShard(CommitSingleShard { mutations, .. })
+                | Self::CommitSingleShardTransaction(CommitSingleShardTransaction {
+                    mutations,
+                    ..
+                })
                 | Self::RecordHomeDecision(RecordHomeDecision { mutations, .. })
                 if mutations.is_empty()
         ) {
@@ -716,6 +827,18 @@ fn validate_intent_mutations(mutations: &[LogicalMutation]) -> Result<(), ShardE
         ));
     }
     Ok(())
+}
+
+fn validate_commit_follows_start(
+    start_time: TransactionTime,
+    mutations: &[LogicalMutation],
+    message: &'static str,
+) -> Result<(), ShardError> {
+    if mutation_transaction_time(&mutations[0]) <= start_time {
+        Err(invalid_command_shape(message))
+    } else {
+        Ok(())
+    }
 }
 
 fn mutation_transaction_time(mutation: &LogicalMutation) -> TransactionTime {

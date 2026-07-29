@@ -9,12 +9,14 @@ use dtg_shard::{
     ShardStateMachine,
 };
 use dtg_storage::{
-    ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, CommandId, CommittedShardBatch,
-    ConsensusCommandEnvelope, ConsensusEntry, ConsensusSnapshotMetadata, ConsensusStore, Digest32,
-    LogicalMutation, Properties, ProviderKind, RaftHardState, RaftMembership, ReadFence,
-    ReplicaBinding, ReplicaId, ReplicaStateStore, SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION,
-    SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, StorageError, StoreFuture, TemporalReadView,
-    TransactionTime, ValidInterval, Version, VertexId, VertexVersion,
+    AdjacencyRead, ApplyReceipt, BackendClass, BindingRole, CapabilityManifest, ChangePage,
+    ChangesRead, CommandId, CommittedShardBatch, ConsensusCommandEnvelope, ConsensusEntry,
+    ConsensusSnapshotMetadata, ConsensusStore, Digest32, EdgeHistoryRead, EdgeId, EdgeRead,
+    EdgeScan, EdgeVersion, LogicalMutation, Properties, ProviderKind, RaftHardState,
+    RaftMembership, ReadFence, ReplicaBinding, ReplicaId, ReplicaStateStore,
+    SUPPORTED_CONSENSUS_COMMAND_FORMAT_VERSION, SUPPORTED_CONSENSUS_WAL_FORMAT_VERSION, ScanPage,
+    StorageError, StoreFuture, TemporalReadView, TransactionTime, ValidInterval, Version,
+    VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexVersion,
 };
 use dtg_storage_fjall::{FjallConsensusStore, FjallReplicaStore};
 use raft::Storage;
@@ -469,7 +471,7 @@ fn host_rejects_heterogeneous_replicas_in_one_generation() {
 fn unknown_command_versions_fail_closed() {
     let command = committed_vertex_command(1, 7, 10);
     let mut encoded = command.encode_current().unwrap();
-    encoded[..4].copy_from_slice(&2_u32.to_be_bytes());
+    encoded[..4].copy_from_slice(&3_u32.to_be_bytes());
     let error = ShardCommand::decode(&encoded).unwrap_err();
     assert_eq!(error.code(), "DTG-SHARD-COMMAND-VERSION");
 }
@@ -633,6 +635,10 @@ struct ToggleStateStore<S> {
     failing: AtomicBool,
 }
 
+struct RecordingReadView {
+    fence: ReadFence,
+}
+
 impl<S> ToggleStateStore<S> {
     fn new(inner: Arc<S>) -> Self {
         Self {
@@ -742,7 +748,50 @@ impl ReplicaStateStore for RecordingStateStore {
         })
     }
 
-    fn begin_read_view(&self, _fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+    fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
+        Box::pin(
+            async move { Ok(Box::new(RecordingReadView { fence }) as Box<dyn TemporalReadView>) },
+        )
+    }
+}
+
+impl TemporalReadView for RecordingReadView {
+    fn fence(&self) -> &ReadFence {
+        &self.fence
+    }
+
+    fn get_vertex(&self, _request: VertexRead) -> StoreFuture<'_, Option<VertexVersion>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn get_edge(&self, _request: EdgeRead) -> StoreFuture<'_, Option<EdgeVersion>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn vertex_history(&self, _request: VertexHistoryRead) -> StoreFuture<'_, Vec<VertexVersion>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn edge_history(&self, _request: EdgeHistoryRead) -> StoreFuture<'_, Vec<EdgeVersion>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn expand(&self, _request: AdjacencyRead) -> StoreFuture<'_, Vec<EdgeVersion>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn changes(&self, _request: ChangesRead) -> StoreFuture<'_, ChangePage> {
+        Box::pin(async { Ok(ChangePage::new(Vec::new(), None)) })
+    }
+
+    fn scan_vertices(
+        &self,
+        _request: VertexScan,
+    ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>> {
+        Box::pin(async { Ok(ScanPage::new(Vec::new(), None)) })
+    }
+
+    fn scan_edges(&self, _request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion, EdgeId>> {
+        Box::pin(async { Ok(ScanPage::new(Vec::new(), None)) })
     }
 }

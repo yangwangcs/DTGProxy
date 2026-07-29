@@ -312,6 +312,75 @@ fn base_and_staged_histories_allow_disjoint_intervals_per_identity() {
 }
 
 #[test]
+fn combined_base_and_staged_histories_reject_overlap_and_reused_versions() {
+    let overlapping_vertex_base =
+        BaseGraphSnapshot::new(vec![vertex(1, 1, 0, 100, "base")], Vec::new()).unwrap();
+    let mut overlapping_vertex = TransactionOverlay::new();
+    overlapping_vertex
+        .stage(LogicalMutation::PutVertex(vertex(1, 2, 50, 150, "staged")))
+        .unwrap();
+    assert_eq!(
+        overlapping_vertex.validate(&overlapping_vertex_base),
+        Err(TxnError::DuplicateIdentity)
+    );
+
+    let mut reused_vertex_version = TransactionOverlay::new();
+    reused_vertex_version
+        .stage(LogicalMutation::PutVertex(vertex(1, 7, 0, 50, "first")))
+        .unwrap();
+    reused_vertex_version
+        .stage(LogicalMutation::PutVertex(vertex(1, 7, 50, 100, "second")))
+        .unwrap();
+    assert_eq!(
+        reused_vertex_version.validate(&BaseGraphSnapshot::default()),
+        Err(TxnError::DuplicateIdentity)
+    );
+
+    let edge_base = BaseGraphSnapshot::new(
+        vec![
+            vertex(1, 1, 0, 200, "source"),
+            vertex(2, 1, 0, 200, "target"),
+        ],
+        vec![edge_interval_version(9, 1, 2, 1, 0, 100)],
+    )
+    .unwrap();
+    let mut overlapping_edge = TransactionOverlay::new();
+    overlapping_edge
+        .stage(LogicalMutation::PutEdge(edge_interval_version(
+            9, 1, 2, 2, 50, 150,
+        )))
+        .unwrap();
+    assert_eq!(
+        overlapping_edge.validate(&edge_base),
+        Err(TxnError::DuplicateIdentity)
+    );
+
+    let staged_vertices = BaseGraphSnapshot::new(
+        vec![
+            vertex(1, 1, 0, 200, "source"),
+            vertex(2, 1, 0, 200, "target"),
+        ],
+        Vec::new(),
+    )
+    .unwrap();
+    let mut reused_edge_version = TransactionOverlay::new();
+    reused_edge_version
+        .stage(LogicalMutation::PutEdge(edge_interval_version(
+            9, 1, 2, 7, 0, 50,
+        )))
+        .unwrap();
+    reused_edge_version
+        .stage(LogicalMutation::PutEdge(edge_interval_version(
+            9, 1, 2, 7, 50, 100,
+        )))
+        .unwrap();
+    assert_eq!(
+        reused_edge_version.validate(&staged_vertices),
+        Err(TxnError::DuplicateIdentity)
+    );
+}
+
+#[test]
 fn edge_endpoints_must_cover_the_complete_edge_interval() {
     let base = BaseGraphSnapshot::new(
         vec![
@@ -327,4 +396,25 @@ fn edge_endpoints_must_cover_the_complete_edge_interval() {
         .unwrap();
 
     assert_eq!(overlay.validate(&base), Err(TxnError::ReferentialIntegrity));
+}
+
+fn edge_interval_version(
+    id: u128,
+    source: u128,
+    target: u128,
+    version: u64,
+    start: i64,
+    end: i64,
+) -> EdgeVersion {
+    EdgeVersion::new(
+        EdgeId::new(id).unwrap(),
+        VertexId::new(source).unwrap(),
+        VertexId::new(target).unwrap(),
+        "knows",
+        Version::new(version),
+        ValidInterval::new(start, end).unwrap(),
+        transaction_time(40),
+        Properties::new(),
+    )
+    .unwrap()
 }

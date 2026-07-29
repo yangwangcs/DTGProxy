@@ -9,7 +9,7 @@ use dtg_storage::{
 
 use crate::{
     BaseGraphSnapshot, ParticipantService, ParticipantWrite, ShardRequest, ShardRequestHeader,
-    ShardSnapshotFence, SnapshotToken, TransactionOverlay, TxnError, TxnFuture,
+    ShardSnapshotFence, SnapshotToken, SubmissionFailure, TransactionOverlay, TxnError, TxnFuture,
     conflict::detect_mutation_conflicts,
 };
 
@@ -161,6 +161,15 @@ impl TemporalTxnCoordinator {
             }) {
                 return Ok(TransactionOutcome::Aborted);
             }
+            if participants.len() == 1
+                && let Some(reservation) = existing_reservation
+                && reservation.resolution() == Some(CommitResolution::Committed)
+            {
+                if reservation.commit_time() <= context.snapshot.start_time {
+                    return Err(TxnError::CorruptRecovery);
+                }
+                return Ok(TransactionOutcome::Committed(reservation.commit_time()));
+            }
             let existing_commit_time =
                 existing_reservation.map(|reservation| reservation.commit_time());
 
@@ -229,11 +238,34 @@ impl TemporalTxnCoordinator {
                         fence.placement_epoch,
                         fence.backend_generation,
                     ),
+                    transaction_id: context.snapshot.transaction_id,
+                    start_time: context.snapshot.start_time,
+                    snapshot_applied_index: fence.applied_index,
                     mutations: stamp_mutations(participant.mutations(), commit_time)?,
                 };
-                self.participants
+                match self
+                    .participants
                     .submit(participant.shard_id(), request)
-                    .await?;
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(SubmissionFailure::Definitive(error)) => {
+                        if self
+                            .timestamps
+                            .resolve_commit_time(
+                                context.snapshot.transaction_id,
+                                commit_time,
+                                CommitResolution::Aborted,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return Ok(TransactionOutcome::Unresolved);
+                        }
+                        return Err(error);
+                    }
+                    Err(SubmissionFailure::Ambiguous(error)) => return Err(error),
+                }
                 self.timestamps
                     .resolve_commit_time(
                         context.snapshot.transaction_id,
@@ -260,6 +292,7 @@ impl TemporalTxnCoordinator {
                     ),
                     transaction_id: context.snapshot.transaction_id,
                     start_time: context.snapshot.start_time,
+                    snapshot_applied_index: fence.applied_index,
                     mutations: mutations.clone(),
                 };
                 let receipt = match self
@@ -299,7 +332,10 @@ impl TemporalTxnCoordinator {
                 ),
                 decision,
             };
-            self.participants.submit(home, request).await?;
+            self.participants
+                .submit(home, request)
+                .await
+                .map_err(SubmissionFailure::into_error)?;
 
             for (participant, mutations, intent_digest) in intents {
                 let fence = context.snapshot.shards[&participant.shard_id()];
@@ -315,13 +351,15 @@ impl TemporalTxnCoordinator {
                     ),
                     transaction_id: context.snapshot.transaction_id,
                     start_time: context.snapshot.start_time,
+                    snapshot_applied_index: fence.applied_index,
                     commit_time,
                     intent_digest,
                     mutations,
                 };
                 self.participants
                     .submit(participant.shard_id(), request)
-                    .await?;
+                    .await
+                    .map_err(SubmissionFailure::into_error)?;
             }
 
             self.timestamps
@@ -362,6 +400,7 @@ impl TemporalTxnCoordinator {
                     ),
                     transaction_id: context.snapshot.transaction_id,
                     start_time: context.snapshot.start_time,
+                    snapshot_applied_index: fence.applied_index,
                     mutations,
                 };
                 let receipt = match self
@@ -399,7 +438,10 @@ impl TemporalTxnCoordinator {
                 ),
                 decision,
             };
-            self.participants.submit(home, request).await?;
+            self.participants
+                .submit(home, request)
+                .await
+                .map_err(SubmissionFailure::into_error)?;
 
             for (shard_id, intent_digest) in intents {
                 let fence = context.snapshot.shards[&shard_id];
@@ -417,7 +459,10 @@ impl TemporalTxnCoordinator {
                     ),
                     terminal,
                 };
-                self.participants.submit(shard_id, request).await?;
+                self.participants
+                    .submit(shard_id, request)
+                    .await
+                    .map_err(SubmissionFailure::into_error)?;
             }
             Ok(TransactionOutcome::Aborted)
         })

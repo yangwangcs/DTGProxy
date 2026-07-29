@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_shard::{
-    CommitSingleShard, FinalizeParticipant, ParticipantIntent, PrewriteIntent, RecordHomeDecision,
-    ShardCommand as PhysicalShardCommand, ShardStateMachine,
+    CommitSingleShardTransaction, FinalizeParticipant, ParticipantIntent, PrewriteIntent,
+    RecordHomeDecision, ShardCommand as PhysicalShardCommand, ShardError, ShardStateMachine,
+    decode_single_shard_transaction_metadata,
 };
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, ChangesRead, ProviderKind, ReadFence,
@@ -15,11 +16,12 @@ use dtg_storage::{
 use dtg_storage_fjall::FjallReplicaStore;
 use dtg_transaction::{
     BackendGeneration, ChangeCursor, ChangeRecord, CommitResolution, CommitTimeReservation,
-    LogicalMutation, ParticipantWrite, PlacementEpoch, RecoveredParticipantIntent, ReplicaMetadata,
-    ShardCommandExecutor, ShardId, ShardRequest, ShardSnapshotFence, SnapshotToken,
-    SubmissionReceipt, TemporalTxnCoordinator, TimestampAuthority, TransactionContext,
-    TransactionHistory, TransactionId, TransactionOutcome, TransactionRecord, TransactionState,
-    TransactionTime, TxnError, TxnFuture, ValidInterval, Value, Version, VertexId, VertexVersion,
+    LogicalMutation, ParticipantWrite, PlacementEpoch, RecoveredParticipantIntent,
+    RecoveredSingleShardCommit, ReplicaMetadata, ShardCommandExecutor, ShardId, ShardRequest,
+    ShardSnapshotFence, SnapshotToken, SubmissionFailure, SubmissionFuture, SubmissionReceipt,
+    TemporalTxnCoordinator, TimestampAuthority, TransactionContext, TransactionHistory,
+    TransactionId, TransactionOutcome, TransactionRecord, TransactionState, TransactionTime,
+    TxnError, TxnFuture, ValidInterval, Value, Version, VertexId, VertexVersion,
 };
 
 #[test]
@@ -42,7 +44,7 @@ fn single_shard_fast_path_uses_one_deterministic_command() {
     );
 
     let commands = shards.commands.lock().unwrap();
-    assert_eq!(commands.len(), 2);
+    assert_eq!(commands.len(), 1);
     assert!(
         commands
             .iter()
@@ -54,6 +56,165 @@ fn single_shard_fast_path_uses_one_deterministic_command() {
         .collect();
     assert_eq!(command_ids.len(), 1);
     assert_eq!(timestamps.published.lock().unwrap().as_slice(), &[50]);
+}
+
+#[test]
+fn resolved_single_shard_commit_is_terminal_before_new_conflict_checks() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(FakeShards::default());
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let mut context = context(&[7]);
+    let mutation = vertex_mutation(1);
+    context.stage(mutation.clone()).unwrap();
+    let participant = ParticipantWrite::new(ShardId::new(7).unwrap(), vec![mutation]).unwrap();
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, vec![participant.clone()])),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    shards.changes.lock().unwrap().insert(
+        ShardId::new(7).unwrap(),
+        vec![ChangeRecord::new(
+            ChangeCursor::new(2, 0),
+            LogicalMutation::PutVertex(
+                VertexVersion::new(
+                    VertexId::new(1).unwrap(),
+                    Version::new(2),
+                    ValidInterval::new(50, 150).unwrap(),
+                    transaction_time(60),
+                    Default::default(),
+                )
+                .unwrap(),
+            ),
+        )],
+    );
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, vec![participant])),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    assert_eq!(shards.commands.lock().unwrap().len(), 1);
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(
+            transaction_time(50),
+            Some(CommitResolution::Committed)
+        )))
+    );
+}
+
+#[test]
+fn definitive_single_shard_rejection_aborts_while_ambiguous_apply_replays() {
+    for definitive in [
+        TxnError::StalePlacementEpoch,
+        TxnError::StaleBackendGeneration,
+        TxnError::InvalidMutation,
+    ] {
+        let timestamps = Arc::new(FakeTimestamps::default());
+        let shards = Arc::new(ClassifiedFailureShards::definitive(definitive.clone()));
+        let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+        let mut context = context(&[7]);
+        let mutation = vertex_mutation(1);
+        context.stage(mutation.clone()).unwrap();
+        let participant = ParticipantWrite::new(ShardId::new(7).unwrap(), vec![mutation]).unwrap();
+
+        assert_eq!(
+            block_on(coordinator.commit(&context, vec![participant])),
+            Err(definitive)
+        );
+        assert_eq!(
+            block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+            Ok(Some(CommitTimeReservation::new(
+                transaction_time(50),
+                Some(CommitResolution::Aborted)
+            )))
+        );
+        assert_eq!(
+            block_on(coordinator.recover(&context)),
+            Ok(TransactionOutcome::Aborted)
+        );
+        assert_eq!(*shards.submit_count.lock().unwrap(), 1);
+    }
+
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(DurableShards::default());
+    shards.set_crash(CrashPoint::After(1));
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let mut context = context(&[7]);
+    let mutation = vertex_mutation(1);
+    context.stage(mutation.clone()).unwrap();
+    let participant = ParticipantWrite::new(ShardId::new(7).unwrap(), vec![mutation]).unwrap();
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, vec![participant])),
+        Err(TxnError::InjectedCrash)
+    );
+    assert_eq!(
+        block_on(timestamps.commit_time_reservation(context.snapshot().transaction_id)),
+        Ok(Some(CommitTimeReservation::new(transaction_time(50), None)))
+    );
+    shards.clear_crash();
+    assert_eq!(
+        block_on(coordinator.recover(&context)),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    assert_eq!(shards.graph_mutation_count(), 1);
+}
+
+#[test]
+fn durable_single_shard_receipt_at_start_time_fails_closed() {
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let shards = Arc::new(FakeShards::default());
+    let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+    let mut context = context(&[7]);
+    let mutation = vertex_mutation(1);
+    context.stage(mutation.clone()).unwrap();
+    let participant = ParticipantWrite::new(ShardId::new(7).unwrap(), vec![mutation]).unwrap();
+
+    assert_eq!(
+        block_on(coordinator.commit(&context, vec![participant])),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    let request = shards.commands.lock().unwrap()[0].1.clone();
+    let ShardRequest::CommitSingleShard {
+        header,
+        transaction_id,
+        start_time,
+        snapshot_applied_index,
+        ..
+    } = request
+    else {
+        unreachable!();
+    };
+    let corrupt_request = ShardRequest::CommitSingleShard {
+        header,
+        transaction_id,
+        start_time,
+        snapshot_applied_index,
+        mutations: vec![vertex_mutation(1)],
+    };
+    shards.histories.lock().unwrap().insert(
+        (ShardId::new(7).unwrap(), transaction_id.get()),
+        TransactionHistory::default().with_single_shard_commit(RecoveredSingleShardCommit::new(
+            header.command_id(),
+            transaction_id,
+            start_time,
+            snapshot_applied_index,
+            start_time,
+            corrupt_request.digest(),
+        )),
+    );
+    timestamps
+        .reserved
+        .lock()
+        .unwrap()
+        .insert(transaction_id.get(), (start_time.get(), None));
+
+    assert_eq!(
+        block_on(coordinator.recover(&context)),
+        Err(TxnError::CorruptRecovery)
+    );
+    assert_eq!(shards.commands.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -316,6 +477,63 @@ fn recovery_rejects_contradictory_or_corrupt_terminal_history_before_publication
             "case {terminal_case:?} must fail closed"
         );
         assert!(timestamps.published.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn abort_recovery_validates_reservation_authority_before_finalizing_participants() {
+    for authority in [
+        AbortAuthorityCase::Committed,
+        AbortAuthorityCase::CorruptPending,
+        AbortAuthorityCase::Unavailable,
+    ] {
+        let timestamps = Arc::new(FakeTimestamps::default());
+        let shards = Arc::new(DurableShards::default());
+        shards.crash_after(3);
+        let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+        let (context, participants) = two_shard_transaction();
+        assert_eq!(
+            block_on(coordinator.abort(&context, participants)),
+            Err(TxnError::InjectedCrash)
+        );
+        shards.clear_crash();
+
+        match authority {
+            AbortAuthorityCase::Committed => {
+                timestamps.reserved.lock().unwrap().insert(
+                    context.snapshot().transaction_id.get(),
+                    (50, Some(CommitResolution::Committed)),
+                );
+            }
+            AbortAuthorityCase::CorruptPending => {
+                timestamps
+                    .reserved
+                    .lock()
+                    .unwrap()
+                    .insert(context.snapshot().transaction_id.get(), (40, None));
+            }
+            AbortAuthorityCase::Unavailable => {
+                *timestamps.reservation_unavailable.lock().unwrap() = true;
+            }
+        }
+        let applied_before = shards.applied_commands.lock().unwrap().len();
+
+        let expected = match authority {
+            AbortAuthorityCase::Unavailable => Ok(TransactionOutcome::Unresolved),
+            AbortAuthorityCase::Committed | AbortAuthorityCase::CorruptPending => {
+                Err(TxnError::CorruptRecovery)
+            }
+        };
+        assert_eq!(
+            block_on(coordinator.recover(&context)),
+            expected,
+            "authority case {authority:?}"
+        );
+        assert_eq!(
+            shards.applied_commands.lock().unwrap().len(),
+            applied_before,
+            "authority case {authority:?} mutated participant history"
+        );
     }
 }
 
@@ -703,8 +921,131 @@ fn fjall_close_reopen_recovers_participant_intents_and_home_decision() {
     }
 }
 
+#[test]
+fn concurrent_prechecks_cannot_admit_two_overlapping_single_or_prepared_writers() {
+    let root = tempfile::tempdir().unwrap();
+    let bindings = BTreeMap::from([
+        (ShardId::new(3).unwrap(), fixture_binding(3, 4)),
+        (ShardId::new(9).unwrap(), fixture_binding(9, 10)),
+    ]);
+    let paths = BTreeMap::from([
+        (ShardId::new(3).unwrap(), root.path().join("shard-3")),
+        (ShardId::new(9).unwrap(), root.path().join("shard-9")),
+    ]);
+
+    let single_timestamps = Arc::new(FakeTimestamps::default());
+    let single_shards = Arc::new(BarrierShards::new(FjallShards::open(&paths, &bindings), 2));
+    let single = TemporalTxnCoordinator::new(single_timestamps, single_shards.clone());
+    let first = one_shard_transaction_with(TransactionId::new(301).unwrap(), 1, 1);
+    let second = one_shard_transaction_with(TransactionId::new(302).unwrap(), 1, 2);
+    let first_coordinator = single.clone();
+    let second_coordinator = single;
+    let first_thread =
+        std::thread::spawn(move || block_on(first_coordinator.commit(&first.0, first.1)));
+    let second_thread =
+        std::thread::spawn(move || block_on(second_coordinator.commit(&second.0, second.1)));
+    let single_outcomes = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+    assert_eq!(
+        single_outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(TransactionOutcome::Committed(_))))
+            .count(),
+        1
+    );
+    assert_eq!(single_shards.inner.graph_mutation_count(), 1);
+
+    let prepared_root = tempfile::tempdir().unwrap();
+    let prepared_paths = BTreeMap::from([
+        (
+            ShardId::new(3).unwrap(),
+            prepared_root.path().join("shard-3"),
+        ),
+        (
+            ShardId::new(9).unwrap(),
+            prepared_root.path().join("shard-9"),
+        ),
+    ]);
+    let prepared_timestamps = Arc::new(FakeTimestamps::default());
+    let prepared_shards = Arc::new(BarrierShards::new(
+        FjallShards::open(&prepared_paths, &bindings),
+        2,
+    ));
+    let prepared = TemporalTxnCoordinator::new(prepared_timestamps, prepared_shards.clone());
+    let first = two_shard_transaction_with(TransactionId::new(401).unwrap(), 7, 8);
+    let second = two_shard_transaction_with(TransactionId::new(402).unwrap(), 7, 9);
+    let first_coordinator = prepared.clone();
+    let second_coordinator = prepared;
+    let first_thread =
+        std::thread::spawn(move || block_on(first_coordinator.commit(&first.0, first.1)));
+    let second_thread =
+        std::thread::spawn(move || block_on(second_coordinator.commit(&second.0, second.1)));
+    let prepared_outcomes = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+    assert_eq!(
+        prepared_outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(TransactionOutcome::Committed(_))))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn fjall_single_shard_crash_after_apply_recovers_from_receipt_without_new_apply() {
+    let root = tempfile::tempdir().unwrap();
+    let shard_id = ShardId::new(3).unwrap();
+    let bindings = BTreeMap::from([(shard_id, fixture_binding(3, 4))]);
+    let paths = BTreeMap::from([(shard_id, root.path().join("shard-3"))]);
+    let timestamps = Arc::new(FakeTimestamps::default());
+    let (context, participants) =
+        one_shard_transaction_with(TransactionId::new(501).unwrap(), 11, 1);
+
+    {
+        let shards = Arc::new(FjallShards::open(&paths, &bindings));
+        shards.crash_after(1);
+        let coordinator = TemporalTxnCoordinator::new(timestamps.clone(), shards.clone());
+        assert_eq!(
+            block_on(coordinator.commit(&context, participants)),
+            Err(TxnError::InjectedCrash)
+        );
+        assert_eq!(shards.applied_index(shard_id), 1);
+        assert_eq!(shards.graph_mutation_count(), 1);
+    }
+
+    let reopened = Arc::new(FjallShards::open(&paths, &bindings));
+    let recovery = TemporalTxnCoordinator::new(timestamps.clone(), reopened.clone());
+    assert_eq!(
+        block_on(recovery.recover(&context)),
+        Ok(TransactionOutcome::Committed(transaction_time(50)))
+    );
+    assert_eq!(reopened.applied_index(shard_id), 1);
+    assert_eq!(reopened.graph_mutation_count(), 1);
+}
+
 fn two_shard_transaction() -> (TransactionContext, Vec<ParticipantWrite>) {
     two_shard_transaction_with(TransactionId::new(99).unwrap(), 1, 2)
+}
+
+fn one_shard_transaction_with(
+    transaction_id: TransactionId,
+    vertex_id: u128,
+    version: u64,
+) -> (TransactionContext, Vec<ParticipantWrite>) {
+    let mut context = context_with_transaction(&[3], transaction_id);
+    let mutation = LogicalMutation::PutVertex(
+        VertexVersion::new(
+            VertexId::new(vertex_id).unwrap(),
+            Version::new(version),
+            ValidInterval::new(0, 100).unwrap(),
+            transaction_time(40),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    context.stage(mutation.clone()).unwrap();
+    (
+        context,
+        vec![ParticipantWrite::new(ShardId::new(3).unwrap(), vec![mutation]).unwrap()],
+    )
 }
 
 fn two_shard_transaction_with(
@@ -777,6 +1118,7 @@ fn transaction_time(value: i64) -> TransactionTime {
 struct FakeTimestamps {
     published: Mutex<Vec<i64>>,
     publish_failure: Mutex<Option<PublishFailure>>,
+    reservation_unavailable: Mutex<bool>,
     reserved: Mutex<BTreeMap<u128, (i64, Option<CommitResolution>)>>,
 }
 
@@ -784,6 +1126,13 @@ struct FakeTimestamps {
 enum PublishFailure {
     Before,
     After,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AbortAuthorityCase {
+    Committed,
+    CorruptPending,
+    Unavailable,
 }
 
 impl FakeTimestamps {
@@ -831,6 +1180,9 @@ impl TimestampAuthority for FakeTimestamps {
         transaction_id: TransactionId,
     ) -> TxnFuture<'_, Option<CommitTimeReservation>> {
         Box::pin(async move {
+            if *self.reservation_unavailable.lock().unwrap() {
+                return Err(TxnError::InjectedCrash);
+            }
             Ok(self
                 .reserved
                 .lock()
@@ -900,12 +1252,53 @@ impl TimestampAuthority for FakeTimestamps {
 struct FakeShards {
     commands: Mutex<Vec<(ShardId, ShardRequest)>>,
     changes: Mutex<BTreeMap<ShardId, Vec<ChangeRecord>>>,
+    histories: Mutex<BTreeMap<(ShardId, u128), TransactionHistory>>,
+}
+
+struct ClassifiedFailureShards {
+    failure: TxnError,
+    submit_count: Mutex<usize>,
+}
+
+impl ClassifiedFailureShards {
+    fn definitive(failure: TxnError) -> Self {
+        Self {
+            failure,
+            submit_count: Mutex::new(0),
+        }
+    }
+}
+
+impl ShardCommandExecutor for ClassifiedFailureShards {
+    fn submit(&self, _shard_id: ShardId, _request: ShardRequest) -> SubmissionFuture<'_> {
+        Box::pin(async move {
+            *self.submit_count.lock().unwrap() += 1;
+            Err(SubmissionFailure::Definitive(self.failure.clone()))
+        })
+    }
+
+    fn changes_after(
+        &self,
+        _shard_id: ShardId,
+        _applied_index: u64,
+    ) -> TxnFuture<'_, Vec<ChangeRecord>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn transaction_history(
+        &self,
+        _shard_id: ShardId,
+        _transaction_id: TransactionId,
+    ) -> TxnFuture<'_, TransactionHistory> {
+        Box::pin(async { Ok(TransactionHistory::default()) })
+    }
 }
 
 impl ShardCommandExecutor for FakeShards {
-    fn submit(&self, shard_id: ShardId, request: ShardRequest) -> TxnFuture<'_, SubmissionReceipt> {
+    fn submit(&self, shard_id: ShardId, request: ShardRequest) -> SubmissionFuture<'_> {
         Box::pin(async move {
-            let (_, intent_digest) = map_request_to_shard(shard_id, &request)?;
+            let (_, intent_digest) =
+                map_request_to_shard(shard_id, &request).map_err(SubmissionFailure::Definitive)?;
             let mut commands = self.commands.lock().unwrap();
             commands.push((shard_id, request));
             Ok(match intent_digest {
@@ -933,10 +1326,18 @@ impl ShardCommandExecutor for FakeShards {
 
     fn transaction_history(
         &self,
-        _shard_id: ShardId,
-        _transaction_id: TransactionId,
+        shard_id: ShardId,
+        transaction_id: TransactionId,
     ) -> TxnFuture<'_, TransactionHistory> {
-        Box::pin(async { Ok(TransactionHistory::default()) })
+        Box::pin(async move {
+            Ok(self
+                .histories
+                .lock()
+                .unwrap()
+                .get(&(shard_id, transaction_id.get()))
+                .cloned()
+                .unwrap_or_default())
+        })
     }
 }
 
@@ -1091,7 +1492,7 @@ impl DurableShards {
                 let last = bytes.last_mut().unwrap();
                 *last ^= 1;
             }
-            IntentCorruption::UnknownVersion => bytes[..4].copy_from_slice(&3_u32.to_be_bytes()),
+            IntentCorruption::UnknownVersion => bytes[..4].copy_from_slice(&4_u32.to_be_bytes()),
             IntentCorruption::TrailingBytes => bytes.push(0),
             IntentCorruption::Oversized => bytes.resize(4 * 1024 * 1024 + 1, 0),
         }
@@ -1144,7 +1545,7 @@ impl DurableShards {
 }
 
 impl ShardCommandExecutor for DurableShards {
-    fn submit(&self, shard_id: ShardId, request: ShardRequest) -> TxnFuture<'_, SubmissionReceipt> {
+    fn submit(&self, shard_id: ShardId, request: ShardRequest) -> SubmissionFuture<'_> {
         Box::pin(async move {
             let boundary = {
                 let mut count = self.submit_count.lock().unwrap();
@@ -1152,13 +1553,15 @@ impl ShardCommandExecutor for DurableShards {
                 *count
             };
             if *self.crash.lock().unwrap() == Some(CrashPoint::Before(boundary)) {
-                return Err(TxnError::InjectedCrash);
+                return Err(SubmissionFailure::Definitive(TxnError::InjectedCrash));
             }
             let command_id = request.header().command_id().get();
-            let (command, intent_digest) = map_request_to_shard(shard_id, &request)?;
+            let (command, intent_digest) =
+                map_request_to_shard(shard_id, &request).map_err(SubmissionFailure::Definitive)?;
             let replayed = !self.applied_commands.lock().unwrap().insert(command_id);
             if !replayed {
-                let mutations = materialize_command(&command)?;
+                let mutations =
+                    materialize_command(&command).map_err(SubmissionFailure::Definitive)?;
                 let mut durable = self.durable.lock().unwrap();
                 let history = durable.entry(shard_id).or_default();
                 let raft_index = boundary as u64 + 1;
@@ -1170,7 +1573,7 @@ impl ShardCommandExecutor for DurableShards {
                 }
             }
             if *self.crash.lock().unwrap() == Some(CrashPoint::After(boundary)) {
-                return Err(TxnError::InjectedCrash);
+                return Err(SubmissionFailure::Ambiguous(TxnError::InjectedCrash));
             }
             Ok(match intent_digest {
                 Some(digest) => SubmissionReceipt::prepared(boundary as u64 + 1, replayed, digest),
@@ -1222,6 +1625,9 @@ impl ShardCommandExecutor for DurableShards {
 fn materialize_command(command: &PhysicalShardCommand) -> Result<Vec<LogicalMutation>, TxnError> {
     match command {
         PhysicalShardCommand::CommitSingleShard(command) => Ok(command.mutations().to_vec()),
+        PhysicalShardCommand::CommitSingleShardTransaction(command) => {
+            Ok(command.mutations().to_vec())
+        }
         PhysicalShardCommand::PrewriteIntent(command) => Ok(vec![
             LogicalMutation::PutTransaction(command.prepared().clone()),
             LogicalMutation::PutReplicaMetadata(ReplicaMetadata::new(
@@ -1246,30 +1652,64 @@ fn shard_result<T>(result: Result<T, dtg_shard::ShardError>) -> Result<T, TxnErr
     result.map_err(|error| TxnError::Shard(error.to_string()))
 }
 
+fn shard_submission_failure(error: ShardError) -> SubmissionFailure {
+    let definitive = matches!(
+        &error,
+        ShardError::InvalidCommand(_)
+            | ShardError::UnsupportedCommandVersion(_)
+            | ShardError::StalePlacementEpoch { .. }
+            | ShardError::StaleBackendGeneration { .. }
+            | ShardError::WriteConflict
+            | ShardError::CorruptIntentHistory(_)
+            | ShardError::BindingMismatch
+    );
+    let error = TxnError::Shard(error.to_string());
+    if definitive {
+        SubmissionFailure::Definitive(error)
+    } else {
+        SubmissionFailure::Ambiguous(error)
+    }
+}
+
 fn map_request_to_shard(
     shard_id: ShardId,
     request: &ShardRequest,
 ) -> Result<(PhysicalShardCommand, Option<dtg_storage::Digest32>), TxnError> {
+    let request_digest = request.digest();
     match request {
-        ShardRequest::CommitSingleShard { header, mutations } => Ok((
-            PhysicalShardCommand::CommitSingleShard(shard_result(CommitSingleShard::new(
-                header.command_id(),
-                header.placement_epoch().get(),
-                header.backend_generation().get(),
-                mutations.clone(),
-            ))?),
+        ShardRequest::CommitSingleShard {
+            header,
+            transaction_id,
+            start_time,
+            snapshot_applied_index,
+            mutations,
+        } => Ok((
+            PhysicalShardCommand::CommitSingleShardTransaction(shard_result(
+                CommitSingleShardTransaction::new(
+                    header.command_id(),
+                    header.placement_epoch().get(),
+                    header.backend_generation().get(),
+                    *transaction_id,
+                    *start_time,
+                    *snapshot_applied_index,
+                    request_digest,
+                    mutations.clone(),
+                ),
+            )?),
             None,
         )),
         ShardRequest::PrewriteIntent {
             header,
             transaction_id,
             start_time,
+            snapshot_applied_index,
             mutations,
         } => {
             let intent = shard_result(ParticipantIntent::new(
                 *transaction_id,
                 shard_id,
                 *start_time,
+                *snapshot_applied_index,
                 mutations.clone(),
             ))?;
             let digest = intent.digest();
@@ -1303,6 +1743,7 @@ fn map_request_to_shard(
             header,
             transaction_id,
             start_time,
+            snapshot_applied_index,
             commit_time,
             intent_digest,
             mutations,
@@ -1311,6 +1752,7 @@ fn map_request_to_shard(
                 *transaction_id,
                 shard_id,
                 *start_time,
+                *snapshot_applied_index,
                 mutations.clone(),
             ))?;
             if intent.digest() != *intent_digest {
@@ -1354,6 +1796,7 @@ fn transaction_history_from_changes(
     let mut prepared = None;
     let mut intent = None;
     let mut terminal = Vec::new();
+    let mut single_shard_commit = None;
     for change in changes {
         match change.mutation() {
             LogicalMutation::PutTransaction(record) if record.id() == transaction_id => {
@@ -1381,6 +1824,7 @@ fn transaction_history_from_changes(
                     let recovered = RecoveredParticipantIntent::new(
                         shard_id,
                         candidate.start_time(),
+                        candidate.snapshot_applied_index(),
                         candidate.mutations().to_vec(),
                         candidate.digest(),
                     );
@@ -1392,10 +1836,36 @@ fn transaction_history_from_changes(
                     }
                 }
             }
+            LogicalMutation::PutReplicaMetadata(metadata)
+                if metadata.name() == dtg_shard::SINGLE_SHARD_TRANSACTION_METADATA_NAME =>
+            {
+                let receipt = decode_single_shard_transaction_metadata(metadata)
+                    .map_err(|_| TxnError::CorruptRecovery)?;
+                if receipt.transaction_id() == transaction_id {
+                    let recovered = RecoveredSingleShardCommit::new(
+                        receipt.command_id(),
+                        receipt.transaction_id(),
+                        receipt.start_time(),
+                        receipt.snapshot_applied_index(),
+                        receipt.commit_time(),
+                        receipt.request_digest(),
+                    );
+                    if single_shard_commit
+                        .replace(recovered)
+                        .is_some_and(|existing| existing != recovered)
+                    {
+                        return Err(TxnError::CorruptRecovery);
+                    }
+                }
+            }
             _ => {}
         }
     }
-    Ok(TransactionHistory::new(prepared, intent, terminal))
+    let history = TransactionHistory::new(prepared, intent, terminal);
+    Ok(match single_shard_commit {
+        Some(commit) => history.with_single_shard_commit(commit),
+        None => history,
+    })
 }
 
 struct FjallShards {
@@ -1451,9 +1921,37 @@ impl FjallShards {
         .is_some()
     }
 
+    fn applied_index(&self, shard_id: ShardId) -> u64 {
+        let store = self.replicas.lock().unwrap()[&shard_id].store.clone();
+        block_on(store.applied_index()).unwrap()
+    }
+
+    fn graph_mutation_count(&self) -> usize {
+        let shard_ids: Vec<_> = self.replicas.lock().unwrap().keys().copied().collect();
+        shard_ids
+            .into_iter()
+            .map(|shard_id| {
+                block_on(self.changes_after(shard_id, 0))
+                    .unwrap()
+                    .into_iter()
+                    .filter(|change| {
+                        matches!(
+                            change.mutation(),
+                            LogicalMutation::PutVertex(_)
+                                | LogicalMutation::DeleteVertex(_)
+                                | LogicalMutation::PutEdge(_)
+                                | LogicalMutation::DeleteEdge(_)
+                        )
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
     fn graph_mutations_are_durable(&self) -> TxnFuture<'_, bool> {
         Box::pin(async move {
-            for shard_id in [ShardId::new(3).unwrap(), ShardId::new(9).unwrap()] {
+            let shard_ids: Vec<_> = self.replicas.lock().unwrap().keys().copied().collect();
+            for shard_id in shard_ids {
                 if self.changes_after(shard_id, 0).await?.iter().any(|change| {
                     matches!(
                         change.mutation(),
@@ -1471,25 +1969,71 @@ impl FjallShards {
     }
 }
 
+struct BarrierShards {
+    inner: FjallShards,
+    prechecks: Barrier,
+}
+
+impl BarrierShards {
+    fn new(inner: FjallShards, parties: usize) -> Self {
+        Self {
+            inner,
+            prechecks: Barrier::new(parties),
+        }
+    }
+}
+
+impl ShardCommandExecutor for BarrierShards {
+    fn submit(&self, shard_id: ShardId, request: ShardRequest) -> SubmissionFuture<'_> {
+        self.inner.submit(shard_id, request)
+    }
+
+    fn changes_after(
+        &self,
+        shard_id: ShardId,
+        applied_index: u64,
+    ) -> TxnFuture<'_, Vec<ChangeRecord>> {
+        Box::pin(async move {
+            self.prechecks.wait();
+            self.inner.changes_after(shard_id, applied_index).await
+        })
+    }
+
+    fn transaction_history(
+        &self,
+        shard_id: ShardId,
+        transaction_id: TransactionId,
+    ) -> TxnFuture<'_, TransactionHistory> {
+        self.inner.transaction_history(shard_id, transaction_id)
+    }
+}
+
 impl ShardCommandExecutor for FjallShards {
-    fn submit(&self, shard_id: ShardId, request: ShardRequest) -> TxnFuture<'_, SubmissionReceipt> {
+    fn submit(&self, shard_id: ShardId, request: ShardRequest) -> SubmissionFuture<'_> {
         Box::pin(async move {
             let boundary = {
                 let mut count = self.submit_count.lock().unwrap();
                 *count += 1;
                 *count
             };
-            let (command, intent_digest) = map_request_to_shard(shard_id, &request)?;
+            let (command, intent_digest) =
+                map_request_to_shard(shard_id, &request).map_err(SubmissionFailure::Definitive)?;
             let receipt = {
                 let mut replicas = self.replicas.lock().unwrap();
                 let replica = replicas.get_mut(&shard_id).unwrap();
                 let index = replica.machine.applied_index().saturating_add(1);
-                shard_result(replica.machine.apply_committed(1, index, command))?
+                replica
+                    .machine
+                    .apply_committed(1, index, command)
+                    .map_err(shard_submission_failure)?
             };
             if *self.crash_after.lock().unwrap() == Some(boundary) {
-                *self.visibility_at_crash.lock().unwrap() =
-                    Some(self.graph_mutations_are_durable().await?);
-                return Err(TxnError::InjectedCrash);
+                *self.visibility_at_crash.lock().unwrap() = Some(
+                    self.graph_mutations_are_durable()
+                        .await
+                        .map_err(SubmissionFailure::Ambiguous)?,
+                );
+                return Err(SubmissionFailure::Ambiguous(TxnError::InjectedCrash));
             }
             Ok(match intent_digest {
                 Some(digest) => {

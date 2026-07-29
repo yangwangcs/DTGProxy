@@ -177,6 +177,14 @@ impl TransactionOverlay {
                 }
             }
         }
+        for history in vertices.values_mut() {
+            sort_vertex_history(history);
+            validate_vertex_history(history.iter())?;
+        }
+        for history in edges.values_mut() {
+            sort_edge_history(history);
+            validate_edge_history(history.iter())?;
+        }
         for history in edges.values() {
             for edge in history {
                 let source = vertices
