@@ -7,3 +7,23 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "dtgproxy-data"
+path = "src/main.rs"
+
+[dependencies]
+dtg-cluster-protocol = { path = "../../execution/dtg-cluster-protocol" }
+dtg-execution = { path = "../../execution/dtg-execution" }
+dtg-storage = { path = "../../storage/dtg-storage" }
+dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
+dtg-storage-neo4j = { path = "../../storage/dtg-storage-neo4j" }
+dtg-storage-postgres = { path = "../../storage/dtg-storage-postgres" }
+dtg-storage-remote = { path = "../../storage/dtg-storage-remote" }
+tokio = { version = "=1.53.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "=0.1.18"
+tonic = { version = "=0.14.6", features = ["transport"] }
+
+[dev-dependencies]
+dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall", features = ["tck"] }
+tempfile = "=3.27.0"
