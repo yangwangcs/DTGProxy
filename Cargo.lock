@@ -723,6 +723,10 @@ dependencies = [
 [[package]]
 name = "dtg-control"
 version = "1.0.0"
+dependencies = [
+ "dtg-kernel",
+ "dtg-storage",
+]
 
 [[package]]
 name = "dtg-controller"
