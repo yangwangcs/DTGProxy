@@ -2,6 +2,7 @@
 
 mod command;
 mod host;
+mod migration;
 mod raft_store;
 mod read;
 mod replica;
@@ -10,11 +11,12 @@ mod state_machine;
 
 pub use command::{
     AdvanceClosedTimestamp, CommandHeader, CommitSingleShard, CommitSingleShardTransaction,
-    FinalizeParticipant, InstallSnapshot, MigrationCommand, MigrationPhase, ParticipantIntent,
-    PrewriteIntent, RecordHomeDecision, SUPPORTED_SHARD_COMMAND_FORMAT_VERSION,
-    SUPPORTED_TRANSACTION_INTENT_VERSION, ShardCommand, TRANSACTION_INTENT_METADATA_NAME,
+    FinalizeParticipant, InstallSnapshot, ParticipantIntent, PrewriteIntent, RecordHomeDecision,
+    SUPPORTED_SHARD_COMMAND_FORMAT_VERSION, SUPPORTED_TRANSACTION_INTENT_VERSION, ShardCommand,
+    TRANSACTION_INTENT_METADATA_NAME,
 };
 pub use host::{ReplicaKey, ShardHost};
+pub use migration::{MigrationCommand, MigrationPhase};
 pub use raft_store::RaftStore;
 pub use read::{
     FollowerReadProof, FollowerReadProofAuthority, ReadError, ReadFailure, ReadMode, ReadPermit,

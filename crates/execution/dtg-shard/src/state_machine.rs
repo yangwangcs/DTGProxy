@@ -360,7 +360,15 @@ impl ShardStateMachine {
         let header = command.header();
         let expected_epoch = self.binding.placement_epoch().get();
         let actual_epoch = header.placement_epoch().get();
-        if actual_epoch != expected_epoch {
+        let cuts_over_from_current = matches!(
+            command,
+            ShardCommand::Migration(migration)
+                if migration.cuts_over_from(
+                    self.binding.placement_epoch(),
+                    self.binding.backend_generation(),
+                )
+        );
+        if !cuts_over_from_current && actual_epoch != expected_epoch {
             return Err(ShardError::StalePlacementEpoch {
                 expected: expected_epoch,
                 actual: actual_epoch,
@@ -368,7 +376,7 @@ impl ShardStateMachine {
         }
         let expected_generation = self.binding.backend_generation().get();
         let actual_generation = header.backend_generation().get();
-        if actual_generation != expected_generation {
+        if !cuts_over_from_current && actual_generation != expected_generation {
             return Err(ShardError::StaleBackendGeneration {
                 expected: expected_generation,
                 actual: actual_generation,

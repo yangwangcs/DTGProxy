@@ -9,7 +9,7 @@ use dtg_storage::{
     TransactionRecord, TransactionState, VertexId, VertexTombstone, VertexVersion,
 };
 
-use crate::ShardError;
+use crate::{MigrationCommand, MigrationPhase, ShardError};
 
 pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 2;
 pub const SUPPORTED_TRANSACTION_INTENT_VERSION: u32 = 3;
@@ -511,41 +511,6 @@ impl InstallSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MigrationPhase {
-    Prepare,
-    Activate,
-    Retire,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MigrationCommand {
-    header: CommandHeader,
-    phase: MigrationPhase,
-}
-
-impl MigrationCommand {
-    pub fn new(
-        command_id: CommandId,
-        placement_epoch: u64,
-        backend_generation: u64,
-        phase: MigrationPhase,
-    ) -> Result<Self, ShardError> {
-        Ok(Self {
-            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
-            phase,
-        })
-    }
-
-    pub const fn header(&self) -> CommandHeader {
-        self.header
-    }
-
-    pub const fn phase(&self) -> MigrationPhase {
-        self.phase
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShardCommand {
     CommitSingleShard(CommitSingleShard),
@@ -609,17 +574,7 @@ impl ShardCommand {
                 )])
             }
             Self::Migration(command) => Ok(vec![LogicalMutation::PutReplicaMetadata(
-                ReplicaMetadata::new(
-                    "dtg.migration_phase",
-                    Value::String(
-                        match command.phase() {
-                            MigrationPhase::Prepare => "prepare",
-                            MigrationPhase::Activate => "activate",
-                            MigrationPhase::Retire => "retire",
-                        }
-                        .into(),
-                    ),
-                )?,
+                migration_metadata(command)?,
             )]),
         }
     }
@@ -689,11 +644,19 @@ impl ShardCommand {
             Self::Migration(command) => {
                 encoder.u8(7);
                 encoder.header(command.header());
-                encoder.u8(match command.phase() {
-                    MigrationPhase::Prepare => 1,
-                    MigrationPhase::Activate => 2,
-                    MigrationPhase::Retire => 3,
-                });
+                encoder.u8(migration_phase_tag(command.phase()));
+                if let Some(migration_id) = command.migration_id() {
+                    encoder.u8(1);
+                    encoder.u128(migration_id);
+                    encoder.u64(command.source_epoch().unwrap().get());
+                    encoder.u64(command.source_generation().unwrap().get());
+                    encoder.u64(command.retained_generation().unwrap().get());
+                    encoder.u64(command.target_generation().unwrap().get());
+                    encoder.bytes(&command.target_backend_class_digest().unwrap().get())?;
+                    encoder.u64(command.catalog_version().unwrap().get());
+                    encoder.u64(command.verified_index().unwrap());
+                    encoder.bytes(&command.logical_digest().unwrap().get())?;
+                }
             }
         }
         encoder.finish()
@@ -754,15 +717,35 @@ impl ShardCommand {
                     Digest32::new(digest),
                 )?)
             }
-            7 => Self::Migration(MigrationCommand {
-                header,
-                phase: match decoder.u8()? {
-                    1 => MigrationPhase::Prepare,
-                    2 => MigrationPhase::Activate,
-                    3 => MigrationPhase::Retire,
-                    _ => return Err(invalid("unknown migration phase")),
-                },
-            }),
+            7 => {
+                let phase = decode_migration_phase(decoder.u8()?)?;
+                let migration = if decoder.is_finished() {
+                    MigrationCommand::new(
+                        header.command_id(),
+                        header.placement_epoch().get(),
+                        header.backend_generation().get(),
+                        phase,
+                    )?
+                } else {
+                    match decoder.u8()? {
+                        1 => MigrationCommand::decode_online(
+                            header,
+                            decoder.u128()?,
+                            decoder.u64()?,
+                            decoder.u64()?,
+                            decoder.u64()?,
+                            decoder.u64()?,
+                            Digest32::new(decoder.fixed_32()?),
+                            Version::new(decoder.u64()?),
+                            decoder.u64()?,
+                            Digest32::new(decoder.fixed_32()?),
+                            phase,
+                        )?,
+                        _ => return Err(invalid("unknown migration context presence tag")),
+                    }
+                };
+                Self::Migration(migration)
+            }
             _ => return Err(invalid("unknown command tag")),
         };
         decoder.finish()?;
@@ -781,6 +764,125 @@ impl ShardCommand {
         command.mutations()?;
         Ok(command)
     }
+}
+
+fn migration_phase_tag(phase: MigrationPhase) -> u8 {
+    match phase {
+        MigrationPhase::Prepare => 1,
+        MigrationPhase::Activate => 2,
+        MigrationPhase::Retire => 3,
+        MigrationPhase::Grace => 4,
+        MigrationPhase::Complete => 5,
+        MigrationPhase::Abort => 6,
+        MigrationPhase::Rollback => 7,
+    }
+}
+
+fn decode_migration_phase(tag: u8) -> Result<MigrationPhase, ShardError> {
+    match tag {
+        1 => Ok(MigrationPhase::Prepare),
+        2 => Ok(MigrationPhase::Activate),
+        3 => Ok(MigrationPhase::Retire),
+        4 => Ok(MigrationPhase::Grace),
+        5 => Ok(MigrationPhase::Complete),
+        6 => Ok(MigrationPhase::Abort),
+        7 => Ok(MigrationPhase::Rollback),
+        _ => Err(invalid("unknown migration phase")),
+    }
+}
+
+fn migration_metadata(command: &MigrationCommand) -> Result<ReplicaMetadata, ShardError> {
+    let phase = match command.phase() {
+        MigrationPhase::Prepare => "prepare",
+        MigrationPhase::Activate => "activate",
+        MigrationPhase::Grace => "grace",
+        MigrationPhase::Retire => "retire",
+        MigrationPhase::Complete => "complete",
+        MigrationPhase::Abort => "abort",
+        MigrationPhase::Rollback => "rollback",
+    };
+    let Some(migration_id) = command.migration_id() else {
+        return Ok(ReplicaMetadata::new(
+            "dtg.migration_phase",
+            Value::String(phase.into()),
+        )?);
+    };
+    let mut metadata = BTreeMap::new();
+    metadata.insert("phase".into(), Value::String(phase.into()));
+    metadata.insert(
+        "migration_id".into(),
+        Value::Bytes(migration_id.to_be_bytes().to_vec()),
+    );
+    metadata.insert(
+        "source_epoch".into(),
+        Value::Bytes(command.source_epoch().unwrap().get().to_be_bytes().to_vec()),
+    );
+    metadata.insert(
+        "source_generation".into(),
+        Value::Bytes(
+            command
+                .source_generation()
+                .unwrap()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+        ),
+    );
+    metadata.insert(
+        "retained_generation".into(),
+        Value::Bytes(
+            command
+                .retained_generation()
+                .unwrap()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+        ),
+    );
+    metadata.insert(
+        "target_generation".into(),
+        Value::Bytes(
+            command
+                .target_generation()
+                .unwrap()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+        ),
+    );
+    metadata.insert(
+        "target_backend_class_digest".into(),
+        Value::Bytes(
+            command
+                .target_backend_class_digest()
+                .unwrap()
+                .get()
+                .to_vec(),
+        ),
+    );
+    metadata.insert(
+        "catalog_version".into(),
+        Value::Bytes(
+            command
+                .catalog_version()
+                .unwrap()
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+        ),
+    );
+    metadata.insert(
+        "verified_index".into(),
+        Value::Bytes(command.verified_index().unwrap().to_be_bytes().to_vec()),
+    );
+    metadata.insert(
+        "logical_digest".into(),
+        Value::Bytes(command.logical_digest().unwrap().get().to_vec()),
+    );
+    Ok(ReplicaMetadata::new(
+        "dtg.migration_phase",
+        Value::Map(metadata),
+    )?)
 }
 
 fn validate_single_shard_mutations(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
@@ -1171,6 +1273,10 @@ impl<'a> Decoder<'a> {
         } else {
             Err(invalid("command contains trailing bytes"))
         }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
     }
 
     fn take(&mut self, count: usize) -> Result<&'a [u8], ShardError> {
