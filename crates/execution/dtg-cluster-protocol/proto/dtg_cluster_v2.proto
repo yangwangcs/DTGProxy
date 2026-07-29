@@ -70,6 +70,7 @@ enum RaftMessageKind {
   RAFT_MESSAGE_KIND_VOTE = 2;
   RAFT_MESSAGE_KIND_SNAPSHOT = 3;
   RAFT_MESSAGE_KIND_HEARTBEAT = 4;
+  RAFT_MESSAGE_KIND_CONTROL = 5;
 }
 
 message RaftEnvelope {

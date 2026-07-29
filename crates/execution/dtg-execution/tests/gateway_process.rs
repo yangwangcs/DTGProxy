@@ -91,6 +91,14 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 fn planning_context() -> PlanningContext {
+    planning_context_with_fence(29, 17, 23)
+}
+
+fn planning_context_with_fence(
+    catalog_version: u64,
+    placement_epoch: u64,
+    backend_generation: u64,
+) -> PlanningContext {
     let capabilities =
         CapabilityManifest::from_names(dtg_plan::EXACT_VERTEX_SCAN_CAPABILITIES).unwrap();
     let class = BackendClass::new(
@@ -104,15 +112,17 @@ fn planning_context() -> PlanningContext {
         .cluster_id(7)
         .graph_id(1)
         .shard_id(13)
-        .placement_epoch(17)
+        .placement_epoch(placement_epoch)
         .replica_id(19)
-        .backend_generation(23)
+        .backend_generation(backend_generation)
         .backend_class_digest(class.digest())
         .provider_kind(ProviderKind::Fjall)
         .contract_version(1)
         .layout_version(1)
         .capability_digest(capabilities.digest())
-        .namespace_id("gateway-wire-fixture")
+        .namespace_id(format!(
+            "gateway-wire-fixture-{placement_epoch}-{backend_generation}"
+        ))
         .endpoint_profile_ref("fixture-endpoint")
         .credential_ref("fixture-credential")
         .role(BindingRole::Active)
@@ -120,7 +130,7 @@ fn planning_context() -> PlanningContext {
         .unwrap();
     PlanningContext::new(
         CatalogSnapshot::new(
-            Version::new(29),
+            Version::new(catalog_version),
             Version::new(31),
             vec![CatalogShard::new(binding, 37)],
         )
@@ -130,6 +140,88 @@ fn planning_context() -> PlanningContext {
         Some(128),
     )
     .unwrap()
+}
+
+#[test]
+fn process_catalog_install_atomically_replaces_the_planning_fence() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let transport = Arc::new(GatewayProtocolV2Transport::new(client.clone()));
+    let execution = GatewayExecution::for_process(transport, planning_context());
+
+    assert!(
+        execution
+            .install_planning_context(planning_context_with_fence(30, 18, 24))
+            .unwrap()
+    );
+
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+    block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 81, deadline, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    let requests = client.requests.lock().unwrap();
+    let context = requests[0].fragments[0].context.as_ref().unwrap();
+    assert_eq!(context.catalog_version, 30);
+    assert_eq!(context.placement_epoch, 18);
+    assert_eq!(context.backend_generation, 24);
+}
+
+#[test]
+fn process_catalog_install_rejects_revision_regression_and_conflict() {
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            RecordingProtocolClient::default(),
+        ))),
+        planning_context(),
+    );
+
+    let regression = execution
+        .install_planning_context(planning_context_with_fence(28, 18, 24))
+        .unwrap_err();
+    assert_eq!(
+        regression.code(),
+        "DTG-EXECUTION-CATALOG-REVISION-REGRESSION"
+    );
+
+    let conflict = execution
+        .install_planning_context(planning_context_with_fence(29, 18, 24))
+        .unwrap_err();
+    assert_eq!(conflict.code(), "DTG-EXECUTION-CATALOG-REVISION-CONFLICT");
+}
+
+#[test]
+fn process_catalog_install_rejects_epoch_and_generation_regression() {
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            RecordingProtocolClient::default(),
+        ))),
+        planning_context_with_fence(29, 17, 23),
+    );
+
+    let epoch = execution
+        .install_planning_context(planning_context_with_fence(30, 16, 24))
+        .unwrap_err();
+    assert_eq!(epoch.code(), "DTG-EXECUTION-CATALOG-EPOCH-REGRESSION");
+
+    let generation = execution
+        .install_planning_context(planning_context_with_fence(30, 18, 22))
+        .unwrap_err();
+    assert_eq!(
+        generation.code(),
+        "DTG-EXECUTION-CATALOG-GENERATION-REGRESSION"
+    );
 }
 
 #[test]

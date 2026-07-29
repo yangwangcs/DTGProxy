@@ -225,7 +225,7 @@ pub fn validate_raft_envelope(
     if wire.term == 0 {
         return Err(ProtocolError::ZeroRaftTerm);
     }
-    if !(1..=4).contains(&wire.kind) {
+    if !(1..=5).contains(&wire.kind) {
         return Err(ProtocolError::UnknownEnum);
     }
     validate_payload(wire.payload, MAX_RAFT_BYTES, 1)

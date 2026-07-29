@@ -169,6 +169,14 @@ fn all_bounded_v2_message_families_validate() {
 }
 
 #[test]
+fn raft_control_messages_are_part_of_the_current_protocol() {
+    let mut raft = valid_raft();
+    raft.kind = proto::RaftMessageKind::Control.into();
+
+    assert_eq!(validate_raft_envelope(raft).unwrap().len(), 3);
+}
+
+#[test]
 fn family_specific_versions_ids_counts_and_enums_fail_closed() {
     let mut fragment = valid_fragment();
     fragment.payload.as_mut().unwrap().format_version = 2;

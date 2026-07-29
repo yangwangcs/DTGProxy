@@ -349,6 +349,50 @@ async fn send_raft_steps_the_target_replica() {
 }
 
 #[tokio::test]
+async fn send_raft_rejects_an_envelope_kind_that_disagrees_with_the_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("rpc-raft-kind");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let message = raft::eraftpb::Message {
+        msg_type: raft::eraftpb::MessageType::MsgHeartbeat as i32,
+        to: binding.replica_id().get(),
+        from: 101,
+        term: 1,
+        commit: 1,
+        ..Default::default()
+    };
+    let body = message.encode_to_vec();
+
+    let error = node
+        .rpc_service()
+        .send_raft(Request::new(RaftEnvelope {
+            context: Some(shard_context(&binding)),
+            from_replica_id: 101,
+            to_replica_id: binding.replica_id().get(),
+            term: 1,
+            committed_index: 1,
+            kind: RaftMessageKind::Vote.into(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
 async fn snapshot_rpc_fails_closed_with_a_typed_retryable_status() {
     let root = tempfile::tempdir().unwrap();
     let binding = fjall_binding("rpc-snapshot");

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
 use dtg_execution::cluster_protocol::proto::{
-    ColumnBatch, ExecutionFragment, LogicalReplicaSnapshot, RaftEnvelope, RetryDisposition,
-    StatusCode, TransactionRequest, TypedStatus,
+    ColumnBatch, ExecutionFragment, LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind,
+    RetryDisposition, StatusCode, TransactionRequest, TypedStatus,
 };
 use dtg_execution::cluster_protocol::{
     PROTOCOL_MAJOR, ProtocolError, ShardRequestContext, checksum_bytes,
@@ -25,6 +25,7 @@ use dtg_execution::{
     ReplicaBinding,
 };
 use dtg_storage_fjall::FjallConsensusStore;
+use prost_011::Message as _;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
@@ -901,6 +902,15 @@ impl DataService for DataRpcService {
             .try_into()
             .map_err(|error| self.invalid(error))?;
         let payload = validate_raft_envelope(wire.clone()).map_err(|error| self.invalid(error))?;
+        let message = raft::eraftpb::Message::decode(payload.body())
+            .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-MALFORMED-RAFT"))?;
+        let encoded_kind = RaftMessageKind::try_from(wire.kind)
+            .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-ENUM"))?;
+        let payload_kind = crate::raft_transport::raft_message_kind(message.get_msg_type())
+            .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-RAFT-KIND"))?;
+        if encoded_kind != payload_kind {
+            return Err(Status::invalid_argument("DTG-PROTOCOL-RAFT-KIND"));
+        }
         let target = dtg_execution::storage::ReplicaId::new(wire.to_replica_id)
             .map_err(|error| self.execution_failure(error))?;
         let key = self

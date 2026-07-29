@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dtg_analytics::{
@@ -483,7 +483,7 @@ enum GatewayExecutionMode {
     },
     Process {
         planner: Planner,
-        planning_context: PlanningContext,
+        planning_context: Arc<RwLock<PlanningContext>>,
         transport: Arc<dyn GatewayExecutionTransport>,
     },
 }
@@ -506,10 +506,39 @@ impl GatewayExecution {
             language: Language::new(Arc::new(EmptySchemaCatalog)),
             mode: GatewayExecutionMode::Process {
                 planner: Planner,
-                planning_context,
+                planning_context: Arc::new(RwLock::new(planning_context)),
                 transport,
             },
         }
+    }
+
+    pub fn install_planning_context(
+        &self,
+        next: PlanningContext,
+    ) -> Result<bool, GatewayExecutionError> {
+        let GatewayExecutionMode::Process {
+            planning_context, ..
+        } = &self.mode
+        else {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-CATALOG-MODE",
+                "catalog installation requires process Gateway execution",
+                GatewayRetry::Never,
+            ));
+        };
+        let mut current = planning_context.write().map_err(|_| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-CATALOG-LOCK",
+                "Gateway planning catalog lock is poisoned",
+                GatewayRetry::Safe,
+            )
+        })?;
+        validate_planning_context_update(&current, &next)?;
+        if *current == next {
+            return Ok(false);
+        }
+        *current = next;
+        Ok(true)
     }
 
     pub fn compile(&self, source: &str) -> Result<LogicalProgram, LanguageError> {
@@ -713,7 +742,14 @@ impl GatewayExecution {
                             GatewayRetry::Never,
                         ));
                     };
-                    Some(planner.plan(&program, planning_context).map_err(|error| {
+                    let planning_context = planning_context.read().map_err(|_| {
+                        GatewayExecutionError::new(
+                            "DTG-EXECUTION-CATALOG-LOCK",
+                            "Gateway planning catalog lock is poisoned",
+                            GatewayRetry::Safe,
+                        )
+                    })?;
+                    Some(planner.plan(&program, &planning_context).map_err(|error| {
                         GatewayExecutionError::new(
                             "DTG-EXECUTION-PLAN",
                             error.to_string(),
@@ -775,6 +811,79 @@ impl GatewayExecution {
             Ok(response)
         })
     }
+}
+
+fn validate_planning_context_update(
+    current: &PlanningContext,
+    next: &PlanningContext,
+) -> Result<(), GatewayExecutionError> {
+    let current_catalog = current.catalog();
+    let next_catalog = next.catalog();
+    if next_catalog.version() < current_catalog.version() {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-CATALOG-REVISION-REGRESSION",
+            "catalog revision regressed",
+            GatewayRetry::Never,
+        ));
+    }
+    if next_catalog.version() == current_catalog.version() {
+        return if current == next {
+            Ok(())
+        } else {
+            Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-CATALOG-REVISION-CONFLICT",
+                "equal catalog revisions contain different planning state",
+                GatewayRetry::Never,
+            ))
+        };
+    }
+    if next_catalog.graph_id() != current_catalog.graph_id() {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-CATALOG-GRAPH-CONFLICT",
+            "catalog update changed the configured graph",
+            GatewayRetry::Never,
+        ));
+    }
+
+    for current_shard in current_catalog.shards() {
+        let Some(next_shard) = next_catalog
+            .shards()
+            .iter()
+            .find(|next| next.binding().shard_id() == current_shard.binding().shard_id())
+        else {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-CATALOG-SHARD-REMOVED",
+                "catalog update removed a previously routed Shard",
+                GatewayRetry::Never,
+            ));
+        };
+        let current_binding = current_shard.binding();
+        let next_binding = next_shard.binding();
+        if next_binding.placement_epoch() < current_binding.placement_epoch() {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-CATALOG-EPOCH-REGRESSION",
+                "catalog placement epoch regressed",
+                GatewayRetry::Never,
+            ));
+        }
+        if next_binding.backend_generation() < current_binding.backend_generation() {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-CATALOG-GENERATION-REGRESSION",
+                "catalog backend generation regressed",
+                GatewayRetry::Never,
+            ));
+        }
+        if next_binding.placement_epoch() == current_binding.placement_epoch()
+            && next_binding.backend_generation() != current_binding.backend_generation()
+        {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-CATALOG-GENERATION-CONFLICT",
+                "backend generation changed without a new placement epoch",
+                GatewayRetry::Never,
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]

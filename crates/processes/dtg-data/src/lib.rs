@@ -2,10 +2,12 @@
 
 mod config;
 mod provider;
+mod raft_transport;
 mod service;
 
 pub use config::{CredentialProfile, DataConfigError, DataProcessConfig, EndpointProfile};
 pub use provider::{FjallResolver, Neo4jResolver, PostgresResolver, RemoteResolver};
+pub use raft_transport::TonicRaftTransport;
 pub use service::{
     AssignmentUpdate, DataMetrics, DataNode, DataNodeBuilder, DataNodeError, DataRpcService,
     LifecycleState, RaftTransport, ReplicaFailure,
