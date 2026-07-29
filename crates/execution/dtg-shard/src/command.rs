@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use dtg_kernel::{
-    BackendGeneration, Digest32, PlacementEpoch, TransactionId, TransactionTime, ValidInterval,
-    Value, Version,
+    BackendGeneration, Digest32, PlacementEpoch, ShardId, TransactionId, TransactionTime,
+    ValidInterval, Value, Version,
 };
 use dtg_storage::{
     CommandId, EdgeId, EdgeTombstone, EdgeVersion, LogicalMutation, Properties, ReplicaMetadata,
@@ -12,6 +12,11 @@ use dtg_storage::{
 use crate::ShardError;
 
 pub const SUPPORTED_SHARD_COMMAND_FORMAT_VERSION: u32 = 1;
+pub const SUPPORTED_TRANSACTION_INTENT_VERSION: u32 = 1;
+
+pub const TRANSACTION_INTENT_METADATA_NAME: &str = "dtg.transaction_intent.v1";
+const MAX_TRANSACTION_INTENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRANSACTION_INTENT_ITEMS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandHeader {
@@ -84,6 +89,147 @@ impl CommitSingleShard {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantIntent {
+    transaction_id: TransactionId,
+    shard_id: ShardId,
+    mutations: Vec<LogicalMutation>,
+}
+
+impl ParticipantIntent {
+    pub fn new(
+        transaction_id: TransactionId,
+        shard_id: ShardId,
+        mutations: Vec<LogicalMutation>,
+    ) -> Result<Self, ShardError> {
+        validate_intent_mutations(&mutations)?;
+        let intent = Self {
+            transaction_id,
+            shard_id,
+            mutations,
+        };
+        intent.encode_current()?;
+        Ok(intent)
+    }
+
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
+    pub fn mutations(&self) -> &[LogicalMutation] {
+        &self.mutations
+    }
+
+    pub fn digest(&self) -> Digest32 {
+        let encoded = self
+            .encode_current()
+            .expect("validated participant intent remains encodable");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"dtg-transaction-participant-intent-v1");
+        hasher.update(&encoded);
+        Digest32::new(*hasher.finalize().as_bytes())
+    }
+
+    pub fn encode_current(&self) -> Result<Vec<u8>, ShardError> {
+        validate_intent_mutations(&self.mutations)?;
+        let mut encoder = Encoder::default();
+        encoder.u32(SUPPORTED_TRANSACTION_INTENT_VERSION);
+        encoder.u128(self.transaction_id.get());
+        encoder.u64(self.shard_id.get());
+        encoder.mutations(&self.mutations)?;
+        let encoded = encoder.finish()?;
+        if encoded.len() > MAX_TRANSACTION_INTENT_BYTES {
+            return Err(invalid("transaction intent exceeds maximum encoded size"));
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode_current(bytes: &[u8]) -> Result<Self, ShardError> {
+        if bytes.len() > MAX_TRANSACTION_INTENT_BYTES {
+            return Err(invalid("transaction intent bytes are oversized"));
+        }
+        let mut decoder = Decoder::new(bytes)?;
+        let version = decoder.u32()?;
+        if version != SUPPORTED_TRANSACTION_INTENT_VERSION {
+            return Err(invalid("unsupported transaction intent version"));
+        }
+        let transaction_id = TransactionId::new(decoder.u128()?)?;
+        let shard_id = ShardId::new(decoder.u64()?)?;
+        let mutations = decoder.mutations()?;
+        decoder.finish()?;
+        Self::new(transaction_id, shard_id, mutations)
+    }
+
+    fn metadata(&self) -> Result<ReplicaMetadata, ShardError> {
+        Ok(ReplicaMetadata::new(
+            TRANSACTION_INTENT_METADATA_NAME,
+            Value::Bytes(self.encode_current()?),
+        )?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrewriteIntent {
+    header: CommandHeader,
+    prepared: TransactionRecord,
+    intent: ParticipantIntent,
+}
+
+impl PrewriteIntent {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        prepared: TransactionRecord,
+        intent: ParticipantIntent,
+    ) -> Result<Self, ShardError> {
+        let command = Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            prepared,
+            intent,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub const fn prepared(&self) -> &TransactionRecord {
+        &self.prepared
+    }
+
+    pub const fn intent(&self) -> &ParticipantIntent {
+        &self.intent
+    }
+
+    fn validate(&self) -> Result<(), ShardError> {
+        if self.prepared.state() != TransactionState::Prepared
+            || self.prepared.id() != self.intent.transaction_id()
+            || self.prepared.record_digest() != self.intent.digest()
+        {
+            return Err(invalid_command_shape(
+                "prewrite intent must bind one prepared record to its participant payload",
+            ));
+        }
+        self.intent.encode_current()?;
+        Ok(())
+    }
+
+    fn mutations(&self) -> Result<Vec<LogicalMutation>, ShardError> {
+        self.validate()?;
+        Ok(vec![
+            LogicalMutation::PutTransaction(self.prepared.clone()),
+            LogicalMutation::PutReplicaMetadata(self.intent.metadata()?),
+        ])
+    }
+}
+
 macro_rules! mutation_command {
     ($name:ident, $validator:ident) => {
         #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,9 +268,83 @@ macro_rules! mutation_command {
     };
 }
 
-mutation_command!(PrewriteIntent, validate_prewrite_intent);
 mutation_command!(RecordHomeDecision, validate_home_decision);
-mutation_command!(FinalizeParticipant, validate_participant_finalization);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizeParticipant {
+    header: CommandHeader,
+    terminal: TransactionRecord,
+    intent: Option<ParticipantIntent>,
+}
+
+impl FinalizeParticipant {
+    pub fn new(
+        command_id: CommandId,
+        placement_epoch: u64,
+        backend_generation: u64,
+        terminal: TransactionRecord,
+        intent: Option<ParticipantIntent>,
+    ) -> Result<Self, ShardError> {
+        let command = Self {
+            header: CommandHeader::new(command_id, placement_epoch, backend_generation)?,
+            terminal,
+            intent,
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    pub const fn header(&self) -> CommandHeader {
+        self.header
+    }
+
+    pub const fn terminal(&self) -> &TransactionRecord {
+        &self.terminal
+    }
+
+    pub const fn intent(&self) -> Option<&ParticipantIntent> {
+        self.intent.as_ref()
+    }
+
+    fn validate(&self) -> Result<(), ShardError> {
+        match self.terminal.state() {
+            TransactionState::Committed => {
+                let intent = self.intent.as_ref().ok_or_else(|| {
+                    invalid_command_shape("commit finalization requires participant intent")
+                })?;
+                if self.terminal.id() != intent.transaction_id()
+                    || self.terminal.record_digest() != intent.digest()
+                    || intent.mutations().iter().any(|mutation| {
+                        mutation_transaction_time(mutation) != self.terminal.transaction_time()
+                    })
+                {
+                    return Err(invalid_command_shape(
+                        "commit finalization does not match participant intent",
+                    ));
+                }
+                intent.encode_current()?;
+                Ok(())
+            }
+            TransactionState::Aborted if self.intent.is_none() => Ok(()),
+            TransactionState::Aborted => Err(invalid_command_shape(
+                "abort finalization must not carry graph mutations",
+            )),
+            TransactionState::Prepared => Err(invalid_command_shape(
+                "participant finalization requires a terminal transaction record",
+            )),
+        }
+    }
+
+    fn mutations(&self) -> Result<Vec<LogicalMutation>, ShardError> {
+        self.validate()?;
+        let mut mutations = match &self.intent {
+            Some(intent) => intent.mutations.clone(),
+            None => Vec::new(),
+        };
+        mutations.push(LogicalMutation::PutTransaction(self.terminal.clone()));
+        Ok(mutations)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvanceClosedTimestamp {
@@ -259,18 +479,12 @@ impl ShardCommand {
                 validate_single_shard_mutations(&command.mutations)?;
                 Ok(command.mutations.clone())
             }
-            Self::PrewriteIntent(command) => {
-                validate_prewrite_intent(&command.mutations)?;
-                Ok(command.mutations.clone())
-            }
+            Self::PrewriteIntent(command) => command.mutations(),
             Self::RecordHomeDecision(command) => {
                 validate_home_decision(&command.mutations)?;
                 Ok(command.mutations.clone())
             }
-            Self::FinalizeParticipant(command) => {
-                validate_participant_finalization(&command.mutations)?;
-                Ok(command.mutations.clone())
-            }
+            Self::FinalizeParticipant(command) => command.mutations(),
             Self::AdvanceClosedTimestamp(command) => Ok(vec![LogicalMutation::PutReplicaMetadata(
                 ReplicaMetadata::new(
                     "dtg.closed_timestamp",
@@ -312,11 +526,9 @@ impl ShardCommand {
             Self::CommitSingleShard(command) => {
                 validate_single_shard_mutations(command.mutations())?
             }
-            Self::PrewriteIntent(command) => validate_prewrite_intent(command.mutations())?,
+            Self::PrewriteIntent(command) => command.validate()?,
             Self::RecordHomeDecision(command) => validate_home_decision(command.mutations())?,
-            Self::FinalizeParticipant(command) => {
-                validate_participant_finalization(command.mutations())?
-            }
+            Self::FinalizeParticipant(command) => command.validate()?,
             Self::AdvanceClosedTimestamp(_) | Self::InstallSnapshot(_) | Self::Migration(_) => {}
         }
         let mut encoder = Encoder::default();
@@ -330,7 +542,8 @@ impl ShardCommand {
             Self::PrewriteIntent(command) => {
                 encoder.u8(2);
                 encoder.header(command.header());
-                encoder.mutations(command.mutations())?;
+                encoder.transaction(command.prepared());
+                encoder.bytes(&command.intent().encode_current()?)?;
             }
             Self::RecordHomeDecision(command) => {
                 encoder.u8(3);
@@ -340,7 +553,14 @@ impl ShardCommand {
             Self::FinalizeParticipant(command) => {
                 encoder.u8(4);
                 encoder.header(command.header());
-                encoder.mutations(command.mutations())?;
+                encoder.transaction(command.terminal());
+                match command.intent() {
+                    Some(intent) => {
+                        encoder.u8(1);
+                        encoder.bytes(&intent.encode_current()?)?;
+                    }
+                    None => encoder.u8(0),
+                }
             }
             Self::AdvanceClosedTimestamp(command) => {
                 encoder.u8(5);
@@ -381,7 +601,8 @@ impl ShardCommand {
             }),
             2 => Self::PrewriteIntent(PrewriteIntent {
                 header,
-                mutations: decoder.mutations()?,
+                prepared: decoder.transaction()?,
+                intent: ParticipantIntent::decode_current(decoder.bytes()?)?,
             }),
             3 => Self::RecordHomeDecision(RecordHomeDecision {
                 header,
@@ -389,7 +610,12 @@ impl ShardCommand {
             }),
             4 => Self::FinalizeParticipant(FinalizeParticipant {
                 header,
-                mutations: decoder.mutations()?,
+                terminal: decoder.transaction()?,
+                intent: match decoder.u8()? {
+                    0 => None,
+                    1 => Some(ParticipantIntent::decode_current(decoder.bytes()?)?),
+                    _ => return Err(invalid("unknown participant intent presence tag")),
+                },
             }),
             5 => Self::AdvanceClosedTimestamp(AdvanceClosedTimestamp {
                 header,
@@ -422,9 +648,7 @@ impl ShardCommand {
         if matches!(
             &command,
             Self::CommitSingleShard(CommitSingleShard { mutations, .. })
-                | Self::PrewriteIntent(PrewriteIntent { mutations, .. })
                 | Self::RecordHomeDecision(RecordHomeDecision { mutations, .. })
-                | Self::FinalizeParticipant(FinalizeParticipant { mutations, .. })
                 if mutations.is_empty()
         ) {
             return Err(invalid("mutation command must not be empty"));
@@ -451,31 +675,44 @@ fn validate_single_shard_mutations(mutations: &[LogicalMutation]) -> Result<(), 
     }
 }
 
-fn validate_prewrite_intent(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
-    let prepared = mutations
+fn validate_intent_mutations(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
+    if mutations.is_empty() || mutations.len() > MAX_TRANSACTION_INTENT_ITEMS {
+        return Err(invalid_command_shape(
+            "transaction intent mutation count is outside the supported bounds",
+        ));
+    }
+    if mutations.iter().any(|mutation| {
+        matches!(
+            mutation,
+            LogicalMutation::PutTransaction(_) | LogicalMutation::PutReplicaMetadata(_)
+        )
+    }) {
+        return Err(invalid_command_shape(
+            "transaction intent may contain only graph mutations",
+        ));
+    }
+    let transaction_time = mutation_transaction_time(&mutations[0]);
+    if mutations
         .iter()
-        .filter(|mutation| {
-            matches!(
-                mutation,
-                LogicalMutation::PutTransaction(transaction)
-                    if transaction.state() == TransactionState::Prepared
-            )
-        })
-        .count();
-    let invalid = mutations.iter().any(|mutation| {
-        matches!(mutation, LogicalMutation::PutReplicaMetadata(_))
-            || matches!(
-                mutation,
-                LogicalMutation::PutTransaction(transaction)
-                    if transaction.state() != TransactionState::Prepared
-            )
-    });
-    if prepared == 1 && !invalid {
-        Ok(())
-    } else {
-        Err(invalid_command_shape(
-            "prewrite intent requires exactly one prepared transaction record",
-        ))
+        .skip(1)
+        .any(|mutation| mutation_transaction_time(mutation) != transaction_time)
+    {
+        return Err(invalid_command_shape(
+            "transaction intent mutations must share one transaction time",
+        ));
+    }
+    Ok(())
+}
+
+fn mutation_transaction_time(mutation: &LogicalMutation) -> TransactionTime {
+    match mutation {
+        LogicalMutation::PutVertex(vertex) => vertex.transaction_time(),
+        LogicalMutation::DeleteVertex(vertex) => vertex.transaction_time(),
+        LogicalMutation::PutEdge(edge) => edge.transaction_time(),
+        LogicalMutation::DeleteEdge(edge) => edge.transaction_time(),
+        LogicalMutation::PutTransaction(_) | LogicalMutation::PutReplicaMetadata(_) => {
+            unreachable!("transaction intents reject non-graph mutations before timestamp checks")
+        }
     }
 }
 
@@ -494,37 +731,6 @@ fn validate_home_decision(mutations: &[LogicalMutation]) -> Result<(), ShardErro
     } else {
         Err(invalid_command_shape(
             "home decision requires one terminal transaction record",
-        ))
-    }
-}
-
-fn validate_participant_finalization(mutations: &[LogicalMutation]) -> Result<(), ShardError> {
-    let terminal = mutations
-        .iter()
-        .filter(|mutation| {
-            matches!(
-                mutation,
-                LogicalMutation::PutTransaction(transaction)
-                    if matches!(
-                        transaction.state(),
-                        TransactionState::Committed | TransactionState::Aborted
-                    )
-            )
-        })
-        .count();
-    let invalid = mutations.iter().any(|mutation| {
-        matches!(mutation, LogicalMutation::PutReplicaMetadata(_))
-            || matches!(
-                mutation,
-                LogicalMutation::PutTransaction(transaction)
-                    if transaction.state() == TransactionState::Prepared
-            )
-    });
-    if terminal == 1 && !invalid {
-        Ok(())
-    } else {
-        Err(invalid_command_shape(
-            "participant finalization requires exactly one terminal transaction record",
         ))
     }
 }
@@ -618,6 +824,19 @@ impl Encoder {
         self.u128(header.command_id().get());
         self.u64(header.placement_epoch().get());
         self.u64(header.backend_generation().get());
+    }
+
+    fn transaction(&mut self, transaction: &TransactionRecord) {
+        self.u128(transaction.id().get());
+        self.u8(match transaction.state() {
+            TransactionState::Prepared => 1,
+            TransactionState::Committed => 2,
+            TransactionState::Aborted => 3,
+        });
+        self.i64(transaction.transaction_time().get());
+        self.u32(32);
+        self.bytes
+            .extend_from_slice(&transaction.record_digest().get());
     }
 
     fn mutations(&mut self, mutations: &[LogicalMutation]) -> Result<(), ShardError> {
@@ -871,6 +1090,19 @@ impl<'a> Decoder<'a> {
             self.u64()?,
             self.u64()?,
         )
+    }
+
+    fn transaction(&mut self) -> Result<TransactionRecord, ShardError> {
+        let id = TransactionId::new(self.u128()?)?;
+        let state = match self.u8()? {
+            1 => TransactionState::Prepared,
+            2 => TransactionState::Committed,
+            3 => TransactionState::Aborted,
+            _ => return Err(invalid("unknown transaction state")),
+        };
+        let transaction_time = TransactionTime::new(self.i64()?)?;
+        let digest = Digest32::new(self.fixed_32()?);
+        Ok(TransactionRecord::new(id, state, transaction_time, digest)?)
     }
 
     fn count(&mut self) -> Result<usize, ShardError> {

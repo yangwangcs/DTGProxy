@@ -228,6 +228,17 @@ impl ShardStateMachine {
             });
         }
 
+        let intent = match command {
+            ShardCommand::PrewriteIntent(command) => Some(command.intent()),
+            ShardCommand::FinalizeParticipant(command) => command.intent(),
+            _ => None,
+        };
+        if intent.is_some_and(|intent| intent.shard_id() != self.binding.shard_id()) {
+            return Err(ShardError::InvalidCommand(
+                "transaction intent belongs to a different Shard".into(),
+            ));
+        }
+
         if let ShardCommand::AdvanceClosedTimestamp(command) = command {
             let proposed = command.closed_timestamp();
             if self

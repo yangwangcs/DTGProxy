@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+blake3 = "1"
 dtg-kernel = { path = "../../kernel/dtg-kernel" }
 dtg-storage = { path = "../../storage/dtg-storage" }
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }

@@ -761,6 +761,7 @@ version = "1.0.0"
 name = "dtg-shard"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "dtg-kernel",
  "dtg-storage",
  "dtg-storage-fjall",
@@ -806,6 +807,14 @@ version = "1.0.0"
 [[package]]
 name = "dtg-transaction"
 version = "1.0.0"
+dependencies = [
+ "blake3",
+ "dtg-kernel",
+ "dtg-shard",
+ "dtg-storage",
+ "dtg-storage-fjall",
+ "tempfile",
+]
 
 [[package]]
 name = "dtgproxy"

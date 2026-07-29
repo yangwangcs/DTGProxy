@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use dtg_shard::{
-    AdvanceClosedTimestamp, CommitSingleShard, RecordHomeDecision, ShardCommand, ShardStateMachine,
+    AdvanceClosedTimestamp, CommitSingleShard, FinalizeParticipant, ParticipantIntent,
+    PrewriteIntent, RecordHomeDecision, ShardCommand, ShardStateMachine,
 };
 use dtg_storage::{
     ApplyReceipt, BindingRole, CommandId, CommittedShardBatch, Digest32, LogicalMutation,
@@ -147,6 +148,221 @@ fn command_value_nesting_and_allocation_budgets_fail_closed() {
     assert!(error.to_string().contains("allocation budget"));
 }
 
+#[test]
+fn prewrite_hides_graph_mutations_until_commit_finalization() {
+    let binding = fixture_binding();
+    let store = Arc::new(RecordingStore::new(binding.clone()));
+    let mut machine = ShardStateMachine::new(binding, store.clone()).unwrap();
+    let transaction_id = TransactionId::new(91).unwrap();
+    let intent = ParticipantIntent::new(
+        transaction_id,
+        dtg_storage::ShardId::new(3).unwrap(),
+        vec![committed_vertex_mutation(900)],
+    )
+    .unwrap();
+    let prepared = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Prepared,
+        TransactionTime::new(40).unwrap(),
+        intent.digest(),
+    )
+    .unwrap();
+    let command = ShardCommand::PrewriteIntent(
+        PrewriteIntent::new(
+            CommandId::new(901).unwrap(),
+            7,
+            10,
+            prepared,
+            intent.clone(),
+        )
+        .unwrap(),
+    );
+
+    machine.apply_committed(11, 1, command).unwrap();
+
+    let state = store.state.lock().unwrap();
+    let mutations = state.batch.as_ref().unwrap().mutations();
+    assert_eq!(mutations.len(), 2);
+    assert!(mutations.iter().any(|mutation| matches!(
+        mutation,
+        LogicalMutation::PutTransaction(record) if record.state() == TransactionState::Prepared
+    )));
+    assert!(mutations.iter().any(|mutation| matches!(
+        mutation,
+        LogicalMutation::PutReplicaMetadata(metadata)
+            if metadata.name() == "dtg.transaction_intent.v1"
+                && matches!(metadata.value(), Value::Bytes(bytes) if ParticipantIntent::decode_current(bytes).is_ok())
+    )));
+    assert!(!mutations.iter().any(|mutation| matches!(
+        mutation,
+        LogicalMutation::PutVertex(_)
+            | LogicalMutation::DeleteVertex(_)
+            | LogicalMutation::PutEdge(_)
+            | LogicalMutation::DeleteEdge(_)
+    )));
+
+    let binding = fixture_binding();
+    let commit_store = Arc::new(RecordingStore::new(binding.clone()));
+    let mut commit_machine = ShardStateMachine::new(binding, commit_store.clone()).unwrap();
+    let committed = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Committed,
+        TransactionTime::new(10).unwrap(),
+        intent.digest(),
+    )
+    .unwrap();
+    commit_machine
+        .apply_committed(
+            11,
+            2,
+            ShardCommand::FinalizeParticipant(
+                FinalizeParticipant::new(
+                    CommandId::new(902).unwrap(),
+                    7,
+                    10,
+                    committed,
+                    Some(intent.clone()),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let state = commit_store.state.lock().unwrap();
+    let mutations = state.batch.as_ref().unwrap().mutations();
+    assert_eq!(mutations.len(), 2);
+    assert!(
+        mutations
+            .iter()
+            .any(|mutation| matches!(mutation, LogicalMutation::PutVertex(_)))
+    );
+    assert!(mutations.iter().any(|mutation| matches!(
+        mutation,
+        LogicalMutation::PutTransaction(record) if record.state() == TransactionState::Committed
+    )));
+
+    let binding = fixture_binding();
+    let abort_store = Arc::new(RecordingStore::new(binding.clone()));
+    let mut abort_machine = ShardStateMachine::new(binding, abort_store.clone()).unwrap();
+    let aborted = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Aborted,
+        TransactionTime::new(50).unwrap(),
+        intent.digest(),
+    )
+    .unwrap();
+    abort_machine
+        .apply_committed(
+            11,
+            2,
+            ShardCommand::FinalizeParticipant(
+                FinalizeParticipant::new(CommandId::new(903).unwrap(), 7, 10, aborted, None)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    let state = abort_store.state.lock().unwrap();
+    assert_eq!(state.batch.as_ref().unwrap().mutations().len(), 1);
+    assert!(matches!(
+        &state.batch.as_ref().unwrap().mutations()[0],
+        LogicalMutation::PutTransaction(record) if record.state() == TransactionState::Aborted
+    ));
+}
+
+#[test]
+fn participant_intent_is_current_only_bounded_and_digest_bound() {
+    let transaction_id = TransactionId::new(91).unwrap();
+    let original = ParticipantIntent::new(
+        transaction_id,
+        dtg_storage::ShardId::new(3).unwrap(),
+        vec![committed_vertex_mutation(900)],
+    )
+    .unwrap();
+    let encoded = original.encode_current().unwrap();
+    assert_eq!(
+        ParticipantIntent::decode_current(&encoded).unwrap(),
+        original
+    );
+
+    let mut unknown = encoded.clone();
+    unknown[..4].copy_from_slice(&2_u32.to_be_bytes());
+    assert!(ParticipantIntent::decode_current(&unknown).is_err());
+
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(ParticipantIntent::decode_current(&trailing).is_err());
+    assert!(ParticipantIntent::decode_current(&vec![0; 4 * 1024 * 1024 + 1]).is_err());
+
+    let changed = ParticipantIntent::new(
+        transaction_id,
+        dtg_storage::ShardId::new(3).unwrap(),
+        vec![committed_vertex_mutation(901)],
+    )
+    .unwrap();
+    let prepared = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Prepared,
+        TransactionTime::new(40).unwrap(),
+        original.digest(),
+    )
+    .unwrap();
+    assert!(PrewriteIntent::new(CommandId::new(904).unwrap(), 7, 10, prepared, changed).is_err());
+
+    let prepared = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Prepared,
+        TransactionTime::new(40).unwrap(),
+        original.digest(),
+    )
+    .unwrap();
+    let command = ShardCommand::PrewriteIntent(
+        PrewriteIntent::new(CommandId::new(905).unwrap(), 7, 10, prepared, original).unwrap(),
+    );
+    let bytes = command.encode_current().unwrap();
+    assert_eq!(ShardCommand::decode(&bytes).unwrap(), command);
+}
+
+#[test]
+fn commit_finalization_rejects_intent_timestamp_mismatch() {
+    let transaction_id = TransactionId::new(91).unwrap();
+    let intent = ParticipantIntent::new(
+        transaction_id,
+        dtg_storage::ShardId::new(3).unwrap(),
+        vec![committed_vertex_mutation(900)],
+    )
+    .unwrap();
+    let terminal = TransactionRecord::new(
+        transaction_id,
+        TransactionState::Committed,
+        TransactionTime::new(50).unwrap(),
+        intent.digest(),
+    )
+    .unwrap();
+
+    assert!(
+        FinalizeParticipant::new(CommandId::new(906).unwrap(), 7, 10, terminal, Some(intent))
+            .is_err()
+    );
+
+    let mixed = ParticipantIntent::new(
+        TransactionId::new(92).unwrap(),
+        dtg_storage::ShardId::new(3).unwrap(),
+        vec![
+            committed_vertex_mutation(901),
+            LogicalMutation::PutVertex(
+                VertexVersion::new(
+                    VertexId::new(902).unwrap(),
+                    Version::new(1),
+                    ValidInterval::new(0, 100).unwrap(),
+                    TransactionTime::new(11).unwrap(),
+                    Properties::new(),
+                )
+                .unwrap(),
+            ),
+        ],
+    );
+    assert!(mixed.is_err());
+}
+
 fn fixture_machine() -> ShardStateMachine {
     let binding = fixture_binding();
     ShardStateMachine::new(binding.clone(), Arc::new(RecordingStore::new(binding))).unwrap()
@@ -161,23 +377,27 @@ fn command_for_generation(generation: u64) -> ShardCommand {
 }
 
 fn command_for(command_id: u128, placement_epoch: u64, backend_generation: u64) -> ShardCommand {
+    ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(command_id).unwrap(),
+            placement_epoch,
+            backend_generation,
+            vec![committed_vertex_mutation(command_id)],
+        )
+        .unwrap(),
+    )
+}
+
+fn committed_vertex_mutation(id: u128) -> LogicalMutation {
     let vertex = VertexVersion::new(
-        VertexId::new(command_id).unwrap(),
+        VertexId::new(id).unwrap(),
         Version::new(1),
         ValidInterval::new(0, 100).unwrap(),
         TransactionTime::new(10).unwrap(),
         Properties::new(),
     )
     .unwrap();
-    ShardCommand::CommitSingleShard(
-        CommitSingleShard::new(
-            CommandId::new(command_id).unwrap(),
-            placement_epoch,
-            backend_generation,
-            vec![LogicalMutation::PutVertex(vertex)],
-        )
-        .unwrap(),
-    )
+    LogicalMutation::PutVertex(vertex)
 }
 
 fn fixture_binding() -> ReplicaBinding {

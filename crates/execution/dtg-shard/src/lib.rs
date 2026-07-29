@@ -8,8 +8,9 @@ mod state_machine;
 
 pub use command::{
     AdvanceClosedTimestamp, CommandHeader, CommitSingleShard, FinalizeParticipant, InstallSnapshot,
-    MigrationCommand, MigrationPhase, PrewriteIntent, RecordHomeDecision,
-    SUPPORTED_SHARD_COMMAND_FORMAT_VERSION, ShardCommand,
+    MigrationCommand, MigrationPhase, ParticipantIntent, PrewriteIntent, RecordHomeDecision,
+    SUPPORTED_SHARD_COMMAND_FORMAT_VERSION, SUPPORTED_TRANSACTION_INTENT_VERSION, ShardCommand,
+    TRANSACTION_INTENT_METADATA_NAME,
 };
 pub use host::{ReplicaKey, ShardHost};
 pub use raft_store::RaftStore;
