@@ -184,7 +184,13 @@ struct CountingReadStore {
     applied_index: AtomicU64,
     begin_read_view_calls: AtomicUsize,
     scan_vertices_calls: Arc<AtomicUsize>,
+    first_scan_gate: Option<Arc<FirstScanGate>>,
     returned_fence: Option<ReadFence>,
+}
+
+struct FirstScanGate {
+    entered: mpsc::SyncSender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
 }
 
 struct PausingReadStore {
@@ -219,12 +225,25 @@ impl CountingReadStore {
             applied_index: AtomicU64::new(applied_index),
             begin_read_view_calls: AtomicUsize::new(0),
             scan_vertices_calls: Arc::new(AtomicUsize::new(0)),
+            first_scan_gate: None,
             returned_fence: None,
         }
     }
 
     fn returning_fence(mut self, fence: ReadFence) -> Self {
         self.returned_fence = Some(fence);
+        self
+    }
+
+    fn blocking_first_scan(
+        mut self,
+        entered: mpsc::SyncSender<()>,
+        resume: mpsc::Receiver<()>,
+    ) -> Self {
+        self.first_scan_gate = Some(Arc::new(FirstScanGate {
+            entered,
+            resume: Mutex::new(resume),
+        }));
         self
     }
 }
@@ -250,10 +269,12 @@ impl ReplicaStateStore for CountingReadStore {
         self.begin_read_view_calls.fetch_add(1, Ordering::SeqCst);
         let returned_fence = self.returned_fence.clone().unwrap_or(fence);
         let scan_vertices_calls = Arc::clone(&self.scan_vertices_calls);
+        let first_scan_gate = self.first_scan_gate.clone();
         Box::pin(async move {
             Ok(Box::new(EmptyReadView {
                 returned_fence,
                 scan_vertices_calls,
+                first_scan_gate,
             }) as Box<_>)
         })
     }
@@ -288,6 +309,7 @@ impl ReplicaStateStore for PausingReadStore {
             Ok(Box::new(EmptyReadView {
                 returned_fence: fence,
                 scan_vertices_calls: Arc::new(AtomicUsize::new(0)),
+                first_scan_gate: None,
             }) as Box<_>)
         })
     }
@@ -296,6 +318,7 @@ impl ReplicaStateStore for PausingReadStore {
 struct EmptyReadView {
     returned_fence: ReadFence,
     scan_vertices_calls: Arc<AtomicUsize>,
+    first_scan_gate: Option<Arc<FirstScanGate>>,
 }
 
 impl TemporalReadView for EmptyReadView {
@@ -331,7 +354,13 @@ impl TemporalReadView for EmptyReadView {
         &self,
         _request: VertexScan,
     ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>> {
-        self.scan_vertices_calls.fetch_add(1, Ordering::SeqCst);
+        let ordinal = self.scan_vertices_calls.fetch_add(1, Ordering::SeqCst);
+        if ordinal == 0
+            && let Some(gate) = &self.first_scan_gate
+        {
+            gate.entered.send(()).unwrap();
+            gate.resume.lock().unwrap().recv().unwrap();
+        }
         Box::pin(async { Ok(ScanPage::new(Vec::new(), None)) })
     }
 
@@ -617,6 +646,10 @@ fn point_fragment_body(vertex_id: u128) -> Vec<u8> {
 }
 
 fn count_fragment_body() -> Vec<u8> {
+    count_fragment_body_with_scan(None, 4096)
+}
+
+fn count_fragment_body_with_scan(after: Option<u128>, limit: u32) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&1_u64.to_be_bytes());
     body.extend_from_slice(&1_u32.to_be_bytes());
@@ -629,8 +662,14 @@ fn count_fragment_body() -> Vec<u8> {
     body.push(2);
     body.extend_from_slice(&10_i64.to_be_bytes());
     body.extend_from_slice(&41_i64.to_be_bytes());
-    body.push(0);
-    body.extend_from_slice(&4096_u32.to_be_bytes());
+    match after {
+        Some(after) => {
+            body.push(1);
+            body.extend_from_slice(&after.to_be_bytes());
+        }
+        None => body.push(0),
+    }
+    body.extend_from_slice(&limit.to_be_bytes());
     body.push(0x1f);
     body.push(0);
     body.extend_from_slice(&0_u32.to_be_bytes());
@@ -686,6 +725,51 @@ fn vertex_count_cache_reuses_an_exact_temporal_snapshot() {
     assert_eq!(store.scan_vertices_calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vertex_count_cache_merges_concurrent_exact_snapshot_misses() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "vertex-count-cache-concurrent");
+    let (entered, first_scan_entered) = mpsc::sync_channel(1);
+    let (resume, first_scan_resume) = mpsc::channel();
+    let store = Arc::new(
+        CountingReadStore::new(binding.clone(), 9).blocking_first_scan(entered, first_scan_resume),
+    );
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let runtime = Arc::new(runtime);
+    let count = count_fragment_body();
+
+    let first = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let count = count.clone();
+        async move {
+            runtime
+                .execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &count)
+                .await
+        }
+    });
+    first_scan_entered.recv().unwrap();
+    let second = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let count = count.clone();
+        async move {
+            runtime
+                .execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &count)
+                .await
+        }
+    });
+
+    for _ in 0..100 {
+        if store.scan_vertices_calls.load(Ordering::SeqCst) > 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let scan_calls = store.scan_vertices_calls.load(Ordering::SeqCst);
+    resume.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(scan_calls, 1);
+}
+
 #[test]
 fn vertex_count_cache_reopens_for_a_new_temporal_snapshot() {
     let binding = binding(ProviderKind::Fjall, 5, 6, "vertex-count-cache-time");
@@ -699,6 +783,27 @@ fn vertex_count_cache_reopens_for_a_new_temporal_snapshot() {
         .unwrap();
 
     assert_eq!(store.scan_vertices_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn vertex_count_cache_distinguishes_valid_time_and_scan_page() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "vertex-count-cache-scope");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let full = count_fragment_body();
+    let limited = count_fragment_body_with_scan(None, 2048);
+    let after = count_fragment_body_with_scan(Some(17), 4096);
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &full))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 18, &full))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 18, &limited))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 18, &after))
+        .unwrap();
+
+    assert_eq!(store.scan_vertices_calls.load(Ordering::SeqCst), 4);
 }
 
 #[test]

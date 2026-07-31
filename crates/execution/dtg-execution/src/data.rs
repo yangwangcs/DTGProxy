@@ -13,6 +13,7 @@ use dtg_storage::{
 };
 use prost_011::Message as _;
 use raft::eraftpb::Message;
+use tokio::sync::watch;
 
 use crate::{
     GatewayExecutionError, GatewayFuture, GatewayRetry, GatewayRows, GatewayValue, RequestDetail,
@@ -209,6 +210,7 @@ pub struct DataExecution {
     stores: Mutex<BTreeMap<ReplicaKey, ResolvedReplicaStore>>,
     read_views: Mutex<BTreeMap<ReplicaKey, CachedReadView>>,
     vertex_counts: Mutex<BTreeMap<ReplicaKey, CachedVertexCount>>,
+    vertex_count_flights: Mutex<BTreeMap<ReplicaKey, VertexCountFlight>>,
     request_metrics: Arc<RequestStageMetrics>,
 }
 
@@ -280,6 +282,18 @@ struct CachedVertexCount {
     fence: ReadFence,
     scope: VertexCountScope,
     count: i64,
+}
+
+struct VertexCountFlight {
+    store: Arc<dyn ReplicaStateStore>,
+    fence: ReadFence,
+    scope: VertexCountScope,
+    completed: watch::Sender<()>,
+}
+
+enum VertexCountFlightLease {
+    Owner,
+    Waiter(watch::Receiver<()>),
 }
 
 impl DataExecution {
@@ -556,37 +570,9 @@ impl DataExecution {
                         after,
                         limit,
                     };
-                    let count =
-                        match self.cached_vertex_count(key, store.state(), &fence, &scope)? {
-                            Some(count) => count,
-                            None => {
-                                let count = view
-                                    .scan_vertices(
-                                        VertexScan::new(
-                                            scope.valid_at,
-                                            scope.transaction_time,
-                                            scope.after,
-                                            scope.limit,
-                                        )
-                                        .map_err(data_storage_error)?,
-                                    )
-                                    .await
-                                    .map_err(data_storage_error)?
-                                    .rows()
-                                    .len();
-                                let count = i64::try_from(count)
-                                    .map_err(|_| data_error("vertex count exceeds i64"))?;
-                                self.cache_vertex_count(
-                                    key,
-                                    store.state(),
-                                    &fence,
-                                    &view,
-                                    scope,
-                                    count,
-                                )?;
-                                count
-                            }
-                        };
+                    let count = self
+                        .vertex_count(key, store.state(), &fence, &view, scope)
+                        .await?;
                     (
                         PARTIAL_VERTEX_COUNT_FIELD,
                         vec![vec![GatewayValue::Integer(count)]],
@@ -736,6 +722,103 @@ impl DataExecution {
         }))
     }
 
+    fn vertex_count<'a>(
+        &'a self,
+        key: ReplicaKey,
+        store: &'a Arc<dyn ReplicaStateStore>,
+        fence: &'a ReadFence,
+        view: &'a Arc<dyn TemporalReadView>,
+        scope: VertexCountScope,
+    ) -> GatewayFuture<'a, Result<i64, GatewayExecutionError>> {
+        Box::pin(async move {
+            loop {
+                if let Some(count) = self.cached_vertex_count(key, store, fence, &scope)? {
+                    return Ok(count);
+                }
+                match self.acquire_vertex_count_flight(key, store, fence, &scope)? {
+                    VertexCountFlightLease::Owner => {
+                        let result = async {
+                            let count = view
+                                .scan_vertices(
+                                    VertexScan::new(
+                                        scope.valid_at,
+                                        scope.transaction_time,
+                                        scope.after,
+                                        scope.limit,
+                                    )
+                                    .map_err(data_storage_error)?,
+                                )
+                                .await
+                                .map_err(data_storage_error)?
+                                .rows()
+                                .len();
+                            let count = i64::try_from(count)
+                                .map_err(|_| data_error("vertex count exceeds i64"))?;
+                            self.cache_vertex_count(key, store, fence, view, scope.clone(), count)?;
+                            Ok(count)
+                        }
+                        .await;
+                        self.finish_vertex_count_flight(key, store, fence, &scope)?;
+                        return result;
+                    }
+                    VertexCountFlightLease::Waiter(mut completed) => {
+                        let _ = completed.changed().await;
+                    }
+                }
+            }
+        })
+    }
+
+    fn acquire_vertex_count_flight(
+        &self,
+        key: ReplicaKey,
+        store: &Arc<dyn ReplicaStateStore>,
+        fence: &ReadFence,
+        scope: &VertexCountScope,
+    ) -> Result<VertexCountFlightLease, GatewayExecutionError> {
+        let mut flights = self
+            .vertex_count_flights
+            .lock()
+            .map_err(|_| data_error("vertex count flight mutex is poisoned"))?;
+        if let Some(flight) = flights.get(&key)
+            && Arc::ptr_eq(&flight.store, store)
+            && flight.fence == *fence
+            && flight.scope == *scope
+        {
+            return Ok(VertexCountFlightLease::Waiter(flight.completed.subscribe()));
+        }
+        let (completed, _) = watch::channel(());
+        flights.insert(
+            key,
+            VertexCountFlight {
+                store: Arc::clone(store),
+                fence: fence.clone(),
+                scope: scope.clone(),
+                completed,
+            },
+        );
+        Ok(VertexCountFlightLease::Owner)
+    }
+
+    fn finish_vertex_count_flight(
+        &self,
+        key: ReplicaKey,
+        store: &Arc<dyn ReplicaStateStore>,
+        fence: &ReadFence,
+        scope: &VertexCountScope,
+    ) -> Result<(), GatewayExecutionError> {
+        let mut flights = self
+            .vertex_count_flights
+            .lock()
+            .map_err(|_| data_error("vertex count flight mutex is poisoned"))?;
+        if flights.get(&key).is_some_and(|flight| {
+            Arc::ptr_eq(&flight.store, store) && flight.fence == *fence && flight.scope == *scope
+        }) {
+            flights.remove(&key);
+        }
+        Ok(())
+    }
+
     fn cache_vertex_count(
         &self,
         key: ReplicaKey,
@@ -793,6 +876,12 @@ impl DataExecution {
             .lock()
             .map_err(|_| {
                 ShardError::InvalidLifecycle("vertex count cache mutex is poisoned".into())
+            })?
+            .remove(&key);
+        self.vertex_count_flights
+            .lock()
+            .map_err(|_| {
+                ShardError::InvalidLifecycle("vertex count flight mutex is poisoned".into())
             })?
             .remove(&key);
         Ok(())
@@ -1373,6 +1462,7 @@ impl DataExecutionBuilder {
             stores: Mutex::new(BTreeMap::new()),
             read_views: Mutex::new(BTreeMap::new()),
             vertex_counts: Mutex::new(BTreeMap::new()),
+            vertex_count_flights: Mutex::new(BTreeMap::new()),
             request_metrics: self.request_metrics,
         })
     }
