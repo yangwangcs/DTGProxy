@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io;
@@ -25,10 +26,13 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 
-use super::{Backend, CellSpec, Workload};
+use super::{
+    Backend, CellSpec, RawObservation, StageMetricsWindow, Workload, stage_metrics_window_from_log,
+};
 
 const CAPABILITIES: &str = "adjacency,immutable-read-view,logical-snapshot,point";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const POST_MEASUREMENT_METRICS_WAIT: Duration = Duration::from_millis(1_250);
 static NEXT_CELL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct DiagnosticRuntime {
@@ -87,6 +91,7 @@ pub struct DiagnosticCluster {
     gateway_address: SocketAddr,
     binding: ReplicaBinding,
     children: Vec<ManagedChild>,
+    process_logs: BTreeMap<&'static str, PathBuf>,
 }
 
 impl DiagnosticCluster {
@@ -146,6 +151,7 @@ impl DiagnosticCluster {
             gateway_address,
             binding,
             children: Vec::with_capacity(4),
+            process_logs: BTreeMap::new(),
         };
         cluster.spawn(
             "meta",
@@ -297,6 +303,27 @@ impl DiagnosticCluster {
         self.gateway_address
     }
 
+    pub async fn measure_cell(&self, spec: CellSpec) -> io::Result<RawObservation> {
+        let mut observation = super::measure_cell(self.bolt_address(), spec).await?;
+        let (gateway_stage_metrics, data_stage_metrics) = tokio::try_join!(
+            self.stage_metrics_window("gateway", &observation),
+            self.stage_metrics_window("data", &observation),
+        )?;
+        observation.gateway_stage_metrics = Some(gateway_stage_metrics);
+        observation.data_stage_metrics = Some(data_stage_metrics);
+        observation.finished_at_unix_ns = unix_time_nanos();
+        Ok(observation)
+    }
+
+    pub fn last_request_metrics_line(&self, process: &str) -> io::Result<String> {
+        const PREFIX: &str = "DTG_REQUEST_STAGE_METRICS=";
+        std::fs::read_to_string(self.process_log_path(process)?)?
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix(PREFIX).map(str::to_owned))
+            .ok_or_else(|| invalid_data(format!("{process} did not export request metrics")))
+    }
+
     pub async fn shutdown(&mut self) -> io::Result<()> {
         retire_children(&mut self.children)
     }
@@ -387,10 +414,60 @@ impl DiagnosticCluster {
         println!("DTG_BACKEND_E2E_CHILD_STARTED={name}:{}", child.id());
         self.children.push(ManagedChild {
             name,
-            log_path,
+            log_path: log_path.clone(),
             child,
         });
+        self.process_logs.insert(name, log_path);
         Ok(())
+    }
+
+    async fn stage_metrics_window(
+        &self,
+        process: &str,
+        observation: &RawObservation,
+    ) -> io::Result<StageMetricsWindow> {
+        let log_path = self.process_log_path(process)?.to_owned();
+        let deadline = tokio::time::Instant::now() + POST_MEASUREMENT_METRICS_WAIT;
+        loop {
+            let log = std::fs::read_to_string(&log_path)?;
+            match stage_metrics_window_from_log(
+                &log,
+                process,
+                observation.measurement_started_at_unix_ns,
+                observation.measurement_finished_at_unix_ns,
+            ) {
+                Ok(window) => {
+                    let latest_allowed = observation
+                        .measurement_finished_at_unix_ns
+                        .saturating_add(duration_nanos(POST_MEASUREMENT_METRICS_WAIT));
+                    if window.before.unix_timestamp_ns < observation.started_at_unix_ns
+                        || window.after.unix_timestamp_ns > latest_allowed
+                    {
+                        return Err(invalid_data(format!(
+                            "{process} request metrics snapshot lies outside the cell interval"
+                        )));
+                    }
+                    return Ok(window);
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::InvalidData
+                        && error
+                            .to_string()
+                            .contains("lack a post-measurement snapshot")
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn process_log_path(&self, process: &str) -> io::Result<&Path> {
+        self.process_logs
+            .get(process)
+            .map(PathBuf::as_path)
+            .ok_or_else(|| invalid_input(format!("managed child {process} is absent")))
     }
 
     async fn wait_for_port(&mut self, address: SocketAddr, name: &str) -> io::Result<()> {
@@ -779,6 +856,20 @@ fn unix_time_millis() -> u64 {
             .as_millis(),
     )
     .unwrap_or(u64::MAX)
+}
+
+fn unix_time_nanos() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

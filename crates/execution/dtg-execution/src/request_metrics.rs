@@ -37,6 +37,21 @@ impl RequestStage {
     const fn index(self) -> usize {
         self as usize
     }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BoltDecode => "bolt_decode",
+            Self::GatewayCompile => "gateway_compile",
+            Self::GatewayPlan => "gateway_plan",
+            Self::GatewayInternalRpc => "gateway_internal_rpc",
+            Self::GatewayLocalExecution => "gateway_local_execution",
+            Self::BoltEncode => "bolt_encode",
+            Self::DataValidation => "data_validation",
+            Self::DataRouting => "data_routing",
+            Self::DataRaftApply => "data_raft_apply",
+            Self::DataProviderExecution => "data_provider_execution",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,12 +225,62 @@ impl RequestMetricsSnapshot {
     }
 }
 
+pub fn encode_request_metrics_snapshot(
+    process_role: &str,
+    unix_timestamp_ns: u64,
+    sequence: u64,
+    snapshot: &RequestMetricsSnapshot,
+) -> serde_json::Result<String> {
+    let stages = snapshot
+        .stages()
+        .map(|(stage, snapshot)| {
+            serde_json::json!({
+                "stage": stage.as_str(),
+                "buckets": snapshot.buckets.as_slice(),
+                "success": snapshot.success,
+                "error": snapshot.error,
+                "cancelled": snapshot.cancelled,
+                "total_nanoseconds": snapshot.total_nanoseconds,
+                "max_nanoseconds": snapshot.max_nanoseconds,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "schema_version": 1,
+        "process_role": process_role,
+        "unix_timestamp_ns": unix_timestamp_ns,
+        "sequence": sequence,
+        "stages": stages,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use super::{RequestStage, RequestStageMetrics, StageOutcome};
+    use super::{RequestStage, RequestStageMetrics, StageOutcome, encode_request_metrics_snapshot};
+
+    #[test]
+    fn encoded_snapshot_has_stable_process_schema_without_request_content() {
+        let metrics = RequestStageMetrics::default();
+        metrics.record(RequestStage::GatewayCompile, StageOutcome::Success, 8);
+
+        let encoded =
+            encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["process_role"], "gateway");
+        assert_eq!(value["unix_timestamp_ns"], 7);
+        assert_eq!(value["sequence"], 11);
+        assert_eq!(value["stages"].as_array().unwrap().len(), 10);
+        assert_eq!(value["stages"][1]["stage"], "gateway_compile");
+        assert_eq!(value["stages"][1]["success"], 1);
+        assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
+        assert!(!encoded.contains("statement"));
+        assert!(!encoded.contains("parameter"));
+    }
 
     #[test]
     fn records_logarithmic_nanosecond_buckets_and_outcomes() {

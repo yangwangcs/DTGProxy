@@ -39,7 +39,7 @@ pub use meta_raft::{
 };
 pub use request_metrics::{
     RequestMetricsSnapshot, RequestStage, RequestStageMetrics, RequestStageSnapshot, StageOutcome,
-    StageTimer,
+    StageTimer, encode_request_metrics_snapshot,
 };
 pub use write::{
     PHYSICAL_WRITE_VERSION, PhysicalWriteError, PhysicalWriteFragment, PhysicalWritePlan,

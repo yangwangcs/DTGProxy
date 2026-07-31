@@ -13,7 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use backend_e2e_support::{
-    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, Workload, measure_cell, percentile_ns,
+    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, Workload, percentile_ns,
+    stage_metrics_window_from_log,
 };
 
 #[derive(serde::Serialize)]
@@ -68,7 +69,7 @@ async fn quick_selected_backend_e2e_comparison() {
                 if !workload.is_write() {
                     cluster.seed_read_dataset(4_096).await.unwrap();
                 }
-                let observation = measure_cell(cluster.bolt_address(), spec).await.unwrap();
+                let observation = cluster.measure_cell(spec).await.unwrap();
                 cluster.shutdown().await.unwrap();
                 assert_eq!(observation.errors, 0);
                 assert!(!observation.latency_samples_ns.is_empty());
@@ -137,9 +138,17 @@ async fn fjall_cell_uses_real_four_process_bolt_path() {
         count.rows,
         vec![vec![backend_e2e_support::BoltValue::Integer(4_097)]]
     );
-    let observation = measure_cell(cluster.bolt_address(), spec).await.unwrap();
+    let observation = cluster.measure_cell(spec).await.unwrap();
     assert_eq!(observation.errors, 0);
     assert_eq!(observation.row_count, 1);
+    println!(
+        "DTG_GATEWAY_FINAL_METRICS={}",
+        cluster.last_request_metrics_line("gateway").unwrap()
+    );
+    println!(
+        "DTG_DATA_FINAL_METRICS={}",
+        cluster.last_request_metrics_line("data").unwrap()
+    );
     cluster.shutdown().await.unwrap();
 }
 
@@ -298,6 +307,8 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
         row_count: 1,
         result_digest: "result".into(),
         query_digest: "query".into(),
+        gateway_stage_metrics: None,
+        data_stage_metrics: None,
     };
 
     let summary: Vec<backend_e2e_support::Summary> =
@@ -307,6 +318,89 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
     let artifact = serde_json::to_value(observation).unwrap();
     assert_eq!(artifact["backend"], "fjall");
     assert_eq!(artifact["workload"], "point_lookup");
+}
+
+#[test]
+fn stage_metrics_window_requires_valid_bracketing_cumulative_snapshots() {
+    let log = format!(
+        "ordinary stderr\n{}\n{}\n{}\n",
+        stage_metrics_line("gateway", 10, 1, 2),
+        stage_metrics_line("gateway", 15, 2, 5),
+        stage_metrics_line("gateway", 20, 3, 9),
+    );
+
+    let window = stage_metrics_window_from_log(&log, "gateway", 15, 20).unwrap();
+    assert_eq!(window.before.unix_timestamp_ns, 15);
+    assert_eq!(window.after.unix_timestamp_ns, 20);
+    assert_eq!(window.before.sequence, 2);
+    assert_eq!(window.after.sequence, 3);
+    assert_eq!(window.delta.stages[0].success, 4);
+    assert_eq!(window.delta.stages[0].buckets[0], 4);
+}
+
+#[test]
+fn stage_metrics_window_rejects_invalid_or_unbracketed_snapshots() {
+    let mut incomplete_snapshot = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line("gateway", 10, 1, 1)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    incomplete_snapshot["stages"].as_array_mut().unwrap().pop();
+    let cases = [
+        (
+            "wrong schema",
+            format!(
+                "{}\n{}\n",
+                stage_metrics_line_with("gateway", 1, 1, 1, 2),
+                stage_metrics_line("gateway", 20, 2, 2),
+            ),
+        ),
+        (
+            "wrong role",
+            format!(
+                "{}\n{}\n",
+                stage_metrics_line("data", 10, 1, 1),
+                stage_metrics_line("data", 20, 2, 2),
+            ),
+        ),
+        (
+            "duplicate sequence",
+            format!(
+                "{}\n{}\n",
+                stage_metrics_line("gateway", 10, 1, 1),
+                stage_metrics_line("gateway", 20, 1, 2),
+            ),
+        ),
+        (
+            "counter regression",
+            format!(
+                "{}\n{}\n",
+                stage_metrics_line("gateway", 10, 1, 3),
+                stage_metrics_line("gateway", 20, 2, 2),
+            ),
+        ),
+        (
+            "incomplete stage snapshot",
+            format!(
+                "DTG_REQUEST_STAGE_METRICS={incomplete_snapshot}\n{}\n",
+                stage_metrics_line("gateway", 20, 2, 2),
+            ),
+        ),
+        (
+            "outside measurement interval",
+            format!(
+                "{}\n{}\n",
+                stage_metrics_line("gateway", 16, 1, 1),
+                stage_metrics_line("gateway", 19, 2, 2),
+            ),
+        ),
+    ];
+
+    for (name, log) in cases {
+        let error = stage_metrics_window_from_log(&log, "gateway", 15, 20).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
+    }
 }
 
 #[test]
@@ -368,6 +462,12 @@ fn quick_artifact_rejects_incomplete_matrix_and_changed_read_identity() {
     errors[0].errors = 1;
     let error = backend_e2e_support::QuickDiagnosticArtifact::new("revision", errors).unwrap_err();
     assert!(error.to_string().contains("contains errors"));
+
+    let mut missing_metrics = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    missing_metrics[0].gateway_stage_metrics = None;
+    let error =
+        backend_e2e_support::QuickDiagnosticArtifact::new("revision", missing_metrics).unwrap_err();
+    assert!(error.to_string().contains("lacks bracketing stage metrics"));
 }
 
 fn complete_quick_observations(
@@ -403,11 +503,71 @@ fn complete_quick_observations(
                         "stable-result".into()
                     },
                     query_digest: format!("{workload:?}"),
+                    gateway_stage_metrics: Some(synthetic_stage_metrics_window("gateway")),
+                    data_stage_metrics: Some(synthetic_stage_metrics_window("data")),
                 });
             }
         }
     }
     observations
+}
+
+fn stage_metrics_line(role: &str, timestamp: u64, sequence: u64, success: u64) -> String {
+    stage_metrics_line_with(role, timestamp, sequence, success, 1)
+}
+
+fn synthetic_stage_metrics_window(role: &str) -> backend_e2e_support::StageMetricsWindow {
+    let log = format!(
+        "{}\n{}\n",
+        stage_metrics_line(role, 10, 1, 1),
+        stage_metrics_line(role, 20, 2, 2),
+    );
+    stage_metrics_window_from_log(&log, role, 15, 20).unwrap()
+}
+
+fn stage_metrics_line_with(
+    role: &str,
+    timestamp: u64,
+    sequence: u64,
+    success: u64,
+    schema_version: u64,
+) -> String {
+    const STAGES: [&str; 10] = [
+        "bolt_decode",
+        "gateway_compile",
+        "gateway_plan",
+        "gateway_internal_rpc",
+        "gateway_local_execution",
+        "bolt_encode",
+        "data_validation",
+        "data_routing",
+        "data_raft_apply",
+        "data_provider_execution",
+    ];
+    let stages = STAGES
+        .into_iter()
+        .map(|stage| {
+            serde_json::json!({
+                "stage": stage,
+                "buckets": vec![success; 64],
+                "success": success,
+                "error": success,
+                "cancelled": success,
+                "total_nanoseconds": success,
+                "max_nanoseconds": success,
+            })
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "DTG_REQUEST_STAGE_METRICS={}",
+        serde_json::json!({
+            "schema_version": schema_version,
+            "process_role": role,
+            "unix_timestamp_ns": timestamp,
+            "sequence": sequence,
+            "stages": stages,
+        })
+    )
 }
 
 async fn serve_fake_bolt_session(socket: &mut TcpStream, exchanges: usize) {

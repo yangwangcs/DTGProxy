@@ -227,6 +227,8 @@ pub async fn measure_cell(
         row_count,
         result_digest,
         query_digest,
+        gateway_stage_metrics: None,
+        data_stage_metrics: None,
     })
 }
 

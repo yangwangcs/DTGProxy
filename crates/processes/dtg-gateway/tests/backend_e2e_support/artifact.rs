@@ -3,7 +3,22 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+const REQUEST_METRICS_PREFIX: &str = "DTG_REQUEST_STAGE_METRICS=";
+const REQUEST_METRIC_STAGES: [&str; 10] = [
+    "bolt_decode",
+    "gateway_compile",
+    "gateway_plan",
+    "gateway_internal_rpc",
+    "gateway_local_execution",
+    "bolt_encode",
+    "data_validation",
+    "data_routing",
+    "data_raft_apply",
+    "data_provider_execution",
+];
+const HISTOGRAM_BUCKETS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +97,175 @@ pub struct RawObservation {
     pub row_count: u64,
     pub result_digest: String,
     pub query_digest: String,
+    pub gateway_stage_metrics: Option<StageMetricsWindow>,
+    pub data_stage_metrics: Option<StageMetricsWindow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StageMetricSnapshot {
+    pub stage: String,
+    pub buckets: Vec<u64>,
+    pub success: u64,
+    pub error: u64,
+    pub cancelled: u64,
+    pub total_nanoseconds: u64,
+    pub max_nanoseconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessMetricsSnapshot {
+    pub schema_version: u32,
+    pub process_role: String,
+    pub unix_timestamp_ns: u64,
+    pub sequence: u64,
+    pub stages: Vec<StageMetricSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StageMetricsDelta {
+    pub before_sequence: u64,
+    pub after_sequence: u64,
+    pub stages: Vec<StageMetricSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StageMetricsWindow {
+    pub before: ProcessMetricsSnapshot,
+    pub after: ProcessMetricsSnapshot,
+    pub delta: StageMetricsDelta,
+}
+
+pub fn stage_metrics_window_from_log(
+    log: &str,
+    expected_role: &str,
+    measurement_started_at_unix_ns: u64,
+    measurement_finished_at_unix_ns: u64,
+) -> io::Result<StageMetricsWindow> {
+    let snapshots = log
+        .lines()
+        .filter_map(|line| line.strip_prefix(REQUEST_METRICS_PREFIX))
+        .map(|json| {
+            serde_json::from_str::<ProcessMetricsSnapshot>(json)
+                .map_err(|error| invalid_data(format!("invalid request metrics snapshot: {error}")))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if snapshots.is_empty() {
+        return Err(invalid_data(format!(
+            "{expected_role} did not export request metrics"
+        )));
+    }
+
+    let mut previous: Option<&ProcessMetricsSnapshot> = None;
+    for snapshot in &snapshots {
+        validate_metrics_snapshot(snapshot, expected_role)?;
+        if let Some(previous) = previous {
+            if snapshot.sequence <= previous.sequence {
+                return Err(invalid_data("request metrics sequence did not increase"));
+            }
+            if snapshot.unix_timestamp_ns < previous.unix_timestamp_ns {
+                return Err(invalid_data("request metrics timestamp regressed"));
+            }
+            ensure_counters_do_not_regress(previous, snapshot)?;
+        }
+        previous = Some(snapshot);
+    }
+
+    let before = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.unix_timestamp_ns <= measurement_started_at_unix_ns)
+        .max_by_key(|snapshot| snapshot.unix_timestamp_ns)
+        .cloned()
+        .ok_or_else(|| invalid_data("request metrics lack a pre-measurement snapshot"))?;
+    let after = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.unix_timestamp_ns >= measurement_finished_at_unix_ns)
+        .min_by_key(|snapshot| snapshot.unix_timestamp_ns)
+        .cloned()
+        .ok_or_else(|| invalid_data("request metrics lack a post-measurement snapshot"))?;
+
+    Ok(StageMetricsWindow {
+        delta: metric_delta(&before, &after),
+        before,
+        after,
+    })
+}
+
+fn validate_metrics_snapshot(
+    snapshot: &ProcessMetricsSnapshot,
+    expected_role: &str,
+) -> io::Result<()> {
+    if snapshot.schema_version != 1 {
+        return Err(invalid_data("request metrics schema version must be 1"));
+    }
+    if snapshot.process_role != expected_role {
+        return Err(invalid_data(format!(
+            "request metrics role must be {expected_role}"
+        )));
+    }
+    if snapshot.unix_timestamp_ns == 0 {
+        return Err(invalid_data("request metrics timestamp must be non-zero"));
+    }
+    if snapshot.stages.len() != REQUEST_METRIC_STAGES.len() {
+        return Err(invalid_data("request metrics stage snapshot is incomplete"));
+    }
+    for (stage, expected_name) in snapshot.stages.iter().zip(REQUEST_METRIC_STAGES) {
+        if stage.stage != expected_name || stage.buckets.len() != HISTOGRAM_BUCKETS {
+            return Err(invalid_data("request metrics stage snapshot is incomplete"));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_counters_do_not_regress(
+    previous: &ProcessMetricsSnapshot,
+    current: &ProcessMetricsSnapshot,
+) -> io::Result<()> {
+    for (previous, current) in previous.stages.iter().zip(&current.stages) {
+        if previous
+            .buckets
+            .iter()
+            .zip(&current.buckets)
+            .any(|(before, after)| after < before)
+            || current.success < previous.success
+            || current.error < previous.error
+            || current.cancelled < previous.cancelled
+            || current.total_nanoseconds < previous.total_nanoseconds
+            || current.max_nanoseconds < previous.max_nanoseconds
+        {
+            return Err(invalid_data("request metrics counter regressed"));
+        }
+    }
+    Ok(())
+}
+
+fn metric_delta(
+    before: &ProcessMetricsSnapshot,
+    after: &ProcessMetricsSnapshot,
+) -> StageMetricsDelta {
+    let stages = before
+        .stages
+        .iter()
+        .zip(&after.stages)
+        .map(|(before, after)| StageMetricSnapshot {
+            stage: after.stage.clone(),
+            buckets: after
+                .buckets
+                .iter()
+                .zip(&before.buckets)
+                .map(|(after, before)| after - before)
+                .collect(),
+            success: after.success - before.success,
+            error: after.error - before.error,
+            cancelled: after.cancelled - before.cancelled,
+            total_nanoseconds: after.total_nanoseconds - before.total_nanoseconds,
+            max_nanoseconds: after.max_nanoseconds - before.max_nanoseconds,
+        })
+        .collect();
+    StageMetricsDelta {
+        before_sequence: before.sequence,
+        after_sequence: after.sequence,
+        stages,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -149,6 +333,13 @@ impl QuickDiagnosticArtifact {
             {
                 return Err(invalid_data(
                     "quick diagnostic observation is incomplete or contains errors",
+                ));
+            }
+            if observation.gateway_stage_metrics.is_none()
+                || observation.data_stage_metrics.is_none()
+            {
+                return Err(invalid_data(
+                    "quick diagnostic observation lacks bracketing stage metrics",
                 ));
             }
             if !cells.insert((
