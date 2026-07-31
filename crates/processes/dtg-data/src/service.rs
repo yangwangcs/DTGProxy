@@ -291,13 +291,14 @@ impl DataNodeBuilder {
         std::fs::create_dir_all(&self.consensus_root).map_err(|error| {
             DataNodeError::Build(format!("cannot create Fjall consensus root: {error}"))
         })?;
+        let request_metrics = Arc::new(RequestStageMetrics::default());
         let execution = self
             .execution
+            .with_request_metrics(Arc::clone(&request_metrics))
             .build()
             .map_err(|error| DataNodeError::Build(error.to_string()))?;
         let state = Arc::new(ProcessState::new());
         let execution = Arc::new(execution);
-        let request_metrics = Arc::new(RequestStageMetrics::default());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(Vec::new()));
         for binding in self.assignments {
@@ -707,9 +708,9 @@ impl DataRpcService {
         })();
         let (shard_context, payload) = timer.finish_result(validation)?;
         let timer = self.request_metrics.start(RequestStage::DataRouting);
-        let key = timer.finish_result(
+        let lookup = timer.finish_result(
             self.execution
-                .locate_replica(
+                .locate_replica_timed(
                     shard_context.request().cluster_id(),
                     shard_context.graph_id(),
                     shard_context.shard_id(),
@@ -719,6 +720,17 @@ impl DataRpcService {
                 )
                 .map_err(|error| self.execution_failure(error)),
         )?;
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRouteLockWait,
+            dtg_execution::StageOutcome::Success,
+            lookup.lock_wait_nanoseconds(),
+        );
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRouteLookup,
+            dtg_execution::StageOutcome::Success,
+            lookup.lookup_nanoseconds(),
+        );
+        let key = lookup.key();
         let observation = self
             .execution
             .replica_observation(key)
@@ -907,9 +919,9 @@ impl DataService for DataRpcService {
         let (shard_context, command) = timer.finish_result(validation)?;
         let command_id = command.header().command_id().get();
         let timer = self.request_metrics.start(RequestStage::DataRouting);
-        let key = timer.finish_result(
+        let lookup = timer.finish_result(
             self.execution
-                .locate_replica(
+                .locate_replica_timed(
                     shard_context.request().cluster_id(),
                     shard_context.graph_id(),
                     shard_context.shard_id(),
@@ -919,12 +931,39 @@ impl DataService for DataRpcService {
                 )
                 .map_err(|error| self.execution_failure(error)),
         )?;
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRouteLockWait,
+            dtg_execution::StageOutcome::Success,
+            lookup.lock_wait_nanoseconds(),
+        );
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRouteLookup,
+            dtg_execution::StageOutcome::Success,
+            lookup.lookup_nanoseconds(),
+        );
+        let key = lookup.key();
         let timer = self.request_metrics.start(RequestStage::DataRaftApply);
-        let progress = timer.finish_result(
+        let apply = timer.finish_result(
             self.execution
-                .apply_transaction_command(key, command)
+                .apply_transaction_command_timed(key, command)
                 .map_err(|error| self.execution_failure(error)),
         )?;
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRaftLockWait,
+            dtg_execution::StageOutcome::Success,
+            apply.lock_wait_nanoseconds(),
+        );
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRaftPropose,
+            dtg_execution::StageOutcome::Success,
+            apply.propose_nanoseconds(),
+        );
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRaftDriveReady,
+            dtg_execution::StageOutcome::Success,
+            apply.drive_ready_nanoseconds(),
+        );
+        let progress = apply.into_progress();
         let mut matching = progress
             .receipts()
             .iter()

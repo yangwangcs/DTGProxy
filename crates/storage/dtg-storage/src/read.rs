@@ -507,4 +507,17 @@ pub trait TemporalReadView: Send + Sync {
     ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>>;
     /// Returns the latest visible version per edge identity, ordered by edge ID.
     fn scan_edges(&self, request: EdgeScan) -> StoreFuture<'_, ScanPage<EdgeVersion, EdgeId>>;
+
+    /// Optional backend-local timing counters for request attribution. This has no effect on
+    /// storage semantics and is absent for providers that do not implement it.
+    fn diagnostics(&self) -> Option<TemporalReadViewDiagnostics> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TemporalReadViewDiagnostics {
+    pub point_evaluation_nanoseconds: u64,
+    pub scan_id_collection_nanoseconds: u64,
+    pub scan_visibility_nanoseconds: u64,
 }

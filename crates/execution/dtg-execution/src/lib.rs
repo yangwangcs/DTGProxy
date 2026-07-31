@@ -19,7 +19,7 @@ pub use dtg_transaction as transaction;
 pub use controller::{ControlActionExecutor, ControllerExecution, ControllerExecutionBuilder};
 pub use data::{
     DataExecution, DataExecutionBuilder, ExecutionBuildError, ProviderResolver,
-    ProviderResolverSet, ResolvedReplicaStore,
+    ProviderResolverSet, RaftApplyTiming, ReplicaLookup, ResolvedReplicaStore,
 };
 pub use dtg_storage::{ProviderKind, ReplicaBinding, ReplicaStateStore, StorageError, StoreFuture};
 #[cfg(feature = "test-support")]
@@ -38,8 +38,9 @@ pub use meta_raft::{
     MetaCommittedEntry, MetaRaftError, MetaRaftHost, MetaRaftProgress, MetaRaftRole,
 };
 pub use request_metrics::{
-    RequestMetricsSink, RequestMetricsSnapshot, RequestStage, RequestStageMetrics,
-    RequestStageSnapshot, StageOutcome, StageTimer, encode_request_metrics_snapshot,
+    DetailTimer, RequestDetail, RequestMetricsSink, RequestMetricsSnapshot, RequestStage,
+    RequestStageMetrics, RequestStageSnapshot, StageOutcome, StageTimer,
+    encode_request_metrics_snapshot,
 };
 pub use write::{
     PHYSICAL_WRITE_VERSION, PhysicalWriteError, PhysicalWriteFragment, PhysicalWritePlan,

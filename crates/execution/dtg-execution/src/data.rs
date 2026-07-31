@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use dtg_shard::{
     RaftProgress, ReplicaKey, ReplicaObservation, ShardCommand, ShardError, ShardHost,
@@ -13,7 +14,10 @@ use dtg_storage::{
 use prost_011::Message as _;
 use raft::eraftpb::Message;
 
-use crate::{GatewayExecutionError, GatewayFuture, GatewayRetry, GatewayRows, GatewayValue};
+use crate::{
+    GatewayExecutionError, GatewayFuture, GatewayRetry, GatewayRows, GatewayValue, RequestDetail,
+    RequestStageMetrics, StageOutcome,
+};
 
 #[derive(Clone)]
 pub struct ResolvedReplicaStore {
@@ -202,6 +206,56 @@ pub struct DataExecution {
     providers: ProviderResolverSet,
     stores: Mutex<BTreeMap<ReplicaKey, ResolvedReplicaStore>>,
     read_views: Mutex<BTreeMap<ReplicaKey, CachedReadView>>,
+    request_metrics: Arc<RequestStageMetrics>,
+}
+
+pub struct ReplicaLookup {
+    key: ReplicaKey,
+    lock_wait_nanoseconds: u64,
+    lookup_nanoseconds: u64,
+}
+
+impl ReplicaLookup {
+    pub const fn key(&self) -> ReplicaKey {
+        self.key
+    }
+
+    pub const fn lock_wait_nanoseconds(&self) -> u64 {
+        self.lock_wait_nanoseconds
+    }
+
+    pub const fn lookup_nanoseconds(&self) -> u64 {
+        self.lookup_nanoseconds
+    }
+}
+
+pub struct RaftApplyTiming {
+    progress: RaftProgress,
+    lock_wait_nanoseconds: u64,
+    propose_nanoseconds: u64,
+    drive_ready_nanoseconds: u64,
+}
+
+impl RaftApplyTiming {
+    pub const fn progress(&self) -> &RaftProgress {
+        &self.progress
+    }
+
+    pub const fn lock_wait_nanoseconds(&self) -> u64 {
+        self.lock_wait_nanoseconds
+    }
+
+    pub const fn propose_nanoseconds(&self) -> u64 {
+        self.propose_nanoseconds
+    }
+
+    pub const fn drive_ready_nanoseconds(&self) -> u64 {
+        self.drive_ready_nanoseconds
+    }
+
+    pub fn into_progress(self) -> RaftProgress {
+        self.progress
+    }
 }
 
 struct CachedReadView {
@@ -321,8 +375,31 @@ impl DataExecution {
         backend_generation: dtg_storage::BackendGeneration,
         replica_id: Option<dtg_storage::ReplicaId>,
     ) -> Result<ReplicaKey, ShardError> {
-        let mut matches = self
-            .lock_shards()?
+        self.locate_replica_timed(
+            cluster_id,
+            graph_id,
+            shard_id,
+            placement_epoch,
+            backend_generation,
+            replica_id,
+        )
+        .map(|lookup| lookup.key)
+    }
+
+    pub fn locate_replica_timed(
+        &self,
+        cluster_id: dtg_storage::ClusterId,
+        graph_id: dtg_storage::GraphId,
+        shard_id: dtg_storage::ShardId,
+        placement_epoch: dtg_storage::PlacementEpoch,
+        backend_generation: dtg_storage::BackendGeneration,
+        replica_id: Option<dtg_storage::ReplicaId>,
+    ) -> Result<ReplicaLookup, ShardError> {
+        let lock_started = Instant::now();
+        let shards = self.lock_shards()?;
+        let lock_wait_nanoseconds = elapsed_nanoseconds(lock_started);
+        let lookup_started = Instant::now();
+        let mut matches = shards
             .observations()
             .into_iter()
             .filter(|observation| {
@@ -349,7 +426,11 @@ impl DataExecution {
                 "request fence resolves to multiple local replicas".into(),
             ));
         }
-        Ok(key)
+        Ok(ReplicaLookup {
+            key,
+            lock_wait_nanoseconds,
+            lookup_nanoseconds: elapsed_nanoseconds(lookup_started),
+        })
     }
 
     pub fn apply_transaction_command(
@@ -357,9 +438,29 @@ impl DataExecution {
         key: ReplicaKey,
         command: ShardCommand,
     ) -> Result<RaftProgress, ShardError> {
+        self.apply_transaction_command_timed(key, command)
+            .map(RaftApplyTiming::into_progress)
+    }
+
+    pub fn apply_transaction_command_timed(
+        &self,
+        key: ReplicaKey,
+        command: ShardCommand,
+    ) -> Result<RaftApplyTiming, ShardError> {
+        let lock_started = Instant::now();
         let mut shards = self.lock_shards()?;
+        let lock_wait_nanoseconds = elapsed_nanoseconds(lock_started);
+        let propose_started = Instant::now();
         shards.propose(key, command)?;
-        shards.drive_ready(key)
+        let propose_nanoseconds = elapsed_nanoseconds(propose_started);
+        let drive_ready_started = Instant::now();
+        let progress = shards.drive_ready(key)?;
+        Ok(RaftApplyTiming {
+            progress,
+            lock_wait_nanoseconds,
+            propose_nanoseconds,
+            drive_ready_nanoseconds: elapsed_nanoseconds(drive_ready_started),
+        })
     }
 
     pub fn receive_raft_message(
@@ -405,6 +506,8 @@ impl DataExecution {
                     ReadFence::new(binding, applied_index),
                 )
                 .await?;
+            let diagnostics_before = view.diagnostics();
+            let scan = matches!(&read, FragmentRead::VertexScan { .. });
             let rows = match read {
                 FragmentRead::VertexPoint(id) => view
                     .get_vertex(VertexRead::new(id, valid_at, transaction_time))
@@ -425,6 +528,11 @@ impl DataExecution {
                     .map(vertex_row)
                     .collect(),
             };
+            self.record_temporal_read_view_diagnostics(
+                diagnostics_before,
+                view.diagnostics(),
+                scan,
+            );
             GatewayRows::new(vec!["value".into()], rows)
         })
     }
@@ -448,16 +556,34 @@ impl DataExecution {
         fence: ReadFence,
     ) -> GatewayFuture<'a, Result<Arc<dyn TemporalReadView>, GatewayExecutionError>> {
         Box::pin(async move {
+            let cache_started = Instant::now();
             if let Some(view) = self.cached_read_view(key, &store, &fence)?
                 && store.applied_index().await.map_err(data_storage_error)? == fence.applied_index()
             {
+                self.request_metrics.record_detail(
+                    RequestDetail::DataReadViewCacheHit,
+                    StageOutcome::Success,
+                    elapsed_nanoseconds(cache_started),
+                );
                 return Ok(view);
             }
 
+            self.request_metrics.record_detail(
+                RequestDetail::DataReadViewCacheMiss,
+                StageOutcome::Success,
+                elapsed_nanoseconds(cache_started),
+            );
+
+            let open_started = Instant::now();
             let opened = store
                 .begin_read_view(fence.clone())
                 .await
                 .map_err(data_storage_error)?;
+            self.request_metrics.record_detail(
+                RequestDetail::DataReadViewOpen,
+                StageOutcome::Success,
+                elapsed_nanoseconds(open_started),
+            );
             if opened.fence() != &fence {
                 return Err(data_error(
                     "provider returned a read view for a different read fence",
@@ -536,11 +662,50 @@ impl DataExecution {
         Ok(())
     }
 
+    fn record_temporal_read_view_diagnostics(
+        &self,
+        before: Option<dtg_storage::TemporalReadViewDiagnostics>,
+        after: Option<dtg_storage::TemporalReadViewDiagnostics>,
+        scan: bool,
+    ) {
+        let (Some(before), Some(after)) = (before, after) else {
+            return;
+        };
+        if scan {
+            self.request_metrics.record_detail(
+                RequestDetail::DataTemporalScanIdCollection,
+                StageOutcome::Success,
+                after
+                    .scan_id_collection_nanoseconds
+                    .saturating_sub(before.scan_id_collection_nanoseconds),
+            );
+            self.request_metrics.record_detail(
+                RequestDetail::DataTemporalScanVisibility,
+                StageOutcome::Success,
+                after
+                    .scan_visibility_nanoseconds
+                    .saturating_sub(before.scan_visibility_nanoseconds),
+            );
+        } else {
+            self.request_metrics.record_detail(
+                RequestDetail::DataTemporalPointEvaluation,
+                StageOutcome::Success,
+                after
+                    .point_evaluation_nanoseconds
+                    .saturating_sub(before.point_evaluation_nanoseconds),
+            );
+        }
+    }
+
     fn lock_shards(&self) -> Result<std::sync::MutexGuard<'_, ShardHost>, ShardError> {
         self.shards
             .lock()
             .map_err(|_| ShardError::InvalidLifecycle("ShardHost mutex is poisoned".into()))
     }
+}
+
+fn elapsed_nanoseconds(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 enum FragmentRead {
@@ -995,6 +1160,7 @@ pub struct DataExecutionBuilder {
     shards: ShardHost,
     providers: ProviderResolverSet,
     error: Option<ExecutionBuildError>,
+    request_metrics: Arc<RequestStageMetrics>,
 }
 
 impl Default for DataExecutionBuilder {
@@ -1003,6 +1169,7 @@ impl Default for DataExecutionBuilder {
             shards: ShardHost::new(),
             providers: ProviderResolverSet::new(),
             error: None,
+            request_metrics: Arc::new(RequestStageMetrics::default()),
         }
     }
 }
@@ -1026,6 +1193,11 @@ impl DataExecutionBuilder {
         self
     }
 
+    pub fn with_request_metrics(mut self, request_metrics: Arc<RequestStageMetrics>) -> Self {
+        self.request_metrics = request_metrics;
+        self
+    }
+
     pub fn build(self) -> Result<DataExecution, ExecutionBuildError> {
         if let Some(error) = self.error {
             return Err(error);
@@ -1038,6 +1210,7 @@ impl DataExecutionBuilder {
             providers: self.providers,
             stores: Mutex::new(BTreeMap::new()),
             read_views: Mutex::new(BTreeMap::new()),
+            request_metrics: self.request_metrics,
         })
     }
 }

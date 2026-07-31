@@ -44,7 +44,7 @@ use dtg_transaction::{
 use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 
-use crate::{ExecutionBuildError, RequestStage, RequestStageMetrics};
+use crate::{ExecutionBuildError, RequestDetail, RequestStage, RequestStageMetrics, StageOutcome};
 
 trait AnalyticsRuntime: Send + Sync {
     fn tick(
@@ -376,6 +376,14 @@ pub trait GatewayExecutionTransport: Send + Sync {
         request: GatewayClusterRequest,
     ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
         Box::pin(async move { self.execute(request).await.map(GatewayQueryResponse::Final) })
+    }
+
+    fn execute_query_with_metrics(
+        &self,
+        request: GatewayClusterRequest,
+        _metrics: Arc<RequestStageMetrics>,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        self.execute_query(request)
     }
 }
 
@@ -887,6 +895,24 @@ impl GatewayExecutionTransport for GatewayProtocolV2Transport {
             decode_protocol_v2_query_responses(responses).map(GatewayQueryResponse::Materialized)
         })
     }
+
+    fn execute_query_with_metrics(
+        &self,
+        request: GatewayClusterRequest,
+        metrics: Arc<RequestStageMetrics>,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        let encode = metrics.start_detail(RequestDetail::GatewayQueryRequestEncode);
+        let wire_request = encode_protocol_v2_request(&request);
+        encode.finish(StageOutcome::Success);
+        Box::pin(async move {
+            let collect = metrics.start_detail(RequestDetail::GatewayQueryResponseCollect);
+            let responses = collect.finish_result(self.client.execute(wire_request).await)?;
+            let decode = metrics.start_detail(RequestDetail::GatewayQueryResponseDecode);
+            decode
+                .finish_result(decode_protocol_v2_query_responses(responses))
+                .map(GatewayQueryResponse::Materialized)
+        })
+    }
 }
 
 enum GatewayExecutionMode {
@@ -1246,6 +1272,7 @@ impl GatewayExecution {
                     &parameters,
                     &planning_context,
                     write_accounting,
+                    &self.request_metrics,
                 )
                 .await?;
                 account_process_write(
@@ -1330,7 +1357,9 @@ impl GatewayExecution {
             };
             let response = if let Some(executable_plan) = executable_plan {
                 let timer = self.request_metrics.start(RequestStage::GatewayInternalRpc);
-                let remote = transport.execute_query(request).await;
+                let remote = transport
+                    .execute_query_with_metrics(request, Arc::clone(&self.request_metrics))
+                    .await;
                 let remote = timer.finish_result(remote)?;
                 match remote {
                     GatewayQueryResponse::Final(response) => response,
@@ -1338,6 +1367,9 @@ impl GatewayExecution {
                         let timer = self
                             .request_metrics
                             .start(RequestStage::GatewayLocalExecution);
+                        let detail_timer = self
+                            .request_metrics
+                            .start_detail(RequestDetail::GatewayQueryLocalMaterialize);
                         let local = async {
                             let query_cancellation = QueryCancellationToken::new();
                             if cancellation.is_cancelled() {
@@ -1393,7 +1425,8 @@ impl GatewayExecution {
                             Ok(GatewayResponse::Rows(GatewayRows::new(fields, rows)?))
                         }
                         .await;
-                        timer.finish_result(local)?
+                        let local = detail_timer.finish_result(local)?;
+                        timer.finish_result(Ok::<_, GatewayExecutionError>(local))?
                     }
                 }
             } else {
@@ -3105,6 +3138,7 @@ async fn execute_process_create(
     parameters: &BTreeMap<String, GatewayValue>,
     planning_context: &PlanningContext,
     write_accounting: &ProcessWriteAccounting,
+    request_metrics: &Arc<RequestStageMetrics>,
 ) -> Result<ProcessWriteOutcome, GatewayExecutionError> {
     let [catalog_shard] = planning_context.catalog().shards() else {
         return Err(GatewayExecutionError::new(
@@ -3152,12 +3186,12 @@ async fn execute_process_create(
         0,
     ))
     .map_err(|error| process_write_error(error.to_string()))?;
-    let start_time = transport
-        .allocate_start_time(&route, transaction_id)
-        .await?;
-    let commit_time = transport
-        .reserve_commit_time(&route, transaction_id)
-        .await?;
+    let start_time = request_metrics
+        .start_detail(RequestDetail::GatewayMetaAllocateStart)
+        .finish_result(transport.allocate_start_time(&route, transaction_id).await)?;
+    let commit_time = request_metrics
+        .start_detail(RequestDetail::GatewayMetaReserveCommit)
+        .finish_result(transport.reserve_commit_time(&route, transaction_id).await)?;
     let command_id = CommandId::new(process_write_identity(
         b"dtg-gateway-create-command-v1",
         context.request_id(),
@@ -3204,7 +3238,10 @@ async fn execute_process_create(
         command,
     );
     reserve_process_write_capacity(write_accounting, transaction_id)?;
-    let receipt = match transport.apply_single_shard(request).await {
+    let receipt = match request_metrics
+        .start_detail(RequestDetail::GatewayDataApplyRpc)
+        .finish_result(transport.apply_single_shard(request).await)
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             complete_process_write_attempt(
@@ -3219,7 +3256,9 @@ async fn execute_process_create(
         }
     };
     complete_process_write_attempt(write_accounting, transaction_id, !receipt.replayed())?;
-    transport.resolve_committed(&route, transaction_id).await?;
+    request_metrics
+        .start_detail(RequestDetail::GatewayMetaResolveCommit)
+        .finish_result(transport.resolve_committed(&route, transaction_id).await)?;
     Ok(ProcessWriteOutcome {
         transaction_id,
         binding: route.binding,

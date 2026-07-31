@@ -6,6 +6,7 @@ use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
 const REQUEST_STAGES: usize = 10;
+const REQUEST_DETAILS: usize = 19;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -52,6 +53,82 @@ impl RequestStage {
             Self::DataRouting => "data_routing",
             Self::DataRaftApply => "data_raft_apply",
             Self::DataProviderExecution => "data_provider_execution",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum RequestDetail {
+    GatewayQueryRequestEncode,
+    GatewayQueryResponseCollect,
+    GatewayQueryResponseDecode,
+    GatewayQueryLocalMaterialize,
+    GatewayMetaAllocateStart,
+    GatewayMetaReserveCommit,
+    GatewayDataApplyRpc,
+    GatewayMetaResolveCommit,
+    DataRouteLockWait,
+    DataRouteLookup,
+    DataRaftPropose,
+    DataRaftDriveReady,
+    DataReadViewCacheHit,
+    DataReadViewCacheMiss,
+    DataReadViewOpen,
+    DataTemporalPointEvaluation,
+    DataTemporalScanIdCollection,
+    DataTemporalScanVisibility,
+    DataRaftLockWait,
+}
+
+impl RequestDetail {
+    const ALL: [Self; REQUEST_DETAILS] = [
+        Self::GatewayQueryRequestEncode,
+        Self::GatewayQueryResponseCollect,
+        Self::GatewayQueryResponseDecode,
+        Self::GatewayQueryLocalMaterialize,
+        Self::GatewayMetaAllocateStart,
+        Self::GatewayMetaReserveCommit,
+        Self::GatewayDataApplyRpc,
+        Self::GatewayMetaResolveCommit,
+        Self::DataRouteLockWait,
+        Self::DataRouteLookup,
+        Self::DataRaftPropose,
+        Self::DataRaftDriveReady,
+        Self::DataReadViewCacheHit,
+        Self::DataReadViewCacheMiss,
+        Self::DataReadViewOpen,
+        Self::DataTemporalPointEvaluation,
+        Self::DataTemporalScanIdCollection,
+        Self::DataTemporalScanVisibility,
+        Self::DataRaftLockWait,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::GatewayQueryRequestEncode => "gateway_query_request_encode",
+            Self::GatewayQueryResponseCollect => "gateway_query_response_collect",
+            Self::GatewayQueryResponseDecode => "gateway_query_response_decode",
+            Self::GatewayQueryLocalMaterialize => "gateway_query_local_materialize",
+            Self::GatewayMetaAllocateStart => "gateway_meta_allocate_start",
+            Self::GatewayMetaReserveCommit => "gateway_meta_reserve_commit",
+            Self::GatewayDataApplyRpc => "gateway_data_apply_rpc",
+            Self::GatewayMetaResolveCommit => "gateway_meta_resolve_commit",
+            Self::DataRouteLockWait => "data_route_lock_wait",
+            Self::DataRouteLookup => "data_route_lookup",
+            Self::DataRaftPropose => "data_raft_propose",
+            Self::DataRaftDriveReady => "data_raft_drive_ready",
+            Self::DataReadViewCacheHit => "data_read_view_cache_hit",
+            Self::DataReadViewCacheMiss => "data_read_view_cache_miss",
+            Self::DataReadViewOpen => "data_read_view_open",
+            Self::DataTemporalPointEvaluation => "data_temporal_point_evaluation",
+            Self::DataTemporalScanIdCollection => "data_temporal_scan_id_collection",
+            Self::DataTemporalScanVisibility => "data_temporal_scan_visibility",
+            Self::DataRaftLockWait => "data_raft_lock_wait",
         }
     }
 }
@@ -125,12 +202,14 @@ fn saturating_fetch_add(value: &AtomicU64, increment: u64) {
 
 pub struct RequestStageMetrics {
     stages: [StageMetrics; REQUEST_STAGES],
+    details: [StageMetrics; REQUEST_DETAILS],
 }
 
 impl Default for RequestStageMetrics {
     fn default() -> Self {
         Self {
             stages: std::array::from_fn(|_| StageMetrics::default()),
+            details: std::array::from_fn(|_| StageMetrics::default()),
         }
     }
 }
@@ -148,11 +227,65 @@ impl RequestStageMetrics {
     pub fn snapshot(&self) -> RequestMetricsSnapshot {
         RequestMetricsSnapshot {
             stages: std::array::from_fn(|index| self.stages[index].snapshot()),
+            details: std::array::from_fn(|index| self.details[index].snapshot()),
         }
     }
 
     fn record(&self, stage: RequestStage, outcome: StageOutcome, nanoseconds: u64) {
         self.stages[stage.index()].record(outcome, nanoseconds);
+    }
+
+    pub fn record_detail(&self, detail: RequestDetail, outcome: StageOutcome, nanoseconds: u64) {
+        self.details[detail.index()].record(outcome, nanoseconds);
+    }
+
+    pub fn start_detail(self: &Arc<Self>, detail: RequestDetail) -> DetailTimer {
+        DetailTimer {
+            metrics: Arc::clone(self),
+            detail,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+}
+
+pub struct DetailTimer {
+    metrics: Arc<RequestStageMetrics>,
+    detail: RequestDetail,
+    started: Instant,
+    finished: bool,
+}
+
+impl DetailTimer {
+    pub fn finish(mut self, outcome: StageOutcome) {
+        self.metrics.record_detail(
+            self.detail,
+            outcome,
+            elapsed_nanoseconds(self.started.elapsed().as_nanos()),
+        );
+        self.finished = true;
+    }
+
+    pub fn finish_result<T, E>(self, result: Result<T, E>) -> Result<T, E> {
+        let outcome = if result.is_ok() {
+            StageOutcome::Success
+        } else {
+            StageOutcome::Error
+        };
+        self.finish(outcome);
+        result
+    }
+}
+
+impl Drop for DetailTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.metrics.record_detail(
+                self.detail,
+                StageOutcome::Cancelled,
+                elapsed_nanoseconds(self.started.elapsed().as_nanos()),
+            );
+        }
     }
 }
 
@@ -213,6 +346,7 @@ pub struct RequestStageSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestMetricsSnapshot {
     pub stages: [RequestStageSnapshot; REQUEST_STAGES],
+    pub details: [RequestStageSnapshot; REQUEST_DETAILS],
 }
 
 impl RequestMetricsSnapshot {
@@ -224,6 +358,12 @@ impl RequestMetricsSnapshot {
         RequestStage::ALL
             .into_iter()
             .zip(self.stages.iter().copied())
+    }
+
+    pub fn details(&self) -> impl Iterator<Item = (RequestDetail, RequestStageSnapshot)> + '_ {
+        RequestDetail::ALL
+            .into_iter()
+            .zip(self.details.iter().copied())
     }
 }
 
@@ -247,12 +387,27 @@ pub fn encode_request_metrics_snapshot(
             })
         })
         .collect::<Vec<_>>();
+    let details = snapshot
+        .details()
+        .map(|(detail, snapshot)| {
+            serde_json::json!({
+                "detail": detail.as_str(),
+                "buckets": snapshot.buckets.as_slice(),
+                "success": snapshot.success,
+                "error": snapshot.error,
+                "cancelled": snapshot.cancelled,
+                "total_nanoseconds": snapshot.total_nanoseconds,
+                "max_nanoseconds": snapshot.max_nanoseconds,
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::to_string(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "process_role": process_role,
         "unix_timestamp_ns": unix_timestamp_ns,
         "sequence": sequence,
         "stages": stages,
+        "details": details,
     }))
 }
 
@@ -298,7 +453,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        RequestMetricsSink, RequestStage, RequestStageMetrics, StageOutcome,
+        RequestDetail, RequestMetricsSink, RequestStage, RequestStageMetrics, StageOutcome,
         encode_request_metrics_snapshot,
     };
 
@@ -342,12 +497,17 @@ mod tests {
     fn encoded_snapshot_has_stable_process_schema_without_request_content() {
         let metrics = RequestStageMetrics::default();
         metrics.record(RequestStage::GatewayCompile, StageOutcome::Success, 8);
+        metrics.record_detail(
+            RequestDetail::DataReadViewCacheHit,
+            StageOutcome::Success,
+            0,
+        );
 
         let encoded =
             encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["process_role"], "gateway");
         assert_eq!(value["unix_timestamp_ns"], 7);
         assert_eq!(value["sequence"], 11);
@@ -355,6 +515,9 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "gateway_compile");
         assert_eq!(value["stages"][1]["success"], 1);
         assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
+        assert_eq!(value["details"].as_array().unwrap().len(), 19);
+        assert_eq!(value["details"][12]["detail"], "data_read_view_cache_hit");
+        assert_eq!(value["details"][12]["success"], 1);
         assert!(!encoded.contains("statement"));
         assert!(!encoded.contains("parameter"));
     }

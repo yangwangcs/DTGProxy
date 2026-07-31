@@ -9,17 +9,18 @@ use std::{
 use std::thread;
 
 #[cfg(feature = "tck")]
-use dtg_storage::SnapshotReplayRecord;
+use dtg_storage::{
+    LogicalReplicaActivation, LogicalSnapshotCandidateReceipt, SnapshotReplayRecord,
+};
 
 use dtg_storage::{
     ArtifactChunk, ArtifactKey, ArtifactKind, ArtifactManifest, ArtifactStore, BackendClass,
     BindingRole, CapabilityManifest, CommandId, CommittedShardBatch, ConsensusCommandEnvelope,
     ConsensusEntry, ConsensusStore, Digest32, EdgeId, EdgeTombstone, EdgeVersion, LogicalMutation,
-    LogicalReplicaActivation, LogicalSnapshotCandidateReceipt, LogicalSnapshotSink,
-    LogicalSnapshotSource, ProviderKind, ReadFence, ReplicaBinding, ReplicaMetadata,
-    ReplicaStateStore, SnapshotChunk, SnapshotManifest, SnapshotRecord, SnapshotRequest,
-    StorageError, TransactionId, TransactionRecord, TransactionState, TransactionTime,
-    ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion,
+    LogicalSnapshotSink, LogicalSnapshotSource, ProviderKind, ReadFence, ReplicaBinding,
+    ReplicaMetadata, ReplicaStateStore, SnapshotChunk, SnapshotManifest, SnapshotRecord,
+    SnapshotRequest, StorageError, TransactionId, TransactionRecord, TransactionState,
+    TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion,
 };
 use dtg_storage_fjall::{FjallArtifactStore, FjallConsensusStore, FjallReplicaStore};
 use fjall::{Database, KeyspaceCreateOptions};

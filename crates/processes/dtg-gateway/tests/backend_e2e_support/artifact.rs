@@ -19,6 +19,27 @@ const REQUEST_METRIC_STAGES: [&str; 10] = [
     "data_provider_execution",
 ];
 const HISTOGRAM_BUCKETS: usize = 64;
+const REQUEST_METRIC_DETAILS: [&str; 19] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +140,19 @@ pub struct ProcessMetricsSnapshot {
     pub unix_timestamp_ns: u64,
     pub sequence: u64,
     pub stages: Vec<StageMetricSnapshot>,
+    #[serde(default)]
+    pub details: Vec<DetailMetricSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DetailMetricSnapshot {
+    pub detail: String,
+    pub buckets: Vec<u64>,
+    pub success: u64,
+    pub error: u64,
+    pub cancelled: u64,
+    pub total_nanoseconds: u64,
+    pub max_nanoseconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -126,6 +160,17 @@ pub struct StageMetricsDelta {
     pub before_sequence: u64,
     pub after_sequence: u64,
     pub stages: Vec<StageMetricDelta>,
+    pub details: Vec<DetailMetricDelta>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DetailMetricDelta {
+    pub detail: String,
+    pub buckets: Vec<u64>,
+    pub success: u64,
+    pub error: u64,
+    pub cancelled: u64,
+    pub total_nanoseconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -204,8 +249,10 @@ fn validate_metrics_snapshot(
     snapshot: &ProcessMetricsSnapshot,
     expected_role: &str,
 ) -> io::Result<()> {
-    if snapshot.schema_version != 1 {
-        return Err(invalid_data("request metrics schema version must be 1"));
+    if !matches!(snapshot.schema_version, 1 | 2) {
+        return Err(invalid_data(
+            "request metrics schema version must be 1 or 2",
+        ));
     }
     if snapshot.process_role != expected_role {
         return Err(invalid_data(format!(
@@ -223,6 +270,25 @@ fn validate_metrics_snapshot(
             return Err(invalid_data("request metrics stage snapshot is incomplete"));
         }
     }
+    if snapshot.schema_version == 1 {
+        if !snapshot.details.is_empty() {
+            return Err(invalid_data(
+                "schema v1 request metrics cannot contain details",
+            ));
+        }
+    } else if snapshot.details.len() != REQUEST_METRIC_DETAILS.len()
+        || snapshot
+            .details
+            .iter()
+            .zip(REQUEST_METRIC_DETAILS)
+            .any(|(detail, expected)| {
+                detail.detail != expected || detail.buckets.len() != HISTOGRAM_BUCKETS
+            })
+    {
+        return Err(invalid_data(
+            "request metrics detail snapshot is incomplete",
+        ));
+    }
     Ok(())
 }
 
@@ -231,21 +297,61 @@ fn ensure_counters_do_not_regress(
     current: &ProcessMetricsSnapshot,
 ) -> io::Result<()> {
     for (previous, current) in previous.stages.iter().zip(&current.stages) {
-        if previous
-            .buckets
-            .iter()
-            .zip(&current.buckets)
-            .any(|(before, after)| after < before)
-            || current.success < previous.success
-            || current.error < previous.error
-            || current.cancelled < previous.cancelled
-            || current.total_nanoseconds < previous.total_nanoseconds
-            || current.max_nanoseconds < previous.max_nanoseconds
-        {
+        if counters_regressed(
+            previous.buckets.iter().zip(&current.buckets),
+            previous.success,
+            current.success,
+            previous.error,
+            current.error,
+            previous.cancelled,
+            current.cancelled,
+            previous.total_nanoseconds,
+            current.total_nanoseconds,
+            previous.max_nanoseconds,
+            current.max_nanoseconds,
+        ) {
             return Err(invalid_data("request metrics counter regressed"));
         }
     }
+    for (previous, current) in previous.details.iter().zip(&current.details) {
+        if counters_regressed(
+            previous.buckets.iter().zip(&current.buckets),
+            previous.success,
+            current.success,
+            previous.error,
+            current.error,
+            previous.cancelled,
+            current.cancelled,
+            previous.total_nanoseconds,
+            current.total_nanoseconds,
+            previous.max_nanoseconds,
+            current.max_nanoseconds,
+        ) {
+            return Err(invalid_data("request metrics detail counter regressed"));
+        }
+    }
     Ok(())
+}
+
+fn counters_regressed<'a>(
+    mut buckets: impl Iterator<Item = (&'a u64, &'a u64)>,
+    previous_success: u64,
+    current_success: u64,
+    previous_error: u64,
+    current_error: u64,
+    previous_cancelled: u64,
+    current_cancelled: u64,
+    previous_total: u64,
+    current_total: u64,
+    previous_max: u64,
+    current_max: u64,
+) -> bool {
+    buckets.any(|(before, after)| after < before)
+        || current_success < previous_success
+        || current_error < previous_error
+        || current_cancelled < previous_cancelled
+        || current_total < previous_total
+        || current_max < previous_max
 }
 
 fn metric_delta(
@@ -270,10 +376,29 @@ fn metric_delta(
             total_nanoseconds: after.total_nanoseconds - before.total_nanoseconds,
         })
         .collect();
+    let details = before
+        .details
+        .iter()
+        .zip(&after.details)
+        .map(|(before, after)| DetailMetricDelta {
+            detail: after.detail.clone(),
+            buckets: after
+                .buckets
+                .iter()
+                .zip(&before.buckets)
+                .map(|(after, before)| after - before)
+                .collect(),
+            success: after.success - before.success,
+            error: after.error - before.error,
+            cancelled: after.cancelled - before.cancelled,
+            total_nanoseconds: after.total_nanoseconds - before.total_nanoseconds,
+        })
+        .collect();
     StageMetricsDelta {
         before_sequence: before.sequence,
         after_sequence: after.sequence,
         stages,
+        details,
     }
 }
 

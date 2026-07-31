@@ -37,7 +37,7 @@ pub use mutation::{
 pub use read::{
     AdjacencyDirection, AdjacencyRead, ChangeCursor, ChangePage, ChangeRecord, ChangesRead,
     EdgeHistoryRead, EdgeRead, EdgeScan, ReadFence, ReplicaStateStore, ScanPage, StoreFuture,
-    TemporalReadView, VertexHistoryRead, VertexRead, VertexScan,
+    TemporalReadView, TemporalReadViewDiagnostics, VertexHistoryRead, VertexRead, VertexScan,
 };
 pub use snapshot::{
     LogicalReplicaActivation, LogicalReplicaActivationReceipt, LogicalSnapshotCandidateReceipt,

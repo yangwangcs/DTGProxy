@@ -341,6 +341,41 @@ fn stage_metrics_window_requires_valid_bracketing_cumulative_snapshots() {
 }
 
 #[test]
+fn stage_metrics_window_accepts_complete_schema_v2_details_and_rejects_incomplete_details() {
+    let log = format!(
+        "{}\n{}\n",
+        stage_metrics_line_with_details("gateway", 10, 1, 1),
+        stage_metrics_line_with_details("gateway", 20, 2, 2),
+    );
+    let window = stage_metrics_window_from_log(&log, "gateway", 15, 20).unwrap();
+    assert_eq!(window.delta.details.len(), 19);
+    assert_eq!(
+        window.delta.details[0].detail,
+        "gateway_query_request_encode"
+    );
+    assert_eq!(window.delta.details[0].success, 1);
+
+    let mut incomplete = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line_with_details("gateway", 10, 1, 1)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    incomplete["details"].as_array_mut().unwrap().pop();
+    let error = stage_metrics_window_from_log(
+        &format!(
+            "DTG_REQUEST_STAGE_METRICS={incomplete}\n{}\n",
+            stage_metrics_line_with_details("gateway", 20, 2, 2),
+        ),
+        "gateway",
+        15,
+        20,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn stage_metrics_window_rejects_invalid_or_unbracketed_snapshots() {
     let mut incomplete_snapshot = serde_json::from_str::<serde_json::Value>(
         stage_metrics_line("gateway", 10, 1, 1)
@@ -570,6 +605,58 @@ fn stage_metrics_line_with(
             "stages": stages,
         })
     )
+}
+
+fn stage_metrics_line_with_details(
+    role: &str,
+    timestamp: u64,
+    sequence: u64,
+    success: u64,
+) -> String {
+    const DETAILS: [&str; 19] = [
+        "gateway_query_request_encode",
+        "gateway_query_response_collect",
+        "gateway_query_response_decode",
+        "gateway_query_local_materialize",
+        "gateway_meta_allocate_start",
+        "gateway_meta_reserve_commit",
+        "gateway_data_apply_rpc",
+        "gateway_meta_resolve_commit",
+        "data_route_lock_wait",
+        "data_route_lookup",
+        "data_raft_propose",
+        "data_raft_drive_ready",
+        "data_read_view_cache_hit",
+        "data_read_view_cache_miss",
+        "data_read_view_open",
+        "data_temporal_point_evaluation",
+        "data_temporal_scan_id_collection",
+        "data_temporal_scan_visibility",
+        "data_raft_lock_wait",
+    ];
+    let mut value = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line_with(role, timestamp, sequence, success, 2)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    value["details"] = serde_json::Value::Array(
+        DETAILS
+            .into_iter()
+            .map(|detail| {
+                serde_json::json!({
+                    "detail": detail,
+                    "buckets": vec![success; 64],
+                    "success": success,
+                    "error": success,
+                    "cancelled": success,
+                    "total_nanoseconds": success,
+                    "max_nanoseconds": success,
+                })
+            })
+            .collect(),
+    );
+    format!("DTG_REQUEST_STAGE_METRICS={value}")
 }
 
 async fn serve_fake_bolt_session(socket: &mut TcpStream, exchanges: usize) {

@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use dtg_storage::{
     AdjacencyRead, ChangeCursor, ChangePage, ChangeRecord, ChangesRead, EdgeHistoryRead, EdgeId,
     EdgeRead, EdgeScan, EdgeVersion, LogicalMutation, ReadFence, ScanPage, StorageError,
-    StoreFuture, TemporalReadView, VertexHistoryRead, VertexId, VertexRead, VertexScan,
-    VertexVersion,
+    StoreFuture, TemporalReadView, TemporalReadViewDiagnostics, VertexHistoryRead, VertexId,
+    VertexRead, VertexScan, VertexVersion,
 };
 use fjall::Readable;
 
@@ -14,6 +16,33 @@ pub(crate) struct FjallReadView {
     fence: ReadFence,
     history: Vec<LogicalMutation>,
     changes: Vec<ChangeRecord>,
+    diagnostics: FjallReadViewDiagnostics,
+}
+
+#[derive(Default)]
+struct FjallReadViewDiagnostics {
+    point_evaluation_nanoseconds: AtomicU64,
+    scan_id_collection_nanoseconds: AtomicU64,
+    scan_visibility_nanoseconds: AtomicU64,
+}
+
+impl FjallReadViewDiagnostics {
+    fn record(counter: &AtomicU64, started: Instant) {
+        counter.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> TemporalReadViewDiagnostics {
+        TemporalReadViewDiagnostics {
+            point_evaluation_nanoseconds: self.point_evaluation_nanoseconds.load(Ordering::Relaxed),
+            scan_id_collection_nanoseconds: self
+                .scan_id_collection_nanoseconds
+                .load(Ordering::Relaxed),
+            scan_visibility_nanoseconds: self.scan_visibility_nanoseconds.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl FjallReadView {
@@ -58,6 +87,7 @@ impl FjallReadView {
             fence,
             history,
             changes,
+            diagnostics: FjallReadViewDiagnostics::default(),
         })
     }
 
@@ -146,7 +176,15 @@ impl TemporalReadView for FjallReadView {
     }
 
     fn get_vertex(&self, request: VertexRead) -> StoreFuture<'_, Option<VertexVersion>> {
-        Box::pin(async move { Ok(self.visible_vertex(&request)) })
+        Box::pin(async move {
+            let started = Instant::now();
+            let vertex = self.visible_vertex(&request);
+            FjallReadViewDiagnostics::record(
+                &self.diagnostics.point_evaluation_nanoseconds,
+                started,
+            );
+            Ok(vertex)
+        })
     }
 
     fn get_edge(&self, request: EdgeRead) -> StoreFuture<'_, Option<EdgeVersion>> {
@@ -243,6 +281,7 @@ impl TemporalReadView for FjallReadView {
         request: VertexScan,
     ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>> {
         Box::pin(async move {
+            let collection_started = Instant::now();
             let ids: std::collections::BTreeSet<_> = self
                 .history
                 .iter()
@@ -253,6 +292,11 @@ impl TemporalReadView for FjallReadView {
                 })
                 .filter(|id| request.after().is_none_or(|after| *id > after))
                 .collect();
+            FjallReadViewDiagnostics::record(
+                &self.diagnostics.scan_id_collection_nanoseconds,
+                collection_started,
+            );
+            let visibility_started = Instant::now();
             let mut all = Vec::new();
             for id in ids {
                 if let Some(vertex) = self.visible_vertex(&VertexRead::new(
@@ -263,6 +307,10 @@ impl TemporalReadView for FjallReadView {
                     all.push(vertex);
                 }
             }
+            FjallReadViewDiagnostics::record(
+                &self.diagnostics.scan_visibility_nanoseconds,
+                visibility_started,
+            );
             let limit = request.limit() as usize;
             let has_more = all.len() > limit;
             all.truncate(limit);
@@ -301,5 +349,9 @@ impl TemporalReadView for FjallReadView {
             let next = has_more.then(|| all.last().map(EdgeVersion::id)).flatten();
             Ok(ScanPage::new(all, next))
         })
+    }
+
+    fn diagnostics(&self) -> Option<TemporalReadViewDiagnostics> {
+        Some(self.diagnostics.snapshot())
     }
 }
