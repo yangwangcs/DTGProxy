@@ -148,6 +148,108 @@ fn hash_join_aggregate_and_merge_have_stable_duplicate_rules() {
 }
 
 #[test]
+fn global_count_all_counts_input_rows() {
+    let batch = ColumnBatch::from_rows(
+        int_schema("value"),
+        vec![
+            vec![QueryValue::Integer(1)],
+            vec![QueryValue::Integer(2)],
+            vec![QueryValue::Integer(3)],
+        ],
+    )
+    .unwrap();
+
+    let output = collect(Box::new(AggregateOperator::count_all(
+        Box::new(BatchOperator::new(vec![batch])),
+        "COUNT(*)",
+    )));
+
+    assert_eq!(output.rows(), vec![vec![QueryValue::Integer(3)]]);
+}
+
+#[test]
+fn global_count_all_returns_zero_for_an_empty_batch() {
+    let empty = ColumnBatch::from_rows(int_schema("value"), Vec::new()).unwrap();
+
+    let output = collect(Box::new(AggregateOperator::count_all(
+        Box::new(BatchOperator::new(vec![empty])),
+        "COUNT(*)",
+    )));
+
+    assert_eq!(output.rows(), vec![vec![QueryValue::Integer(0)]]);
+}
+
+#[test]
+fn global_count_runtime_lowers_zero_groups() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![ExecutableAccess::Logical(
+            LogicalRead::new(
+                ReadOperation::VertexScan,
+                8,
+                TransactionTime::new(23).unwrap(),
+                17,
+            )
+            .unwrap(),
+        )],
+        vec![1],
+    )
+    .unwrap();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        2,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1],
+                    output: "vertex".into(),
+                },
+            )
+            .unwrap(),
+            ExecutableOperator::new(
+                2,
+                ExecutableOperatorKind::Aggregate {
+                    input: 1,
+                    groups: Vec::new(),
+                    aggregates: vec![ExecutableAggregate {
+                        function: AggregateKind::Count,
+                        argument: None,
+                        alias: "COUNT(*)".into(),
+                        distinct: false,
+                    }],
+                },
+            )
+            .unwrap(),
+        ],
+        int_schema("COUNT(*)"),
+    )
+    .unwrap();
+    let store = FixtureStore::new(
+        capabilities,
+        vec![vertex(1, 1), vertex(2, 2), vertex(3, 3)],
+        Vec::new(),
+    );
+
+    let mut stream = block_on(QueryRuntime::new(16).execute(
+        &plan,
+        storage_map(store.storage(false)),
+        &snapshot(),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+        None,
+    ))
+    .unwrap();
+    let output = block_on(stream.collect()).unwrap();
+
+    assert_eq!(output.rows(), vec![vec![QueryValue::Integer(3)]]);
+}
+
+#[test]
 fn overlay_applies_read_your_own_writes_before_results_escape() {
     let base = vertex(1, 10);
     let staged = vertex(2, 20);

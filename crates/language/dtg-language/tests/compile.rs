@@ -1,8 +1,8 @@
 use dtg_language::{EmptySchemaCatalog, SchemaCatalog, compile};
 use dtg_language_ir::{
-    BinaryOperator, ExpandDirection, Field, GraphId, GraphScope, LogicalExpr, LogicalMutation,
-    LogicalNodeKind, LogicalStatement, LogicalType, SortDirection, TemporalScope, TimeExpr,
-    ValidInterval, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate, Value,
+    AggregateKind, BinaryOperator, ExpandDirection, Field, GraphId, GraphScope, LogicalExpr,
+    LogicalMutation, LogicalNodeKind, LogicalStatement, LogicalType, SortDirection, TemporalScope,
+    TimeExpr, ValidInterval, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate, Value,
 };
 
 struct Catalog;
@@ -10,6 +10,37 @@ impl SchemaCatalog for Catalog {
     fn graph_id(&self, name: &str) -> Option<GraphId> {
         (name == "accounts").then(|| GraphId::new(7).unwrap())
     }
+}
+
+#[test]
+fn compiles_global_count_star() {
+    let program = compile("MATCH (n) RETURN COUNT(*)", &EmptySchemaCatalog).unwrap();
+    let LogicalStatement::Query(plan) = &program.statement else {
+        panic!()
+    };
+    let LogicalNodeKind::Aggregate(aggregate) = &plan.nodes[plan.root.get() as usize].kind else {
+        panic!()
+    };
+    assert!(aggregate.groups.is_empty());
+    assert_eq!(aggregate.aggregates.len(), 1);
+    assert_eq!(aggregate.aggregates[0].function, AggregateKind::Count);
+    assert_eq!(aggregate.aggregates[0].argument, None);
+    assert!(!aggregate.aggregates[0].distinct);
+    assert_eq!(program.result_schema.fields[0].name, "COUNT(*)");
+}
+
+#[test]
+fn count_star_is_rejected_outside_the_return_list() {
+    let error = compile("MATCH (n) WHERE COUNT(*) = 1 RETURN n", &EmptySchemaCatalog).unwrap_err();
+
+    assert_eq!(error.code(), "DTG-LANG-AGGREGATE");
+}
+
+#[test]
+fn count_remains_a_valid_variable_name_without_a_star_argument() {
+    let program = compile("MATCH (count) RETURN count", &EmptySchemaCatalog).unwrap();
+
+    assert_eq!(program.result_schema.fields[0].name, "count");
 }
 
 #[test]

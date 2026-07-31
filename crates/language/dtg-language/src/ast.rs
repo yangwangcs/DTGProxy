@@ -107,6 +107,7 @@ pub(crate) enum Mode {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Expr {
+    CountStar,
     Parameter(String),
     Integer(i64),
     String(String),

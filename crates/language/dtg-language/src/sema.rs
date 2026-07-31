@@ -88,7 +88,9 @@ fn validate_statement(statement: &Statement) -> Result<(), LanguageError> {
                 validate_expr(right, &bindings)?;
             }
             for expression in &query.returns {
-                validate_expr(expression, &bindings)?;
+                if !matches!(expression, Expr::CountStar) {
+                    validate_expr(expression, &bindings)?;
+                }
             }
             for key in &query.order_by {
                 validate_expr(&key.expression, &bindings)?;
@@ -391,6 +393,10 @@ fn validate_properties(
 
 fn validate_expr(expr: &Expr, bindings: &Bindings) -> Result<(), LanguageError> {
     match expr {
+        Expr::CountStar => Err(LanguageError::semantic(
+            "DTG-LANG-AGGREGATE",
+            "COUNT(*) is only supported in the RETURN list",
+        )),
         Expr::Parameter(_) | Expr::Integer(_) | Expr::String(_) | Expr::Boolean(_) | Expr::Null => {
             Ok(())
         }

@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dtg_kernel::{TransactionTime, ValidInterval, Value};
 use dtg_language_ir::{
-    AnalyticsExecutionMode, AnalyticsSubmission, BuiltInAlgorithmId, Expand, ExpandDirection,
-    Field, GraphScope, LogicalExpr, LogicalMutation, LogicalNode, LogicalNodeId, LogicalNodeKind,
-    LogicalPlan, LogicalProgram, LogicalStatement, LogicalType, LogicalWrite, NodeScan, Projection,
-    ReadScope, RowSchema, Sort, SortDirection, SortKey, TemporalScope, TimeExpr, ValidIntervalExpr,
-    ValidTimeExpr, ValidTimePredicate,
+    Aggregate, AggregateFunction, AggregateKind, AnalyticsExecutionMode, AnalyticsSubmission,
+    BuiltInAlgorithmId, Expand, ExpandDirection, Field, GraphScope, LogicalExpr, LogicalMutation,
+    LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement,
+    LogicalType, LogicalWrite, NodeScan, Projection, ReadScope, RowSchema, Sort, SortDirection,
+    SortKey, TemporalScope, TimeExpr, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate,
 };
 
 use crate::{
@@ -139,7 +139,30 @@ fn normalize_write(write: &crate::ast::Write) -> Result<LogicalWrite, LanguageEr
 
 fn normalize_query(query: &crate::ast::Query) -> Result<(LogicalPlan, RowSchema), LanguageError> {
     let bindings = query_bindings(query);
-    let (projections, result_schema) = normalize_projections(&query.returns, &bindings);
+    let has_count_star = query
+        .returns
+        .iter()
+        .any(|expression| matches!(expression, Expr::CountStar));
+    if has_count_star && !matches!(query.returns.as_slice(), [Expr::CountStar]) {
+        return Err(LanguageError::semantic(
+            "DTG-LANG-AGGREGATE",
+            "COUNT(*) must be the only RETURN expression",
+        ));
+    }
+    let (projections, result_schema) = if has_count_star {
+        (
+            Vec::new(),
+            RowSchema {
+                fields: vec![Field {
+                    name: "COUNT(*)".into(),
+                    data_type: LogicalType::Integer,
+                    nullable: false,
+                }],
+            },
+        )
+    } else {
+        normalize_projections(&query.returns, &bindings)
+    };
     let mut plan = normalize_selection(&query.scopes, &query.matches, query.where_clause.as_ref())?;
     if !query.order_by.is_empty() {
         let id = LogicalNodeId::new(plan.nodes.len() as u32);
@@ -162,7 +185,23 @@ fn normalize_query(query: &crate::ast::Query) -> Result<(LogicalPlan, RowSchema)
         });
         plan.root = id;
     }
-    if !projections.is_empty() {
+    if has_count_star {
+        let id = LogicalNodeId::new(plan.nodes.len() as u32);
+        plan.nodes.push(LogicalNode {
+            id,
+            kind: LogicalNodeKind::Aggregate(Aggregate {
+                input: plan.root,
+                groups: Vec::new(),
+                aggregates: vec![AggregateFunction {
+                    function: AggregateKind::Count,
+                    argument: None,
+                    alias: "COUNT(*)".into(),
+                    distinct: false,
+                }],
+            }),
+        });
+        plan.root = id;
+    } else if !projections.is_empty() {
         let id = LogicalNodeId::new(plan.nodes.len() as u32);
         plan.nodes.push(LogicalNode {
             id,
@@ -374,6 +413,7 @@ fn normalize_projections(
 
 fn expression_alias(expression: &Expr) -> Option<String> {
     match expression {
+        Expr::CountStar => Some("COUNT(*)".into()),
         Expr::Parameter(name) => Some(format!("${name}")),
         Expr::Column(name) => Some(name.clone()),
         Expr::Property { input, name } => Some(format!("{input}.{name}")),
@@ -386,6 +426,7 @@ fn expression_type(
     bindings: &BTreeMap<String, LogicalType>,
 ) -> (LogicalType, bool) {
     match expression {
+        Expr::CountStar => (LogicalType::Integer, false),
         Expr::Parameter(_) => (LogicalType::Any, true),
         Expr::Integer(_) => (LogicalType::Integer, false),
         Expr::String(_) => (LogicalType::String, false),
@@ -481,6 +522,7 @@ fn read_scope(valid: Option<&Scope>, system: Option<&Scope>) -> Result<ReadScope
 }
 fn time_expr(expr: &Expr) -> Result<TimeExpr, LanguageError> {
     match expr {
+        Expr::CountStar => unreachable!("COUNT(*) is normalized as an aggregate"),
         Expr::Parameter(name) => Ok(TimeExpr::Parameter(name.clone())),
         Expr::Integer(value) => TransactionTime::new(*value)
             .map(TimeExpr::Literal)
@@ -521,6 +563,7 @@ fn valid_interval(start: &Expr, end: &Expr) -> Result<ValidIntervalExpr, Languag
 }
 fn logical_expr(expr: &Expr) -> LogicalExpr {
     match expr {
+        Expr::CountStar => unreachable!("COUNT(*) is normalized as an aggregate"),
         Expr::Parameter(name) => LogicalExpr::Parameter(name.clone()),
         Expr::Integer(value) => LogicalExpr::Literal(Value::Integer(*value)),
         Expr::String(value) => LogicalExpr::Literal(Value::String(value.clone())),

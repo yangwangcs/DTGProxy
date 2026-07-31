@@ -364,6 +364,15 @@ impl Parser<'_> {
     }
     fn expr(&mut self) -> Result<Expr, LanguageError> {
         let first = match &self.current().kind {
+            TokenKind::Word(value)
+                if value.eq_ignore_ascii_case("count") && self.at_count_star() =>
+            {
+                self.cursor += 1;
+                self.expect_symbol('(')?;
+                self.expect_symbol('*')?;
+                self.expect_symbol(')')?;
+                Expr::CountStar
+            }
             TokenKind::Parameter(value) => {
                 let value = Expr::Parameter(value.clone());
                 self.cursor += 1;
@@ -443,6 +452,22 @@ impl Parser<'_> {
     }
     fn at_word(&self, word: &str) -> bool {
         self.current().is_word(word)
+    }
+    fn at_count_star(&self) -> bool {
+        matches!(
+            (
+                self.tokens.get(self.cursor).map(|token| &token.kind),
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                self.tokens.get(self.cursor + 2).map(|token| &token.kind),
+                self.tokens.get(self.cursor + 3).map(|token| &token.kind),
+            ),
+            (
+                Some(TokenKind::Word(name)),
+                Some(TokenKind::Symbol('(')),
+                Some(TokenKind::Symbol('*')),
+                Some(TokenKind::Symbol(')')),
+            ) if name.eq_ignore_ascii_case("count")
+        )
     }
     fn expect_word(&mut self, word: &str) -> Result<(), LanguageError> {
         self.take_word(word)

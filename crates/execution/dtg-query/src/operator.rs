@@ -308,7 +308,7 @@ impl Operator for HashJoinOperator {
 
 pub struct AggregateOperator {
     input: Box<dyn Operator>,
-    group_column: usize,
+    group_column: Option<usize>,
     schema: RowSchema,
     emitted: bool,
 }
@@ -331,7 +331,7 @@ impl AggregateOperator {
             });
         Self {
             input,
-            group_column,
+            group_column: Some(group_column),
             schema: RowSchema {
                 fields: vec![
                     group_field,
@@ -341,6 +341,21 @@ impl AggregateOperator {
                         nullable: false,
                     },
                 ],
+            },
+            emitted: false,
+        }
+    }
+
+    pub fn count_all(input: Box<dyn Operator>, count_name: impl Into<String>) -> Self {
+        Self {
+            input,
+            group_column: None,
+            schema: RowSchema {
+                fields: vec![Field {
+                    name: count_name.into(),
+                    data_type: LogicalType::Integer,
+                    nullable: false,
+                }],
             },
             emitted: false,
         }
@@ -362,27 +377,46 @@ impl Operator for AggregateOperator {
                 return Ok(None);
             }
             self.emitted = true;
-            let (_, rows) = collect_rows(&mut self.input, context).await?;
-            let mut groups: BTreeMap<ScalarKey, (QueryValue, u64)> = BTreeMap::new();
-            for row in rows {
-                context.checkpoint()?;
-                let value = row.get(self.group_column).cloned().ok_or_else(|| {
-                    QueryError::InvalidPlan("aggregate group column is absent".into())
-                })?;
-                let key = scalar_key(Some(&value))?;
-                let entry = groups.entry(key).or_insert((value, 0));
-                entry.1 = entry.1.checked_add(1).ok_or(QueryError::RowBudget)?;
+            match self.group_column {
+                Some(group_column) => {
+                    let (_, rows) = collect_rows(&mut self.input, context).await?;
+                    let mut groups: BTreeMap<ScalarKey, (QueryValue, u64)> = BTreeMap::new();
+                    for row in rows {
+                        context.checkpoint()?;
+                        let value = row.get(group_column).cloned().ok_or_else(|| {
+                            QueryError::InvalidPlan("aggregate group column is absent".into())
+                        })?;
+                        let key = scalar_key(Some(&value))?;
+                        let entry = groups.entry(key).or_insert((value, 0));
+                        entry.1 = entry.1.checked_add(1).ok_or(QueryError::RowBudget)?;
+                    }
+                    context.charge_memory((groups.len() as u64).saturating_mul(32))?;
+                    let rows = groups
+                        .into_values()
+                        .map(|(group, count)| {
+                            i64::try_from(count)
+                                .map(|count| vec![group, QueryValue::Integer(count)])
+                                .map_err(|_| QueryError::RowBudget)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    ColumnBatch::from_rows(self.schema.clone(), rows).map(Some)
+                }
+                None => {
+                    let mut count = 0_u64;
+                    while let Some(batch) = self.input.next_batch(context).await? {
+                        context.checkpoint()?;
+                        let rows =
+                            u64::try_from(batch.row_count()).map_err(|_| QueryError::RowBudget)?;
+                        count = count.checked_add(rows).ok_or(QueryError::RowBudget)?;
+                    }
+                    let count = i64::try_from(count).map_err(|_| QueryError::RowBudget)?;
+                    ColumnBatch::from_rows(
+                        self.schema.clone(),
+                        vec![vec![QueryValue::Integer(count)]],
+                    )
+                    .map(Some)
+                }
             }
-            context.charge_memory((groups.len() as u64).saturating_mul(32))?;
-            let rows = groups
-                .into_values()
-                .map(|(group, count)| {
-                    i64::try_from(count)
-                        .map(|count| vec![group, QueryValue::Integer(count)])
-                        .map_err(|_| QueryError::RowBudget)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            ColumnBatch::from_rows(self.schema.clone(), rows).map(Some)
         })
     }
 }

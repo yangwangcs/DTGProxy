@@ -202,11 +202,6 @@ impl QueryRuntime {
             } => {
                 let input =
                     self.build_operator(input, definitions, fragment_storage, visiting, built)?;
-                let [group] = groups.as_slice() else {
-                    return Err(QueryError::Unsupported(
-                        "query runtime currently supports one aggregate group".into(),
-                    ));
-                };
                 let [aggregate] = aggregates.as_slice() else {
                     return Err(QueryError::Unsupported(
                         "query runtime currently supports one aggregate function".into(),
@@ -220,21 +215,31 @@ impl QueryRuntime {
                         "query runtime currently supports non-distinct COUNT(*)".into(),
                     ));
                 }
-                validate_expression(group.expression(), input.schema())?;
-                let grouped = ProjectOperator::new(
-                    input,
-                    vec![ProjectionExpr::new(
-                        group.alias(),
-                        LogicalType::Any,
-                        true,
-                        group.expression().clone(),
-                    )],
-                );
-                Box::new(AggregateOperator::count_by(
-                    Box::new(grouped),
-                    0,
-                    aggregate.alias.clone(),
-                ))
+                match groups.as_slice() {
+                    [] => Box::new(AggregateOperator::count_all(input, aggregate.alias.clone())),
+                    [group] => {
+                        validate_expression(group.expression(), input.schema())?;
+                        let grouped = ProjectOperator::new(
+                            input,
+                            vec![ProjectionExpr::new(
+                                group.alias(),
+                                LogicalType::Any,
+                                true,
+                                group.expression().clone(),
+                            )],
+                        );
+                        Box::new(AggregateOperator::count_by(
+                            Box::new(grouped),
+                            0,
+                            aggregate.alias.clone(),
+                        ))
+                    }
+                    _ => {
+                        return Err(QueryError::Unsupported(
+                            "query runtime currently supports at most one aggregate group".into(),
+                        ));
+                    }
+                }
             }
             ExecutableOperatorKind::Sort { input, keys } => {
                 let input =
