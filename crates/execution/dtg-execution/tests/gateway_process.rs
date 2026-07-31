@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -135,6 +136,17 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
 struct RecordingWriteTransport {
     events: Mutex<Vec<&'static str>>,
     requests: Mutex<Vec<GatewayWriteRequest>>,
+    apply_calls: AtomicUsize,
+    resolve_failures: AtomicUsize,
+}
+
+impl RecordingWriteTransport {
+    fn fail_resolve_once() -> Self {
+        Self {
+            resolve_failures: AtomicUsize::new(1),
+            ..Self::default()
+        }
+    }
 }
 
 impl GatewayWriteTransport for RecordingWriteTransport {
@@ -162,7 +174,8 @@ impl GatewayWriteTransport for RecordingWriteTransport {
     ) -> GatewayFuture<'_, Result<GatewayWriteReceipt, GatewayExecutionError>> {
         self.events.lock().unwrap().push("apply");
         self.requests.lock().unwrap().push(request);
-        Box::pin(async { Ok(GatewayWriteReceipt::new(38, false)) })
+        let call = self.apply_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(GatewayWriteReceipt::new(38 + call as u64, call > 0)) })
     }
 
     fn resolve_committed(
@@ -171,7 +184,23 @@ impl GatewayWriteTransport for RecordingWriteTransport {
         _transaction_id: TransactionId,
     ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
         self.events.lock().unwrap().push("resolve");
-        Box::pin(async { Ok(()) })
+        let fail = self
+            .resolve_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        Box::pin(async move {
+            if fail {
+                Err(GatewayExecutionError::new(
+                    "DTG-TEST-RESOLVE",
+                    "injected resolve failure",
+                    dtg_execution::GatewayRetry::Safe,
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 
     fn abort(
@@ -182,6 +211,51 @@ impl GatewayWriteTransport for RecordingWriteTransport {
         self.events.lock().unwrap().push("abort");
         Box::pin(async { Ok(()) })
     }
+}
+
+#[test]
+fn process_create_retry_after_resolve_failure_accounts_for_the_write_once() {
+    let writes = Arc::new(RecordingWriteTransport::fail_resolve_once());
+    let client = Arc::new(RecordingProtocolClient::default());
+    let execution = GatewayExecution::for_process_with_writes(
+        Arc::new(GatewayProtocolV2Transport::new(client.clone())),
+        writes,
+        planning_context(),
+    );
+    let context = GatewayRequestContext::new(7, 91, u64::MAX, Vec::new()).unwrap();
+    let cancellation = GatewayCancellationToken::new();
+
+    let first = block_on(execution.execute_statement(
+        context.clone(),
+        "CREATE (n:Bench {value: 1}) VALID FROM 1".into(),
+        BTreeMap::new(),
+        None,
+        &cancellation,
+    ));
+    assert_eq!(first.unwrap_err().code(), "DTG-TEST-RESOLVE");
+    assert_eq!(
+        block_on(execution.execute_statement(
+            context,
+            "CREATE (n:Bench {value: 1}) VALID FROM 1".into(),
+            BTreeMap::new(),
+            None,
+            &cancellation,
+        ))
+        .unwrap(),
+        GatewayResponse::Acknowledged
+    );
+
+    block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 92, u64::MAX, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &cancellation,
+    ))
+    .unwrap();
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(requests[0].fragments[0].applied_index, 39);
+    assert_eq!(requests[0].fragments[0].transaction_time, 43);
 }
 
 #[test]

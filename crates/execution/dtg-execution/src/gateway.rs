@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dtg_analytics::{
@@ -617,34 +617,7 @@ impl GatewayWriteTransport for TonicGatewayWriteTransport {
                 .await
                 .map_err(cluster_rpc_error)?
                 .into_inner();
-            let details = status_details(status)?;
-            let bytes: [u8; 9] = details.as_slice().try_into().map_err(|_| {
-                GatewayExecutionError::new(
-                    "DTG-EXECUTION-WRITE-RECEIPT",
-                    "Data write response is not an applied receipt",
-                    GatewayRetry::Safe,
-                )
-            })?;
-            let applied_index = u64::from_be_bytes(bytes[..8].try_into().expect("length checked"));
-            if applied_index == 0 {
-                return Err(GatewayExecutionError::new(
-                    "DTG-EXECUTION-WRITE-RECEIPT",
-                    "Data write response contains a zero applied index",
-                    GatewayRetry::Safe,
-                ));
-            }
-            let replayed = match bytes[8] {
-                0 => false,
-                1 => true,
-                _ => {
-                    return Err(GatewayExecutionError::new(
-                        "DTG-EXECUTION-WRITE-RECEIPT",
-                        "Data write response contains an invalid replay flag",
-                        GatewayRetry::Safe,
-                    ));
-                }
-            };
-            Ok(GatewayWriteReceipt::new(applied_index, replayed))
+            decode_write_receipt(status_details(status)?)
         })
     }
 
@@ -712,8 +685,13 @@ fn transaction_rpc_request(
 }
 
 fn status_details(status: proto::TypedStatus) -> Result<Vec<u8>, GatewayExecutionError> {
+    let validated = validate_typed_status(status.clone()).map_err(|error| {
+        GatewayExecutionError::new(error.code(), error.to_string(), GatewayRetry::Never)
+    })?;
     if status.code == proto::StatusCode::Ok as i32 {
-        return Ok(status.details.map_or(Vec::new(), |details| details.body));
+        return Ok(validated
+            .details()
+            .map_or_else(Vec::new, |details| details.body().to_vec()));
     }
     let retry = match proto::RetryDisposition::try_from(status.retry).ok() {
         Some(proto::RetryDisposition::Safe) => GatewayRetry::Safe,
@@ -724,6 +702,36 @@ fn status_details(status: proto::TypedStatus) -> Result<Vec<u8>, GatewayExecutio
         status.message,
         retry,
     ))
+}
+
+fn decode_write_receipt(details: Vec<u8>) -> Result<GatewayWriteReceipt, GatewayExecutionError> {
+    let bytes: [u8; 9] = details.as_slice().try_into().map_err(|_| {
+        GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-RECEIPT",
+            "Data write response is not an applied receipt",
+            GatewayRetry::Safe,
+        )
+    })?;
+    let applied_index = u64::from_be_bytes(bytes[..8].try_into().expect("length checked"));
+    if applied_index == 0 {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-RECEIPT",
+            "Data write response contains a zero applied index",
+            GatewayRetry::Safe,
+        ));
+    }
+    let replayed = match bytes[8] {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-WRITE-RECEIPT",
+                "Data write response contains an invalid replay flag",
+                GatewayRetry::Safe,
+            ));
+        }
+    };
+    Ok(GatewayWriteReceipt::new(applied_index, replayed))
 }
 
 fn cluster_connect_error(error: tonic::transport::Error) -> GatewayExecutionError {
@@ -872,6 +880,7 @@ enum GatewayExecutionMode {
         planning_context: Arc<RwLock<PlanningContext>>,
         transport: Arc<dyn GatewayExecutionTransport>,
         write_transport: Option<Arc<dyn GatewayWriteTransport>>,
+        pending_write_bounds: Arc<Mutex<BTreeSet<TransactionId>>>,
     },
 }
 
@@ -897,6 +906,7 @@ impl GatewayExecution {
                 planning_context: Arc::new(RwLock::new(planning_context)),
                 transport,
                 write_transport: None,
+                pending_write_bounds: Arc::new(Mutex::new(BTreeSet::new())),
             },
         }
     }
@@ -1173,6 +1183,7 @@ impl GatewayExecution {
                 let GatewayExecutionMode::Process {
                     planning_context,
                     write_transport,
+                    pending_write_bounds,
                     ..
                 } = &self.mode
                 else {
@@ -1205,6 +1216,7 @@ impl GatewayExecution {
                     write,
                     &parameters,
                     &planning_context,
+                    pending_write_bounds,
                 )
                 .await?;
                 advance_process_snapshot(
@@ -1216,6 +1228,10 @@ impl GatewayExecution {
                     },
                     &outcome,
                 )?;
+                pending_write_bounds
+                    .lock()
+                    .map_err(|_| process_write_error("pending write-bound lock is poisoned"))?
+                    .remove(&outcome.transaction_id);
                 validate_process_request_end(cancellation)?;
                 return Ok(GatewayResponse::Acknowledged);
             }
@@ -3044,6 +3060,7 @@ async fn execute_process_create(
     write: &dtg_language_ir::LogicalWrite,
     parameters: &BTreeMap<String, GatewayValue>,
     planning_context: &PlanningContext,
+    pending_write_bounds: &Mutex<BTreeSet<TransactionId>>,
 ) -> Result<ProcessWriteOutcome, GatewayExecutionError> {
     let [catalog_shard] = planning_context.catalog().shards() else {
         return Err(GatewayExecutionError::new(
@@ -3151,19 +3168,32 @@ async fn execute_process_create(
             return Err(error);
         }
     };
+    let increment_bound = {
+        let mut pending = pending_write_bounds
+            .lock()
+            .map_err(|_| process_write_error("pending write-bound lock is poisoned"))?;
+        if receipt.replayed() {
+            pending.contains(&transaction_id)
+        } else {
+            pending.insert(transaction_id);
+            true
+        }
+    };
     transport.resolve_committed(&route, transaction_id).await?;
     Ok(ProcessWriteOutcome {
+        transaction_id,
         binding: route.binding,
         applied_index: receipt.applied_index(),
-        replayed: receipt.replayed(),
+        increment_bound,
         commit_time,
     })
 }
 
 struct ProcessWriteOutcome {
+    transaction_id: TransactionId,
     binding: dtg_storage::ReplicaBinding,
     applied_index: u64,
-    replayed: bool,
+    increment_bound: bool,
     commit_time: dtg_storage::TransactionTime,
 }
 
@@ -3184,7 +3214,11 @@ fn advance_process_snapshot(
         ));
     };
     if shard.binding() != &outcome.binding {
-        return Ok(());
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-CATALOG-RACE",
+            "process CREATE committed against a replaced catalog binding",
+            GatewayRetry::Safe,
+        ));
     }
     let applied_index = shard.applied_index().max(outcome.applied_index);
     let transaction_time = current
@@ -3192,10 +3226,10 @@ fn advance_process_snapshot(
         .transaction_time()
         .max(outcome.commit_time);
     let logical_scan_bound = current.logical_scan_bound().map(|bound| {
-        if outcome.replayed {
-            bound
-        } else {
+        if outcome.increment_bound {
             bound.saturating_add(1)
+        } else {
+            bound
         }
     });
     if applied_index == shard.applied_index()
@@ -3432,4 +3466,67 @@ fn lower_pushdown(
         request: Box::new(request.clone()),
         residual,
     })
+}
+
+#[cfg(test)]
+mod write_receipt_tests {
+    use super::*;
+
+    fn request_context() -> proto::RequestContext {
+        proto::RequestContext {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: SUPPORTED_MINOR_MAX,
+            cluster_id: 7_u64.to_be_bytes().to_vec(),
+            request_id: 11_u128.to_be_bytes().to_vec(),
+            deadline_unix_ms: 1_900_000_000_000,
+            trace_context: b"traceparent".to_vec(),
+        }
+    }
+
+    fn status(body: Vec<u8>) -> proto::TypedStatus {
+        proto::TypedStatus {
+            request: Some(request_context()),
+            code: proto::StatusCode::Ok as i32,
+            retry: proto::RetryDisposition::Never as i32,
+            message: "ok".into(),
+            idempotency_key: Vec::new(),
+            details: Some(proto::BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+        }
+    }
+
+    #[test]
+    fn status_details_rejects_corrupt_bounded_payload_metadata() {
+        let mut corrupt_checksum = status(vec![0; 9]);
+        corrupt_checksum.details.as_mut().unwrap().checksum[0] ^= 1;
+        assert_eq!(
+            status_details(corrupt_checksum).unwrap_err().code(),
+            "DTG-PROTOCOL-CHECKSUM"
+        );
+
+        let mut wrong_length = status(vec![0; 9]);
+        wrong_length.details.as_mut().unwrap().declared_len += 1;
+        assert_eq!(
+            status_details(wrong_length).unwrap_err().code(),
+            "DTG-PROTOCOL-LENGTH"
+        );
+
+        let mut zero_items = status(vec![0; 9]);
+        zero_items.details.as_mut().unwrap().item_count = 0;
+        assert_eq!(
+            status_details(zero_items).unwrap_err().code(),
+            "DTG-PROTOCOL-ITEM-LIMIT"
+        );
+    }
+
+    #[test]
+    fn write_receipt_requires_exactly_nine_bytes() {
+        let error = decode_write_receipt(vec![0; 8]).unwrap_err();
+        assert_eq!(error.code(), "DTG-EXECUTION-WRITE-RECEIPT");
+    }
 }
