@@ -332,14 +332,15 @@ git commit -m "test(perf): add four-process diagnostic lifecycle"
 
 ---
 
-### Task 4: Publish immutable raw and summary artifacts
+### Task 4: Publish isolated backend artifacts and one combined summary
 
 **Files:**
 - Modify: `crates/processes/dtg-gateway/tests/backend_e2e_support/artifact.rs`
 - Modify: `crates/processes/dtg-gateway/tests/backend_e2e_diagnostic.rs`
 
 **Interfaces:**
-- Produces: `manifest.json`, `raw/*.json`, `summary.json`, `summary.csv`, `logs/`, and `SHA256SUMS`.
+- Produces: three verified backend staging artifacts and one final `manifest.json`, `raw/*.json`,
+  `summary.json`, `summary.csv`, `logs/`, and `SHA256SUMS` tree.
 
 - [ ] **Step 1: Write failing artifact tests**
 
@@ -364,16 +365,17 @@ Reject non-finite values.
 
 Write each final through a unique same-directory temporary file, `sync_all`, publish with a no-overwrite hard link, remove the temporary, and sync the parent. Generate byte-sorted SHA-256 entries for every regular file except `SHA256SUMS`, then re-read and verify them before returning.
 
-- [ ] **Step 5: Add the full environment-gated capture test**
+- [ ] **Step 5: Add selected-backend capture and offline combine tests**
 
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires release binaries and live PostgreSQL/Neo4j services"]
-async fn capture_three_backend_e2e_diagnostic() {
+#[ignore = "requires release binaries and the selected live backend"]
+async fn capture_selected_backend_e2e_diagnostic() {
     let runtime = DiagnosticRuntime::from_env().unwrap();
-    assert!(!runtime.output_dir.exists());
+    let selected = runtime.selected_backend;
+    assert!(!runtime.backend_output_dir.exists());
     let mut observations = Vec::new();
-    for spec in CellSpec::matrix(runtime.shuffle_seed) {
+    for spec in CellSpec::matrix_for_backend(selected, runtime.shuffle_seed) {
         let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
         if spec.workload.is_read() {
             cluster.seed_read_dataset(4_096).await.unwrap();
@@ -381,10 +383,22 @@ async fn capture_three_backend_e2e_diagnostic() {
         observations.push(measure_cell(cluster.bolt_address(), spec).await.unwrap());
         cluster.shutdown().await.unwrap();
     }
-    write_artifact(&runtime, &observations).unwrap();
+    write_backend_artifact(&runtime, &observations).unwrap();
+    verify_backend_artifact(&runtime.backend_output_dir, selected).unwrap();
+}
+
+#[test]
+#[ignore = "requires three verified backend staging artifacts"]
+fn combine_three_backend_e2e_diagnostic() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    combine_backend_artifacts(&runtime.staging_root, &runtime.output_dir).unwrap();
     verify_artifact(&runtime.output_dir).unwrap();
 }
 ```
+
+`matrix_for_backend` returns exactly 18 cells. The combine step accepts exactly one verified Fjall,
+one PostgreSQL, and one Neo4j staging artifact, copies their 54 raw files and logs into a new final
+tree, recomputes all 18 summary groups, and refuses missing, duplicate, changed, or extra inputs.
 
 - [ ] **Step 6: Verify green**
 
@@ -417,19 +431,31 @@ git commit -m "test(perf): publish immutable backend diagnostics"
 
 - [ ] **Step 1: Write the failing shell contract**
 
-With fake `docker`, `cargo`, `curl`, and `openssl`, require logs for both exact images, release build, exact ignored test invocation, and removal of both exact containers on success and injected Cargo failure.
+With fake `docker`, `cargo`, `curl`, and `openssl`, require the deterministic backend order, release
+build, three exact selected-backend test invocations, one final combine invocation, and removal of
+each exact external container before the following backend starts. Repeat with injected Cargo
+failure and require cleanup before exit.
 
 Run: `bash scripts/tests/run-backend-e2e-diagnostic-contract.sh`
 
 - [ ] **Step 2: Implement the lifecycle wrapper**
 
-Accept only `--output-dir ABSOLUTE_NEW_DIR`; otherwise derive `artifacts/backend-e2e-diagnostic/<UTC timestamp>-<git short revision>`. Start `postgres:17` and `neo4j:5.26-community` with generated credentials and dynamic loopback ports. Use bounded readiness through `docker exec ... pg_isready` and loopback `curl`. Trap EXIT/INT/TERM and remove only the two exact names.
+Accept only `--output-dir ABSOLUTE_NEW_DIR`; otherwise derive
+`artifacts/backend-e2e-diagnostic/<UTC timestamp>-<git short revision>`. Compute the backend order
+from seed `4923929926749575257` and record it in staging metadata. For Fjall, invoke the selected
+capture without an external service. For PostgreSQL, start only `postgres:17`, wait with bounded
+`docker exec ... pg_isready`, capture 18 cells, remove that exact container, and prove it is absent.
+For Neo4j, start only `neo4j:5.26-community`, wait with bounded loopback `curl`, capture 18 cells,
+remove that exact container, and prove it is absent. Never keep PostgreSQL and Neo4j alive at the
+same time. Trap EXIT/INT/TERM and remove only the currently owned exact container name.
 
 Export:
 
 ```text
 DTG_BACKEND_E2E_BIN_DIR=<absolute target/release>
-DTG_BACKEND_E2E_OUTPUT_DIR=<absolute new output>
+DTG_BACKEND_E2E_OUTPUT_DIR=<absolute final output>
+DTG_BACKEND_E2E_STAGING_ROOT=<absolute temporary staging root>
+DTG_BACKEND_E2E_SELECTED_BACKEND=fjall|postgresql|neo4j
 DTG_BACKEND_E2E_POSTGRES_ENDPOINT=host=127.0.0.1 port=<port> dbname=dtgproxy sslmode=disable
 DTG_BACKEND_E2E_POSTGRES_CREDENTIAL=user=dtgproxy password=<generated>
 DTG_BACKEND_E2E_NEO4J_ENDPOINT=http://127.0.0.1:<port>
@@ -438,7 +464,9 @@ DTG_BACKEND_E2E_NEO4J_PASSWORD=<generated>
 DTG_BACKEND_E2E_SHUFFLE_SEED=4923929926749575257
 ```
 
-Build the four release binaries and run the exact ignored capture test.
+Build the four release binaries once. Run `capture_selected_backend_e2e_diagnostic` once per
+backend, clearing variables that do not belong to the selected backend. After all three staging
+artifacts verify and all services retire, run `combine_three_backend_e2e_diagnostic` once.
 
 - [ ] **Step 3: Verify wrapper contracts**
 
