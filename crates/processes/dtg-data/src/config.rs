@@ -129,7 +129,7 @@ impl DataProcessConfig {
                 config = config.assign(parse_assignment(assignment, &capabilities)?);
             }
         }
-        Ok(config)
+        configure_environment_bootstrap(config, &get)
     }
 
     #[must_use]
@@ -212,6 +212,67 @@ fn environment_string(
         .transpose()
 }
 
+fn required_environment_string(
+    get: &impl Fn(&str) -> Option<OsString>,
+    name: &str,
+) -> Result<String, DataConfigError> {
+    environment_string(get, name)?
+        .ok_or_else(|| DataConfigError::InvalidEnvironment(format!("{name} is required")))
+}
+
+fn configure_environment_bootstrap(
+    mut config: DataProcessConfig,
+    get: &impl Fn(&str) -> Option<OsString>,
+) -> Result<DataProcessConfig, DataConfigError> {
+    let has_postgresql = config
+        .assignments
+        .iter()
+        .any(|binding| binding.provider_kind() == &ProviderKind::PostgreSql);
+    let has_neo4j = config
+        .assignments
+        .iter()
+        .any(|binding| binding.provider_kind() == &ProviderKind::Neo4j);
+    if has_postgresql {
+        let endpoint = required_environment_string(get, "DTG_DATA_POSTGRES_ENDPOINT")?;
+        let credential = required_environment_string(get, "DTG_DATA_POSTGRES_CREDENTIAL")?;
+        config = config
+            .with_endpoint_profile(
+                "environment-bootstrap",
+                EndpointProfile::PostgreSql(endpoint),
+            )
+            .with_credential_profile(
+                "environment-bootstrap",
+                CredentialProfile::PostgreSql(credential),
+            );
+    }
+    if has_neo4j {
+        if config
+            .endpoint_profiles
+            .contains_key("environment-bootstrap")
+        {
+            return Err(DataConfigError::InvalidEnvironment(
+                "environment bootstrap cannot mix PostgreSQL and Neo4j assignments".into(),
+            ));
+        }
+        config = config
+            .with_endpoint_profile(
+                "environment-bootstrap",
+                EndpointProfile::Neo4j {
+                    endpoint: required_environment_string(get, "DTG_DATA_NEO4J_ENDPOINT")?,
+                    database: required_environment_string(get, "DTG_DATA_NEO4J_DATABASE")?,
+                },
+            )
+            .with_credential_profile(
+                "environment-bootstrap",
+                CredentialProfile::Neo4jBasic {
+                    username: required_environment_string(get, "DTG_DATA_NEO4J_USERNAME")?,
+                    password: required_environment_string(get, "DTG_DATA_NEO4J_PASSWORD")?,
+                },
+            );
+    }
+    Ok(config)
+}
+
 fn parse_assignment(
     assignment: &str,
     capabilities: &CapabilityManifest,
@@ -270,4 +331,86 @@ fn parse_assignment(
         .role(BindingRole::Active)
         .build()
         .map_err(|error| DataConfigError::InvalidAssignment(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_bootstrap_loads_postgresql_profile() {
+        let values = BTreeMap::from([
+            (
+                "DTG_DATA_CAPABILITIES",
+                OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
+            ),
+            (
+                "DTG_DATA_ASSIGNMENTS",
+                OsString::from("7:11:13:17:19:23:postgresql:1:1:postgres-bench"),
+            ),
+            (
+                "DTG_DATA_POSTGRES_ENDPOINT",
+                OsString::from("host=127.0.0.1 port=55432 dbname=dtgproxy sslmode=disable"),
+            ),
+            (
+                "DTG_DATA_POSTGRES_CREDENTIAL",
+                OsString::from("user=dtgproxy password=secret"),
+            ),
+        ]);
+        let config = DataProcessConfig::from_environment(|name| values.get(name).cloned()).unwrap();
+        assert!(matches!(
+            config.endpoint_profiles().get("environment-bootstrap"),
+            Some(EndpointProfile::PostgreSql(value)) if value.contains("port=55432")
+        ));
+        assert!(matches!(
+            config.credential_profiles().get("environment-bootstrap"),
+            Some(CredentialProfile::PostgreSql(value)) if value == "user=dtgproxy password=secret"
+        ));
+    }
+
+    #[test]
+    fn environment_bootstrap_loads_neo4j_profile_and_redacts_password() {
+        let values = BTreeMap::from([
+            (
+                "DTG_DATA_CAPABILITIES",
+                OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
+            ),
+            (
+                "DTG_DATA_ASSIGNMENTS",
+                OsString::from("7:11:13:17:19:23:neo4j:1:1:neo4j-bench"),
+            ),
+            (
+                "DTG_DATA_NEO4J_ENDPOINT",
+                OsString::from("http://127.0.0.1:57474"),
+            ),
+            ("DTG_DATA_NEO4J_DATABASE", OsString::from("neo4j")),
+            ("DTG_DATA_NEO4J_USERNAME", OsString::from("neo4j")),
+            ("DTG_DATA_NEO4J_PASSWORD", OsString::from("secret")),
+        ]);
+        let config = DataProcessConfig::from_environment(|name| values.get(name).cloned()).unwrap();
+        let debug = format!("{:?}", config.credential_profiles());
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn external_assignment_rejects_incomplete_profile() {
+        let values = BTreeMap::from([
+            (
+                "DTG_DATA_CAPABILITIES",
+                OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
+            ),
+            (
+                "DTG_DATA_ASSIGNMENTS",
+                OsString::from("7:11:13:17:19:23:postgresql:1:1:postgres-bench"),
+            ),
+            (
+                "DTG_DATA_POSTGRES_ENDPOINT",
+                OsString::from("host=127.0.0.1"),
+            ),
+        ]);
+        let error =
+            DataProcessConfig::from_environment(|name| values.get(name).cloned()).unwrap_err();
+        assert!(error.to_string().contains("DTG_DATA_POSTGRES_CREDENTIAL"));
+    }
 }
