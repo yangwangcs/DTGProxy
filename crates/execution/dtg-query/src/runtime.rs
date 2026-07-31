@@ -141,6 +141,7 @@ impl QueryRuntime {
                 "materialized input contains extra fragment {fragment_id}"
             )));
         }
+        validate_materialized_fragment_owners(plan)?;
         for (fragment_id, batches) in &fragment_batches {
             if let Some(schema) = batches.first().map(ColumnBatch::schema) {
                 let [field] = schema.fields.as_slice() else {
@@ -478,6 +479,61 @@ impl QueryRuntime {
             )?))
         }
     }
+}
+
+fn validate_materialized_fragment_owners(plan: &ExecutablePlan) -> Result<(), QueryError> {
+    let fragments = plan
+        .fragments()
+        .iter()
+        .map(|fragment| (fragment.id(), fragment))
+        .collect::<BTreeMap<_, _>>();
+    for fragment in plan.fragments() {
+        if fragment.accesses().len() != 1 {
+            return Err(QueryError::InvalidPlan(format!(
+                "materialized fragment {} contains {} storage accesses; exactly one is required",
+                fragment.id(),
+                fragment.accesses().len()
+            )));
+        }
+    }
+
+    let mut owners = BTreeMap::new();
+    for operator in plan.operators() {
+        let ExecutableOperatorKind::Source {
+            logical_node,
+            fragments: source_fragments,
+            ..
+        } = operator.kind()
+        else {
+            continue;
+        };
+        for fragment_id in source_fragments {
+            let fragment = fragments.get(fragment_id).ok_or_else(|| {
+                QueryError::InvalidPlan(format!(
+                    "physical source references missing fragment {fragment_id}"
+                ))
+            })?;
+            if fragment.access(*logical_node).is_none() {
+                return Err(QueryError::InvalidPlan(format!(
+                    "fragment {fragment_id} is missing logical source {logical_node}"
+                )));
+            }
+            if let Some((owner_operator, owner_logical_node)) =
+                owners.insert(*fragment_id, (operator.id(), *logical_node))
+            {
+                if owner_operator == operator.id() && owner_logical_node == *logical_node {
+                    return Err(QueryError::InvalidPlan(format!(
+                        "physical source contains duplicate fragment {fragment_id}"
+                    )));
+                }
+                return Err(QueryError::InvalidPlan(format!(
+                    "materialized fragment {fragment_id} has multiple source owners: operator {owner_operator} logical node {owner_logical_node} and operator {} logical node {logical_node}",
+                    operator.id()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn materialized_access_schema(access: &ExecutableAccess) -> RowSchema {

@@ -550,6 +550,242 @@ fn materialized_source_rejects_duplicate_fragment_references() {
 }
 
 #[test]
+fn materialized_source_rejects_fragment_reused_by_distinct_logical_sources() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![
+            ExecutableAccess::Logical(
+                LogicalRead::new(
+                    ReadOperation::VertexScan,
+                    8,
+                    TransactionTime::new(23).unwrap(),
+                    17,
+                )
+                .unwrap(),
+            ),
+            ExecutableAccess::Logical(
+                LogicalRead::new(
+                    ReadOperation::VertexScan,
+                    8,
+                    TransactionTime::new(23).unwrap(),
+                    17,
+                )
+                .unwrap(),
+            ),
+        ],
+        vec![1, 2],
+    )
+    .unwrap();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        3,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1],
+                    output: "left_vertex".into(),
+                },
+            )
+            .unwrap(),
+            ExecutableOperator::new(
+                2,
+                ExecutableOperatorKind::Source {
+                    logical_node: 2,
+                    fragments: vec![1],
+                    output: "right_vertex".into(),
+                },
+            )
+            .unwrap(),
+            ExecutableOperator::new(
+                3,
+                ExecutableOperatorKind::Join {
+                    left: 1,
+                    right: 2,
+                    kind: JoinKind::Inner,
+                    predicate: Some(Expression::new(LogicalExpr::Binary {
+                        left: Box::new(LogicalExpr::Column("left_vertex".into())),
+                        operator: BinaryOperator::Equal,
+                        right: Box::new(LogicalExpr::Column("right_vertex".into())),
+                    })),
+                },
+            )
+            .unwrap(),
+        ],
+        RowSchema::empty(),
+    )
+    .unwrap();
+    let batch = ColumnBatch::from_rows(
+        RowSchema {
+            fields: vec![Field {
+                name: "vertex".into(),
+                data_type: LogicalType::Any,
+                nullable: false,
+            }],
+        },
+        vec![vec![QueryValue::Map(BTreeMap::from([(
+            "id".into(),
+            QueryValue::Integer(1),
+        )]))]],
+    )
+    .unwrap();
+
+    let result = block_on(QueryRuntime::new(16).execute_materialized(
+        &plan,
+        BTreeMap::from([(1, vec![batch])]),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+    ));
+
+    match result {
+        Err(QueryError::InvalidPlan(message)) => {
+            assert!(message.contains("fragment 1"));
+        }
+        Err(error) => panic!("expected invalid plan, got {error}"),
+        Ok(_) => panic!("fragment reused across logical sources was accepted"),
+    }
+}
+
+#[test]
+fn materialized_source_rejects_fragment_with_multiple_storage_accesses() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![
+            ExecutableAccess::Logical(
+                LogicalRead::new(
+                    ReadOperation::VertexScan,
+                    8,
+                    TransactionTime::new(23).unwrap(),
+                    17,
+                )
+                .unwrap(),
+            ),
+            ExecutableAccess::Logical(
+                LogicalRead::new(
+                    ReadOperation::VertexScan,
+                    8,
+                    TransactionTime::new(23).unwrap(),
+                    17,
+                )
+                .unwrap(),
+            ),
+        ],
+        vec![1, 2],
+    )
+    .unwrap();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        1,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1],
+                    output: "n".into(),
+                },
+            )
+            .unwrap(),
+        ],
+        RowSchema::empty(),
+    )
+    .unwrap();
+
+    let result = block_on(QueryRuntime::new(16).execute_materialized(
+        &plan,
+        BTreeMap::from([(1, Vec::new())]),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+    ));
+
+    match result {
+        Err(QueryError::InvalidPlan(message)) => {
+            assert!(message.contains("fragment 1 contains 2 storage accesses"));
+        }
+        Err(error) => panic!("expected invalid plan, got {error}"),
+        Ok(_) => panic!("fragment with multiple storage accesses was accepted"),
+    }
+}
+
+#[test]
+fn materialized_single_source_merges_multiple_one_access_fragments() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragments = [13_u64, 17_u64]
+        .into_iter()
+        .enumerate()
+        .map(|(index, shard_id)| {
+            ExecutableFragment::with_access_nodes(
+                u32::try_from(index + 1).unwrap(),
+                execution_fence_for_shard(&capabilities, shard_id),
+                vec![ExecutableAccess::Logical(
+                    LogicalRead::new(
+                        ReadOperation::VertexScan,
+                        8,
+                        TransactionTime::new(23).unwrap(),
+                        17,
+                    )
+                    .unwrap(),
+                )],
+                vec![1],
+            )
+            .unwrap()
+        })
+        .collect();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        fragments,
+        1,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1, 2],
+                    output: "n".into(),
+                },
+            )
+            .unwrap(),
+        ],
+        RowSchema::empty(),
+    )
+    .unwrap();
+    let batch = |id| {
+        ColumnBatch::from_rows(
+            RowSchema {
+                fields: vec![Field {
+                    name: "vertex".into(),
+                    data_type: LogicalType::Any,
+                    nullable: false,
+                }],
+            },
+            vec![vec![QueryValue::Map(BTreeMap::from([(
+                "id".into(),
+                QueryValue::Integer(id),
+            )]))]],
+        )
+        .unwrap()
+    };
+
+    let mut stream = block_on(QueryRuntime::new(16).execute_materialized(
+        &plan,
+        BTreeMap::from([(1, vec![batch(1)]), (2, vec![batch(2)])]),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+    ))
+    .unwrap();
+    let output = block_on(stream.collect()).unwrap();
+
+    assert_eq!(output.row_count(), 2);
+}
+
+#[test]
 fn overlay_applies_read_your_own_writes_before_results_escape() {
     let base = vertex(1, 10);
     let staged = vertex(2, 20);
