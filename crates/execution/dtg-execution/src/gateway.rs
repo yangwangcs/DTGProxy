@@ -16,8 +16,8 @@ use dtg_cluster_v2::{
 };
 use dtg_language::{EmptySchemaCatalog, Language, LanguageError, LogicalProgram};
 use dtg_language_ir::{
-    LogicalNodeKind, LogicalPlan, LogicalStatement, TemporalScope, TimeExpr, ValidTimeExpr,
-    ValidTimePredicate,
+    LogicalExpr, LogicalNodeKind, LogicalPlan, LogicalStatement, TemporalScope, TimeExpr,
+    ValidTimeExpr, ValidTimePredicate,
 };
 use dtg_plan::{
     ExchangeKind, LogicalReadOperation, LogicalReadRequest, PhysicalExpr, PhysicalPlan, Planner,
@@ -30,7 +30,7 @@ use dtg_query::{
     QueryError, QueryOverlay, QueryRuntime, QueryStorage, QueryStream, ReadOperation,
     ResidualPredicate, SnapshotGuard, SnapshotShardFence,
 };
-use dtg_storage::{PushdownOperation, ShardId, TransactionId, Version};
+use dtg_storage::{PushdownOperation, ShardId, TransactionId, Value, Version};
 use dtg_transaction::{
     ParticipantWrite, ShardSnapshotFence, SnapshotToken, TemporalTxnCoordinator,
     TransactionContext, TransactionOutcome, TxnFuture,
@@ -577,6 +577,40 @@ impl GatewayExecution {
         )
     }
 
+    pub fn lower_plan_with_parameters(
+        &self,
+        plan: &PhysicalPlan,
+        parameters: &BTreeMap<String, GatewayValue>,
+    ) -> Result<ExecutablePlan, GatewayExecutionError> {
+        validate_exchanges(plan).map_err(gateway_lowering_error)?;
+        let fragments = plan
+            .fragments()
+            .iter()
+            .map(lower_fragment)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(gateway_lowering_error)?;
+        let operators = plan
+            .operators()
+            .iter()
+            .map(|operator| lower_operator_with_parameters(operator, parameters))
+            .collect::<Result<Vec<_>, _>>()?;
+        ExecutablePlan::with_operators(
+            plan.version,
+            fragments,
+            plan.root_operator().get(),
+            operators,
+            plan.result_schema().clone(),
+        )
+        .map_err(gateway_lowering_error)
+    }
+
+    pub fn bind_logical_expr(
+        expression: &LogicalExpr,
+        parameters: &BTreeMap<String, GatewayValue>,
+    ) -> Result<LogicalExpr, GatewayExecutionError> {
+        bind_logical_expr(expression, parameters)
+    }
+
     pub fn tick_analytics(
         &mut self,
         ledger: &mut AnalyticsLedger,
@@ -759,6 +793,9 @@ impl GatewayExecution {
                 }
                 _ => None,
             };
+            if let Some(plan) = &physical_plan {
+                self.lower_plan_with_parameters(plan, &parameters)?;
+            }
             let request = GatewayClusterRequest {
                 context,
                 operation,
@@ -2093,6 +2130,32 @@ fn lower_fragment(fragment: &dtg_plan::PlanFragment) -> Result<ExecutableFragmen
 }
 
 fn lower_operator(operator: &dtg_plan::PhysicalOperator) -> Result<ExecutableOperator, QueryError> {
+    lower_operator_with(
+        operator,
+        &|expression| Ok(Expression::new(expression.clone())),
+        &lower_expression,
+        &|error| error,
+    )
+}
+
+fn lower_operator_with_parameters(
+    operator: &dtg_plan::PhysicalOperator,
+    parameters: &BTreeMap<String, GatewayValue>,
+) -> Result<ExecutableOperator, GatewayExecutionError> {
+    lower_operator_with(
+        operator,
+        &|expression| bind_logical_expr(expression, parameters).map(Expression::new),
+        &|expression| lower_expression_with_parameters(expression, parameters),
+        &gateway_lowering_error,
+    )
+}
+
+fn lower_operator_with<E>(
+    operator: &dtg_plan::PhysicalOperator,
+    lower_logical: &impl Fn(&LogicalExpr) -> Result<Expression, E>,
+    lower_physical: &impl Fn(&PhysicalExpr) -> Result<Expression, E>,
+    map_query_error: &impl Fn(QueryError) -> E,
+) -> Result<ExecutableOperator, E> {
     use dtg_plan::PhysicalOperatorKind;
 
     let kind = match operator.kind() {
@@ -2107,19 +2170,19 @@ fn lower_operator(operator: &dtg_plan::PhysicalOperator) -> Result<ExecutableOpe
         },
         PhysicalOperatorKind::Filter { input, predicate } => ExecutableOperatorKind::Filter {
             input: input.get(),
-            predicate: lower_expression(predicate)?,
+            predicate: lower_physical(predicate)?,
         },
         PhysicalOperatorKind::Project { input, projections } => ExecutableOperatorKind::Project {
             input: input.get(),
             projections: projections
                 .iter()
                 .map(|projection| {
-                    ExecutableProjection::new(
+                    Ok(ExecutableProjection::new(
                         projection.alias.clone(),
-                        Expression::new(projection.expression.clone()),
-                    )
+                        lower_logical(&projection.expression)?,
+                    ))
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, E>>()?,
         },
         PhysicalOperatorKind::Join {
             left,
@@ -2130,7 +2193,7 @@ fn lower_operator(operator: &dtg_plan::PhysicalOperator) -> Result<ExecutableOpe
             left: left.get(),
             right: right.get(),
             kind: *kind,
-            predicate: predicate.as_ref().map(lower_expression).transpose()?,
+            predicate: predicate.as_ref().map(lower_physical).transpose()?,
         },
         PhysicalOperatorKind::Aggregate {
             input,
@@ -2141,31 +2204,35 @@ fn lower_operator(operator: &dtg_plan::PhysicalOperator) -> Result<ExecutableOpe
             groups: groups
                 .iter()
                 .map(|projection| {
-                    ExecutableProjection::new(
+                    Ok(ExecutableProjection::new(
                         projection.alias.clone(),
-                        Expression::new(projection.expression.clone()),
-                    )
+                        lower_logical(&projection.expression)?,
+                    ))
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, E>>()?,
             aggregates: aggregates
                 .iter()
-                .map(|aggregate| ExecutableAggregate {
-                    function: aggregate.function,
-                    argument: aggregate.argument.clone().map(Expression::new),
-                    alias: aggregate.alias.clone(),
-                    distinct: aggregate.distinct,
+                .map(|aggregate| {
+                    Ok(ExecutableAggregate {
+                        function: aggregate.function,
+                        argument: aggregate.argument.as_ref().map(lower_logical).transpose()?,
+                        alias: aggregate.alias.clone(),
+                        distinct: aggregate.distinct,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, E>>()?,
         },
         PhysicalOperatorKind::Sort { input, keys } => ExecutableOperatorKind::Sort {
             input: input.get(),
             keys: keys
                 .iter()
-                .map(|key| ExecutableSortKey {
-                    expression: Expression::new(key.expression.clone()),
-                    direction: key.direction,
+                .map(|key| {
+                    Ok(ExecutableSortKey {
+                        expression: lower_logical(&key.expression)?,
+                        direction: key.direction,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, E>>()?,
         },
         PhysicalOperatorKind::Limit { input, skip, limit } => ExecutableOperatorKind::Limit {
             input: input.get(),
@@ -2178,11 +2245,11 @@ fn lower_operator(operator: &dtg_plan::PhysicalOperator) -> Result<ExecutableOpe
             alias,
         } => ExecutableOperatorKind::Unwind {
             input: input.get(),
-            expression: lower_expression(expression)?,
+            expression: lower_physical(expression)?,
             alias: alias.clone(),
         },
     };
-    ExecutableOperator::new(operator.id().get(), kind)
+    ExecutableOperator::new(operator.id().get(), kind).map_err(map_query_error)
 }
 
 fn lower_expression(expression: &PhysicalExpr) -> Result<Expression, QueryError> {
@@ -2193,6 +2260,100 @@ fn lower_expression(expression: &PhysicalExpr) -> Result<Expression, QueryError>
                 .into(),
         )),
     }
+}
+
+fn lower_expression_with_parameters(
+    expression: &PhysicalExpr,
+    parameters: &BTreeMap<String, GatewayValue>,
+) -> Result<Expression, GatewayExecutionError> {
+    match expression {
+        PhysicalExpr::Evaluate(expression) => {
+            bind_logical_expr(expression, parameters).map(Expression::new)
+        }
+        PhysicalExpr::VerifyStorageSemantics { .. } => {
+            Err(gateway_lowering_error(QueryError::InvalidPlan(
+                "storage verification expression cannot be used as a physical operator expression"
+                    .into(),
+            )))
+        }
+    }
+}
+
+pub fn bind_logical_expr(
+    expression: &LogicalExpr,
+    parameters: &BTreeMap<String, GatewayValue>,
+) -> Result<LogicalExpr, GatewayExecutionError> {
+    match expression {
+        LogicalExpr::Literal(value) => Ok(LogicalExpr::Literal(value.clone())),
+        LogicalExpr::Parameter(name) => parameters
+            .get(name)
+            .ok_or_else(|| {
+                GatewayExecutionError::new(
+                    "DTG-EXECUTION-MISSING-PARAMETER",
+                    format!("missing required parameter: {name}"),
+                    GatewayRetry::Never,
+                )
+            })
+            .and_then(gateway_value_to_storage)
+            .map(LogicalExpr::Literal),
+        LogicalExpr::Column(name) => Ok(LogicalExpr::Column(name.clone())),
+        LogicalExpr::Property { input, name } => Ok(LogicalExpr::Property {
+            input: Box::new(bind_logical_expr(input, parameters)?),
+            name: name.clone(),
+        }),
+        LogicalExpr::Unary { operator, input } => Ok(LogicalExpr::Unary {
+            operator: *operator,
+            input: Box::new(bind_logical_expr(input, parameters)?),
+        }),
+        LogicalExpr::Binary {
+            left,
+            operator,
+            right,
+        } => Ok(LogicalExpr::Binary {
+            left: Box::new(bind_logical_expr(left, parameters)?),
+            operator: *operator,
+            right: Box::new(bind_logical_expr(right, parameters)?),
+        }),
+        LogicalExpr::List(values) => values
+            .iter()
+            .map(|value| bind_logical_expr(value, parameters))
+            .collect::<Result<Vec<_>, _>>()
+            .map(LogicalExpr::List),
+        LogicalExpr::Map(values) => values
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), bind_logical_expr(value, parameters)?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(LogicalExpr::Map),
+    }
+}
+
+fn gateway_value_to_storage(value: &GatewayValue) -> Result<Value, GatewayExecutionError> {
+    match value {
+        GatewayValue::Null => Ok(Value::Null),
+        GatewayValue::Boolean(value) => Ok(Value::Boolean(*value)),
+        GatewayValue::Integer(value) => Ok(Value::Integer(*value)),
+        GatewayValue::FloatBits(value) => Ok(Value::FloatBits(*value)),
+        GatewayValue::Bytes(value) => Ok(Value::Bytes(value.clone())),
+        GatewayValue::String(value) => Ok(Value::String(value.clone())),
+        GatewayValue::List(values) => values
+            .iter()
+            .map(gateway_value_to_storage)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        GatewayValue::Map(values) => values
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), gateway_value_to_storage(value)?)))
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(Value::Map),
+    }
+}
+
+fn gateway_lowering_error(error: QueryError) -> GatewayExecutionError {
+    GatewayExecutionError::new(
+        "DTG-EXECUTION-LOWER",
+        error.to_string(),
+        GatewayRetry::Never,
+    )
 }
 
 fn lower_access(

@@ -6,11 +6,11 @@ use dtg_language_ir::{
 use dtg_storage::ShardId;
 
 use crate::{
-    AggregateOperator, BuiltInSpillPolicy, CancellationToken, ColumnBatch, ExecutableFragment,
-    ExecutableOperatorKind, ExecutablePlan, Expression, FilterOperator, HashJoinOperator,
-    LimitOperator, Operator, OverlayOperator, ProjectOperator, ProjectionExpr, QueryBudget,
-    QueryContext, QueryError, QueryFuture, QueryOverlay, QueryStorage, SortOperator, SpillConfig,
-    SpillMergeOperator, StorageSourceOperator, UnwindOperator,
+    AggregateOperator, BatchOperator, BuiltInSpillPolicy, CancellationToken, ColumnBatch,
+    ExecutableFragment, ExecutableOperatorKind, ExecutablePlan, Expression, FilterOperator,
+    HashJoinOperator, LimitOperator, Operator, OverlayOperator, ProjectOperator, ProjectionExpr,
+    QueryBudget, QueryContext, QueryError, QueryFuture, QueryOverlay, QueryStorage, SortOperator,
+    SpillConfig, SpillMergeOperator, StorageSourceOperator, UnwindOperator,
 };
 
 pub struct QueryRuntime {
@@ -21,6 +21,11 @@ pub struct QueryRuntime {
 enum RuntimeSpill {
     BuiltIn(BuiltInSpillPolicy),
     Injected(SpillConfig),
+}
+
+enum FragmentSources<'a> {
+    Local(&'a BTreeMap<u32, (&'a ExecutableFragment, QueryStorage)>),
+    Materialized(&'a BTreeMap<u32, Vec<ColumnBatch>>),
 }
 
 impl QueryRuntime {
@@ -79,10 +84,11 @@ impl QueryRuntime {
             .collect::<BTreeMap<_, _>>();
         let mut visiting = BTreeSet::new();
         let mut built = BTreeSet::new();
+        let sources = FragmentSources::Local(&fragment_storage);
         let mut root = self.build_operator(
             plan.root_operator(),
             &definitions,
-            &fragment_storage,
+            &sources,
             &mut visiting,
             &mut built,
         )?;
@@ -106,11 +112,90 @@ impl QueryRuntime {
         Ok(QueryStream::from_operator(root, budget, cancellation))
     }
 
+    pub async fn execute_materialized(
+        &self,
+        plan: &ExecutablePlan,
+        fragment_batches: BTreeMap<u32, Vec<ColumnBatch>>,
+        budget: QueryBudget,
+        cancellation: CancellationToken,
+    ) -> Result<QueryStream, QueryError> {
+        if self.batch_size == 0 {
+            return Err(QueryError::InvalidPlan(
+                "query runtime batch size must be nonzero".into(),
+            ));
+        }
+        let expected = plan
+            .fragments()
+            .iter()
+            .map(ExecutableFragment::id)
+            .collect::<BTreeSet<_>>();
+        let provided = fragment_batches.keys().copied().collect::<BTreeSet<_>>();
+        if let Some(fragment_id) = expected.difference(&provided).next() {
+            return Err(QueryError::InvalidPlan(format!(
+                "materialized input is missing fragment {fragment_id}"
+            )));
+        }
+        if let Some(fragment_id) = provided.difference(&expected).next() {
+            return Err(QueryError::InvalidPlan(format!(
+                "materialized input contains extra fragment {fragment_id}"
+            )));
+        }
+        for (fragment_id, batches) in &fragment_batches {
+            let Some(schema) = batches.first().map(ColumnBatch::schema) else {
+                return Err(QueryError::InvalidPlan(format!(
+                    "materialized fragment {fragment_id} contains no batches"
+                )));
+            };
+            let [field] = schema.fields.as_slice() else {
+                return Err(QueryError::InvalidPlan(format!(
+                    "materialized fragment {fragment_id} must have a one-column schema"
+                )));
+            };
+            if field.name.is_empty() {
+                return Err(QueryError::InvalidPlan(format!(
+                    "materialized fragment {fragment_id} source name must be nonempty"
+                )));
+            }
+            if batches.iter().any(|batch| batch.schema() != schema) {
+                return Err(QueryError::InvalidPlan(format!(
+                    "materialized fragment {fragment_id} batch schemas must be identical"
+                )));
+            }
+        }
+
+        let definitions = plan
+            .operators()
+            .iter()
+            .map(|operator| (operator.id(), operator.kind().clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut visiting = BTreeSet::new();
+        let mut built = BTreeSet::new();
+        let sources = FragmentSources::Materialized(&fragment_batches);
+        let root = self.build_operator(
+            plan.root_operator(),
+            &definitions,
+            &sources,
+            &mut visiting,
+            &mut built,
+        )?;
+        if built.len() != definitions.len() {
+            return Err(QueryError::InvalidPlan(
+                "physical operator DAG contains unreachable operators".into(),
+            ));
+        }
+        if !plan.result_schema().fields.is_empty() && root.schema() != plan.result_schema() {
+            return Err(QueryError::InvalidPlan(
+                "physical root schema does not match declared result schema".into(),
+            ));
+        }
+        Ok(QueryStream::from_operator(root, budget, cancellation))
+    }
+
     fn build_operator(
         &self,
         id: u32,
         definitions: &BTreeMap<u32, ExecutableOperatorKind>,
-        fragment_storage: &BTreeMap<u32, (&ExecutableFragment, QueryStorage)>,
+        sources: &FragmentSources<'_>,
         visiting: &mut BTreeSet<u32>,
         built: &mut BTreeSet<u32>,
     ) -> Result<Box<dyn Operator>, QueryError> {
@@ -133,16 +218,14 @@ impl QueryRuntime {
                 logical_node,
                 fragments,
                 output,
-            } => self.build_source(logical_node, &fragments, &output, fragment_storage)?,
+            } => self.build_source(logical_node, &fragments, &output, sources)?,
             ExecutableOperatorKind::Filter { input, predicate } => {
-                let input =
-                    self.build_operator(input, definitions, fragment_storage, visiting, built)?;
+                let input = self.build_operator(input, definitions, sources, visiting, built)?;
                 validate_expression(&predicate, input.schema())?;
                 Box::new(FilterOperator::new(input, predicate))
             }
             ExecutableOperatorKind::Project { input, projections } => {
-                let input =
-                    self.build_operator(input, definitions, fragment_storage, visiting, built)?;
+                let input = self.build_operator(input, definitions, sources, visiting, built)?;
                 if projections.is_empty() {
                     return Err(QueryError::InvalidPlan(
                         "physical projection must contain at least one expression".into(),
@@ -179,10 +262,8 @@ impl QueryRuntime {
                         "query runtime currently supports only inner hash joins".into(),
                     ));
                 }
-                let left =
-                    self.build_operator(left, definitions, fragment_storage, visiting, built)?;
-                let right =
-                    self.build_operator(right, definitions, fragment_storage, visiting, built)?;
+                let left = self.build_operator(left, definitions, sources, visiting, built)?;
+                let right = self.build_operator(right, definitions, sources, visiting, built)?;
                 let predicate = predicate.ok_or_else(|| {
                     QueryError::Unsupported("inner hash join requires an equality predicate".into())
                 })?;
@@ -200,8 +281,7 @@ impl QueryRuntime {
                 groups,
                 aggregates,
             } => {
-                let input =
-                    self.build_operator(input, definitions, fragment_storage, visiting, built)?;
+                let input = self.build_operator(input, definitions, sources, visiting, built)?;
                 let [aggregate] = aggregates.as_slice() else {
                     return Err(QueryError::Unsupported(
                         "query runtime currently supports one aggregate function".into(),
@@ -242,8 +322,7 @@ impl QueryRuntime {
                 }
             }
             ExecutableOperatorKind::Sort { input, keys } => {
-                let input =
-                    self.build_operator(input, definitions, fragment_storage, visiting, built)?;
+                let input = self.build_operator(input, definitions, sources, visiting, built)?;
                 let [key] = keys.as_slice() else {
                     return Err(QueryError::Unsupported(
                         "query runtime currently supports one sort key".into(),
@@ -258,8 +337,7 @@ impl QueryRuntime {
                 Box::new(SortOperator::new(input, column, key.direction))
             }
             ExecutableOperatorKind::Limit { input, skip, limit } => {
-                let input =
-                    self.build_operator(input, definitions, fragment_storage, visiting, built)?;
+                let input = self.build_operator(input, definitions, sources, visiting, built)?;
                 let skip = usize::try_from(skip)
                     .map_err(|_| QueryError::InvalidPlan("LIMIT skip exceeds usize".into()))?;
                 let limit = match limit {
@@ -274,8 +352,7 @@ impl QueryRuntime {
                 expression,
                 alias,
             } => {
-                let input =
-                    self.build_operator(input, definitions, fragment_storage, visiting, built)?;
+                let input = self.build_operator(input, definitions, sources, visiting, built)?;
                 validate_expression(&expression, input.schema())?;
                 Box::new(UnwindOperator::new(
                     input,
@@ -295,7 +372,7 @@ impl QueryRuntime {
         logical_node: u32,
         fragments: &[u32],
         output: &str,
-        fragment_storage: &BTreeMap<u32, (&ExecutableFragment, QueryStorage)>,
+        fragment_sources: &FragmentSources<'_>,
     ) -> Result<Box<dyn Operator>, QueryError> {
         if fragments.is_empty() || output.is_empty() {
             return Err(QueryError::InvalidPlan(
@@ -304,22 +381,34 @@ impl QueryRuntime {
         }
         let mut sources = Vec::with_capacity(fragments.len());
         for fragment_id in fragments {
-            let (fragment, shard_storage) = fragment_storage.get(fragment_id).ok_or_else(|| {
-                QueryError::InvalidPlan(format!(
-                    "physical source references missing fragment {fragment_id}"
-                ))
-            })?;
-            let access = fragment.access(logical_node).cloned().ok_or_else(|| {
-                QueryError::InvalidPlan(format!(
-                    "fragment {fragment_id} is missing logical source {logical_node}"
-                ))
-            })?;
-            let source = StorageSourceOperator::new(
-                access,
-                fragment.fence().clone(),
-                shard_storage.clone(),
-                self.batch_size,
-            )?;
+            let source: Box<dyn Operator> = match fragment_sources {
+                FragmentSources::Local(fragment_storage) => {
+                    let (fragment, shard_storage) =
+                        fragment_storage.get(fragment_id).ok_or_else(|| {
+                            QueryError::InvalidPlan(format!(
+                                "physical source references missing fragment {fragment_id}"
+                            ))
+                        })?;
+                    let access = fragment.access(logical_node).cloned().ok_or_else(|| {
+                        QueryError::InvalidPlan(format!(
+                            "fragment {fragment_id} is missing logical source {logical_node}"
+                        ))
+                    })?;
+                    Box::new(StorageSourceOperator::new(
+                        access,
+                        fragment.fence().clone(),
+                        shard_storage.clone(),
+                        self.batch_size,
+                    )?)
+                }
+                FragmentSources::Materialized(fragment_batches) => Box::new(BatchOperator::new(
+                    fragment_batches.get(fragment_id).cloned().ok_or_else(|| {
+                        QueryError::InvalidPlan(format!(
+                            "physical source references missing fragment {fragment_id}"
+                        ))
+                    })?,
+                )),
+            };
             let storage_field = source
                 .schema()
                 .fields
@@ -330,7 +419,7 @@ impl QueryRuntime {
                 .name
                 .clone();
             sources.push(Box::new(ProjectOperator::new(
-                Box::new(source),
+                source,
                 vec![ProjectionExpr::new(
                     output,
                     LogicalType::Any,

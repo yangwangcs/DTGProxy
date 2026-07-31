@@ -10,7 +10,8 @@ use dtg_execution::{
     GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
     GatewayValue,
 };
-use dtg_plan::{CatalogShard, CatalogSnapshot, PlanningContext, SnapshotRequirements};
+use dtg_language_ir::{BinaryOperator, LogicalExpr, UnaryOperator, Value};
+use dtg_plan::{CatalogShard, CatalogSnapshot, Planner, PlanningContext, SnapshotRequirements};
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
     Version,
@@ -348,6 +349,151 @@ fn process_execution_decodes_protocol_v2_typed_rows() {
             .unwrap()
         )
     );
+}
+
+#[test]
+fn binds_parameters_recursively_in_expression_shapes_and_values() {
+    let expression = LogicalExpr::Map(vec![
+        (
+            "binary".into(),
+            LogicalExpr::Binary {
+                left: Box::new(LogicalExpr::Parameter("id".into())),
+                operator: BinaryOperator::Equal,
+                right: Box::new(LogicalExpr::Literal(Value::Integer(2048))),
+            },
+        ),
+        (
+            "list".into(),
+            LogicalExpr::List(vec![
+                LogicalExpr::Parameter("null".into()),
+                LogicalExpr::Parameter("boolean".into()),
+                LogicalExpr::Parameter("float".into()),
+                LogicalExpr::Parameter("bytes".into()),
+                LogicalExpr::Parameter("string".into()),
+            ]),
+        ),
+        (
+            "unary".into(),
+            LogicalExpr::Unary {
+                operator: UnaryOperator::Negate,
+                input: Box::new(LogicalExpr::Parameter("integer".into())),
+            },
+        ),
+        (
+            "projection".into(),
+            LogicalExpr::Parameter("projection".into()),
+        ),
+        (
+            "aggregate".into(),
+            LogicalExpr::Parameter("aggregate".into()),
+        ),
+        ("sort".into(), LogicalExpr::Parameter("sort".into())),
+        ("unwind".into(), LogicalExpr::Parameter("unwind".into())),
+        ("nested".into(), LogicalExpr::Parameter("nested".into())),
+    ]);
+    let parameters = BTreeMap::from([
+        ("id".into(), GatewayValue::Integer(2048)),
+        ("null".into(), GatewayValue::Null),
+        ("boolean".into(), GatewayValue::Boolean(true)),
+        ("float".into(), GatewayValue::FloatBits(17)),
+        ("bytes".into(), GatewayValue::Bytes(vec![1, 2])),
+        ("string".into(), GatewayValue::String("value".into())),
+        ("integer".into(), GatewayValue::Integer(9)),
+        ("projection".into(), GatewayValue::Integer(1)),
+        ("aggregate".into(), GatewayValue::Integer(2)),
+        ("sort".into(), GatewayValue::Integer(3)),
+        (
+            "unwind".into(),
+            GatewayValue::List(vec![GatewayValue::Integer(4)]),
+        ),
+        (
+            "nested".into(),
+            GatewayValue::Map(BTreeMap::from([(
+                "items".into(),
+                GatewayValue::List(vec![GatewayValue::String("nested".into())]),
+            )])),
+        ),
+    ]);
+
+    let bound = GatewayExecution::bind_logical_expr(&expression, &parameters).unwrap();
+
+    let LogicalExpr::Map(values) = bound else {
+        panic!("expected bound map expression")
+    };
+    let LogicalExpr::Binary { left, .. } = &values[0].1 else {
+        panic!("expected binary expression")
+    };
+    assert_eq!(left.as_ref(), &LogicalExpr::Literal(Value::Integer(2048)));
+    assert!(format!("{values:?}").find("Parameter").is_none());
+    assert_eq!(
+        values.last().unwrap().1,
+        LogicalExpr::Literal(Value::Map(BTreeMap::from([(
+            "items".into(),
+            Value::List(vec![Value::String("nested".into())]),
+        )])))
+    );
+}
+
+#[test]
+fn binds_parameters_while_lowering_the_fixed_point_predicate() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client)),
+        planning_context(),
+    );
+    let program = execution
+        .compile("MATCH (n) WHERE n.id = $id RETURN n.id")
+        .unwrap();
+    let physical = Planner.plan(&program, &planning_context()).unwrap();
+
+    let executable = execution
+        .lower_plan_with_parameters(
+            &physical,
+            &BTreeMap::from([("id".into(), GatewayValue::Integer(2048))]),
+        )
+        .unwrap();
+
+    let predicate = executable
+        .operators()
+        .iter()
+        .find_map(|operator| match operator.kind() {
+            dtg_query::ExecutableOperatorKind::Filter { predicate, .. } => Some(predicate),
+            _ => None,
+        })
+        .unwrap();
+    let LogicalExpr::Binary { right, .. } = predicate.logical() else {
+        panic!("expected binary predicate")
+    };
+    assert_eq!(right.as_ref(), &LogicalExpr::Literal(Value::Integer(2048)));
+}
+
+#[test]
+fn binds_missing_names_before_remote_success() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client.clone())),
+        planning_context(),
+    );
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+
+    let error = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 12, deadline, Vec::new()).unwrap(),
+        "MATCH (n) WHERE n.id = $id RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code(), "DTG-EXECUTION-MISSING-PARAMETER");
+    assert!(client.requests.lock().unwrap().is_empty());
 }
 
 #[test]

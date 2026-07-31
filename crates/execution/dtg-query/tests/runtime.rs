@@ -1,5 +1,7 @@
 mod support;
 
+use std::collections::BTreeMap;
+
 use dtg_language_ir::{
     AggregateKind, BinaryOperator, Field, JoinKind, LogicalExpr, LogicalType, RowSchema,
     SortDirection, Value,
@@ -247,6 +249,112 @@ fn global_count_runtime_lowers_zero_groups() {
     let output = block_on(stream.collect()).unwrap();
 
     assert_eq!(output.rows(), vec![vec![QueryValue::Integer(3)]]);
+}
+
+#[test]
+fn materialized_source_filters_and_projects() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![ExecutableAccess::Logical(
+            LogicalRead::new(
+                ReadOperation::VertexScan,
+                8,
+                TransactionTime::new(23).unwrap(),
+                17,
+            )
+            .unwrap(),
+        )],
+        vec![1],
+    )
+    .unwrap();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        3,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1],
+                    output: "n".into(),
+                },
+            )
+            .unwrap(),
+            ExecutableOperator::new(
+                2,
+                ExecutableOperatorKind::Filter {
+                    input: 1,
+                    predicate: Expression::new(LogicalExpr::Binary {
+                        left: Box::new(LogicalExpr::Property {
+                            input: Box::new(LogicalExpr::Column("n".into())),
+                            name: "id".into(),
+                        }),
+                        operator: BinaryOperator::Equal,
+                        right: Box::new(LogicalExpr::Literal(Value::Integer(2048))),
+                    }),
+                },
+            )
+            .unwrap(),
+            ExecutableOperator::new(
+                3,
+                ExecutableOperatorKind::Project {
+                    input: 2,
+                    projections: vec![ExecutableProjection::new(
+                        "n.id",
+                        Expression::new(LogicalExpr::Property {
+                            input: Box::new(LogicalExpr::Column("n".into())),
+                            name: "id".into(),
+                        }),
+                    )],
+                },
+            )
+            .unwrap(),
+        ],
+        RowSchema {
+            fields: vec![Field {
+                name: "n.id".into(),
+                data_type: LogicalType::Any,
+                nullable: true,
+            }],
+        },
+    )
+    .unwrap();
+    let batch = |start, end| {
+        ColumnBatch::from_rows(
+            RowSchema {
+                fields: vec![Field {
+                    name: "vertex".into(),
+                    data_type: LogicalType::Any,
+                    nullable: false,
+                }],
+            },
+            (start..=end)
+                .map(|id| {
+                    vec![QueryValue::Map(BTreeMap::from([(
+                        "id".into(),
+                        QueryValue::Integer(id),
+                    )]))]
+                })
+                .collect(),
+        )
+        .unwrap()
+    };
+    let materialized = BTreeMap::from([(1, vec![batch(1, 2048), batch(2049, 4096)])]);
+
+    let mut stream = block_on(QueryRuntime::new(256).execute_materialized(
+        &plan,
+        materialized,
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+    ))
+    .unwrap();
+    let output = block_on(stream.collect()).unwrap();
+
+    assert_eq!(output.schema(), plan.result_schema());
+    assert_eq!(output.rows(), vec![vec![QueryValue::Integer(2048)]]);
 }
 
 #[test]

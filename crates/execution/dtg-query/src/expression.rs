@@ -12,7 +12,7 @@ impl Expression {
         Self { logical }
     }
 
-    pub(crate) const fn logical(&self) -> &LogicalExpr {
+    pub const fn logical(&self) -> &LogicalExpr {
         &self.logical
     }
 
