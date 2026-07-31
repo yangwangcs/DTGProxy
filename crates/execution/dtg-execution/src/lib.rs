@@ -5,6 +5,7 @@ mod data;
 mod gateway;
 mod meta;
 mod meta_raft;
+mod request_metrics;
 mod write;
 
 pub use dtg_analytics as analytics;
@@ -35,6 +36,10 @@ pub use gateway::{
 pub use meta::{MetaExecution, MetaExecutionBuilder};
 pub use meta_raft::{
     MetaCommittedEntry, MetaRaftError, MetaRaftHost, MetaRaftProgress, MetaRaftRole,
+};
+pub use request_metrics::{
+    RequestMetricsSnapshot, RequestStage, RequestStageMetrics, RequestStageSnapshot, StageOutcome,
+    StageTimer,
 };
 pub use write::{
     PHYSICAL_WRITE_VERSION, PhysicalWriteError, PhysicalWriteFragment, PhysicalWritePlan,

@@ -26,7 +26,7 @@ use dtg_execution::storage::{
 use dtg_execution::{
     GatewayCancellationToken, GatewayExecution, GatewayExecutionError, GatewayFuture,
     GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
-    GatewayRetry, ProviderKind, encode_physical_fragment_body,
+    GatewayRetry, ProviderKind, RequestStage, encode_physical_fragment_body,
 };
 use dtg_language_ir::{
     Field, GraphScope, LogicalExpr, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
@@ -320,6 +320,12 @@ async fn v2_rpc_rejects_malformed_requests_and_records_metrics() {
     assert_eq!(error.code(), Code::InvalidArgument);
     assert_eq!(service.metrics().rpc_requests(), 1);
     assert_eq!(service.metrics().rpc_failures(), 1);
+    let validation = service
+        .request_metrics()
+        .snapshot()
+        .stage(RequestStage::DataValidation);
+    assert_eq!(validation.success, 0);
+    assert_eq!(validation.error, 1);
 }
 
 #[tokio::test]
@@ -836,6 +842,18 @@ async fn execute_fragment_preserves_a_present_zero_row_fragment() {
     assert_eq!(batch.fragment_id, 72_u128.to_be_bytes());
     assert_eq!(batch.row_count, 0);
     assert!(stream.next().await.is_none());
+
+    let metrics = node.request_metrics().snapshot();
+    for stage in [
+        RequestStage::DataValidation,
+        RequestStage::DataRouting,
+        RequestStage::DataProviderExecution,
+    ] {
+        let stage = metrics.stage(stage);
+        assert_eq!(stage.success, 1);
+        assert_eq!(stage.error, 0);
+        assert_eq!(stage.cancelled, 0);
+    }
 }
 
 #[tokio::test]

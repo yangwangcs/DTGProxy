@@ -44,7 +44,7 @@ use dtg_transaction::{
 use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 
-use crate::ExecutionBuildError;
+use crate::{ExecutionBuildError, RequestStage, RequestStageMetrics};
 
 trait AnalyticsRuntime: Send + Sync {
     fn tick(
@@ -909,6 +909,7 @@ enum GatewayExecutionMode {
 pub struct GatewayExecution {
     language: Language,
     mode: GatewayExecutionMode,
+    request_metrics: Arc<RequestStageMetrics>,
 }
 
 impl GatewayExecution {
@@ -930,6 +931,7 @@ impl GatewayExecution {
                 write_transport: None,
                 write_accounting: Arc::new(ProcessWriteAccounting::default()),
             },
+            request_metrics: Arc::new(RequestStageMetrics::default()),
         }
     }
 
@@ -980,7 +982,12 @@ impl GatewayExecution {
     }
 
     pub fn compile(&self, source: &str) -> Result<LogicalProgram, LanguageError> {
-        self.language.compile(source)
+        let timer = self.request_metrics.start(RequestStage::GatewayCompile);
+        timer.finish_result(self.language.compile(source))
+    }
+
+    pub fn request_metrics(&self) -> Arc<RequestStageMetrics> {
+        Arc::clone(&self.request_metrics)
     }
 
     pub fn plan(
@@ -1260,8 +1267,9 @@ impl GatewayExecution {
                 .iter()
                 .map(|field| field.name.clone())
                 .collect();
-            let physical_plan = match &program.statement {
+            let planned = match &program.statement {
                 LogicalStatement::Query(_) => {
+                    let timer = self.request_metrics.start(RequestStage::GatewayPlan);
                     let GatewayExecutionMode::Process {
                         planner,
                         planning_context,
@@ -1274,27 +1282,31 @@ impl GatewayExecution {
                             GatewayRetry::Never,
                         ));
                     };
-                    let planning_context = planning_context.read().map_err(|_| {
-                        GatewayExecutionError::new(
-                            "DTG-EXECUTION-CATALOG-LOCK",
-                            "Gateway planning catalog lock is poisoned",
-                            GatewayRetry::Safe,
-                        )
-                    })?;
-                    Some(planner.plan(&program, &planning_context).map_err(|error| {
-                        GatewayExecutionError::new(
-                            "DTG-EXECUTION-PLAN",
-                            error.to_string(),
-                            GatewayRetry::Never,
-                        )
-                    })?)
+                    let result = (|| {
+                        let planning_context = planning_context.read().map_err(|_| {
+                            GatewayExecutionError::new(
+                                "DTG-EXECUTION-CATALOG-LOCK",
+                                "Gateway planning catalog lock is poisoned",
+                                GatewayRetry::Safe,
+                            )
+                        })?;
+                        let physical_plan =
+                            planner.plan(&program, &planning_context).map_err(|error| {
+                                GatewayExecutionError::new(
+                                    "DTG-EXECUTION-PLAN",
+                                    error.to_string(),
+                                    GatewayRetry::Never,
+                                )
+                            })?;
+                        let executable_plan =
+                            self.lower_plan_with_parameters(&physical_plan, &parameters)?;
+                        Ok((Some(physical_plan), Some(executable_plan)))
+                    })();
+                    timer.finish_result(result)?
                 }
-                _ => None,
+                _ => (None, None),
             };
-            let executable_plan = physical_plan
-                .as_ref()
-                .map(|plan| self.lower_plan_with_parameters(plan, &parameters))
-                .transpose()?;
+            let (physical_plan, executable_plan) = planned;
             let request = GatewayClusterRequest {
                 context,
                 operation,
@@ -1317,65 +1329,76 @@ impl GatewayExecution {
                 ));
             };
             let response = if let Some(executable_plan) = executable_plan {
-                match transport.execute_query(request).await? {
+                let timer = self.request_metrics.start(RequestStage::GatewayInternalRpc);
+                let remote = transport.execute_query(request).await;
+                let remote = timer.finish_result(remote)?;
+                match remote {
                     GatewayQueryResponse::Final(response) => response,
                     GatewayQueryResponse::Materialized(fragment_batches) => {
-                        let query_cancellation = QueryCancellationToken::new();
-                        if cancellation.is_cancelled() {
-                            query_cancellation.cancel();
-                        }
-                        let budget = process_query_budget(query_deadline)?;
-                        let mut stream = query
-                            .execute_materialized(
-                                &executable_plan,
-                                fragment_batches,
-                                budget,
-                                query_cancellation.clone(),
-                            )
-                            .await
-                            .map_err(gateway_query_error)?;
-                        let mut result_rows = Vec::new();
-                        while let Some(batch) = {
+                        let timer = self
+                            .request_metrics
+                            .start(RequestStage::GatewayLocalExecution);
+                        let local = async {
+                            let query_cancellation = QueryCancellationToken::new();
                             if cancellation.is_cancelled() {
                                 query_cancellation.cancel();
                             }
-                            stream.next_batch().await.map_err(gateway_query_error)?
-                        } {
-                            if batch.schema() != executable_plan.result_schema() {
+                            let budget = process_query_budget(query_deadline)?;
+                            let mut stream = query
+                                .execute_materialized(
+                                    &executable_plan,
+                                    fragment_batches,
+                                    budget,
+                                    query_cancellation.clone(),
+                                )
+                                .await
+                                .map_err(gateway_query_error)?;
+                            let mut result_rows = Vec::new();
+                            while let Some(batch) = {
+                                if cancellation.is_cancelled() {
+                                    query_cancellation.cancel();
+                                }
+                                stream.next_batch().await.map_err(gateway_query_error)?
+                            } {
+                                if batch.schema() != executable_plan.result_schema() {
+                                    return Err(GatewayExecutionError::new(
+                                        "DTG-EXECUTION-RESULT-SCHEMA",
+                                        "query runtime batch schema differs from the executable plan",
+                                        GatewayRetry::Never,
+                                    ));
+                                }
+                                result_rows.extend(batch.rows());
+                            }
+                            let fields = executable_plan
+                                .result_schema()
+                                .fields
+                                .iter()
+                                .map(|field| field.name.clone())
+                                .collect::<Vec<_>>();
+                            if fields != expected_result_fields {
                                 return Err(GatewayExecutionError::new(
                                     "DTG-EXECUTION-RESULT-SCHEMA",
-                                    "query runtime batch schema differs from the executable plan",
+                                    "query runtime result schema differs from planned result fields",
                                     GatewayRetry::Never,
                                 ));
                             }
-                            result_rows.extend(batch.rows());
+                            let rows = result_rows
+                                .into_iter()
+                                .map(|row| {
+                                    row.into_iter()
+                                        .map(query_value_to_gateway)
+                                        .collect::<Result<Vec<_>, _>>()
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(GatewayResponse::Rows(GatewayRows::new(fields, rows)?))
                         }
-                        let fields = executable_plan
-                            .result_schema()
-                            .fields
-                            .iter()
-                            .map(|field| field.name.clone())
-                            .collect::<Vec<_>>();
-                        if fields != expected_result_fields {
-                            return Err(GatewayExecutionError::new(
-                                "DTG-EXECUTION-RESULT-SCHEMA",
-                                "query runtime result schema differs from planned result fields",
-                                GatewayRetry::Never,
-                            ));
-                        }
-                        let rows = result_rows
-                            .into_iter()
-                            .map(|row| {
-                                row.into_iter()
-                                    .map(query_value_to_gateway)
-                                    .collect::<Result<Vec<_>, _>>()
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        GatewayResponse::Rows(GatewayRows::new(fields, rows)?)
+                        .await;
+                        timer.finish_result(local)?
                     }
                 }
             } else {
-                transport.execute(request).await?
+                let timer = self.request_metrics.start(RequestStage::GatewayInternalRpc);
+                timer.finish_result(transport.execute(request).await)?
             };
             validate_process_request_end(cancellation)?;
             Ok(response)
@@ -1407,7 +1430,8 @@ impl GatewayExecution {
                     GatewayRetry::Never,
                 ));
             };
-            let response = transport.execute(request).await?;
+            let timer = self.request_metrics.start(RequestStage::GatewayInternalRpc);
+            let response = timer.finish_result(transport.execute(request).await)?;
             validate_process_request_end(cancellation)?;
             Ok(response)
         })
@@ -1551,6 +1575,7 @@ impl GatewayExecutionBuilder {
                     .analytics
                     .ok_or(ExecutionBuildError::MissingComponent("analytics scheduler"))?,
             },
+            request_metrics: Arc::new(RequestStageMetrics::default()),
         })
     }
 }

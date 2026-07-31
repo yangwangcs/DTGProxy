@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use dtg_execution::{
     GatewayAnalyticsState, GatewayCancellationToken, GatewayExecutionError, GatewayOperation,
-    GatewayRows, GatewayValue,
+    GatewayRows, GatewayValue, RequestStage, RequestStageMetrics,
 };
 
 use crate::GatewayService;
@@ -35,24 +35,22 @@ async fn serve_connection(
     service: Arc<GatewayService>,
 ) -> Result<(), io::Error> {
     negotiate(&mut socket).await?;
+    let request_metrics = service.request_metrics();
     let mut pending_rows = None;
     loop {
         let Some(message) = read_chunked_message(&mut socket).await? else {
             return Ok(());
         };
-        let mut decoder = PackDecoder::new(&message);
-        let (fields, signature) = decoder.structure()?;
-        match signature {
-            0x01 if fields == 1 => {
-                decoder.skip_value()?;
-                decoder.finish()?;
-                write_success(&mut socket, &[]).await?;
+        let timer = request_metrics.start(RequestStage::BoltDecode);
+        let decoded = timer.finish_result(decode_message(&message))?;
+        match decoded {
+            BoltMessage::Hello => {
+                write_success(&mut socket, &request_metrics, &[]).await?;
             }
-            0x10 if fields == 3 => {
-                let statement = decoder.string()?.to_owned();
-                let parameters = decoder.gateway_map()?;
-                decoder.skip_value()?;
-                decoder.finish()?;
+            BoltMessage::Run {
+                statement,
+                parameters,
+            } => {
                 let cancellation = GatewayCancellationToken::new();
                 match service
                     .execute_statement(statement, parameters, None, &cancellation)
@@ -62,43 +60,95 @@ async fn serve_connection(
                     | Ok(dtg_execution::GatewayResponse::AnalyticsResult { rows, .. }) => {
                         let fields = rows.fields().to_vec();
                         pending_rows = Some(rows);
-                        write_success(&mut socket, &[("fields", PackValue::Strings(fields))])
-                            .await?;
+                        write_success(
+                            &mut socket,
+                            &request_metrics,
+                            &[("fields", PackValue::Strings(fields))],
+                        )
+                        .await?;
                     }
                     Ok(_) => {
                         pending_rows = None;
-                        write_success(&mut socket, &[]).await?;
+                        write_success(&mut socket, &request_metrics, &[]).await?;
                     }
                     Err(error) => {
                         pending_rows = None;
-                        write_failure(&mut socket, &error).await?;
+                        write_failure(&mut socket, &request_metrics, &error).await?;
                     }
                 }
             }
-            0x3f if fields == 1 => {
-                decoder.skip_value()?;
-                decoder.finish()?;
+            BoltMessage::Pull => {
                 if let Some(rows) = pending_rows.take() {
                     for row in rows.rows() {
-                        write_record(&mut socket, row).await?;
+                        write_record(&mut socket, &request_metrics, row).await?;
                     }
                 }
-                write_success(&mut socket, &[("has_more", PackValue::Boolean(false))]).await?;
+                write_success(
+                    &mut socket,
+                    &request_metrics,
+                    &[("has_more", PackValue::Boolean(false))],
+                )
+                .await?;
             }
-            0x0f if fields == 0 => return Ok(()),
-            0x02 if fields == 0 => {
+            BoltMessage::Goodbye => return Ok(()),
+            BoltMessage::Reset => {
                 pending_rows = None;
-                write_success(&mut socket, &[]).await?;
+                write_success(&mut socket, &request_metrics, &[]).await?;
             }
-            _ => {
+            BoltMessage::Unsupported => {
                 write_failure(
                     &mut socket,
+                    &request_metrics,
                     &BoltError::protocol("unsupported Bolt message signature"),
                 )
                 .await?;
             }
         }
     }
+}
+
+enum BoltMessage {
+    Hello,
+    Run {
+        statement: String,
+        parameters: BTreeMap<String, GatewayValue>,
+    },
+    Pull,
+    Goodbye,
+    Reset,
+    Unsupported,
+}
+
+fn decode_message(message: &[u8]) -> Result<BoltMessage, io::Error> {
+    let mut decoder = PackDecoder::new(message);
+    let (fields, signature) = decoder.structure()?;
+    let decoded = match signature {
+        0x01 if fields == 1 => {
+            decoder.skip_value()?;
+            BoltMessage::Hello
+        }
+        0x10 if fields == 3 => {
+            let statement = decoder.string()?.to_owned();
+            let parameters = decoder.gateway_map()?;
+            decoder.skip_value()?;
+            BoltMessage::Run {
+                statement,
+                parameters,
+            }
+        }
+        0x3f if fields == 1 => {
+            decoder.skip_value()?;
+            BoltMessage::Pull
+        }
+        0x0f if fields == 0 => BoltMessage::Goodbye,
+        0x02 if fields == 0 => BoltMessage::Reset,
+        _ => BoltMessage::Unsupported,
+    };
+    if matches!(decoded, BoltMessage::Unsupported) {
+        return Ok(decoded);
+    }
+    decoder.finish()?;
+    Ok(decoded)
 }
 
 async fn negotiate(socket: &mut TcpStream) -> Result<(), io::Error> {
@@ -172,40 +222,64 @@ enum PackValue {
 
 async fn write_success(
     socket: &mut TcpStream,
+    request_metrics: &Arc<RequestStageMetrics>,
     metadata: &[(&str, PackValue)],
 ) -> Result<(), io::Error> {
-    let mut message = vec![0xb1, 0x70];
-    encode_tiny_map_len(metadata.len(), &mut message)?;
-    for (key, value) in metadata {
-        encode_string(key, &mut message)?;
-        match value {
-            PackValue::Boolean(value) => message.push(if *value { 0xc3 } else { 0xc2 }),
-            PackValue::Strings(values) => {
-                encode_list_len(values.len(), &mut message)?;
-                for value in values {
-                    encode_string(value, &mut message)?;
+    let timer = request_metrics.start(RequestStage::BoltEncode);
+    let encoded: Result<Vec<u8>, io::Error> = (|| {
+        let mut message = vec![0xb1, 0x70];
+        encode_tiny_map_len(metadata.len(), &mut message)?;
+        for (key, value) in metadata {
+            encode_string(key, &mut message)?;
+            match value {
+                PackValue::Boolean(value) => message.push(if *value { 0xc3 } else { 0xc2 }),
+                PackValue::Strings(values) => {
+                    encode_list_len(values.len(), &mut message)?;
+                    for value in values {
+                        encode_string(value, &mut message)?;
+                    }
                 }
             }
         }
-    }
+        Ok(message)
+    })();
+    let message = timer.finish_result(encoded)?;
     write_chunked_message(socket, &message).await
 }
 
-async fn write_failure(socket: &mut TcpStream, error: &BoltError) -> Result<(), io::Error> {
-    let mut message = vec![0xb1, 0x7f, 0xa2];
-    encode_string("code", &mut message)?;
-    encode_string(error.code(), &mut message)?;
-    encode_string("message", &mut message)?;
-    encode_string(error.message(), &mut message)?;
+async fn write_failure(
+    socket: &mut TcpStream,
+    request_metrics: &Arc<RequestStageMetrics>,
+    error: &BoltError,
+) -> Result<(), io::Error> {
+    let timer = request_metrics.start(RequestStage::BoltEncode);
+    let encoded: Result<Vec<u8>, io::Error> = (|| {
+        let mut message = vec![0xb1, 0x7f, 0xa2];
+        encode_string("code", &mut message)?;
+        encode_string(error.code(), &mut message)?;
+        encode_string("message", &mut message)?;
+        encode_string(error.message(), &mut message)?;
+        Ok(message)
+    })();
+    let message = timer.finish_result(encoded)?;
     write_chunked_message(socket, &message).await
 }
 
-async fn write_record(socket: &mut TcpStream, row: &[GatewayValue]) -> Result<(), io::Error> {
-    let mut message = vec![0xb1, 0x71];
-    encode_list_len(row.len(), &mut message)?;
-    for value in row {
-        encode_gateway_value(value, &mut message)?;
-    }
+async fn write_record(
+    socket: &mut TcpStream,
+    request_metrics: &Arc<RequestStageMetrics>,
+    row: &[GatewayValue],
+) -> Result<(), io::Error> {
+    let timer = request_metrics.start(RequestStage::BoltEncode);
+    let encoded: Result<Vec<u8>, io::Error> = (|| {
+        let mut message = vec![0xb1, 0x71];
+        encode_list_len(row.len(), &mut message)?;
+        for value in row {
+            encode_gateway_value(value, &mut message)?;
+        }
+        Ok(message)
+    })();
+    let message = timer.finish_result(encoded)?;
     write_chunked_message(socket, &message).await
 }
 

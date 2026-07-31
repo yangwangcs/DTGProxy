@@ -11,7 +11,7 @@ use dtg_execution::{
     GatewayCancellationToken, GatewayClusterRequest, GatewayExecution, GatewayExecutionError,
     GatewayExecutionTransport, GatewayFuture, GatewayProtocolV2Client, GatewayProtocolV2Transport,
     GatewayRequestContext, GatewayResponse, GatewayValue, GatewayWriteReceipt, GatewayWriteRequest,
-    GatewayWriteTransport,
+    GatewayWriteTransport, RequestStage,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -283,6 +283,17 @@ impl GatewayExecutionTransport for CapturingClusterTransport {
     ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
         self.requests.lock().unwrap().push(request);
         Box::pin(async { Ok(GatewayResponse::Acknowledged) })
+    }
+}
+
+struct PendingClusterTransport;
+
+impl GatewayExecutionTransport for PendingClusterTransport {
+    fn execute(
+        &self,
+        _request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
+        Box::pin(std::future::pending())
     }
 }
 
@@ -928,6 +939,71 @@ fn process_executes_remote_point_query_at_gateway() {
     };
     assert_eq!(point.fields(), &["n.id"]);
     assert_eq!(point.rows(), &[vec![GatewayValue::Integer(2048)]]);
+
+    let metrics = execution.request_metrics().snapshot();
+    for stage in [
+        RequestStage::GatewayCompile,
+        RequestStage::GatewayPlan,
+        RequestStage::GatewayInternalRpc,
+        RequestStage::GatewayLocalExecution,
+    ] {
+        let stage = metrics.stage(stage);
+        assert_eq!(stage.success, 1);
+        assert_eq!(stage.error, 0);
+        assert_eq!(stage.cancelled, 0);
+    }
+}
+
+#[test]
+fn invalid_process_query_records_compile_error() {
+    let execution = GatewayExecution::for_process(
+        Arc::new(CapturingClusterTransport::default()),
+        planning_context(),
+    );
+
+    let error = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 103, u64::MAX, Vec::new()).unwrap(),
+        "MATCH".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap_err();
+    assert!(!error.code().is_empty());
+
+    let compile = execution
+        .request_metrics()
+        .snapshot()
+        .stage(RequestStage::GatewayCompile);
+    assert_eq!(compile.success, 0);
+    assert_eq!(compile.error, 1);
+    assert_eq!(compile.cancelled, 0);
+}
+
+#[test]
+fn dropped_process_query_future_records_internal_rpc_cancellation() {
+    let execution =
+        GatewayExecution::for_process(Arc::new(PendingClusterTransport), planning_context());
+    let cancellation = GatewayCancellationToken::new();
+    let mut future = execution.execute_statement(
+        GatewayRequestContext::new(7, 104, u64::MAX, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &cancellation,
+    );
+    let waker = Waker::from(Arc::new(ThreadWake));
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    drop(future);
+
+    let rpc = execution
+        .request_metrics()
+        .snapshot()
+        .stage(RequestStage::GatewayInternalRpc);
+    assert_eq!(rpc.success, 0);
+    assert_eq!(rpc.error, 0);
+    assert_eq!(rpc.cancelled, 1);
 }
 
 #[test]

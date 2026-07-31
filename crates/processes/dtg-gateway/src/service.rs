@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dtg_execution::{
     GatewayCancellationToken, GatewayExecution, GatewayOperation, GatewayRequestContext,
-    GatewayResponse, GatewayRows, GatewayValue,
+    GatewayResponse, GatewayRows, GatewayValue, RequestStageMetrics,
 };
 
 use crate::{BoltError, BoltSession, GatewayConfig};
@@ -29,6 +30,10 @@ impl GatewayService {
 
     pub fn config(&self) -> &GatewayConfig {
         &self.config
+    }
+
+    pub fn request_metrics(&self) -> Arc<RequestStageMetrics> {
+        self.execution.request_metrics()
     }
 
     pub const fn bolt(&self) -> BoltSession<'_> {

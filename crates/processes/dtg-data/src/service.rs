@@ -24,7 +24,7 @@ use dtg_execution::storage::{
 };
 use dtg_execution::{
     DataExecution, DataExecutionBuilder, GatewayRows, GatewayValue, ProviderKind, ProviderResolver,
-    ReplicaBinding,
+    ReplicaBinding, RequestStage, RequestStageMetrics,
 };
 use dtg_storage_fjall::FjallConsensusStore;
 use prost_011::Message as _;
@@ -297,6 +297,7 @@ impl DataNodeBuilder {
             .map_err(|error| DataNodeError::Build(error.to_string()))?;
         let state = Arc::new(ProcessState::new());
         let execution = Arc::new(execution);
+        let request_metrics = Arc::new(RequestStageMetrics::default());
         let observed = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(Vec::new()));
         for binding in self.assignments {
@@ -333,6 +334,7 @@ impl DataNodeBuilder {
             observed,
             failures,
             state,
+            request_metrics,
             driver_stop,
         })
     }
@@ -499,6 +501,7 @@ pub struct DataNode {
     observed: Arc<Mutex<Vec<ReplicaBinding>>>,
     failures: Arc<Mutex<Vec<ReplicaFailure>>>,
     state: Arc<ProcessState>,
+    request_metrics: Arc<RequestStageMetrics>,
     driver_stop: Arc<AtomicBool>,
 }
 
@@ -607,10 +610,15 @@ impl DataNode {
         self.state.metrics.clone()
     }
 
+    pub fn request_metrics(&self) -> Arc<RequestStageMetrics> {
+        Arc::clone(&self.request_metrics)
+    }
+
     pub fn rpc_service(&self) -> DataRpcService {
         DataRpcService {
             state: self.state.clone(),
             execution: self.execution.clone(),
+            request_metrics: Arc::clone(&self.request_metrics),
         }
     }
 
@@ -634,6 +642,7 @@ impl Drop for DataNode {
 pub struct DataRpcService {
     state: Arc<ProcessState>,
     execution: Arc<DataExecution>,
+    request_metrics: Arc<RequestStageMetrics>,
 }
 
 impl DataRpcService {
@@ -647,6 +656,10 @@ impl DataRpcService {
 
     pub fn metrics(&self) -> DataMetrics {
         self.state.metrics.clone()
+    }
+
+    pub fn request_metrics(&self) -> Arc<RequestStageMetrics> {
+        Arc::clone(&self.request_metrics)
     }
 
     pub fn begin_draining(&self) {
@@ -680,25 +693,32 @@ impl DataRpcService {
             .context
             .as_ref()
             .and_then(|context| context.request.clone());
-        let shard_context: ShardRequestContext = wire
-            .context
-            .clone()
-            .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
-            .try_into()
-            .map_err(|error| self.invalid(error))?;
-        let payload =
-            validate_execution_fragment(wire.clone()).map_err(|error| self.invalid(error))?;
-        let key = self
-            .execution
-            .locate_replica(
-                shard_context.request().cluster_id(),
-                shard_context.graph_id(),
-                shard_context.shard_id(),
-                shard_context.placement_epoch(),
-                shard_context.backend_generation(),
-                None,
-            )
-            .map_err(|error| self.execution_failure(error))?;
+        let timer = self.request_metrics.start(RequestStage::DataValidation);
+        let validation: Result<_, Status> = (|| {
+            let shard_context: ShardRequestContext = wire
+                .context
+                .clone()
+                .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
+                .try_into()
+                .map_err(|error| self.invalid(error))?;
+            let payload =
+                validate_execution_fragment(wire.clone()).map_err(|error| self.invalid(error))?;
+            Ok((shard_context, payload))
+        })();
+        let (shard_context, payload) = timer.finish_result(validation)?;
+        let timer = self.request_metrics.start(RequestStage::DataRouting);
+        let key = timer.finish_result(
+            self.execution
+                .locate_replica(
+                    shard_context.request().cluster_id(),
+                    shard_context.graph_id(),
+                    shard_context.shard_id(),
+                    shard_context.placement_epoch(),
+                    shard_context.backend_generation(),
+                    None,
+                )
+                .map_err(|error| self.execution_failure(error)),
+        )?;
         let observation = self
             .execution
             .replica_observation(key)
@@ -708,18 +728,22 @@ impl DataRpcService {
         {
             return Err(self.execution_failure("fragment capability digest drifted"));
         }
-        let rows = self
-            .execution
-            .execute_fragment(
-                key,
-                wire.applied_index,
-                dtg_execution::storage::TransactionTime::new(wire.transaction_time)
-                    .map_err(|error| self.execution_failure(error))?,
-                wire.valid_at,
-                payload.body(),
-            )
-            .await
-            .map_err(|error| self.execution_failure(error))?;
+        let timer = self
+            .request_metrics
+            .start(RequestStage::DataProviderExecution);
+        let rows = timer.finish_result(
+            self.execution
+                .execute_fragment(
+                    key,
+                    wire.applied_index,
+                    dtg_execution::storage::TransactionTime::new(wire.transaction_time)
+                        .map_err(|error| self.execution_failure(error))?,
+                    wire.valid_at,
+                    payload.body(),
+                )
+                .await
+                .map_err(|error| self.execution_failure(error)),
+        )?;
         encode_fragment_batches(response_context, wire.fragment_id, rows)
             .map_err(|error| self.execution_failure(error))
     }
@@ -860,37 +884,46 @@ impl DataService for DataRpcService {
             .context
             .as_ref()
             .and_then(|context| context.request.clone());
-        let shard_context: ShardRequestContext = wire
-            .context
-            .clone()
-            .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
-            .try_into()
-            .map_err(|error| self.invalid(error))?;
-        let payload =
-            validate_transaction_request(wire.clone()).map_err(|error| self.invalid(error))?;
-        let command = dtg_execution::shard::ShardCommand::decode(payload.body())
-            .map_err(|error| self.execution_failure(error))?;
-        if command.header().placement_epoch() != shard_context.placement_epoch()
-            || command.header().backend_generation() != shard_context.backend_generation()
-        {
-            return Err(self.execution_failure("transaction command and request fence differ"));
-        }
+        let timer = self.request_metrics.start(RequestStage::DataValidation);
+        let validation: Result<_, Status> = (|| {
+            let shard_context: ShardRequestContext = wire
+                .context
+                .clone()
+                .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
+                .try_into()
+                .map_err(|error| self.invalid(error))?;
+            let payload =
+                validate_transaction_request(wire.clone()).map_err(|error| self.invalid(error))?;
+            let command = dtg_execution::shard::ShardCommand::decode(payload.body())
+                .map_err(|error| self.execution_failure(error))?;
+            if command.header().placement_epoch() != shard_context.placement_epoch()
+                || command.header().backend_generation() != shard_context.backend_generation()
+            {
+                return Err(self.execution_failure("transaction command and request fence differ"));
+            }
+            Ok((shard_context, command))
+        })();
+        let (shard_context, command) = timer.finish_result(validation)?;
         let command_id = command.header().command_id().get();
-        let key = self
-            .execution
-            .locate_replica(
-                shard_context.request().cluster_id(),
-                shard_context.graph_id(),
-                shard_context.shard_id(),
-                shard_context.placement_epoch(),
-                shard_context.backend_generation(),
-                None,
-            )
-            .map_err(|error| self.execution_failure(error))?;
-        let progress = self
-            .execution
-            .apply_transaction_command(key, command)
-            .map_err(|error| self.execution_failure(error))?;
+        let timer = self.request_metrics.start(RequestStage::DataRouting);
+        let key = timer.finish_result(
+            self.execution
+                .locate_replica(
+                    shard_context.request().cluster_id(),
+                    shard_context.graph_id(),
+                    shard_context.shard_id(),
+                    shard_context.placement_epoch(),
+                    shard_context.backend_generation(),
+                    None,
+                )
+                .map_err(|error| self.execution_failure(error)),
+        )?;
+        let timer = self.request_metrics.start(RequestStage::DataRaftApply);
+        let progress = timer.finish_result(
+            self.execution
+                .apply_transaction_command(key, command)
+                .map_err(|error| self.execution_failure(error)),
+        )?;
         let mut matching = progress
             .receipts()
             .iter()
@@ -932,35 +965,43 @@ impl DataService for DataRpcService {
             .context
             .as_ref()
             .and_then(|context| context.request.clone());
-        let shard_context: ShardRequestContext = wire
-            .context
-            .clone()
-            .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
-            .try_into()
-            .map_err(|error| self.invalid(error))?;
-        let payload = validate_raft_envelope(wire.clone()).map_err(|error| self.invalid(error))?;
-        let message = raft::eraftpb::Message::decode(payload.body())
-            .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-MALFORMED-RAFT"))?;
-        let encoded_kind = RaftMessageKind::try_from(wire.kind)
-            .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-ENUM"))?;
-        let payload_kind = crate::raft_transport::raft_message_kind(message.get_msg_type())
-            .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-RAFT-KIND"))?;
-        if encoded_kind != payload_kind {
-            return Err(Status::invalid_argument("DTG-PROTOCOL-RAFT-KIND"));
-        }
-        let target = dtg_execution::storage::ReplicaId::new(wire.to_replica_id)
-            .map_err(|error| self.execution_failure(error))?;
-        let key = self
-            .execution
-            .locate_replica(
-                shard_context.request().cluster_id(),
-                shard_context.graph_id(),
-                shard_context.shard_id(),
-                shard_context.placement_epoch(),
-                shard_context.backend_generation(),
-                Some(target),
-            )
-            .map_err(|error| self.execution_failure(error))?;
+        let timer = self.request_metrics.start(RequestStage::DataValidation);
+        let validation: Result<_, Status> = (|| {
+            let shard_context: ShardRequestContext = wire
+                .context
+                .clone()
+                .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
+                .try_into()
+                .map_err(|error| self.invalid(error))?;
+            let payload =
+                validate_raft_envelope(wire.clone()).map_err(|error| self.invalid(error))?;
+            let message = raft::eraftpb::Message::decode(payload.body())
+                .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-MALFORMED-RAFT"))?;
+            let encoded_kind = RaftMessageKind::try_from(wire.kind)
+                .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-ENUM"))?;
+            let payload_kind = crate::raft_transport::raft_message_kind(message.get_msg_type())
+                .map_err(|_| Status::invalid_argument("DTG-PROTOCOL-RAFT-KIND"))?;
+            if encoded_kind != payload_kind {
+                return Err(Status::invalid_argument("DTG-PROTOCOL-RAFT-KIND"));
+            }
+            let target = dtg_execution::storage::ReplicaId::new(wire.to_replica_id)
+                .map_err(|error| self.execution_failure(error))?;
+            Ok((shard_context, payload, target))
+        })();
+        let (shard_context, payload, target) = timer.finish_result(validation)?;
+        let timer = self.request_metrics.start(RequestStage::DataRouting);
+        let key = timer.finish_result(
+            self.execution
+                .locate_replica(
+                    shard_context.request().cluster_id(),
+                    shard_context.graph_id(),
+                    shard_context.shard_id(),
+                    shard_context.placement_epoch(),
+                    shard_context.backend_generation(),
+                    Some(target),
+                )
+                .map_err(|error| self.execution_failure(error)),
+        )?;
         self.execution
             .receive_raft_message(
                 key,
