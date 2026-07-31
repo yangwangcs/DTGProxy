@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_kernel::{Digest32, KernelError, TransactionId, TransactionTime, ValidInterval};
@@ -21,6 +21,8 @@ pub const SINGLE_SHARD_TRANSACTION_METADATA_NAME: &str = "dtg.single_shard_trans
 pub const ACTIVE_TRANSACTION_INTENTS_METADATA_NAME: &str = "dtg.transaction_active_intents.v1";
 pub const TRANSACTION_STATE_METADATA_PREFIX: &str = "dtg.transaction_state.v1/";
 
+static ASYNC_BRIDGE_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
 struct ThreadWaker(std::thread::Thread);
 
 impl Wake for ThreadWaker {
@@ -34,6 +36,26 @@ impl Wake for ThreadWaker {
 }
 
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        return tokio::task::block_in_place(|| async_bridge_runtime().block_on(future));
+    }
+    block_on_current_thread(future)
+}
+
+fn async_bridge_runtime() -> &'static tokio::runtime::Runtime {
+    ASYNC_BRIDGE_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("dtg-shard-async-bridge")
+            .build()
+            .expect("dtg-shard async bridge runtime must initialize")
+    })
+}
+
+fn block_on_current_thread<F: Future>(future: F) -> F::Output {
     let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
     let mut context = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
@@ -42,6 +64,83 @@ pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Ready(output) => return output,
             Poll::Pending => std::thread::park(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
+
+    use super::block_on;
+
+    #[test]
+    fn block_on_drives_tokio_future_from_single_worker_runtime() {
+        const ASYNC_DELAY: Duration = Duration::from_millis(25);
+        const WATCHDOG_DELAY: Duration = Duration::from_millis(500);
+        const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .thread_name("dtg-shard-block-on-test")
+            .build()
+            .expect("single-worker Tokio test runtime must build");
+        let (worker_tx, worker_rx) = mpsc::sync_channel(1);
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let fallback_fired = Arc::new(AtomicBool::new(false));
+        let task_fallback_fired = Arc::clone(&fallback_fired);
+
+        runtime.spawn(async move {
+            worker_tx
+                .send(std::thread::current())
+                .expect("test must receive the Tokio worker thread");
+            let started = Instant::now();
+            let completed_before_fallback = block_on(async move {
+                let mut timer = std::pin::pin!(tokio::time::sleep(ASYNC_DELAY));
+                poll_fn(|context| {
+                    if timer.as_mut().poll(context).is_ready() {
+                        Poll::Ready(true)
+                    } else if task_fallback_fired.load(Ordering::Acquire) {
+                        Poll::Ready(false)
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await
+            });
+            completion_tx
+                .send((started.elapsed(), completed_before_fallback))
+                .expect("test must receive bridge completion");
+        });
+
+        let worker = worker_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("Tokio worker task must start");
+        let (cancel_watchdog_tx, cancel_watchdog_rx) = mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if cancel_watchdog_rx.recv_timeout(WATCHDOG_DELAY).is_ok() {
+                false
+            } else {
+                fallback_fired.store(true, Ordering::Release);
+                worker.unpark();
+                true
+            }
+        });
+
+        let (elapsed, completed_before_fallback) = completion_rx
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("watchdog must prevent the old bridge from hanging forever");
+        let _ = cancel_watchdog_tx.send(());
+        let watchdog_fired = watchdog.join().expect("watchdog thread must not panic");
+
+        assert!(
+            completed_before_fallback && !watchdog_fired && elapsed < WATCHDOG_DELAY,
+            "Tokio-driven future completed after the watchdog fallback: {elapsed:?}"
+        );
     }
 }
 

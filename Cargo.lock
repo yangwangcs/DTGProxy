@@ -511,6 +511,7 @@ dependencies = [
  "raft",
  "slog",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
