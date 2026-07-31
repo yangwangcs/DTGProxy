@@ -533,6 +533,13 @@ fn validate_materialized_fragment_owners(plan: &ExecutablePlan) -> Result<(), Qu
             }
         }
     }
+    for fragment_id in fragments.keys() {
+        if !owners.contains_key(fragment_id) {
+            return Err(QueryError::InvalidPlan(format!(
+                "materialized fragment {fragment_id} has no source owner"
+            )));
+        }
+    }
     Ok(())
 }
 
