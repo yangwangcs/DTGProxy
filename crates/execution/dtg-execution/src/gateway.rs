@@ -30,11 +30,17 @@ use dtg_query::{
     LogicalRead, QueryBudget, QueryError, QueryOverlay, QueryRuntime, QueryStorage, QueryStream,
     QueryValue, ReadOperation, ResidualPredicate, SnapshotGuard, SnapshotShardFence,
 };
+use dtg_shard::{CommitSingleShardTransaction, ShardCommand};
+use dtg_storage::{
+    CommandId, LogicalMutation as StorageMutation, Properties, ValidInterval, VertexId,
+    VertexVersion,
+};
 use dtg_storage::{PushdownOperation, ShardId, TransactionId, Value, Version};
 use dtg_transaction::{
     ParticipantWrite, ShardSnapshotFence, SnapshotToken, TemporalTxnCoordinator,
     TransactionContext, TransactionOutcome, TxnFuture,
 };
+use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 
 use crate::ExecutionBuildError;
@@ -372,6 +378,311 @@ pub trait GatewayExecutionTransport: Send + Sync {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayWriteRoute {
+    context: GatewayRequestContext,
+    binding: dtg_storage::ReplicaBinding,
+    catalog_version: Version,
+    snapshot_applied_index: u64,
+}
+
+impl GatewayWriteRoute {
+    fn new(
+        context: GatewayRequestContext,
+        binding: dtg_storage::ReplicaBinding,
+        catalog_version: Version,
+        snapshot_applied_index: u64,
+    ) -> Self {
+        Self {
+            context,
+            binding,
+            catalog_version,
+            snapshot_applied_index,
+        }
+    }
+
+    pub const fn context(&self) -> &GatewayRequestContext {
+        &self.context
+    }
+
+    pub const fn binding(&self) -> &dtg_storage::ReplicaBinding {
+        &self.binding
+    }
+
+    pub const fn catalog_version(&self) -> Version {
+        self.catalog_version
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayWriteRequest {
+    route: GatewayWriteRoute,
+    transaction_id: TransactionId,
+    start_time: dtg_storage::TransactionTime,
+    commit_time: dtg_storage::TransactionTime,
+    command: ShardCommand,
+}
+
+impl GatewayWriteRequest {
+    fn new(
+        route: GatewayWriteRoute,
+        transaction_id: TransactionId,
+        start_time: dtg_storage::TransactionTime,
+        commit_time: dtg_storage::TransactionTime,
+        command: ShardCommand,
+    ) -> Self {
+        Self {
+            route,
+            transaction_id,
+            start_time,
+            commit_time,
+            command,
+        }
+    }
+
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    pub const fn start_time(&self) -> dtg_storage::TransactionTime {
+        self.start_time
+    }
+
+    pub const fn commit_time(&self) -> dtg_storage::TransactionTime {
+        self.commit_time
+    }
+
+    pub const fn snapshot_applied_index(&self) -> u64 {
+        self.route.snapshot_applied_index
+    }
+
+    pub fn mutations(&self) -> &[StorageMutation] {
+        let ShardCommand::CommitSingleShardTransaction(command) = &self.command else {
+            unreachable!("process write request contains a single-shard transaction command")
+        };
+        command.mutations()
+    }
+
+    pub const fn command(&self) -> &ShardCommand {
+        &self.command
+    }
+}
+
+pub trait GatewayWriteTransport: Send + Sync {
+    fn allocate_start_time(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>>;
+
+    fn reserve_commit_time(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>>;
+
+    fn apply_single_shard(
+        &self,
+        request: GatewayWriteRequest,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>>;
+
+    fn resolve_committed(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>>;
+
+    fn abort(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>>;
+}
+
+#[derive(Clone)]
+pub struct TonicGatewayWriteTransport {
+    meta: proto::meta_service_client::MetaServiceClient<Channel>,
+    data: proto::data_service_client::DataServiceClient<Channel>,
+}
+
+impl TonicGatewayWriteTransport {
+    pub async fn connect(
+        meta_endpoint: impl Into<String>,
+        data_endpoint: impl Into<String>,
+    ) -> Result<Arc<dyn GatewayWriteTransport>, GatewayExecutionError> {
+        let meta = proto::meta_service_client::MetaServiceClient::connect(meta_endpoint.into())
+            .await
+            .map_err(cluster_connect_error)?;
+        let data = proto::data_service_client::DataServiceClient::connect(data_endpoint.into())
+            .await
+            .map_err(cluster_connect_error)?;
+        Ok(Arc::new(Self { meta, data }))
+    }
+
+    async fn timestamp(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+        operation: i32,
+    ) -> Result<dtg_storage::TransactionTime, GatewayExecutionError> {
+        let request = transaction_rpc_request(route, transaction_id, operation, None)?;
+        let mut client = self.meta.clone();
+        let status = client
+            .submit_transaction(request)
+            .await
+            .map_err(cluster_rpc_error)?
+            .into_inner();
+        let details = status_details(status)?;
+        let bytes: [u8; 8] = details.as_slice().try_into().map_err(|_| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-TIMESTAMP",
+                "Meta timestamp response is not an i64",
+                GatewayRetry::Safe,
+            )
+        })?;
+        dtg_storage::TransactionTime::new(i64::from_be_bytes(bytes)).map_err(|error| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-TIMESTAMP",
+                error.to_string(),
+                GatewayRetry::Safe,
+            )
+        })
+    }
+}
+
+impl GatewayWriteTransport for TonicGatewayWriteTransport {
+    fn allocate_start_time(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>> {
+        let route = route.clone();
+        Box::pin(async move { self.timestamp(&route, transaction_id, 1).await })
+    }
+
+    fn reserve_commit_time(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>> {
+        let route = route.clone();
+        Box::pin(async move { self.timestamp(&route, transaction_id, 2).await })
+    }
+
+    fn apply_single_shard(
+        &self,
+        request: GatewayWriteRequest,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        Box::pin(async move {
+            let command = request.command().encode_current().map_err(|error| {
+                GatewayExecutionError::new(
+                    "DTG-EXECUTION-WRITE-COMMAND",
+                    error.to_string(),
+                    GatewayRetry::Never,
+                )
+            })?;
+            let wire = transaction_rpc_request(
+                &request.route,
+                request.transaction_id(),
+                2,
+                Some((request.command().header().command_id().get(), command)),
+            )?;
+            let mut client = self.data.clone();
+            let status = client
+                .apply_transaction(wire)
+                .await
+                .map_err(cluster_rpc_error)?
+                .into_inner();
+            status_details(status).map(|_| ())
+        })
+    }
+
+    fn resolve_committed(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        let route = route.clone();
+        Box::pin(async move { self.timestamp(&route, transaction_id, 5).await.map(|_| ()) })
+    }
+
+    fn abort(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        let route = route.clone();
+        Box::pin(async move { self.timestamp(&route, transaction_id, 3).await.map(|_| ()) })
+    }
+}
+
+fn transaction_rpc_request(
+    route: &GatewayWriteRoute,
+    transaction_id: TransactionId,
+    operation: i32,
+    command: Option<(u128, Vec<u8>)>,
+) -> Result<tonic::Request<proto::TransactionRequest>, GatewayExecutionError> {
+    let request = proto::RequestContext {
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: SUPPORTED_MINOR_MAX,
+        cluster_id: route.context.cluster_id().to_be_bytes().to_vec(),
+        request_id: route.context.request_id().to_be_bytes().to_vec(),
+        deadline_unix_ms: route.context.deadline_unix_ms(),
+        trace_context: route.context.trace_context().to_vec(),
+    };
+    let (idempotency_key, body) = command.unwrap_or((transaction_id.get(), vec![operation as u8]));
+    let payload = proto::BoundedPayload {
+        format_version: 1,
+        declared_len: body.len() as u64,
+        item_count: 1,
+        checksum: checksum_bytes(&body).to_vec(),
+        body,
+    };
+    Ok(tonic::Request::new(proto::TransactionRequest {
+        context: Some(proto::ShardContext {
+            request: Some(request),
+            graph_id: route.binding.graph_id().get(),
+            shard_id: u32::try_from(route.binding.shard_id().get()).map_err(|_| {
+                GatewayExecutionError::new(
+                    "DTG-EXECUTION-WRITE-ROUTING",
+                    "Shard identifier exceeds wire range",
+                    GatewayRetry::Never,
+                )
+            })?,
+            placement_epoch: route.binding.placement_epoch().get(),
+            backend_generation: route.binding.backend_generation().get(),
+            catalog_version: route.catalog_version.get(),
+        }),
+        transaction_id: transaction_id.get().to_be_bytes().to_vec(),
+        operation,
+        idempotency_key: idempotency_key.to_be_bytes().to_vec(),
+        payload: Some(payload),
+    }))
+}
+
+fn status_details(status: proto::TypedStatus) -> Result<Vec<u8>, GatewayExecutionError> {
+    if status.code == proto::StatusCode::Ok as i32 {
+        return Ok(status.details.map_or(Vec::new(), |details| details.body));
+    }
+    let retry = match proto::RetryDisposition::try_from(status.retry).ok() {
+        Some(proto::RetryDisposition::Safe) => GatewayRetry::Safe,
+        _ => GatewayRetry::Never,
+    };
+    Err(GatewayExecutionError::new(
+        "DTG-CLUSTER-STATUS",
+        status.message,
+        retry,
+    ))
+}
+
+fn cluster_connect_error(error: tonic::transport::Error) -> GatewayExecutionError {
+    GatewayExecutionError::new("DTG-CLUSTER-CONNECT", error.to_string(), GatewayRetry::Safe)
+}
+
+fn cluster_rpc_error(error: tonic::Status) -> GatewayExecutionError {
+    GatewayExecutionError::new("DTG-CLUSTER-RPC", error.to_string(), GatewayRetry::Safe)
+}
+
 pub enum GatewayQueryResponse {
     Materialized(BTreeMap<u32, Vec<QueryColumnBatch>>),
     Final(GatewayResponse),
@@ -509,6 +820,7 @@ enum GatewayExecutionMode {
         query: QueryRuntime,
         planning_context: Arc<RwLock<PlanningContext>>,
         transport: Arc<dyn GatewayExecutionTransport>,
+        write_transport: Option<Arc<dyn GatewayWriteTransport>>,
     },
 }
 
@@ -533,8 +845,26 @@ impl GatewayExecution {
                 query: QueryRuntime::new(1024),
                 planning_context: Arc::new(RwLock::new(planning_context)),
                 transport,
+                write_transport: None,
             },
         }
+    }
+
+    pub fn for_process_with_writes(
+        transport: Arc<dyn GatewayExecutionTransport>,
+        write_transport: Arc<dyn GatewayWriteTransport>,
+        planning_context: PlanningContext,
+    ) -> Self {
+        let mut execution = Self::for_process(transport, planning_context);
+        let GatewayExecutionMode::Process {
+            write_transport: slot,
+            ..
+        } = &mut execution.mode
+        else {
+            unreachable!("process constructor creates process execution")
+        };
+        *slot = Some(write_transport);
+        execution
     }
 
     pub fn install_planning_context(
@@ -781,6 +1111,54 @@ impl GatewayExecution {
                 }
             };
             let temporal_mode = normalized_temporal_mode(&program.statement)?;
+            if let LogicalStatement::Write(write) = &program.statement {
+                if transaction_id.is_some() {
+                    return Err(GatewayExecutionError::new(
+                        "DTG-EXECUTION-WRITE-TRANSACTION",
+                        "explicit process transactions do not support writes",
+                        GatewayRetry::Never,
+                    ));
+                }
+                let GatewayExecutionMode::Process {
+                    planning_context,
+                    write_transport,
+                    ..
+                } = &self.mode
+                else {
+                    return Err(GatewayExecutionError::new(
+                        "DTG-EXECUTION-PROCESS-TRANSPORT",
+                        "GatewayExecution was not constructed for process execution",
+                        GatewayRetry::Never,
+                    ));
+                };
+                let transport = write_transport.as_ref().ok_or_else(|| {
+                    GatewayExecutionError::new(
+                        "DTG-EXECUTION-WRITE-TRANSPORT",
+                        "process write transport is not configured",
+                        GatewayRetry::Never,
+                    )
+                })?;
+                let planning_context = planning_context
+                    .read()
+                    .map_err(|_| {
+                        GatewayExecutionError::new(
+                            "DTG-EXECUTION-CATALOG-LOCK",
+                            "Gateway planning catalog lock is poisoned",
+                            GatewayRetry::Safe,
+                        )
+                    })?
+                    .clone();
+                execute_process_create(
+                    transport.as_ref(),
+                    context,
+                    write,
+                    &parameters,
+                    &planning_context,
+                )
+                .await?;
+                validate_process_request_end(cancellation)?;
+                return Ok(GatewayResponse::Acknowledged);
+            }
             let result_fields = program
                 .result_schema
                 .fields
@@ -2598,6 +2976,193 @@ pub fn bind_logical_expr(
             .collect::<Result<Vec<_>, _>>()
             .map(LogicalExpr::Map),
     }
+}
+
+async fn execute_process_create(
+    transport: &dyn GatewayWriteTransport,
+    context: GatewayRequestContext,
+    write: &dtg_language_ir::LogicalWrite,
+    parameters: &BTreeMap<String, GatewayValue>,
+    planning_context: &PlanningContext,
+) -> Result<(), GatewayExecutionError> {
+    let [catalog_shard] = planning_context.catalog().shards() else {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-ROUTING",
+            "process CREATE requires exactly one catalog Shard",
+            GatewayRetry::Never,
+        ));
+    };
+    if catalog_shard.binding().role() != dtg_storage::BindingRole::Active {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-ROUTING",
+            "process CREATE requires an active catalog Shard",
+            GatewayRetry::Never,
+        ));
+    }
+    if write.input.is_some() || write.mutations.len() != 1 {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-SHAPE",
+            "process writes support only one input-free vertex CREATE",
+            GatewayRetry::Never,
+        ));
+    }
+    let dtg_language_ir::LogicalMutation::CreateVertex {
+        labels,
+        properties,
+        valid_from,
+        ..
+    } = &write.mutations[0]
+    else {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-SHAPE",
+            "process writes support only one input-free vertex CREATE",
+            GatewayRetry::Never,
+        ));
+    };
+    let route = GatewayWriteRoute::new(
+        context.clone(),
+        catalog_shard.binding().clone(),
+        planning_context.catalog().version(),
+        catalog_shard.applied_index(),
+    );
+    let transaction_id = TransactionId::new(process_write_identity(
+        b"dtg-gateway-create-transaction-v1",
+        context.request_id(),
+        0,
+    ))
+    .map_err(|error| process_write_error(error.to_string()))?;
+    let start_time = transport
+        .allocate_start_time(&route, transaction_id)
+        .await?;
+    let commit_time = transport
+        .reserve_commit_time(&route, transaction_id)
+        .await?;
+    let command_id = CommandId::new(process_write_identity(
+        b"dtg-gateway-create-command-v1",
+        context.request_id(),
+        0,
+    ))
+    .map_err(|error| process_write_error(error.to_string()))?;
+    let vertex_id = VertexId::new(process_write_identity(
+        b"dtg-gateway-create-vertex-v1",
+        context.request_id(),
+        0,
+    ))
+    .map_err(|error| process_write_error(error.to_string()))?;
+    let vertex = lower_process_create_vertex(
+        vertex_id,
+        labels,
+        properties,
+        valid_from,
+        parameters,
+        commit_time,
+    )?;
+    let request_digest = dtg_storage::Digest32::new(process_write_digest(
+        b"dtg-gateway-create-command-digest-v1",
+        context.request_id(),
+        0,
+    ));
+    let command = ShardCommand::CommitSingleShardTransaction(
+        CommitSingleShardTransaction::new(
+            command_id,
+            route.binding().placement_epoch().get(),
+            route.binding().backend_generation().get(),
+            transaction_id,
+            start_time,
+            route.snapshot_applied_index,
+            request_digest,
+            vec![StorageMutation::PutVertex(vertex)],
+        )
+        .map_err(|error| process_write_error(error.to_string()))?,
+    );
+    let request = GatewayWriteRequest::new(
+        route.clone(),
+        transaction_id,
+        start_time,
+        commit_time,
+        command,
+    );
+    if let Err(error) = transport.apply_single_shard(request).await {
+        if error.retry() == GatewayRetry::Never {
+            transport.abort(&route, transaction_id).await?;
+        }
+        return Err(error);
+    }
+    transport.resolve_committed(&route, transaction_id).await
+}
+
+fn lower_process_create_vertex(
+    vertex_id: VertexId,
+    labels: &[String],
+    properties: &BTreeMap<String, LogicalExpr>,
+    valid_from: &ValidTimeExpr,
+    parameters: &BTreeMap<String, GatewayValue>,
+    commit_time: dtg_storage::TransactionTime,
+) -> Result<VertexVersion, GatewayExecutionError> {
+    const LABELS_PROPERTY: &str = "\0dtg.labels";
+    if properties.contains_key(LABELS_PROPERTY) {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-LABELS",
+            "process CREATE properties may not overwrite the reserved label property",
+            GatewayRetry::Never,
+        ));
+    }
+    let valid_from = match valid_from {
+        ValidTimeExpr::Literal(value) => *value,
+        ValidTimeExpr::Parameter(_) => {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-WRITE-VALID-TIME",
+                "process CREATE requires a literal VALID FROM value",
+                GatewayRetry::Never,
+            ));
+        }
+    };
+    let mut persisted = Properties::new();
+    for (name, expression) in properties {
+        let LogicalExpr::Literal(value) = bind_logical_expr(expression, parameters)? else {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-WRITE-PROPERTY",
+                "process CREATE properties must bind to literal values",
+                GatewayRetry::Never,
+            ));
+        };
+        persisted.insert(name.clone(), value);
+    }
+    persisted.insert(
+        LABELS_PROPERTY.into(),
+        Value::List(labels.iter().cloned().map(Value::String).collect()),
+    );
+    VertexVersion::new(
+        vertex_id,
+        Version::new(1),
+        ValidInterval::new(valid_from, i64::MAX)
+            .map_err(|error| process_write_error(error.to_string()))?,
+        commit_time,
+        persisted,
+    )
+    .map_err(|error| process_write_error(error.to_string()))
+}
+
+fn process_write_identity(domain: &[u8], request_id: u128, ordinal: u64) -> u128 {
+    let digest = process_write_digest(domain, request_id, ordinal);
+    u128::from_be_bytes(
+        digest[..16]
+            .try_into()
+            .expect("SHA-256 prefix has 16 bytes"),
+    )
+    .max(1)
+}
+
+fn process_write_digest(domain: &[u8], request_id: u128, ordinal: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(request_id.to_be_bytes());
+    hasher.update(ordinal.to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn process_write_error(message: impl Into<String>) -> GatewayExecutionError {
+    GatewayExecutionError::new("DTG-EXECUTION-WRITE", message, GatewayRetry::Never)
 }
 
 fn gateway_value_to_storage(value: &GatewayValue) -> Result<Value, GatewayExecutionError> {

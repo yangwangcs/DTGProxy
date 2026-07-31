@@ -417,6 +417,7 @@ dependencies = [
  "dtg-transaction",
  "prost 0.11.9",
  "raft",
+ "sha2",
  "slog",
  "tempfile",
  "tokio",

@@ -21,15 +21,16 @@ pub use data::{
     ProviderResolverSet, ResolvedReplicaStore,
 };
 pub use dtg_storage::{ProviderKind, ReplicaBinding, ReplicaStateStore, StorageError, StoreFuture};
+#[cfg(feature = "test-support")]
+pub use gateway::encode_physical_fragment_body;
 pub use gateway::{
     GatewayAnalyticsState, GatewayCancellationToken, GatewayClusterRequest, GatewayExecution,
     GatewayExecutionBuilder, GatewayExecutionError, GatewayExecutionTransport,
     GatewayExecutionTransportFactory, GatewayFuture, GatewayOperation, GatewayProtocolV2Client,
     GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse, GatewayRetry, GatewayRows,
-    GatewayTemporalMode, GatewayTime, GatewayValue, TonicGatewayProtocolV2TransportFactory,
+    GatewayTemporalMode, GatewayTime, GatewayValue, GatewayWriteRequest, GatewayWriteRoute,
+    GatewayWriteTransport, TonicGatewayProtocolV2TransportFactory, TonicGatewayWriteTransport,
 };
-#[cfg(feature = "test-support")]
-pub use gateway::encode_physical_fragment_body;
 pub use meta::{MetaExecution, MetaExecutionBuilder};
 pub use meta_raft::{
     MetaCommittedEntry, MetaRaftError, MetaRaftHost, MetaRaftProgress, MetaRaftRole,

@@ -16,6 +16,7 @@ pub struct GatewayConfig {
     cluster_id: u64,
     request_timeout: Duration,
     cluster_endpoint: String,
+    meta_endpoint: String,
 }
 
 impl GatewayConfig {
@@ -35,6 +36,7 @@ impl GatewayConfig {
             cluster_id,
             request_timeout,
             cluster_endpoint: "http://127.0.0.1:7690".into(),
+            meta_endpoint: "http://127.0.0.1:7689".into(),
         })
     }
 
@@ -59,8 +61,11 @@ impl GatewayConfig {
             })?;
         let endpoint = std::env::var("DTG_GATEWAY_CLUSTER_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:7690".into());
+        let meta_endpoint = std::env::var("DTG_GATEWAY_META_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:7689".into());
         Self::new(bind_addr, cluster_id, Duration::from_millis(timeout_ms))?
-            .with_cluster_endpoint(endpoint)
+            .with_cluster_endpoint(endpoint)?
+            .with_meta_endpoint(meta_endpoint)
     }
 
     pub fn with_cluster_endpoint(
@@ -89,6 +94,22 @@ impl GatewayConfig {
 
     pub fn cluster_endpoint(&self) -> &str {
         &self.cluster_endpoint
+    }
+
+    pub fn with_meta_endpoint(
+        mut self,
+        endpoint: impl Into<String>,
+    ) -> Result<Self, GatewayConfigError> {
+        let endpoint = endpoint.into();
+        if endpoint.trim().is_empty() {
+            return Err(GatewayConfigError::EmptyMetaEndpoint);
+        }
+        self.meta_endpoint = endpoint;
+        Ok(self)
+    }
+
+    pub fn meta_endpoint(&self) -> &str {
+        &self.meta_endpoint
     }
 
     pub fn planning_context_from_env(&self) -> Result<PlanningContext, GatewayConfigError> {
@@ -204,6 +225,7 @@ pub enum GatewayConfigError {
     InvalidCluster(String),
     InvalidRequestTimeout(String),
     EmptyClusterEndpoint,
+    EmptyMetaEndpoint,
     MissingPlanning(String),
     InvalidPlanning(String),
 }
@@ -217,6 +239,7 @@ impl GatewayConfigError {
             Self::InvalidCluster(_) => "DTG-GATEWAY-CONFIG-CLUSTER",
             Self::InvalidRequestTimeout(_) => "DTG-GATEWAY-CONFIG-TIMEOUT",
             Self::EmptyClusterEndpoint => "DTG-GATEWAY-CONFIG-ENDPOINT",
+            Self::EmptyMetaEndpoint => "DTG-GATEWAY-CONFIG-META-ENDPOINT",
             Self::MissingPlanning(_) => "DTG-GATEWAY-CONFIG-PLANNING-MISSING",
             Self::InvalidPlanning(_) => "DTG-GATEWAY-CONFIG-PLANNING",
         }
@@ -261,3 +284,21 @@ fn required_i64(name: &str) -> Result<i64, GatewayConfigError> {
 }
 
 impl std::error::Error for GatewayConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_endpoint_is_configured_separately_from_data_endpoint() {
+        let config =
+            GatewayConfig::new("127.0.0.1:7687".parse().unwrap(), 7, Duration::from_secs(1))
+                .unwrap()
+                .with_cluster_endpoint("http://data:7690")
+                .unwrap()
+                .with_meta_endpoint("http://meta:7689")
+                .unwrap();
+        assert_eq!(config.cluster_endpoint(), "http://data:7690");
+        assert_eq!(config.meta_endpoint(), "http://meta:7689");
+    }
+}

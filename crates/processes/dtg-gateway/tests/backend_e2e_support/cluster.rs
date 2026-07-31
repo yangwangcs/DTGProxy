@@ -82,6 +82,7 @@ pub struct DiagnosticCluster {
     log_dir: PathBuf,
     gateway_binary: PathBuf,
     spec: CellSpec,
+    meta_address: SocketAddr,
     data_address: SocketAddr,
     gateway_address: SocketAddr,
     binding: ReplicaBinding,
@@ -140,6 +141,7 @@ impl DiagnosticCluster {
             log_dir,
             gateway_binary: runtime.binary("dtgproxy-gateway"),
             spec,
+            meta_address,
             data_address,
             gateway_address,
             binding,
@@ -341,6 +343,10 @@ impl DiagnosticCluster {
             (
                 "DTG_GATEWAY_CLUSTER_ENDPOINT",
                 format!("http://{}", self.data_address),
+            ),
+            (
+                "DTG_GATEWAY_META_ENDPOINT",
+                format!("http://{}", self.meta_address),
             ),
             (
                 "DTG_GATEWAY_GRAPH_ID",

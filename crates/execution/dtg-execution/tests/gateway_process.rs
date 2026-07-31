@@ -8,7 +8,7 @@ use dtg_cluster_v2::{checksum_bytes, proto};
 use dtg_execution::{
     GatewayCancellationToken, GatewayExecution, GatewayExecutionError, GatewayFuture,
     GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
-    GatewayValue,
+    GatewayValue, GatewayWriteRequest, GatewayWriteTransport,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -18,8 +18,8 @@ use dtg_language_ir::{
 };
 use dtg_plan::{CatalogShard, CatalogSnapshot, Planner, PlanningContext, SnapshotRequirements};
 use dtg_storage::{
-    BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
-    Version,
+    BackendClass, BindingRole, CapabilityManifest, LogicalMutation, ProviderKind, ReplicaBinding,
+    TransactionId, TransactionTime, Version,
 };
 
 #[derive(Clone, Copy, Default)]
@@ -129,6 +129,123 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
                 .collect())
         })
     }
+}
+
+#[derive(Default)]
+struct RecordingWriteTransport {
+    events: Mutex<Vec<&'static str>>,
+    requests: Mutex<Vec<GatewayWriteRequest>>,
+}
+
+impl GatewayWriteTransport for RecordingWriteTransport {
+    fn allocate_start_time(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
+        self.events.lock().unwrap().push("prewrite");
+        Box::pin(async { Ok(TransactionTime::new(41).unwrap()) })
+    }
+
+    fn reserve_commit_time(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
+        self.events.lock().unwrap().push("commit");
+        Box::pin(async { Ok(TransactionTime::new(43).unwrap()) })
+    }
+
+    fn apply_single_shard(
+        &self,
+        request: GatewayWriteRequest,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        self.events.lock().unwrap().push("apply");
+        self.requests.lock().unwrap().push(request);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn resolve_committed(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        self.events.lock().unwrap().push("resolve");
+        Box::pin(async { Ok(()) })
+    }
+
+    fn abort(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        self.events.lock().unwrap().push("abort");
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[test]
+fn process_create_requires_transaction_dispatch() {
+    let writes = Arc::new(RecordingWriteTransport::default());
+    let execution = GatewayExecution::for_process_with_writes(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            RecordingProtocolClient::default(),
+        ))),
+        writes.clone(),
+        planning_context(),
+    );
+
+    let response = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 81, u64::MAX, Vec::new()).unwrap(),
+        "CREATE (n:Bench {value: 1}) VALID FROM 1".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    assert_eq!(response, GatewayResponse::Acknowledged);
+    assert_eq!(
+        writes.events.lock().unwrap().as_slice(),
+        ["prewrite", "commit", "apply", "resolve"]
+    );
+    let requests = writes.requests.lock().unwrap();
+    let request = requests.first().unwrap();
+    assert_eq!(
+        request.transaction_id().get(),
+        0x68097dfc0e984bbabae54d2b1af0a090
+    );
+    assert_eq!(request.start_time().get(), 41);
+    assert_eq!(request.commit_time().get(), 43);
+    assert_eq!(request.snapshot_applied_index(), 37);
+    let dtg_execution::shard::ShardCommand::CommitSingleShardTransaction(command) =
+        request.command()
+    else {
+        panic!("expected a single-shard transaction command")
+    };
+    assert_eq!(
+        command.header().command_id().get(),
+        0x0af214337536ce02fe7b52a208925362
+    );
+    assert_eq!(
+        command.request_digest().get(),
+        [
+            0x28, 0xc3, 0x63, 0xbb, 0x8a, 0xbd, 0x66, 0x5f, 0xa0, 0xd6, 0xc7, 0x85, 0x4a, 0x73,
+            0x9f, 0xb3, 0x04, 0xf3, 0x12, 0x4a, 0x35, 0xed, 0xf8, 0x77, 0xa4, 0x58, 0xc1, 0x43,
+            0xd6, 0x68, 0x48, 0xae,
+        ]
+    );
+    let [LogicalMutation::PutVertex(vertex)] = request.mutations() else {
+        panic!("expected one persisted vertex mutation")
+    };
+    assert_eq!(vertex.id().get(), 0x55a0592a07ab5f0a6ad41fd79b1e5a6a);
+    assert_eq!(vertex.properties().get("value"), Some(&Value::Integer(1)));
+    assert_eq!(
+        vertex.properties().get("\0dtg.labels"),
+        Some(&Value::List(vec![Value::String("Bench".into())]))
+    );
+    assert_eq!(vertex.valid_time().start(), 1);
+    assert_eq!(vertex.valid_time().end(), i64::MAX);
 }
 
 struct ThreadWake;
@@ -361,7 +478,7 @@ fn query_wire_carries_versioned_physical_fragments_and_every_planning_fence() {
 }
 
 #[test]
-fn process_execution_encodes_normalized_requests_on_protocol_v2() {
+fn process_write_without_transaction_transport_fails_closed() {
     let client = Arc::new(RecordingProtocolClient::default());
     let transport = Arc::new(GatewayProtocolV2Transport::new(client.clone()));
     let execution = GatewayExecution::for_process(transport, planning_context());
@@ -374,24 +491,18 @@ fn process_execution_encodes_normalized_requests_on_protocol_v2() {
     .unwrap()
         + 5_000;
     let context = GatewayRequestContext::new(7, 9, deadline, vec![1, 2]).unwrap();
-    let response = block_on(execution.execute_statement(
+    let error = block_on(execution.execute_statement(
         context,
         "CREATE (n {id: $id}) VALID FROM 40".into(),
         BTreeMap::from([("id".into(), GatewayValue::Integer(1))]),
         None,
         &GatewayCancellationToken::new(),
     ))
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(response, GatewayResponse::Acknowledged);
+    assert_eq!(error.code(), "DTG-EXECUTION-WRITE-TRANSPORT");
     let requests = client.requests.lock().unwrap();
-    let request = &requests[0];
-    assert_eq!(request.request.as_ref().unwrap().protocol_major, 2);
-    let payload = request.execution_request.as_ref().unwrap();
-    assert_eq!(payload.format_version, 1);
-    assert_eq!(payload.declared_len as usize, payload.body.len());
-    assert_eq!(payload.checksum, checksum_bytes(&payload.body));
-    assert_eq!(payload.body[0], 2);
+    assert!(requests.is_empty());
 }
 
 #[test]

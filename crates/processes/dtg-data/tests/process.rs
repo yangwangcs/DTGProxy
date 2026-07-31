@@ -17,7 +17,7 @@ use dtg_execution::cluster_protocol::proto::{
 use dtg_execution::planning::{
     CatalogShard, CatalogSnapshot, Planner, PlanningContext, SnapshotRequirements, StorageAccess,
 };
-use dtg_execution::shard::{CommitSingleShard, ShardCommand};
+use dtg_execution::shard::{CommitSingleShard, CommitSingleShardTransaction, ShardCommand};
 use dtg_execution::storage::{
     BackendClass, BindingRole, CapabilityManifest, CommandId, LogicalMutation, Properties,
     ReplicaBinding, StorageTckFactory, TransactionTime, ValidInterval, Version, VertexId,
@@ -375,6 +375,90 @@ async fn apply_transaction_proposes_the_typed_shard_command() {
 }
 
 #[tokio::test]
+async fn single_shard_transaction_is_applied_once_with_durable_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("rpc-single-shard-transaction");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let vertex = VertexVersion::new(
+        VertexId::new(71).unwrap(),
+        Version::new(1),
+        ValidInterval::new(1, i64::MAX).unwrap(),
+        TransactionTime::new(43).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShardTransaction(
+        CommitSingleShardTransaction::new(
+            CommandId::new(73).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            dtg_execution::storage::TransactionId::new(79).unwrap(),
+            TransactionTime::new(41).unwrap(),
+            1,
+            dtg_execution::storage::Digest32::new([83; 32]),
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .unwrap(),
+    );
+    let body = command.encode_current().unwrap();
+    let request = || TransactionRequest {
+        context: Some(shard_context(&binding)),
+        transaction_id: 79_u128.to_be_bytes().to_vec(),
+        operation: TransactionOperation::Commit.into(),
+        idempotency_key: 73_u128.to_be_bytes().to_vec(),
+        payload: Some(BoundedPayload {
+            format_version: 1,
+            declared_len: body.len() as u64,
+            item_count: 1,
+            checksum: checksum_bytes(&body).to_vec(),
+            body: body.clone(),
+        }),
+    };
+    node.rpc_service()
+        .apply_transaction(Request::new(request()))
+        .await
+        .unwrap();
+    let applied = node.replica_observations().await[0].applied_index();
+    assert!(applied > 1);
+
+    let mut stream = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 89_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: scan_fragment_body().len() as u64,
+                item_count: 2,
+                checksum: checksum_bytes(&scan_fragment_body()).to_vec(),
+                body: scan_fragment_body(),
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index: applied,
+            transaction_time: 43,
+            valid_at: 1,
+            snapshot_immutable: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stream.next().await.unwrap().unwrap().row_count, 1);
+
+    node.rpc_service()
+        .apply_transaction(Request::new(request()))
+        .await
+        .unwrap();
+    assert!(node.replica_observations().await[0].applied_index() > applied);
+}
+
+#[tokio::test]
 async fn execute_fragment_reads_the_fenced_replica_store() {
     let root = tempfile::tempdir().unwrap();
     let binding = fjall_binding("rpc-fragment");
@@ -660,6 +744,41 @@ async fn gateway_v2_rpc_executes_a_real_fenced_fragment() {
     assert_eq!(response.status.unwrap().code, StatusCode::Ok as i32);
     assert_eq!(response.batch.unwrap().row_count, 1);
     assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn gateway_write_is_not_treated_as_query() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("gateway-write-rejection");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let body = vec![2];
+    let result = ClusterGatewayService::execute(
+        &node.rpc_service(),
+        Request::new(GatewayRequest {
+            request: shard_context(&binding).request,
+            execution_request: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            fragments: Vec::new(),
+        }),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("Gateway write was treated as a query"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("only planned query fragments"));
 }
 
 #[tokio::test]

@@ -20,6 +20,24 @@ async fn fjall_cell_uses_real_four_process_bolt_path() {
     let spec = CellSpec::one(Backend::Fjall, Workload::PointLookup, 1, 1);
     let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
     cluster.seed_read_dataset(4_096).await.unwrap();
+    let mut session = backend_e2e_support::BoltSession::connect(cluster.bolt_address())
+        .await
+        .unwrap();
+    let created = session
+        .run("CREATE (n:Bench {value: 1}) VALID FROM 1", BTreeMap::new())
+        .await
+        .unwrap();
+    assert!(created.fields.is_empty());
+    assert!(created.rows.is_empty());
+    let count = session
+        .run("MATCH (n) RETURN COUNT(*)", BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(count.fields, vec!["COUNT(*)"]);
+    assert_eq!(
+        count.rows,
+        vec![vec![backend_e2e_support::BoltValue::Integer(4_097)]]
+    );
     let observation = measure_cell(cluster.bolt_address(), spec).await.unwrap();
     assert_eq!(observation.errors, 0);
     assert_eq!(observation.row_count, 1);
