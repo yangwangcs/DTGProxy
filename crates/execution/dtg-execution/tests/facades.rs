@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_analytics::{
@@ -20,7 +21,8 @@ use dtg_control::{
 use dtg_execution::{
     ControlActionExecutor, ControllerExecution, DataExecution, GatewayCancellationToken,
     GatewayExecution, GatewayRequestContext, GatewayValue, MetaExecution, ProviderKind,
-    ProviderResolver, ReplicaBinding, ReplicaStateStore, RequestStage, StoreFuture,
+    ProviderResolver, ReplicaBinding, ReplicaStateStore, RequestStage, ResolvedReplicaStore,
+    StoreFuture,
 };
 use dtg_language::{EmptySchemaCatalog, Language};
 use dtg_plan::{
@@ -33,10 +35,12 @@ use dtg_query::{
 };
 use dtg_shard::ShardError;
 use dtg_storage::{
-    ApplyReceipt, BackendClass, BackendGeneration, BindingRole, CapabilityManifest, ChangeRecord,
-    CommittedShardBatch, ConsensusEntry, ConsensusSnapshotInstall, ConsensusSnapshotMetadata,
-    ConsensusStore, PlacementEpoch, RaftHardState, RaftMembership, ReadFence, ReplicaMetadata,
-    ShardId, StorageError, TemporalReadView, TransactionId, TransactionTime, Version,
+    AdjacencyRead, ApplyReceipt, BackendClass, BackendGeneration, BindingRole, CapabilityManifest,
+    ChangePage, ChangeRecord, ChangesRead, CommittedShardBatch, ConsensusEntry,
+    ConsensusSnapshotInstall, ConsensusSnapshotMetadata, ConsensusStore, EdgeHistoryRead, EdgeRead,
+    EdgeScan, EdgeVersion, PlacementEpoch, RaftHardState, RaftMembership, ReadFence,
+    ReplicaMetadata, ScanPage, ShardId, StorageError, TemporalReadView, TransactionId,
+    TransactionTime, Version, VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexVersion,
 };
 use dtg_transaction::{
     CommitResolution, CommitTimeReservation, ShardCommandExecutor, ShardRequest,
@@ -92,7 +96,7 @@ impl ConsensusStore for BindingConsensus {
     }
 
     fn append(&self, _entries: Vec<ConsensusEntry>) -> StoreFuture<'_, ()> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(()) })
     }
 
     fn entries(
@@ -101,47 +105,54 @@ impl ConsensusStore for BindingConsensus {
         _high: u64,
         _max_bytes: u64,
     ) -> StoreFuture<'_, Vec<ConsensusEntry>> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn truncate_suffix(&self, _from_index: u64) -> StoreFuture<'_, ()> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(()) })
     }
 
     fn hard_state(&self) -> StoreFuture<'_, RaftHardState> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(RaftHardState::default()) })
     }
 
     fn set_hard_state(&self, _state: RaftHardState) -> StoreFuture<'_, ()> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(()) })
     }
 
     fn membership(&self) -> StoreFuture<'_, RaftMembership> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        let replica_id = self.binding.replica_id();
+        Box::pin(async move {
+            Ok(RaftMembership {
+                voters: vec![replica_id],
+                learners: Vec::new(),
+                configuration_index: 0,
+            })
+        })
     }
 
     fn set_membership(&self, _membership: RaftMembership) -> StoreFuture<'_, ()> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(()) })
     }
 
     fn snapshot_metadata(&self) -> StoreFuture<'_, Option<ConsensusSnapshotMetadata>> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(None) })
     }
 
     fn set_snapshot_metadata(&self, _metadata: ConsensusSnapshotMetadata) -> StoreFuture<'_, ()> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(()) })
     }
 
     fn snapshot_install(&self) -> StoreFuture<'_, Option<ConsensusSnapshotInstall>> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(None) })
     }
 
     fn stage_snapshot_install(&self, _install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(()) })
     }
 
     fn commit_snapshot_install(&self, _install: ConsensusSnapshotInstall) -> StoreFuture<'_, ()> {
-        Box::pin(async { Err(StorageError::Unsupported) })
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -164,6 +175,101 @@ impl ReplicaStateStore for BindingStore {
 
     fn begin_read_view(&self, _fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
         Box::pin(async { Err(StorageError::Unsupported) })
+    }
+}
+
+struct CountingReadStore {
+    binding: ReplicaBinding,
+    applied_index: AtomicU64,
+    begin_read_view_calls: AtomicUsize,
+    returned_fence: Option<ReadFence>,
+}
+
+impl CountingReadStore {
+    fn new(binding: ReplicaBinding, applied_index: u64) -> Self {
+        Self {
+            binding,
+            applied_index: AtomicU64::new(applied_index),
+            begin_read_view_calls: AtomicUsize::new(0),
+            returned_fence: None,
+        }
+    }
+
+    fn returning_fence(mut self, fence: ReadFence) -> Self {
+        self.returned_fence = Some(fence);
+        self
+    }
+}
+
+impl ReplicaStateStore for CountingReadStore {
+    fn binding(&self) -> &ReplicaBinding {
+        &self.binding
+    }
+
+    fn applied_index(&self) -> StoreFuture<'_, u64> {
+        Box::pin(async move { Ok(self.applied_index.load(Ordering::SeqCst)) })
+    }
+
+    fn replica_metadata<'a>(&'a self, _name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn apply(&self, _batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
+        Box::pin(async { Err(StorageError::Unsupported) })
+    }
+
+    fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
+        self.begin_read_view_calls.fetch_add(1, Ordering::SeqCst);
+        let returned_fence = self.returned_fence.clone().unwrap_or(fence);
+        Box::pin(async move { Ok(Box::new(EmptyReadView { returned_fence }) as Box<_>) })
+    }
+}
+
+struct EmptyReadView {
+    returned_fence: ReadFence,
+}
+
+impl TemporalReadView for EmptyReadView {
+    fn fence(&self) -> &ReadFence {
+        &self.returned_fence
+    }
+
+    fn get_vertex(&self, _request: VertexRead) -> StoreFuture<'_, Option<VertexVersion>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn get_edge(&self, _request: EdgeRead) -> StoreFuture<'_, Option<EdgeVersion>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn vertex_history(&self, _request: VertexHistoryRead) -> StoreFuture<'_, Vec<VertexVersion>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn edge_history(&self, _request: EdgeHistoryRead) -> StoreFuture<'_, Vec<EdgeVersion>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn expand(&self, _request: AdjacencyRead) -> StoreFuture<'_, Vec<EdgeVersion>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn changes(&self, _request: ChangesRead) -> StoreFuture<'_, ChangePage> {
+        Box::pin(async { Ok(ChangePage::new(Vec::new(), None)) })
+    }
+
+    fn scan_vertices(
+        &self,
+        _request: VertexScan,
+    ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>> {
+        Box::pin(async { Ok(ScanPage::new(Vec::new(), None)) })
+    }
+
+    fn scan_edges(
+        &self,
+        _request: EdgeScan,
+    ) -> StoreFuture<'_, ScanPage<EdgeVersion, dtg_storage::EdgeId>> {
+        Box::pin(async { Ok(ScanPage::new(Vec::new(), None)) })
     }
 }
 
@@ -421,6 +527,128 @@ fn analytics_spec(identity: &str) -> AnalyticsJobSpec {
         JobTimestamp::new(100),
     )
     .unwrap()
+}
+
+fn point_fragment_body(vertex_id: u128) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u64.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.push(0);
+    body.push(0);
+    body.extend_from_slice(&vertex_id.to_be_bytes());
+    body.push(0);
+    body.push(0);
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body
+}
+
+fn read_runtime(
+    binding: ReplicaBinding,
+    store: Arc<CountingReadStore>,
+) -> (DataExecution, dtg_shard::ReplicaKey) {
+    let runtime = DataExecution::builder()
+        .with_provider(ProviderKind::Fjall, resolver(ProviderKind::Fjall))
+        .build()
+        .unwrap();
+    let key = runtime
+        .add_replica_runtime(
+            Arc::new(BindingConsensus {
+                binding: binding.clone(),
+            }),
+            ResolvedReplicaStore::state_only(store),
+        )
+        .unwrap();
+    (runtime, key)
+}
+
+#[test]
+fn read_view_cache_reuses_an_exact_fence_for_two_point_reads() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "read-view-cache");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let point = point_fragment_body(17);
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &point))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &point))
+        .unwrap();
+
+    assert_eq!(store.begin_read_view_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn read_view_cache_reopens_for_a_new_applied_index() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "read-view-cache-index");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let point = point_fragment_body(17);
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &point))
+        .unwrap();
+    store.applied_index.store(10, Ordering::SeqCst);
+    block_on(runtime.execute_fragment(key, 10, TransactionTime::new(23).unwrap(), 17, &point))
+        .unwrap();
+
+    assert_eq!(store.begin_read_view_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn read_view_cache_does_not_survive_replica_replacement() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "read-view-cache-replacement");
+    let first = Arc::new(CountingReadStore::new(binding.clone(), 0));
+    let (runtime, key) = read_runtime(binding.clone(), Arc::clone(&first));
+    let point = point_fragment_body(17);
+    runtime.start_replica(key).unwrap();
+
+    block_on(runtime.execute_fragment(key, 0, TransactionTime::new(23).unwrap(), 17, &point))
+        .unwrap();
+    runtime.remove_replica(key).unwrap();
+
+    let replacement = Arc::new(CountingReadStore::new(binding.clone(), 0));
+    let replacement_store: Arc<dyn ReplicaStateStore> = replacement.clone();
+    let replacement_key = runtime
+        .add_replica_runtime(
+            Arc::new(BindingConsensus { binding }),
+            ResolvedReplicaStore::state_only(replacement_store),
+        )
+        .unwrap();
+    assert_eq!(key, replacement_key);
+    block_on(runtime.execute_fragment(
+        replacement_key,
+        0,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &point,
+    ))
+    .unwrap();
+
+    assert_eq!(first.begin_read_view_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.begin_read_view_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn read_view_cache_rejects_a_provider_view_with_a_different_fence() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "read-view-cache-fence-drift");
+    let store = Arc::new(
+        CountingReadStore::new(binding.clone(), 9)
+            .returning_fence(ReadFence::new(binding.clone(), 8)),
+    );
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+
+    let result = block_on(runtime.execute_fragment(
+        key,
+        9,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &point_fragment_body(17),
+    ));
+
+    assert!(result.is_err());
+    assert_eq!(store.begin_read_view_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

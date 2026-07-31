@@ -8,7 +8,7 @@ use dtg_shard::{
 use dtg_storage::{
     ConsensusStore, LogicalReplicaActivation, LogicalSnapshotSink, NamespaceId, ProviderKind,
     PushdownExecutor, ReadFence, ReplicaBinding, ReplicaStateStore, StorageError, StoreFuture,
-    TransactionTime, VertexId, VertexRead, VertexScan,
+    TemporalReadView, TransactionTime, VertexId, VertexRead, VertexScan,
 };
 use prost_011::Message as _;
 use raft::eraftpb::Message;
@@ -201,6 +201,13 @@ pub struct DataExecution {
     shards: Mutex<ShardHost>,
     providers: ProviderResolverSet,
     stores: Mutex<BTreeMap<ReplicaKey, ResolvedReplicaStore>>,
+    read_views: Mutex<BTreeMap<ReplicaKey, CachedReadView>>,
+}
+
+struct CachedReadView {
+    store: Arc<dyn ReplicaStateStore>,
+    fence: ReadFence,
+    view: Arc<dyn TemporalReadView>,
 }
 
 impl DataExecution {
@@ -231,7 +238,9 @@ impl DataExecution {
         consensus_store: Arc<dyn ConsensusStore>,
         state_store: Arc<dyn ReplicaStateStore>,
     ) -> Result<ReplicaKey, ShardError> {
-        self.lock_shards()?.add(consensus_store, state_store)
+        let key = self.lock_shards()?.add(consensus_store, state_store)?;
+        self.clear_read_view(key)?;
+        Ok(key)
     }
 
     pub fn add_replica_runtime(
@@ -246,6 +255,7 @@ impl DataExecution {
             .lock()
             .map_err(|_| ShardError::InvalidLifecycle("replica store mutex is poisoned".into()))?
             .insert(key, runtime_store);
+        self.clear_read_view(key)?;
         Ok(key)
     }
 
@@ -284,6 +294,7 @@ impl DataExecution {
             .lock()
             .map_err(|_| ShardError::InvalidLifecycle("replica store mutex is poisoned".into()))?
             .remove(&key);
+        self.clear_read_view(key)?;
         Ok(progress)
     }
 
@@ -387,11 +398,13 @@ impl DataExecution {
             let store = self.runtime_store(key)?;
             let binding = store.state().binding().clone();
             let read = decode_fragment_read(encoded)?;
-            let view = store
-                .state()
-                .begin_read_view(ReadFence::new(binding, applied_index))
-                .await
-                .map_err(data_storage_error)?;
+            let view = self
+                .read_view(
+                    key,
+                    store.state().clone(),
+                    ReadFence::new(binding, applied_index),
+                )
+                .await?;
             let rows = match read {
                 FragmentRead::VertexPoint(id) => view
                     .get_vertex(VertexRead::new(id, valid_at, transaction_time))
@@ -426,6 +439,95 @@ impl DataExecution {
             .get(&key)
             .cloned()
             .ok_or_else(|| data_error("replica runtime store is absent"))
+    }
+
+    fn read_view<'a>(
+        &'a self,
+        key: ReplicaKey,
+        store: Arc<dyn ReplicaStateStore>,
+        fence: ReadFence,
+    ) -> GatewayFuture<'a, Result<Arc<dyn TemporalReadView>, GatewayExecutionError>> {
+        Box::pin(async move {
+            if store.applied_index().await.map_err(data_storage_error)? != fence.applied_index() {
+                return Err(data_error(
+                    "replica applied index does not match requested read fence",
+                ));
+            }
+            if let Some(view) = self.cached_read_view(key, &store, &fence)? {
+                return Ok(view);
+            }
+
+            let opened = store
+                .begin_read_view(fence.clone())
+                .await
+                .map_err(data_storage_error)?;
+            if opened.fence() != &fence {
+                return Err(data_error(
+                    "provider returned a read view for a different read fence",
+                ));
+            }
+            let opened: Arc<dyn TemporalReadView> = Arc::from(opened);
+
+            if !Arc::ptr_eq(self.runtime_store(key)?.state(), &store) {
+                return Err(data_error(
+                    "replica runtime store changed while opening read view",
+                ));
+            }
+            if store.applied_index().await.map_err(data_storage_error)? != fence.applied_index() {
+                return Ok(opened);
+            }
+
+            let mut read_views = self
+                .read_views
+                .lock()
+                .map_err(|_| data_error("read view cache mutex is poisoned"))?;
+            if let Some(cached) = read_views.get(&key)
+                && Arc::ptr_eq(&cached.store, &store)
+                && cached.fence == fence
+            {
+                return Ok(Arc::clone(&cached.view));
+            }
+            if read_views.get(&key).is_some_and(|cached| {
+                Arc::ptr_eq(&cached.store, &store)
+                    && cached.fence.binding() == fence.binding()
+                    && cached.fence.applied_index() > fence.applied_index()
+            }) {
+                return Ok(opened);
+            }
+            read_views.insert(
+                key,
+                CachedReadView {
+                    store,
+                    fence,
+                    view: Arc::clone(&opened),
+                },
+            );
+            Ok(opened)
+        })
+    }
+
+    fn cached_read_view(
+        &self,
+        key: ReplicaKey,
+        store: &Arc<dyn ReplicaStateStore>,
+        fence: &ReadFence,
+    ) -> Result<Option<Arc<dyn TemporalReadView>>, GatewayExecutionError> {
+        let read_views = self
+            .read_views
+            .lock()
+            .map_err(|_| data_error("read view cache mutex is poisoned"))?;
+        Ok(read_views.get(&key).and_then(|cached| {
+            (Arc::ptr_eq(&cached.store, store) && cached.fence == *fence)
+                .then(|| Arc::clone(&cached.view))
+        }))
+    }
+
+    fn clear_read_view(&self, key: ReplicaKey) -> Result<(), ShardError> {
+        self.read_views
+            .lock()
+            .map_err(|_| ShardError::InvalidLifecycle("read view cache mutex is poisoned".into()))?
+            .remove(&key);
+        Ok(())
     }
 
     fn lock_shards(&self) -> Result<std::sync::MutexGuard<'_, ShardHost>, ShardError> {
@@ -929,6 +1031,7 @@ impl DataExecutionBuilder {
             shards: Mutex::new(self.shards),
             providers: self.providers,
             stores: Mutex::new(BTreeMap::new()),
+            read_views: Mutex::new(BTreeMap::new()),
         })
     }
 }
