@@ -153,7 +153,6 @@ pub async fn measure_cell(
     let started_at_unix_ns = unix_time_nanos();
     let warmup_deadline = phase_started + warmup;
     let measurement_deadline = warmup_deadline + measurement;
-    let measurement_started_at_unix_ns = started_at_unix_ns.saturating_add(nanos_u64(warmup));
     let (statement, parameters) = workload_request(cell.workload);
     let query_digest = query_digest(statement, &parameters);
     let mut workers = JoinSet::new();
@@ -172,6 +171,11 @@ pub async fn measure_cell(
             .await
         });
     }
+
+    tokio::time::sleep_until(warmup_deadline.into()).await;
+    let measurement_started_at_unix_ns = unix_time_nanos();
+    tokio::time::sleep_until(measurement_deadline.into()).await;
+    let measurement_finished_at_unix_ns = unix_time_nanos();
 
     let mut latency_samples_ns = Vec::new();
     let mut operations = 0_u64;
@@ -201,7 +205,6 @@ pub async fn measure_cell(
         }
     }
     let (_, row_count, result_digest) = identity.unwrap_or((Vec::new(), 0, String::new()));
-    let measurement_finished_at_unix_ns = unix_time_nanos();
     Ok(RawObservation {
         backend: cell.backend,
         workload: cell.workload,

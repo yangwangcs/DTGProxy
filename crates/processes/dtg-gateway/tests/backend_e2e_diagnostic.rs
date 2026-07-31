@@ -77,8 +77,9 @@ async fn measure_cell_records_each_measured_read_on_one_worker_connection() {
         repetition: 0,
     };
 
+    let warmup = Duration::from_millis(10);
     let observation =
-        backend_e2e_support::measure_cell(address, cell, Duration::ZERO, Duration::from_millis(10))
+        backend_e2e_support::measure_cell(address, cell, warmup, Duration::from_millis(10))
             .await
             .unwrap();
 
@@ -95,6 +96,13 @@ async fn measure_cell_records_each_measured_read_on_one_worker_connection() {
         .as_u64()
         .unwrap();
     assert_eq!(warmup_finished_at_unix_ns, measurement_started_at_unix_ns);
+    assert!(
+        measurement_started_at_unix_ns
+            > observation
+                .started_at_unix_ns
+                .saturating_add(warmup.as_nanos() as u64),
+        "the measurement boundary must be sampled when warmup actually finishes"
+    );
     assert!(measurement_finished_at_unix_ns >= measurement_started_at_unix_ns);
     server.await.unwrap();
 }
