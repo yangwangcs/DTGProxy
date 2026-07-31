@@ -10,7 +10,12 @@ use dtg_execution::{
     GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
     GatewayValue,
 };
-use dtg_language_ir::{BinaryOperator, LogicalExpr, UnaryOperator, Value};
+use dtg_language_ir::{
+    Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
+    LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement,
+    LogicalType, NodeScan, Parameter, Projection, ReadScope, RowSchema, Sort, SortDirection,
+    SortKey, UnaryOperator, Unwind, Value,
+};
 use dtg_plan::{CatalogShard, CatalogSnapshot, Planner, PlanningContext, SnapshotRequirements};
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
@@ -468,6 +473,157 @@ fn binds_parameters_while_lowering_the_fixed_point_predicate() {
 }
 
 #[test]
+fn binds_parameters_in_every_non_filter_physical_operator_position() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client)),
+        planning_context(),
+    );
+    let parameter = |name: &str| LogicalExpr::Parameter(name.into());
+    let program = LogicalProgram {
+        version: dtg_language_ir::IrVersion::CURRENT,
+        graph_scope: GraphScope::Explicit(dtg_storage::GraphId::new(1).unwrap()),
+        parameters: ["project", "aggregate", "sort", "unwind"]
+            .into_iter()
+            .map(|name| Parameter {
+                name: name.into(),
+                data_type: LogicalType::Any,
+                required: true,
+            })
+            .collect(),
+        statement: LogicalStatement::Query(LogicalPlan {
+            root: LogicalNodeId::new(5),
+            nodes: vec![
+                LogicalNode {
+                    id: LogicalNodeId::new(1),
+                    kind: LogicalNodeKind::NodeScan(NodeScan {
+                        variable: "n".into(),
+                        labels: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(2),
+                    kind: LogicalNodeKind::Project {
+                        input: LogicalNodeId::new(1),
+                        projections: vec![Projection {
+                            expression: parameter("project"),
+                            alias: "projected".into(),
+                        }],
+                    },
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(3),
+                    kind: LogicalNodeKind::Aggregate(Aggregate {
+                        input: LogicalNodeId::new(2),
+                        groups: Vec::new(),
+                        aggregates: vec![AggregateFunction {
+                            function: AggregateKind::Count,
+                            argument: Some(parameter("aggregate")),
+                            alias: "counted".into(),
+                            distinct: false,
+                        }],
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(4),
+                    kind: LogicalNodeKind::Sort(Sort {
+                        input: LogicalNodeId::new(3),
+                        keys: vec![SortKey {
+                            expression: parameter("sort"),
+                            direction: SortDirection::Descending,
+                        }],
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(5),
+                    kind: LogicalNodeKind::Unwind(Unwind {
+                        input: LogicalNodeId::new(4),
+                        expression: parameter("unwind"),
+                        alias: "item".into(),
+                    }),
+                },
+            ],
+        }),
+        result_schema: RowSchema {
+            fields: vec![Field {
+                name: "item".into(),
+                data_type: LogicalType::Any,
+                nullable: true,
+            }],
+        },
+    };
+    let physical = Planner.plan(&program, &planning_context()).unwrap();
+
+    let executable = execution
+        .lower_plan_with_parameters(
+            &physical,
+            &BTreeMap::from([
+                ("project".into(), GatewayValue::Integer(11)),
+                ("aggregate".into(), GatewayValue::Integer(12)),
+                ("sort".into(), GatewayValue::Integer(13)),
+                (
+                    "unwind".into(),
+                    GatewayValue::List(vec![GatewayValue::Integer(14)]),
+                ),
+            ]),
+        )
+        .unwrap();
+
+    let project = executable
+        .operators()
+        .iter()
+        .find_map(|operator| match operator.kind() {
+            dtg_query::ExecutableOperatorKind::Project { projections, .. } => Some(projections),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        project[0].expression().logical(),
+        &LogicalExpr::Literal(Value::Integer(11))
+    );
+
+    let aggregate = executable
+        .operators()
+        .iter()
+        .find_map(|operator| match operator.kind() {
+            dtg_query::ExecutableOperatorKind::Aggregate { aggregates, .. } => Some(aggregates),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        aggregate[0].argument.as_ref().unwrap().logical(),
+        &LogicalExpr::Literal(Value::Integer(12))
+    );
+
+    let sort = executable
+        .operators()
+        .iter()
+        .find_map(|operator| match operator.kind() {
+            dtg_query::ExecutableOperatorKind::Sort { keys, .. } => Some(keys),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        sort[0].expression.logical(),
+        &LogicalExpr::Literal(Value::Integer(13))
+    );
+
+    let unwind = executable
+        .operators()
+        .iter()
+        .find_map(|operator| match operator.kind() {
+            dtg_query::ExecutableOperatorKind::Unwind { expression, .. } => Some(expression),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        unwind.logical(),
+        &LogicalExpr::Literal(Value::List(vec![Value::Integer(14)]))
+    );
+}
+
+#[test]
 fn binds_missing_names_before_remote_success() {
     let client = Arc::new(RecordingProtocolClient::default());
     let execution = GatewayExecution::for_process(
@@ -486,6 +642,35 @@ fn binds_missing_names_before_remote_success() {
     let error = block_on(execution.execute_statement(
         GatewayRequestContext::new(7, 12, deadline, Vec::new()).unwrap(),
         "MATCH (n) WHERE n.id = $id RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code(), "DTG-EXECUTION-MISSING-PARAMETER");
+    assert!(client.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn binds_missing_sort_parameter_before_remote_success() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client.clone())),
+        planning_context(),
+    );
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+
+    let error = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 13, deadline, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n.id ORDER BY $sort".into(),
         BTreeMap::new(),
         None,
         &GatewayCancellationToken::new(),

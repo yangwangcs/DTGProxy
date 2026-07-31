@@ -1,16 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dtg_language_ir::{
-    AggregateKind, BinaryOperator, JoinKind, LogicalExpr, LogicalType, RowSchema,
+    AggregateKind, BinaryOperator, Field, JoinKind, LogicalExpr, LogicalType, RowSchema,
 };
-use dtg_storage::ShardId;
+use dtg_storage::{PushdownOperation, ShardId};
 
 use crate::{
     AggregateOperator, BatchOperator, BuiltInSpillPolicy, CancellationToken, ColumnBatch,
-    ExecutableFragment, ExecutableOperatorKind, ExecutablePlan, Expression, FilterOperator,
-    HashJoinOperator, LimitOperator, Operator, OverlayOperator, ProjectOperator, ProjectionExpr,
-    QueryBudget, QueryContext, QueryError, QueryFuture, QueryOverlay, QueryStorage, SortOperator,
-    SpillConfig, SpillMergeOperator, StorageSourceOperator, UnwindOperator,
+    ExecutableAccess, ExecutableFragment, ExecutableOperatorKind, ExecutablePlan, Expression,
+    FilterOperator, HashJoinOperator, LimitOperator, Operator, OverlayOperator, ProjectOperator,
+    ProjectionExpr, QueryBudget, QueryContext, QueryError, QueryFuture, QueryOverlay, QueryStorage,
+    ReadOperation, SortOperator, SpillConfig, SpillMergeOperator, StorageSourceOperator,
+    UnwindOperator,
 };
 
 pub struct QueryRuntime {
@@ -25,7 +26,7 @@ enum RuntimeSpill {
 
 enum FragmentSources<'a> {
     Local(&'a BTreeMap<u32, (&'a ExecutableFragment, QueryStorage)>),
-    Materialized(&'a BTreeMap<u32, Vec<ColumnBatch>>),
+    Materialized(&'a BTreeMap<u32, (&'a ExecutableFragment, Vec<ColumnBatch>)>),
 }
 
 impl QueryRuntime {
@@ -141,27 +142,44 @@ impl QueryRuntime {
             )));
         }
         for (fragment_id, batches) in &fragment_batches {
-            let Some(schema) = batches.first().map(ColumnBatch::schema) else {
-                return Err(QueryError::InvalidPlan(format!(
-                    "materialized fragment {fragment_id} contains no batches"
-                )));
-            };
-            let [field] = schema.fields.as_slice() else {
-                return Err(QueryError::InvalidPlan(format!(
-                    "materialized fragment {fragment_id} must have a one-column schema"
-                )));
-            };
-            if field.name.is_empty() {
-                return Err(QueryError::InvalidPlan(format!(
-                    "materialized fragment {fragment_id} source name must be nonempty"
-                )));
-            }
-            if batches.iter().any(|batch| batch.schema() != schema) {
-                return Err(QueryError::InvalidPlan(format!(
-                    "materialized fragment {fragment_id} batch schemas must be identical"
-                )));
+            if let Some(schema) = batches.first().map(ColumnBatch::schema) {
+                let [field] = schema.fields.as_slice() else {
+                    return Err(QueryError::InvalidPlan(format!(
+                        "materialized fragment {fragment_id} must have a one-column schema"
+                    )));
+                };
+                if field.name.is_empty() {
+                    return Err(QueryError::InvalidPlan(format!(
+                        "materialized fragment {fragment_id} source name must be nonempty"
+                    )));
+                }
+                if batches.iter().any(|batch| batch.schema() != schema) {
+                    return Err(QueryError::InvalidPlan(format!(
+                        "materialized fragment {fragment_id} batch schemas must be identical"
+                    )));
+                }
             }
         }
+
+        let plan_fragments = plan
+            .fragments()
+            .iter()
+            .map(|fragment| (fragment.id(), fragment))
+            .collect::<BTreeMap<_, _>>();
+        let fragments = fragment_batches
+            .into_iter()
+            .map(|(fragment_id, batches)| {
+                (
+                    fragment_id,
+                    (
+                        *plan_fragments
+                            .get(&fragment_id)
+                            .expect("fragment identity coverage was validated"),
+                        batches,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
         let definitions = plan
             .operators()
@@ -170,7 +188,7 @@ impl QueryRuntime {
             .collect::<BTreeMap<_, _>>();
         let mut visiting = BTreeSet::new();
         let mut built = BTreeSet::new();
-        let sources = FragmentSources::Materialized(&fragment_batches);
+        let sources = FragmentSources::Materialized(&fragments);
         let root = self.build_operator(
             plan.root_operator(),
             &definitions,
@@ -379,6 +397,14 @@ impl QueryRuntime {
                 "physical source fragments and output must be nonempty".into(),
             ));
         }
+        let mut referenced = BTreeSet::new();
+        for fragment_id in fragments {
+            if !referenced.insert(*fragment_id) {
+                return Err(QueryError::InvalidPlan(format!(
+                    "physical source contains duplicate fragment {fragment_id}"
+                )));
+            }
+        }
         let mut sources = Vec::with_capacity(fragments.len());
         for fragment_id in fragments {
             let source: Box<dyn Operator> = match fragment_sources {
@@ -401,13 +427,25 @@ impl QueryRuntime {
                         self.batch_size,
                     )?)
                 }
-                FragmentSources::Materialized(fragment_batches) => Box::new(BatchOperator::new(
-                    fragment_batches.get(fragment_id).cloned().ok_or_else(|| {
+                FragmentSources::Materialized(fragment_batches) => {
+                    let (fragment, batches) =
+                        fragment_batches.get(fragment_id).ok_or_else(|| {
+                            QueryError::InvalidPlan(format!(
+                                "physical source references missing fragment {fragment_id}"
+                            ))
+                        })?;
+                    let access = fragment.access(logical_node).ok_or_else(|| {
                         QueryError::InvalidPlan(format!(
-                            "physical source references missing fragment {fragment_id}"
+                            "fragment {fragment_id} is missing logical source {logical_node}"
                         ))
-                    })?,
-                )),
+                    })?;
+                    let batches = if batches.is_empty() {
+                        vec![ColumnBatch::empty(materialized_access_schema(access))]
+                    } else {
+                        batches.clone()
+                    };
+                    Box::new(BatchOperator::new(batches))
+                }
             };
             let storage_field = source
                 .schema()
@@ -439,6 +477,26 @@ impl QueryRuntime {
                 self.spill_config()?,
             )?))
         }
+    }
+}
+
+fn materialized_access_schema(access: &ExecutableAccess) -> RowSchema {
+    let vertex = match access {
+        ExecutableAccess::Logical(read) => matches!(
+            read.operation(),
+            ReadOperation::VertexPoint(_) | ReadOperation::VertexScan
+        ),
+        ExecutableAccess::Pushdown { request, .. } => matches!(
+            request.operation(),
+            PushdownOperation::Vertex(_) | PushdownOperation::VertexScan(_)
+        ),
+    };
+    RowSchema {
+        fields: vec![Field {
+            name: if vertex { "vertex" } else { "relationship" }.into(),
+            data_type: LogicalType::Any,
+            nullable: false,
+        }],
     }
 }
 

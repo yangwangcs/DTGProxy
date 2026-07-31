@@ -11,8 +11,9 @@ use dtg_query::{
     ExecutableAccess, ExecutableAggregate, ExecutableFragment, ExecutableOperator,
     ExecutableOperatorKind, ExecutablePlan, ExecutableProjection, ExecutableSortKey,
     ExpandOperator, Expression, FilterOperator, HashJoinOperator, LimitOperator, LogicalRead,
-    OverlayOperator, ProjectOperator, ProjectionExpr, QueryBudget, QueryOverlay, QueryRuntime,
-    QueryStream, QueryValue, ReadOperation, SnapshotGuard, SnapshotShardFence, SortOperator,
+    OverlayOperator, ProjectOperator, ProjectionExpr, QueryBudget, QueryError, QueryOverlay,
+    QueryRuntime, QueryStream, QueryValue, ReadOperation, SnapshotGuard, SnapshotShardFence,
+    SortOperator,
 };
 use dtg_storage::{
     AdjacencyDirection, CapabilityManifest, LogicalMutation, ShardId, SnapshotRecord,
@@ -355,6 +356,197 @@ fn materialized_source_filters_and_projects() {
 
     assert_eq!(output.schema(), plan.result_schema());
     assert_eq!(output.rows(), vec![vec![QueryValue::Integer(2048)]]);
+}
+
+#[test]
+fn materialized_present_zero_row_fragment_is_an_empty_input() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![ExecutableAccess::Logical(
+            LogicalRead::new(
+                ReadOperation::VertexScan,
+                8,
+                TransactionTime::new(23).unwrap(),
+                17,
+            )
+            .unwrap(),
+        )],
+        vec![1],
+    )
+    .unwrap();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        2,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1],
+                    output: "vertex".into(),
+                },
+            )
+            .unwrap(),
+            ExecutableOperator::new(
+                2,
+                ExecutableOperatorKind::Aggregate {
+                    input: 1,
+                    groups: Vec::new(),
+                    aggregates: vec![ExecutableAggregate {
+                        function: AggregateKind::Count,
+                        argument: None,
+                        alias: "COUNT(*)".into(),
+                        distinct: false,
+                    }],
+                },
+            )
+            .unwrap(),
+        ],
+        int_schema("COUNT(*)"),
+    )
+    .unwrap();
+
+    let mut stream = block_on(QueryRuntime::new(16).execute_materialized(
+        &plan,
+        BTreeMap::from([(1, Vec::new())]),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+    ))
+    .unwrap();
+    let output = block_on(stream.collect()).unwrap();
+
+    assert_eq!(output.rows(), vec![vec![QueryValue::Integer(0)]]);
+}
+
+#[test]
+fn materialized_source_rejects_fragment_without_requested_logical_access() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![ExecutableAccess::Logical(
+            LogicalRead::new(
+                ReadOperation::VertexScan,
+                8,
+                TransactionTime::new(23).unwrap(),
+                17,
+            )
+            .unwrap(),
+        )],
+        vec![2],
+    )
+    .unwrap();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        1,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1],
+                    output: "n".into(),
+                },
+            )
+            .unwrap(),
+        ],
+        RowSchema::empty(),
+    )
+    .unwrap();
+    let batch = ColumnBatch::from_rows(
+        RowSchema {
+            fields: vec![Field {
+                name: "vertex".into(),
+                data_type: LogicalType::Any,
+                nullable: false,
+            }],
+        },
+        vec![vec![QueryValue::Map(BTreeMap::new())]],
+    )
+    .unwrap();
+
+    let result = block_on(QueryRuntime::new(16).execute_materialized(
+        &plan,
+        BTreeMap::from([(1, vec![batch])]),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+    ));
+
+    match result {
+        Err(QueryError::InvalidPlan(message)) => {
+            assert!(message.contains("fragment 1 is missing logical source 1"));
+        }
+        Err(error) => panic!("expected invalid plan, got {error}"),
+        Ok(_) => panic!("fragment without the requested logical access was accepted"),
+    }
+}
+
+#[test]
+fn materialized_source_rejects_duplicate_fragment_references() {
+    let capabilities = CapabilityManifest::from_names([] as [&str; 0]).unwrap();
+    let fragment = ExecutableFragment::with_access_nodes(
+        1,
+        execution_fence_for_shard(&capabilities, 13),
+        vec![ExecutableAccess::Logical(
+            LogicalRead::new(
+                ReadOperation::VertexScan,
+                8,
+                TransactionTime::new(23).unwrap(),
+                17,
+            )
+            .unwrap(),
+        )],
+        vec![1],
+    )
+    .unwrap();
+    let plan = ExecutablePlan::with_operators(
+        Version::new(1),
+        vec![fragment],
+        1,
+        vec![
+            ExecutableOperator::new(
+                1,
+                ExecutableOperatorKind::Source {
+                    logical_node: 1,
+                    fragments: vec![1, 1],
+                    output: "n".into(),
+                },
+            )
+            .unwrap(),
+        ],
+        RowSchema::empty(),
+    )
+    .unwrap();
+    let batch = ColumnBatch::from_rows(
+        RowSchema {
+            fields: vec![Field {
+                name: "vertex".into(),
+                data_type: LogicalType::Any,
+                nullable: false,
+            }],
+        },
+        vec![vec![QueryValue::Map(BTreeMap::new())]],
+    )
+    .unwrap();
+
+    let result = block_on(QueryRuntime::new(16).execute_materialized(
+        &plan,
+        BTreeMap::from([(1, vec![batch])]),
+        QueryBudget::unlimited(),
+        CancellationToken::new(),
+    ));
+
+    match result {
+        Err(QueryError::InvalidPlan(message)) => {
+            assert!(message.contains("duplicate fragment 1"));
+        }
+        Err(error) => panic!("expected invalid plan, got {error}"),
+        Ok(_) => panic!("duplicate fragment references were accepted"),
+    }
 }
 
 #[test]
