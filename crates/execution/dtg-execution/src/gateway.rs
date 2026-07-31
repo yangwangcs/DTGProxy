@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dtg_analytics::{
@@ -11,8 +11,8 @@ use dtg_analytics::{
     JobTimestamp, ProjectionError, ShardSnapshotProvenance, SnapshotProvenance,
 };
 use dtg_cluster_v2::{
-    PROTOCOL_MAJOR, SUPPORTED_MINOR_MAX, checksum_bytes, proto, validate_column_batch,
-    validate_typed_status,
+    PROTOCOL_MAJOR, SUPPORTED_MINOR_MAX, ValidatedPayload, checksum_bytes, proto,
+    validate_column_batch, validate_typed_status,
 };
 use dtg_language::{EmptySchemaCatalog, Language, LanguageError, LogicalProgram};
 use dtg_language_ir::{
@@ -556,8 +556,14 @@ impl TonicGatewayWriteTransport {
             .await
             .map_err(cluster_rpc_error)?
             .into_inner();
-        let details = status_details(status)?;
-        let bytes: [u8; 8] = details.as_slice().try_into().map_err(|_| {
+        let details = status_details(status)?.ok_or_else(|| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-TIMESTAMP",
+                "Meta timestamp response is missing details",
+                GatewayRetry::Safe,
+            )
+        })?;
+        let bytes: [u8; 8] = details.body().try_into().map_err(|_| {
             GatewayExecutionError::new(
                 "DTG-EXECUTION-TIMESTAMP",
                 "Meta timestamp response is not an i64",
@@ -684,14 +690,14 @@ fn transaction_rpc_request(
     }))
 }
 
-fn status_details(status: proto::TypedStatus) -> Result<Vec<u8>, GatewayExecutionError> {
+fn status_details(
+    status: proto::TypedStatus,
+) -> Result<Option<ValidatedPayload>, GatewayExecutionError> {
     let validated = validate_typed_status(status.clone()).map_err(|error| {
         GatewayExecutionError::new(error.code(), error.to_string(), GatewayRetry::Never)
     })?;
     if status.code == proto::StatusCode::Ok as i32 {
-        return Ok(validated
-            .details()
-            .map_or_else(Vec::new, |details| details.body().to_vec()));
+        return Ok(validated.details().cloned());
     }
     let retry = match proto::RetryDisposition::try_from(status.retry).ok() {
         Some(proto::RetryDisposition::Safe) => GatewayRetry::Safe,
@@ -704,8 +710,24 @@ fn status_details(status: proto::TypedStatus) -> Result<Vec<u8>, GatewayExecutio
     ))
 }
 
-fn decode_write_receipt(details: Vec<u8>) -> Result<GatewayWriteReceipt, GatewayExecutionError> {
-    let bytes: [u8; 9] = details.as_slice().try_into().map_err(|_| {
+fn decode_write_receipt(
+    details: Option<ValidatedPayload>,
+) -> Result<GatewayWriteReceipt, GatewayExecutionError> {
+    let details = details.ok_or_else(|| {
+        GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-RECEIPT",
+            "Data write response is missing an applied receipt",
+            GatewayRetry::Safe,
+        )
+    })?;
+    if details.format_version() != 1 || details.item_count() != 1 || details.len() != 9 {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-WRITE-RECEIPT",
+            "Data write response is not a single applied receipt",
+            GatewayRetry::Safe,
+        ));
+    }
+    let bytes: [u8; 9] = details.body().try_into().map_err(|_| {
         GatewayExecutionError::new(
             "DTG-EXECUTION-WRITE-RECEIPT",
             "Data write response is not an applied receipt",
@@ -880,7 +902,7 @@ enum GatewayExecutionMode {
         planning_context: Arc<RwLock<PlanningContext>>,
         transport: Arc<dyn GatewayExecutionTransport>,
         write_transport: Option<Arc<dyn GatewayWriteTransport>>,
-        pending_write_bounds: Arc<Mutex<BTreeSet<TransactionId>>>,
+        write_accounting: Arc<ProcessWriteAccounting>,
     },
 }
 
@@ -906,7 +928,7 @@ impl GatewayExecution {
                 planning_context: Arc::new(RwLock::new(planning_context)),
                 transport,
                 write_transport: None,
-                pending_write_bounds: Arc::new(Mutex::new(BTreeSet::new())),
+                write_accounting: Arc::new(ProcessWriteAccounting::default()),
             },
         }
     }
@@ -1183,7 +1205,7 @@ impl GatewayExecution {
                 let GatewayExecutionMode::Process {
                     planning_context,
                     write_transport,
-                    pending_write_bounds,
+                    write_accounting,
                     ..
                 } = &self.mode
                 else {
@@ -1216,10 +1238,11 @@ impl GatewayExecution {
                     write,
                     &parameters,
                     &planning_context,
-                    pending_write_bounds,
+                    write_accounting,
                 )
                 .await?;
-                advance_process_snapshot(
+                account_process_write(
+                    write_accounting,
                     match &self.mode {
                         GatewayExecutionMode::Process {
                             planning_context, ..
@@ -1228,10 +1251,6 @@ impl GatewayExecution {
                     },
                     &outcome,
                 )?;
-                pending_write_bounds
-                    .lock()
-                    .map_err(|_| process_write_error("pending write-bound lock is poisoned"))?
-                    .remove(&outcome.transaction_id);
                 validate_process_request_end(cancellation)?;
                 return Ok(GatewayResponse::Acknowledged);
             }
@@ -3060,7 +3079,7 @@ async fn execute_process_create(
     write: &dtg_language_ir::LogicalWrite,
     parameters: &BTreeMap<String, GatewayValue>,
     planning_context: &PlanningContext,
-    pending_write_bounds: &Mutex<BTreeSet<TransactionId>>,
+    write_accounting: &Mutex<ProcessWriteAccounting>,
 ) -> Result<ProcessWriteOutcome, GatewayExecutionError> {
     let [catalog_shard] = planning_context.catalog().shards() else {
         return Err(GatewayExecutionError::new(
@@ -3159,32 +3178,33 @@ async fn execute_process_create(
         commit_time,
         command,
     );
+    let capacity_reservation = reserve_process_write_capacity(write_accounting, transaction_id)?;
     let receipt = match transport.apply_single_shard(request).await {
         Ok(receipt) => receipt,
         Err(error) => {
+            complete_process_write_attempt(
+                write_accounting,
+                transaction_id,
+                capacity_reservation,
+                error.retry() == GatewayRetry::Safe,
+            )?;
             if error.retry() == GatewayRetry::Never {
                 transport.abort(&route, transaction_id).await?;
             }
             return Err(error);
         }
     };
-    let increment_bound = {
-        let mut pending = pending_write_bounds
-            .lock()
-            .map_err(|_| process_write_error("pending write-bound lock is poisoned"))?;
-        if receipt.replayed() {
-            pending.contains(&transaction_id)
-        } else {
-            pending.insert(transaction_id);
-            true
-        }
-    };
+    complete_process_write_attempt(
+        write_accounting,
+        transaction_id,
+        capacity_reservation,
+        !receipt.replayed(),
+    )?;
     transport.resolve_committed(&route, transaction_id).await?;
     Ok(ProcessWriteOutcome {
         transaction_id,
         binding: route.binding,
         applied_index: receipt.applied_index(),
-        increment_bound,
         commit_time,
     })
 }
@@ -3193,13 +3213,177 @@ struct ProcessWriteOutcome {
     transaction_id: TransactionId,
     binding: dtg_storage::ReplicaBinding,
     applied_index: u64,
-    increment_bound: bool,
     commit_time: dtg_storage::TransactionTime,
+}
+
+// This is bounded process-local diagnostic retention, not restart recovery. Completed receipts
+// are evicted fail-closed for bound growth; pending receipts are admitted before Data I/O and
+// never evicted while ambiguous.
+const PROCESS_WRITE_ACCOUNTING_LIMIT: usize = 4_096;
+
+#[derive(Clone, Copy)]
+enum ProcessWriteAccountingState {
+    Reserved,
+    Pending,
+    Accounting,
+    Accounted,
+}
+
+#[derive(Default)]
+struct ProcessWriteAccounting {
+    state: Mutex<ProcessWriteAccountingStateMachine>,
+    receipt_ready: Condvar,
+}
+
+#[derive(Default)]
+struct ProcessWriteAccountingStateMachine {
+    states: BTreeMap<TransactionId, ProcessWriteAccountingState>,
+    accounted_order: VecDeque<TransactionId>,
+    pending_count: usize,
+    capacity_reservations: usize,
+}
+
+impl ProcessWriteAccountingStateMachine {
+    fn reserve_capacity(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> Result<bool, GatewayExecutionError> {
+        if self.states.contains_key(&transaction_id) {
+            return Ok(false);
+        }
+        if self.pending_count + self.capacity_reservations >= PROCESS_WRITE_ACCOUNTING_LIMIT {
+            return Err(process_write_error(
+                "process write-accounting capacity is exhausted",
+            ));
+        }
+        self.capacity_reservations += 1;
+        self.states
+            .insert(transaction_id, ProcessWriteAccountingState::Reserved);
+        Ok(true)
+    }
+
+    fn complete_attempt(
+        &mut self,
+        transaction_id: TransactionId,
+        used_capacity: bool,
+        retain_pending: bool,
+    ) {
+        if !used_capacity {
+            return;
+        }
+        self.capacity_reservations = self
+            .capacity_reservations
+            .checked_sub(1)
+            .expect("capacity reservation exists");
+        if retain_pending {
+            self.states
+                .insert(transaction_id, ProcessWriteAccountingState::Pending);
+            self.pending_count += 1;
+        } else {
+            self.states.remove(&transaction_id);
+        }
+    }
+
+    fn mark_accounted(&mut self, transaction_id: TransactionId) {
+        self.states
+            .insert(transaction_id, ProcessWriteAccountingState::Accounted);
+        self.pending_count = self
+            .pending_count
+            .checked_sub(1)
+            .expect("accounted write was pending");
+        self.accounted_order.push_back(transaction_id);
+        while self.accounted_order.len() > PROCESS_WRITE_ACCOUNTING_LIMIT {
+            let expired = self.accounted_order.pop_front().expect("length checked");
+            self.states.remove(&expired);
+        }
+    }
+}
+
+fn reserve_process_write_capacity(
+    write_accounting: &ProcessWriteAccounting,
+    transaction_id: TransactionId,
+) -> Result<bool, GatewayExecutionError> {
+    write_accounting
+        .state
+        .lock()
+        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?
+        .reserve_capacity(transaction_id)
+}
+
+fn complete_process_write_attempt(
+    write_accounting: &ProcessWriteAccounting,
+    transaction_id: TransactionId,
+    used_capacity: bool,
+    retain_pending: bool,
+) -> Result<(), GatewayExecutionError> {
+    let mut accounting = write_accounting
+        .state
+        .lock()
+        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?;
+    if used_capacity {
+        accounting.complete_attempt(transaction_id, true, retain_pending);
+        write_accounting.receipt_ready.notify_all();
+    } else {
+        while matches!(
+            accounting.states.get(&transaction_id),
+            Some(ProcessWriteAccountingState::Reserved)
+        ) {
+            accounting = write_accounting.receipt_ready.wait(accounting).map_err(|_| {
+                process_write_error("process write-accounting lock is poisoned")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+// Lock ordering is write accounting, then planning context. Neither lock spans Meta/Data I/O;
+// install_planning_context acquires only the planning-context lock, so it has no inverse ordering.
+fn account_process_write(
+    write_accounting: &ProcessWriteAccounting,
+    planning_context: &RwLock<PlanningContext>,
+    outcome: &ProcessWriteOutcome,
+) -> Result<(), GatewayExecutionError> {
+    let mut accounting = write_accounting
+        .state
+        .lock()
+        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?;
+    let increment_bound = match accounting.states.get(&outcome.transaction_id).copied() {
+        Some(ProcessWriteAccountingState::Pending) => {
+            accounting.states.insert(
+                outcome.transaction_id,
+                ProcessWriteAccountingState::Accounting,
+            );
+            true
+        }
+        Some(ProcessWriteAccountingState::Accounted) | None => false,
+        Some(ProcessWriteAccountingState::Accounting) => {
+            return Err(process_write_error(
+                "process write accounting state was observed while owned",
+            ));
+        }
+    };
+    match advance_process_snapshot(planning_context, outcome, increment_bound) {
+        Ok(()) => {
+            if increment_bound {
+                accounting.mark_accounted(outcome.transaction_id);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if increment_bound {
+                accounting
+                    .states
+                    .insert(outcome.transaction_id, ProcessWriteAccountingState::Pending);
+            }
+            Err(error)
+        }
+    }
 }
 
 fn advance_process_snapshot(
     planning_context: &RwLock<PlanningContext>,
     outcome: &ProcessWriteOutcome,
+    increment_bound: bool,
 ) -> Result<(), GatewayExecutionError> {
     let mut current = planning_context.write().map_err(|_| {
         GatewayExecutionError::new(
@@ -3226,7 +3410,7 @@ fn advance_process_snapshot(
         .transaction_time()
         .max(outcome.commit_time);
     let logical_scan_bound = current.logical_scan_bound().map(|bound| {
-        if outcome.increment_bound {
+        if increment_bound {
             bound.saturating_add(1)
         } else {
             bound
@@ -3526,7 +3710,52 @@ mod write_receipt_tests {
 
     #[test]
     fn write_receipt_requires_exactly_nine_bytes() {
-        let error = decode_write_receipt(vec![0; 8]).unwrap_err();
+        let error = decode_write_receipt(status_details(status(vec![0; 8])).unwrap()).unwrap_err();
         assert_eq!(error.code(), "DTG-EXECUTION-WRITE-RECEIPT");
+    }
+
+    #[test]
+    fn write_receipt_requires_one_bounded_item_and_present_details() {
+        let mut multiple_items = status(vec![0, 0, 0, 0, 0, 0, 0, 1, 0]);
+        multiple_items.details.as_mut().unwrap().item_count = 2;
+        assert_eq!(
+            decode_write_receipt(status_details(multiple_items).unwrap())
+                .unwrap_err()
+                .code(),
+            "DTG-EXECUTION-WRITE-RECEIPT"
+        );
+
+        let mut missing_details = status(vec![0; 9]);
+        missing_details.details = None;
+        assert_eq!(
+            decode_write_receipt(status_details(missing_details).unwrap())
+                .unwrap_err()
+                .code(),
+            "DTG-EXECUTION-WRITE-RECEIPT"
+        );
+    }
+
+    #[test]
+    fn pending_write_accounting_rejects_new_attempts_without_evicting_ambiguity() {
+        let mut accounting = ProcessWriteAccounting::default();
+        let first = TransactionId::new(1).unwrap();
+        for id in 1..=u128::try_from(PROCESS_WRITE_ACCOUNTING_LIMIT).unwrap() {
+            let transaction_id = TransactionId::new(id).unwrap();
+            assert!(accounting.reserve_capacity(transaction_id).unwrap());
+            accounting.complete_attempt(transaction_id, true, true);
+        }
+        assert!(matches!(
+            accounting.states.get(&first),
+            Some(ProcessWriteAccountingState::Pending)
+        ));
+        assert!(
+            accounting
+                .reserve_capacity(TransactionId::new(5_000).unwrap())
+                .is_err()
+        );
+        assert!(matches!(
+            accounting.states.get(&first),
+            Some(ProcessWriteAccountingState::Pending)
+        ));
     }
 }

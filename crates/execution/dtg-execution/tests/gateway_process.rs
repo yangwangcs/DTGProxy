@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -7,9 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dtg_cluster_v2::{checksum_bytes, proto};
 use dtg_execution::{
-    GatewayCancellationToken, GatewayExecution, GatewayExecutionError, GatewayFuture,
-    GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
-    GatewayValue, GatewayWriteReceipt, GatewayWriteRequest, GatewayWriteTransport,
+    GatewayCancellationToken, GatewayClusterRequest, GatewayExecution, GatewayExecutionError,
+    GatewayExecutionTransport, GatewayFuture, GatewayProtocolV2Client, GatewayProtocolV2Transport,
+    GatewayRequestContext, GatewayResponse, GatewayValue, GatewayWriteReceipt, GatewayWriteRequest,
+    GatewayWriteTransport,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -17,7 +19,9 @@ use dtg_language_ir::{
     LogicalType, NodeScan, Parameter, Projection, ReadScope, RowSchema, Sort, SortDirection,
     SortKey, UnaryOperator, Unwind, Value,
 };
-use dtg_plan::{CatalogShard, CatalogSnapshot, Planner, PlanningContext, SnapshotRequirements};
+use dtg_plan::{
+    CatalogShard, CatalogSnapshot, Planner, PlanningContext, SnapshotRequirements, StorageAccess,
+};
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, LogicalMutation, ProviderKind, ReplicaBinding,
     TransactionId, TransactionTime, Version,
@@ -137,13 +141,33 @@ struct RecordingWriteTransport {
     events: Mutex<Vec<&'static str>>,
     requests: Mutex<Vec<GatewayWriteRequest>>,
     apply_calls: AtomicUsize,
+    resolve_calls: AtomicUsize,
     resolve_failures: AtomicUsize,
+    resolve_barrier: Option<Arc<Barrier>>,
+    synchronize_after_resolve: Option<usize>,
 }
 
 impl RecordingWriteTransport {
     fn fail_resolve_once() -> Self {
         Self {
             resolve_failures: AtomicUsize::new(1),
+            ..Self::default()
+        }
+    }
+
+    fn synchronize_two_resolutions() -> Self {
+        Self {
+            resolve_barrier: Some(Arc::new(Barrier::new(2))),
+            synchronize_after_resolve: Some(0),
+            ..Self::default()
+        }
+    }
+
+    fn fail_once_then_synchronize_two_resolutions() -> Self {
+        Self {
+            resolve_failures: AtomicUsize::new(1),
+            resolve_barrier: Some(Arc::new(Barrier::new(2))),
+            synchronize_after_resolve: Some(1),
             ..Self::default()
         }
     }
@@ -184,13 +208,22 @@ impl GatewayWriteTransport for RecordingWriteTransport {
         _transaction_id: TransactionId,
     ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
         self.events.lock().unwrap().push("resolve");
+        let call = self.resolve_calls.fetch_add(1, Ordering::SeqCst);
         let fail = self
             .resolve_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok();
+        let barrier = self
+            .synchronize_after_resolve
+            .is_some_and(|first| call >= first)
+            .then(|| self.resolve_barrier.clone())
+            .flatten();
         Box::pin(async move {
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
             if fail {
                 Err(GatewayExecutionError::new(
                     "DTG-TEST-RESOLVE",
@@ -213,15 +246,101 @@ impl GatewayWriteTransport for RecordingWriteTransport {
     }
 }
 
+#[derive(Default)]
+struct CapturingClusterTransport {
+    requests: Mutex<Vec<GatewayClusterRequest>>,
+}
+
+impl GatewayExecutionTransport for CapturingClusterTransport {
+    fn execute(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
+        self.requests.lock().unwrap().push(request);
+        Box::pin(async { Ok(GatewayResponse::Acknowledged) })
+    }
+}
+
+fn logical_scan_bound(transport: &CapturingClusterTransport) -> u32 {
+    let requests = transport.requests.lock().unwrap();
+    let plan = requests.last().unwrap().physical_plan().unwrap();
+    match plan.fragments()[0].storage_accesses() {
+        [StorageAccess::Logical(read)] => read.row_bound(),
+        [StorageAccess::Pushdown { request, .. }] => match request.operation() {
+            dtg_storage::PushdownOperation::VertexScan(scan) => scan.limit(),
+            operation => panic!("expected a vertex scan, got {operation:?}"),
+        },
+        accesses => panic!("expected one logical scan, got {accesses:?}"),
+    }
+}
+
+fn create_statement() -> String {
+    "CREATE (n:Bench {value: 1}) VALID FROM 1".into()
+}
+
+fn count_statement() -> String {
+    "MATCH (n) RETURN COUNT(*)".into()
+}
+
+#[test]
+fn overlapping_initial_creates_advance_the_scan_bound_once() {
+    let writes = Arc::new(RecordingWriteTransport::synchronize_two_resolutions());
+    let queries = Arc::new(CapturingClusterTransport::default());
+    let execution = Arc::new(GatewayExecution::for_process_with_writes(
+        queries.clone(),
+        writes,
+        planning_context(),
+    ));
+    let first = {
+        let execution = execution.clone();
+        std::thread::spawn(move || {
+            block_on(execution.execute_statement(
+                GatewayRequestContext::new(7, 93, u64::MAX, Vec::new()).unwrap(),
+                create_statement(),
+                BTreeMap::new(),
+                None,
+                &GatewayCancellationToken::new(),
+            ))
+        })
+    };
+    let second = {
+        let execution = execution.clone();
+        std::thread::spawn(move || {
+            block_on(execution.execute_statement(
+                GatewayRequestContext::new(7, 93, u64::MAX, Vec::new()).unwrap(),
+                create_statement(),
+                BTreeMap::new(),
+                None,
+                &GatewayCancellationToken::new(),
+            ))
+        })
+    };
+    assert_eq!(
+        first.join().unwrap().unwrap(),
+        GatewayResponse::Acknowledged
+    );
+    assert_eq!(
+        second.join().unwrap().unwrap(),
+        GatewayResponse::Acknowledged
+    );
+
+    block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 94, u64::MAX, Vec::new()).unwrap(),
+        count_statement(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+    assert_eq!(logical_scan_bound(&queries), 129);
+}
+
 #[test]
 fn process_create_retry_after_resolve_failure_accounts_for_the_write_once() {
     let writes = Arc::new(RecordingWriteTransport::fail_resolve_once());
-    let client = Arc::new(RecordingProtocolClient::default());
-    let execution = GatewayExecution::for_process_with_writes(
-        Arc::new(GatewayProtocolV2Transport::new(client.clone())),
-        writes,
-        planning_context(),
-    );
+    let queries = Arc::new(CapturingClusterTransport::default());
+    let execution =
+        GatewayExecution::for_process_with_writes(queries.clone(), writes, planning_context());
     let context = GatewayRequestContext::new(7, 91, u64::MAX, Vec::new()).unwrap();
     let cancellation = GatewayCancellationToken::new();
 
@@ -247,15 +366,100 @@ fn process_create_retry_after_resolve_failure_accounts_for_the_write_once() {
 
     block_on(execution.execute_statement(
         GatewayRequestContext::new(7, 92, u64::MAX, Vec::new()).unwrap(),
-        "MATCH (n) RETURN n.id".into(),
+        count_statement(),
         BTreeMap::new(),
         None,
         &cancellation,
     ))
     .unwrap();
-    let requests = client.requests.lock().unwrap();
-    assert_eq!(requests[0].fragments[0].applied_index, 39);
-    assert_eq!(requests[0].fragments[0].transaction_time, 43);
+    assert_eq!(logical_scan_bound(&queries), 129);
+
+    assert_eq!(
+        block_on(execution.execute_statement(
+            GatewayRequestContext::new(7, 91, u64::MAX, Vec::new()).unwrap(),
+            create_statement(),
+            BTreeMap::new(),
+            None,
+            &GatewayCancellationToken::new(),
+        ))
+        .unwrap(),
+        GatewayResponse::Acknowledged
+    );
+    block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 93, u64::MAX, Vec::new()).unwrap(),
+        count_statement(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+    assert_eq!(logical_scan_bound(&queries), 129);
+}
+
+#[test]
+fn overlapping_replays_after_failed_resolution_advance_the_scan_bound_once() {
+    let writes = Arc::new(RecordingWriteTransport::fail_once_then_synchronize_two_resolutions());
+    let queries = Arc::new(CapturingClusterTransport::default());
+    let execution = Arc::new(GatewayExecution::for_process_with_writes(
+        queries.clone(),
+        writes,
+        planning_context(),
+    ));
+    assert_eq!(
+        block_on(execution.execute_statement(
+            GatewayRequestContext::new(7, 95, u64::MAX, Vec::new()).unwrap(),
+            create_statement(),
+            BTreeMap::new(),
+            None,
+            &GatewayCancellationToken::new(),
+        ))
+        .unwrap_err()
+        .code(),
+        "DTG-TEST-RESOLVE"
+    );
+
+    let first = {
+        let execution = execution.clone();
+        std::thread::spawn(move || {
+            block_on(execution.execute_statement(
+                GatewayRequestContext::new(7, 95, u64::MAX, Vec::new()).unwrap(),
+                create_statement(),
+                BTreeMap::new(),
+                None,
+                &GatewayCancellationToken::new(),
+            ))
+        })
+    };
+    let second = {
+        let execution = execution.clone();
+        std::thread::spawn(move || {
+            block_on(execution.execute_statement(
+                GatewayRequestContext::new(7, 95, u64::MAX, Vec::new()).unwrap(),
+                create_statement(),
+                BTreeMap::new(),
+                None,
+                &GatewayCancellationToken::new(),
+            ))
+        })
+    };
+    assert_eq!(
+        first.join().unwrap().unwrap(),
+        GatewayResponse::Acknowledged
+    );
+    assert_eq!(
+        second.join().unwrap().unwrap(),
+        GatewayResponse::Acknowledged
+    );
+
+    block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 96, u64::MAX, Vec::new()).unwrap(),
+        count_statement(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+    assert_eq!(logical_scan_bound(&queries), 129);
 }
 
 #[test]
