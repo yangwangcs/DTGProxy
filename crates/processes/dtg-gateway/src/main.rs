@@ -4,12 +4,15 @@ use dtg_execution::{
     GatewayExecution, GatewayExecutionTransportFactory, TonicGatewayProtocolV2TransportFactory,
     TonicGatewayWriteTransport,
 };
-use dtg_gateway::{GatewayConfig, GatewayService};
+use dtg_gateway::{GatewayConfig, GatewayService, build_gateway_runtime};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    build_gateway_runtime()?.block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::from_env()?;
     let factory = TonicGatewayProtocolV2TransportFactory;
     let transport = factory.connect(config.cluster_endpoint()).await?;
