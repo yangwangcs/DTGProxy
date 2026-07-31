@@ -331,6 +331,25 @@ impl MetaService for MetaRpcService {
                         .map(|reservation| reservation.commit_time())
                         .ok_or(TxnError::CorruptRecovery)
                 }),
+            5 => {
+                let reservation = self
+                    .timestamps
+                    .commit_time_reservation(transaction_id)
+                    .await;
+                match reservation {
+                    Ok(Some(reservation)) => self
+                        .timestamps
+                        .resolve_commit_time(
+                            transaction_id,
+                            reservation.commit_time(),
+                            CommitResolution::Committed,
+                        )
+                        .await
+                        .map(|()| reservation.commit_time()),
+                    Ok(None) => Err(TxnError::CorruptRecovery),
+                    Err(error) => Err(error),
+                }
+            }
             _ => unreachable!("validated transaction operation"),
         };
         Ok(Response::new(match result {

@@ -4,13 +4,110 @@ use dtg_control::{
     ShardId, ShardPlacement, Version,
 };
 use dtg_execution::cluster_protocol::proto::{
-    CatalogWatchRequest, RequestContext, meta_service_server::MetaService,
+    BoundedPayload, CatalogWatchRequest, RequestContext, ShardContext, StatusCode,
+    TransactionRequest, meta_service_server::MetaService,
 };
+use dtg_execution::cluster_protocol::{PROTOCOL_MAJOR, checksum_bytes};
 use dtg_meta::{MetaConfig, MetaProcess};
 use dtg_storage::DurabilityPolicy;
 use dtg_transaction::{CommitResolution, TransactionId};
 use tokio_stream::StreamExt;
 use tonic::Request;
+
+#[tokio::test]
+async fn meta_rpc_resolve_committed_is_idempotent_and_cannot_be_reversed() {
+    let root = tempfile::tempdir().unwrap();
+    let process = MetaProcess::open(MetaConfig::for_test(root.path(), 7, 1).unwrap())
+        .await
+        .unwrap();
+    let service = process.rpc_service();
+    let transaction_id = 91_u128.to_be_bytes().to_vec();
+
+    let reserved = MetaService::submit_transaction(
+        &service,
+        Request::new(transaction_request(transaction_id.clone(), 2)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(reserved.code, StatusCode::Ok as i32);
+    let commit_time = i64::from_be_bytes(reserved.details.unwrap().body.try_into().unwrap());
+
+    let recovered = MetaService::submit_transaction(
+        &service,
+        Request::new(transaction_request(transaction_id.clone(), 4)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(recovered.code, StatusCode::Ok as i32);
+    assert_eq!(
+        i64::from_be_bytes(recovered.details.unwrap().body.try_into().unwrap()),
+        commit_time
+    );
+
+    let committed = MetaService::submit_transaction(
+        &service,
+        Request::new(transaction_request(transaction_id.clone(), 5)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(committed.code, StatusCode::Ok as i32);
+    assert_eq!(
+        i64::from_be_bytes(committed.details.unwrap().body.try_into().unwrap()),
+        commit_time
+    );
+
+    let repeated = MetaService::submit_transaction(
+        &service,
+        Request::new(transaction_request(transaction_id.clone(), 5)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(repeated.code, StatusCode::Ok as i32);
+
+    let aborted = MetaService::submit_transaction(
+        &service,
+        Request::new(transaction_request(transaction_id, 3)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(aborted.code, StatusCode::Conflict as i32);
+}
+
+fn transaction_request(transaction_id: Vec<u8>, operation: i32) -> TransactionRequest {
+    let body = vec![operation as u8];
+    TransactionRequest {
+        context: Some(ShardContext {
+            request: Some(RequestContext {
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: 1,
+                cluster_id: 7_u64.to_be_bytes().to_vec(),
+                request_id: 92_u128.to_be_bytes().to_vec(),
+                deadline_unix_ms: u64::MAX,
+                trace_context: Vec::new(),
+            }),
+            graph_id: 1,
+            shard_id: 1,
+            placement_epoch: 1,
+            backend_generation: 1,
+            catalog_version: 1,
+        }),
+        transaction_id,
+        operation,
+        idempotency_key: 93_u128.to_be_bytes().to_vec(),
+        payload: Some(BoundedPayload {
+            format_version: 1,
+            declared_len: body.len() as u64,
+            item_count: 1,
+            checksum: checksum_bytes(&body).to_vec(),
+            body,
+        }),
+    }
+}
 
 #[tokio::test]
 async fn meta_process_replays_catalog_and_timestamps_from_fjall_consensus() {
