@@ -448,12 +448,9 @@ impl DataExecution {
         fence: ReadFence,
     ) -> GatewayFuture<'a, Result<Arc<dyn TemporalReadView>, GatewayExecutionError>> {
         Box::pin(async move {
-            if store.applied_index().await.map_err(data_storage_error)? != fence.applied_index() {
-                return Err(data_error(
-                    "replica applied index does not match requested read fence",
-                ));
-            }
-            if let Some(view) = self.cached_read_view(key, &store, &fence)? {
+            if let Some(view) = self.cached_read_view(key, &store, &fence)?
+                && store.applied_index().await.map_err(data_storage_error)? == fence.applied_index()
+            {
                 return Ok(view);
             }
 
@@ -468,15 +465,24 @@ impl DataExecution {
             }
             let opened: Arc<dyn TemporalReadView> = Arc::from(opened);
 
-            if !Arc::ptr_eq(self.runtime_store(key)?.state(), &store) {
-                return Err(data_error(
-                    "replica runtime store changed while opening read view",
-                ));
-            }
             if store.applied_index().await.map_err(data_storage_error)? != fence.applied_index() {
                 return Ok(opened);
             }
 
+            // Holding these in lifecycle order prevents a removed store from repopulating the
+            // cache after a replacement has cleared its entry.
+            let stores = self
+                .stores
+                .lock()
+                .map_err(|_| data_error("replica store mutex is poisoned"))?;
+            if !stores
+                .get(&key)
+                .is_some_and(|runtime| Arc::ptr_eq(runtime.state(), &store))
+            {
+                return Err(data_error(
+                    "replica runtime store changed while opening read view",
+                ));
+            }
             let mut read_views = self
                 .read_views
                 .lock()

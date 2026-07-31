@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 
 use dtg_analytics::{
     AlgorithmRequest, AnalyticsAlgorithmStep, AnalyticsArtifact, AnalyticsArtifactIoBudget,
@@ -185,6 +186,31 @@ struct CountingReadStore {
     returned_fence: Option<ReadFence>,
 }
 
+struct PausingReadStore {
+    binding: ReplicaBinding,
+    applied_index: AtomicU64,
+    begin_called: AtomicUsize,
+    entered_after_open: mpsc::SyncSender<()>,
+    resume_after_open: Mutex<mpsc::Receiver<()>>,
+}
+
+impl PausingReadStore {
+    fn new(
+        binding: ReplicaBinding,
+        applied_index: u64,
+        entered_after_open: mpsc::SyncSender<()>,
+        resume_after_open: mpsc::Receiver<()>,
+    ) -> Self {
+        Self {
+            binding,
+            applied_index: AtomicU64::new(applied_index),
+            begin_called: AtomicUsize::new(0),
+            entered_after_open,
+            resume_after_open: Mutex::new(resume_after_open),
+        }
+    }
+}
+
 impl CountingReadStore {
     fn new(binding: ReplicaBinding, applied_index: u64) -> Self {
         Self {
@@ -222,6 +248,39 @@ impl ReplicaStateStore for CountingReadStore {
         self.begin_read_view_calls.fetch_add(1, Ordering::SeqCst);
         let returned_fence = self.returned_fence.clone().unwrap_or(fence);
         Box::pin(async move { Ok(Box::new(EmptyReadView { returned_fence }) as Box<_>) })
+    }
+}
+
+impl ReplicaStateStore for PausingReadStore {
+    fn binding(&self) -> &ReplicaBinding {
+        &self.binding
+    }
+
+    fn applied_index(&self) -> StoreFuture<'_, u64> {
+        Box::pin(async move {
+            if self.begin_called.load(Ordering::SeqCst) != 0 {
+                self.entered_after_open.send(()).unwrap();
+                self.resume_after_open.lock().unwrap().recv().unwrap();
+            }
+            Ok(self.applied_index.load(Ordering::SeqCst))
+        })
+    }
+
+    fn replica_metadata<'a>(&'a self, _name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn apply(&self, _batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
+        Box::pin(async { Err(StorageError::Unsupported) })
+    }
+
+    fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
+        self.begin_called.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(Box::new(EmptyReadView {
+                returned_fence: fence,
+            }) as Box<_>)
+        })
     }
 }
 
@@ -546,10 +605,10 @@ fn point_fragment_body(vertex_id: u128) -> Vec<u8> {
     body
 }
 
-fn read_runtime(
-    binding: ReplicaBinding,
-    store: Arc<CountingReadStore>,
-) -> (DataExecution, dtg_shard::ReplicaKey) {
+fn read_runtime<T>(binding: ReplicaBinding, store: Arc<T>) -> (DataExecution, dtg_shard::ReplicaKey)
+where
+    T: ReplicaStateStore + 'static,
+{
     let runtime = DataExecution::builder()
         .with_provider(ProviderKind::Fjall, resolver(ProviderKind::Fjall))
         .build()
@@ -649,6 +708,80 @@ fn read_view_cache_rejects_a_provider_view_with_a_different_fence() {
 
     assert!(result.is_err());
     assert_eq!(store.begin_read_view_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn read_view_cache_defers_a_miss_to_the_provider_read_view() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "read-view-cache-provider-fence");
+    let store = Arc::new(
+        CountingReadStore::new(binding.clone(), 10)
+            .returning_fence(ReadFence::new(binding.clone(), 9)),
+    );
+    let (runtime, key) = read_runtime(binding, store.clone());
+
+    block_on(runtime.execute_fragment(
+        key,
+        9,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &point_fragment_body(17),
+    ))
+    .unwrap();
+
+    assert_eq!(store.begin_read_view_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn read_view_cache_does_not_retain_an_open_view_after_replica_replacement() {
+    let binding = binding(
+        ProviderKind::Fjall,
+        5,
+        6,
+        "read-view-cache-replacement-race",
+    );
+    let (entered_after_open, entered) = mpsc::sync_channel(1);
+    let (resume, resume_after_open) = mpsc::channel();
+    let old = Arc::new(PausingReadStore::new(
+        binding.clone(),
+        0,
+        entered_after_open,
+        resume_after_open,
+    ));
+    let old_weak = Arc::downgrade(&old);
+    let (runtime, key) = read_runtime(binding.clone(), old.clone());
+    runtime.start_replica(key).unwrap();
+    let runtime = Arc::new(runtime);
+    let worker = {
+        let runtime = Arc::clone(&runtime);
+        thread::spawn(move || {
+            block_on(runtime.execute_fragment(
+                key,
+                0,
+                TransactionTime::new(23).unwrap(),
+                17,
+                &point_fragment_body(17),
+            ))
+        })
+    };
+
+    entered.recv().unwrap();
+    runtime.remove_replica(key).unwrap();
+    let replacement: Arc<dyn ReplicaStateStore> =
+        Arc::new(CountingReadStore::new(binding.clone(), 0));
+    assert_eq!(
+        runtime
+            .add_replica_runtime(
+                Arc::new(BindingConsensus { binding }),
+                ResolvedReplicaStore::state_only(replacement),
+            )
+            .unwrap(),
+        key
+    );
+    resume.send(()).unwrap();
+    assert!(worker.join().unwrap().is_err());
+    drop(old);
+
+    assert!(old_weak.upgrade().is_none());
 }
 
 #[test]
