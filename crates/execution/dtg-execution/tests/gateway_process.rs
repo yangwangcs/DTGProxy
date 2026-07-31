@@ -83,7 +83,21 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
                     vec![encoded_batch(1, encoded_vertex_rows(1..=2), 2)]
                 }
                 ProtocolFixture::RawPoint => {
-                    vec![encoded_batch(1, encoded_vertex_rows(1..=4096), 4096)]
+                    let encoded_id = 2048_u128.to_be_bytes();
+                    let point_lookup = request.fragments.iter().all(|fragment| {
+                        fragment.payload.as_ref().is_some_and(|payload| {
+                            payload
+                                .body
+                                .windows(encoded_id.len())
+                                .any(|window| window == encoded_id)
+                        })
+                    });
+                    let (rows, row_count) = if point_lookup {
+                        (2048..=2048, 1)
+                    } else {
+                        (1..=4096, 4096)
+                    };
+                    vec![encoded_batch(1, encoded_vertex_rows(rows), row_count)]
                 }
                 ProtocolFixture::RawCount => request
                     .fragments
@@ -1189,36 +1203,36 @@ fn binds_parameters_recursively_in_expression_shapes_and_values() {
 }
 
 #[test]
-fn binds_parameters_while_lowering_the_fixed_point_predicate() {
+fn plans_a_literal_node_id_predicate_as_a_vertex_point() {
     let client = Arc::new(RecordingProtocolClient::default());
     let execution = GatewayExecution::for_process(
         Arc::new(GatewayProtocolV2Transport::new(client)),
         planning_context(),
     );
     let program = execution
-        .compile("MATCH (n) WHERE n.id = $id RETURN n.id")
+        .compile("MATCH (n) WHERE n.id = 2048 RETURN n.id")
         .unwrap();
     let physical = Planner.plan(&program, &planning_context()).unwrap();
-
-    let executable = execution
-        .lower_plan_with_parameters(
-            &physical,
-            &BTreeMap::from([("id".into(), GatewayValue::Integer(2048))]),
-        )
-        .unwrap();
-
-    let predicate = executable
-        .operators()
-        .iter()
-        .find_map(|operator| match operator.kind() {
-            dtg_query::ExecutableOperatorKind::Filter { predicate, .. } => Some(predicate),
-            _ => None,
-        })
-        .unwrap();
-    let LogicalExpr::Binary { right, .. } = predicate.logical() else {
-        panic!("expected binary predicate")
+    let access = &physical.fragments()[0].storage_accesses()[0];
+    let point_id = match access {
+        dtg_plan::StorageAccess::Logical(request) => {
+            let dtg_plan::LogicalReadOperation::VertexPoint(id) = request.operation() else {
+                panic!("exact node identity must use a logical vertex point read")
+            };
+            id.get()
+        }
+        dtg_plan::StorageAccess::Pushdown { request, .. } => {
+            let dtg_storage::PushdownOperation::Vertex(read) = request.operation() else {
+                panic!("exact node identity must use a pushed-down vertex point read")
+            };
+            read.id().get()
+        }
     };
-    assert_eq!(right.as_ref(), &LogicalExpr::Literal(Value::Integer(2048)));
+    assert_eq!(point_id, 2048);
+    assert!(!physical.operators().iter().any(|operator| matches!(
+        operator.kind(),
+        dtg_plan::PhysicalOperatorKind::Filter { .. }
+    )));
 }
 
 #[test]

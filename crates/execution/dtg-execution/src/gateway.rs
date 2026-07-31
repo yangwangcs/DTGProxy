@@ -1317,8 +1317,10 @@ impl GatewayExecution {
                                 GatewayRetry::Safe,
                             )
                         })?;
-                        let physical_plan =
-                            planner.plan(&program, &planning_context).map_err(|error| {
+                        let bound_program = bind_vertex_lookup_parameters(&program, &parameters)?;
+                        let physical_plan = planner
+                            .plan(&bound_program, &planning_context)
+                            .map_err(|error| {
                                 GatewayExecutionError::new(
                                     "DTG-EXECUTION-PLAN",
                                     error.to_string(),
@@ -3129,6 +3131,22 @@ pub fn bind_logical_expr(
             .collect::<Result<Vec<_>, _>>()
             .map(LogicalExpr::Map),
     }
+}
+
+fn bind_vertex_lookup_parameters(
+    program: &LogicalProgram,
+    parameters: &BTreeMap<String, GatewayValue>,
+) -> Result<LogicalProgram, GatewayExecutionError> {
+    let mut program = program.clone();
+    let LogicalStatement::Query(plan) = &mut program.statement else {
+        return Ok(program);
+    };
+    for node in &mut plan.nodes {
+        if let LogicalNodeKind::VertexLookup(lookup) = &mut node.kind {
+            lookup.id = bind_logical_expr(&lookup.id, parameters)?;
+        }
+    }
+    Ok(program)
 }
 
 async fn execute_process_create(

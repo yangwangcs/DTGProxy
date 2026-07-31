@@ -44,6 +44,35 @@ fn count_remains_a_valid_variable_name_without_a_star_argument() {
 }
 
 #[test]
+fn normalizes_exact_node_id_predicate_to_a_vertex_lookup() {
+    let program = compile(
+        "MATCH (n:Bench) WHERE n.id = $id RETURN n.id",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = &program.statement else {
+        panic!()
+    };
+    let lookup = plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            LogicalNodeKind::VertexLookup(lookup) => Some(lookup),
+            _ => None,
+        })
+        .expect("exact node identity predicate must become a vertex lookup");
+    assert_eq!(lookup.variable, "n");
+    assert_eq!(lookup.labels, ["Bench"]);
+    assert_eq!(lookup.id, LogicalExpr::Parameter("id".into()));
+    assert!(
+        !plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, LogicalNodeKind::Filter { .. }))
+    );
+}
+
+#[test]
 fn as_of_query_normalizes_to_explicit_scope() {
     let program = compile(
         "MATCH (n) FOR SYSTEM_TIME AS OF $t RETURN n",

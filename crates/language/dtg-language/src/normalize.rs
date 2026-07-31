@@ -7,6 +7,7 @@ use dtg_language_ir::{
     LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement,
     LogicalType, LogicalWrite, NodeScan, Projection, ReadScope, RowSchema, Sort, SortDirection,
     SortKey, TemporalScope, TimeExpr, ValidIntervalExpr, ValidTimeExpr, ValidTimePredicate,
+    VertexLookup,
 };
 
 use crate::{
@@ -223,6 +224,7 @@ fn normalize_selection(
     let mut nodes = Vec::new();
     let mut root = None;
     let mut bound = BTreeSet::new();
+    let point_lookup = exact_vertex_lookup(matches, where_clause);
     for matching in matches {
         let (valid, system) = effective_scope(scopes, &matching.scopes)?;
         let scope = read_scope(valid.as_ref(), system.as_ref())?;
@@ -240,14 +242,24 @@ fn normalize_selection(
             root.expect("a bound anchor requires an existing root")
         } else {
             let id = LogicalNodeId::new(nodes.len() as u32);
-            nodes.push(LogicalNode {
-                id,
-                kind: LogicalNodeKind::NodeScan(NodeScan {
-                    variable: first.variable.clone(),
-                    labels: first.labels.clone(),
-                    read_scope: scope.clone(),
-                }),
-            });
+            let kind = point_lookup.as_ref().map_or_else(
+                || {
+                    LogicalNodeKind::NodeScan(NodeScan {
+                        variable: first.variable.clone(),
+                        labels: first.labels.clone(),
+                        read_scope: scope.clone(),
+                    })
+                },
+                |id| {
+                    LogicalNodeKind::VertexLookup(VertexLookup {
+                        variable: first.variable.clone(),
+                        id: logical_expr(id),
+                        labels: first.labels.clone(),
+                        read_scope: scope.clone(),
+                    })
+                },
+            );
+            nodes.push(LogicalNode { id, kind });
             bound.insert(first.variable.clone());
             id
         };
@@ -292,7 +304,9 @@ fn normalize_selection(
     let mut root = root.ok_or_else(|| {
         LanguageError::semantic("DTG-LANG-EMPTY-QUERY", "query requires a MATCH pattern")
     })?;
-    if let Some((left, right)) = where_clause {
+    if point_lookup.is_none()
+        && let Some((left, right)) = where_clause
+    {
         let id = LogicalNodeId::new(nodes.len() as u32);
         nodes.push(LogicalNode {
             id,
@@ -308,6 +322,37 @@ fn normalize_selection(
         root = id;
     }
     Ok(LogicalPlan { root, nodes })
+}
+
+fn exact_vertex_lookup<'a>(
+    matches: &'a [crate::ast::Match],
+    where_clause: Option<&'a (Expr, Expr)>,
+) -> Option<&'a Expr> {
+    let [matching] = matches else {
+        return None;
+    };
+    if matching.pattern.nodes.len() != 1 || !matching.pattern.relationships.is_empty() {
+        return None;
+    }
+    let variable = &matching.pattern.nodes[0].variable;
+    let (left, right) = where_clause?;
+    match (left, right) {
+        (Expr::Property { input, name }, identity)
+            if input == variable && name == "id" && vertex_identity_expression(identity) =>
+        {
+            Some(identity)
+        }
+        (identity, Expr::Property { input, name })
+            if input == variable && name == "id" && vertex_identity_expression(identity) =>
+        {
+            Some(identity)
+        }
+        _ => None,
+    }
+}
+
+fn vertex_identity_expression(expression: &Expr) -> bool {
+    matches!(expression, Expr::Integer(_) | Expr::Parameter(_))
 }
 
 fn expand_edge(
