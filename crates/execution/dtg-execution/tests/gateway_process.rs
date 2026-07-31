@@ -77,8 +77,8 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
                 }
             }),
         };
-        let mut batches = (request.execution_request.as_ref().unwrap().body[0] == 1)
-            .then(|| match self.fixture {
+        let mut batches = if request.execution_request.as_ref().unwrap().body[0] == 1 {
+            match self.fixture {
                 ProtocolFixture::RawTwo => {
                     vec![encoded_batch(1, encoded_vertex_rows(1..=2), 2)]
                 }
@@ -112,8 +112,10 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
                 ProtocolFixture::MissingFragment => {
                     vec![encoded_batch(1, encoded_vertex_rows(1..=1), 1)]
                 }
-            })
-            .unwrap_or_default();
+            }
+        } else {
+            Vec::new()
+        };
         for batch in &mut batches {
             batch.request = request.request.clone();
         }
