@@ -3079,7 +3079,7 @@ async fn execute_process_create(
     write: &dtg_language_ir::LogicalWrite,
     parameters: &BTreeMap<String, GatewayValue>,
     planning_context: &PlanningContext,
-    write_accounting: &Mutex<ProcessWriteAccounting>,
+    write_accounting: &ProcessWriteAccounting,
 ) -> Result<ProcessWriteOutcome, GatewayExecutionError> {
     let [catalog_shard] = planning_context.catalog().shards() else {
         return Err(GatewayExecutionError::new(
@@ -3328,9 +3328,10 @@ fn complete_process_write_attempt(
             accounting.states.get(&transaction_id),
             Some(ProcessWriteAccountingState::Reserved)
         ) {
-            accounting = write_accounting.receipt_ready.wait(accounting).map_err(|_| {
-                process_write_error("process write-accounting lock is poisoned")
-            })?;
+            accounting = write_accounting
+                .receipt_ready
+                .wait(accounting)
+                .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?;
         }
     }
     Ok(())
@@ -3356,6 +3357,11 @@ fn account_process_write(
             true
         }
         Some(ProcessWriteAccountingState::Accounted) | None => false,
+        Some(ProcessWriteAccountingState::Reserved) => {
+            return Err(process_write_error(
+                "process write accounting receipt was not classified",
+            ));
+        }
         Some(ProcessWriteAccountingState::Accounting) => {
             return Err(process_write_error(
                 "process write accounting state was observed while owned",
@@ -3737,24 +3743,23 @@ mod write_receipt_tests {
 
     #[test]
     fn pending_write_accounting_rejects_new_attempts_without_evicting_ambiguity() {
-        let mut accounting = ProcessWriteAccounting::default();
+        let accounting = ProcessWriteAccounting::default();
         let first = TransactionId::new(1).unwrap();
         for id in 1..=u128::try_from(PROCESS_WRITE_ACCOUNTING_LIMIT).unwrap() {
             let transaction_id = TransactionId::new(id).unwrap();
-            assert!(accounting.reserve_capacity(transaction_id).unwrap());
-            accounting.complete_attempt(transaction_id, true, true);
+            assert!(reserve_process_write_capacity(&accounting, transaction_id).unwrap());
+            complete_process_write_attempt(&accounting, transaction_id, true, true).unwrap();
         }
         assert!(matches!(
-            accounting.states.get(&first),
+            accounting.state.lock().unwrap().states.get(&first),
             Some(ProcessWriteAccountingState::Pending)
         ));
         assert!(
-            accounting
-                .reserve_capacity(TransactionId::new(5_000).unwrap())
+            reserve_process_write_capacity(&accounting, TransactionId::new(5_000).unwrap())
                 .is_err()
         );
         assert!(matches!(
-            accounting.states.get(&first),
+            accounting.state.lock().unwrap().states.get(&first),
             Some(ProcessWriteAccountingState::Pending)
         ));
     }
