@@ -18,8 +18,9 @@ use dtg_control::{
     RetentionPin,
 };
 use dtg_execution::{
-    ControlActionExecutor, ControllerExecution, DataExecution, GatewayExecution, MetaExecution,
-    ProviderKind, ProviderResolver, ReplicaBinding, ReplicaStateStore, StoreFuture,
+    ControlActionExecutor, ControllerExecution, DataExecution, GatewayCancellationToken,
+    GatewayExecution, GatewayRequestContext, GatewayValue, MetaExecution, ProviderKind,
+    ProviderResolver, ReplicaBinding, ReplicaStateStore, RequestStage, StoreFuture,
 };
 use dtg_language::{EmptySchemaCatalog, Language};
 use dtg_plan::{
@@ -563,6 +564,28 @@ fn gateway_composition_lowers_every_execution_fence_without_drift() {
             .unwrap(),
         AnalyticsSchedulerTick::Idle
     );
+}
+
+#[test]
+fn composed_gateway_process_query_does_not_cancel_plan_metric() {
+    let gateway = gateway();
+    let error = block_on(gateway.execute_statement(
+        GatewayRequestContext::new(1, 7, u64::MAX, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n".into(),
+        BTreeMap::<String, GatewayValue>::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code(), "DTG-EXECUTION-PROCESS-TRANSPORT");
+    let plan = gateway
+        .request_metrics()
+        .snapshot()
+        .stage(RequestStage::GatewayPlan);
+    assert_eq!(plan.success, 0);
+    assert_eq!(plan.error, 0);
+    assert_eq!(plan.cancelled, 0);
 }
 
 #[test]
