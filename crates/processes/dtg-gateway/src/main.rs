@@ -29,11 +29,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         GatewayExecution::for_process_with_writes(transport, write_transport, planning_context);
     let bind_addr = config.bind_addr();
     let service = Arc::new(GatewayService::new(config, execution));
-    let metrics_exporter = spawn_metrics_exporter(
-        "gateway",
-        service.request_metrics(),
-        RequestMetricsSink::stderr()?,
-    );
+    let metrics_sink =
+        RequestMetricsSink::stderr().unwrap_or_else(|_| RequestMetricsSink::disabled());
+    let metrics_exporter =
+        spawn_metrics_exporter("gateway", service.request_metrics(), metrics_sink);
     let listener = TcpListener::bind(bind_addr).await?;
     let result = tokio::select! {
         result = dtg_gateway::serve_bolt(listener, service) => result,

@@ -14,11 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DataProcessConfig::from_env()?;
     let rpc_addr = config.rpc_addr();
     let node = DataNodeBuilder::from_config(config).start().await?;
-    let metrics_exporter = spawn_metrics_exporter(
-        "data",
-        node.request_metrics(),
-        RequestMetricsSink::stderr()?,
-    );
+    let metrics_sink =
+        RequestMetricsSink::stderr().unwrap_or_else(|_| RequestMetricsSink::disabled());
+    let metrics_exporter = spawn_metrics_exporter("data", node.request_metrics(), metrics_sink);
     let service = node.rpc_service();
     let shutdown = service.clone();
 

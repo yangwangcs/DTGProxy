@@ -261,6 +261,12 @@ pub struct RequestMetricsSink {
 }
 
 impl RequestMetricsSink {
+    pub fn disabled() -> Self {
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        Self { sender }
+    }
+
     pub fn stderr() -> io::Result<Self> {
         Self::spawn_with_writer(|line| {
             let mut stderr = io::stderr().lock();
@@ -320,6 +326,16 @@ mod tests {
 
         drop(sink);
         release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn disabled_metrics_sink_drops_without_blocking() {
+        let sink = RequestMetricsSink::disabled();
+        let started = Instant::now();
+        for ordinal in 0..10_000 {
+            sink.try_write(format!("ignored-{ordinal}"));
+        }
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
