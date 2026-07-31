@@ -291,12 +291,11 @@ fn check_identity(
     identity: &mut Option<BoltResult>,
     result: BoltResult,
 ) -> io::Result<()> {
-    if !workload.is_write() {
-        if let Some(existing) = identity {
-            if existing.fields != result.fields || existing.result_digest != result.result_digest {
-                return Err(invalid_data("read operation returned a different identity"));
-            }
-        }
+    if !workload.is_write()
+        && let Some(existing) = identity
+        && (existing.fields != result.fields || existing.result_digest != result.result_digest)
+    {
+        return Err(invalid_data("read operation returned a different identity"));
     }
     *identity = Some(result);
     Ok(())

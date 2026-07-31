@@ -1,6 +1,7 @@
 mod backend_e2e_support;
 
 use std::collections::BTreeMap;
+use std::env;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,8 +11,71 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use backend_e2e_support::{
-    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, Workload, measure_cell,
+    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, Workload, measure_cell, percentile_ns,
 };
+
+#[derive(serde::Serialize)]
+struct QuickResult {
+    backend: Backend,
+    workload: Workload,
+    concurrency: usize,
+    operations: u64,
+    throughput_ops_per_second: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    errors: u64,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires release DTGProxy binaries and the selected live backend"]
+async fn quick_selected_backend_e2e_comparison() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let backend = match env::var("DTG_BACKEND_E2E_SELECTED_BACKEND").as_deref() {
+        Ok("fjall") => Backend::Fjall,
+        Ok("postgresql") => Backend::PostgreSql,
+        Ok("neo4j") => Backend::Neo4j,
+        _ => panic!("DTG_BACKEND_E2E_SELECTED_BACKEND must be fjall, postgresql, or neo4j"),
+    };
+    for workload in [
+        Workload::CreateVertex,
+        Workload::PointLookup,
+        Workload::CountVertices,
+    ] {
+        for concurrency in [1, 8] {
+            let spec = CellSpec {
+                backend,
+                workload,
+                concurrency,
+                repetition: 0,
+            };
+            let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+            if !workload.is_write() {
+                cluster.seed_read_dataset(4_096).await.unwrap();
+            }
+            let observation = measure_cell(cluster.bolt_address(), spec).await.unwrap();
+            cluster.shutdown().await.unwrap();
+            assert_eq!(observation.errors, 0);
+            assert!(!observation.latency_samples_ns.is_empty());
+            let result = QuickResult {
+                backend,
+                workload,
+                concurrency,
+                operations: observation.operations,
+                throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
+                    / observation.measured_duration_ns as f64,
+                p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
+                p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
+                p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
+                errors: observation.errors,
+            };
+            println!(
+                "DTG_BACKEND_E2E_QUICK_RESULT={}",
+                serde_json::to_string(&result).unwrap()
+            );
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires release DTGProxy binaries"]
@@ -201,7 +265,7 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
     };
 
     let summary: Vec<backend_e2e_support::Summary> =
-        backend_e2e_support::summarize(&[observation.clone()]);
+        backend_e2e_support::summarize(std::slice::from_ref(&observation));
     assert_eq!(summary.len(), 1);
     assert_eq!(summary[0].p95_ns, 30);
     let artifact = serde_json::to_value(observation).unwrap();
