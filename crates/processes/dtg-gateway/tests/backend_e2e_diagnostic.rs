@@ -3,6 +3,8 @@ mod backend_e2e_support;
 use std::collections::BTreeMap;
 use std::env;
 use std::io;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -37,44 +39,77 @@ async fn quick_selected_backend_e2e_comparison() {
         Ok("neo4j") => Backend::Neo4j,
         _ => panic!("DTG_BACKEND_E2E_SELECTED_BACKEND must be fjall, postgresql, or neo4j"),
     };
-    for workload in [
-        Workload::CreateVertex,
-        Workload::PointLookup,
-        Workload::CountVertices,
-    ] {
-        for concurrency in [1, 8] {
-            let spec = CellSpec {
-                backend,
-                workload,
-                concurrency,
-                repetition: 0,
-            };
-            let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
-            if !workload.is_write() {
-                cluster.seed_read_dataset(4_096).await.unwrap();
+    let output = env::var_os("DTG_BACKEND_E2E_QUICK_OUTPUT").map(PathBuf::from);
+    let repetitions = if output.is_some() {
+        let configured = env::var("DTG_BACKEND_E2E_QUICK_REPETITIONS")
+            .expect("DTG_BACKEND_E2E_QUICK_REPETITIONS is required with quick output")
+            .parse::<u8>()
+            .expect("DTG_BACKEND_E2E_QUICK_REPETITIONS must be an integer");
+        assert_eq!(configured, 3, "quick artifact requires three repetitions");
+        configured
+    } else {
+        1
+    };
+    let mut observations = Vec::with_capacity(usize::from(repetitions) * 6);
+    for repetition in 0..repetitions {
+        for workload in [
+            Workload::CreateVertex,
+            Workload::PointLookup,
+            Workload::CountVertices,
+        ] {
+            for concurrency in [1, 8] {
+                let spec = CellSpec {
+                    backend,
+                    workload,
+                    concurrency,
+                    repetition,
+                };
+                let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+                if !workload.is_write() {
+                    cluster.seed_read_dataset(4_096).await.unwrap();
+                }
+                let observation = measure_cell(cluster.bolt_address(), spec).await.unwrap();
+                cluster.shutdown().await.unwrap();
+                assert_eq!(observation.errors, 0);
+                assert!(!observation.latency_samples_ns.is_empty());
+                let result = QuickResult {
+                    backend,
+                    workload,
+                    concurrency,
+                    operations: observation.operations,
+                    throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
+                        / observation.measured_duration_ns as f64,
+                    p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
+                    p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
+                    p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
+                    errors: observation.errors,
+                };
+                println!(
+                    "DTG_BACKEND_E2E_QUICK_RESULT={}",
+                    serde_json::to_string(&result).unwrap()
+                );
+                observations.push(observation);
             }
-            let observation = measure_cell(cluster.bolt_address(), spec).await.unwrap();
-            cluster.shutdown().await.unwrap();
-            assert_eq!(observation.errors, 0);
-            assert!(!observation.latency_samples_ns.is_empty());
-            let result = QuickResult {
-                backend,
-                workload,
-                concurrency,
-                operations: observation.operations,
-                throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
-                    / observation.measured_duration_ns as f64,
-                p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
-                p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
-                p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
-                errors: observation.errors,
-            };
-            println!(
-                "DTG_BACKEND_E2E_QUICK_RESULT={}",
-                serde_json::to_string(&result).unwrap()
-            );
         }
     }
+    if let Some(output) = output {
+        let artifact =
+            backend_e2e_support::QuickDiagnosticArtifact::new(current_revision(), observations)
+                .unwrap();
+        backend_e2e_support::write_quick_artifact(&output, &artifact).unwrap();
+    }
+}
+
+fn current_revision() -> String {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git must resolve the quick diagnostic revision");
+    assert!(output.status.success(), "git rev-parse HEAD failed");
+    String::from_utf8(output.stdout)
+        .expect("git revision must be UTF-8")
+        .trim()
+        .to_owned()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -271,6 +306,82 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
     let artifact = serde_json::to_value(observation).unwrap();
     assert_eq!(artifact["backend"], "fjall");
     assert_eq!(artifact["workload"], "point_lookup");
+}
+
+#[test]
+fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
+    let observations = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    let artifact =
+        backend_e2e_support::QuickDiagnosticArtifact::new("test-revision", observations).unwrap();
+    assert_eq!(artifact.repetitions, 3);
+    assert_eq!(artifact.observations.len(), 18);
+    assert_eq!(artifact.summaries.len(), 6);
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("quick.json");
+    backend_e2e_support::write_quick_artifact(&output, &artifact).unwrap();
+    assert!(backend_e2e_support::write_quick_artifact(&output, &artifact).is_err());
+}
+
+#[test]
+fn quick_artifact_rejects_incomplete_matrix_and_changed_read_identity() {
+    let mut incomplete = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    incomplete.pop();
+    let error =
+        backend_e2e_support::QuickDiagnosticArtifact::new("revision", incomplete).unwrap_err();
+    assert!(error.to_string().contains("three complete repetitions"));
+
+    let mut changed = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    let observation = changed
+        .iter_mut()
+        .find(|observation| {
+            observation.repetition == 2
+                && observation.workload == backend_e2e_support::Workload::PointLookup
+                && observation.concurrency == 1
+        })
+        .unwrap();
+    observation.result_digest = "changed-result".into();
+    let error = backend_e2e_support::QuickDiagnosticArtifact::new("revision", changed).unwrap_err();
+    assert!(error.to_string().contains("read identity changed"));
+}
+
+fn complete_quick_observations(
+    backend: backend_e2e_support::Backend,
+    repetitions: u8,
+) -> Vec<backend_e2e_support::RawObservation> {
+    let mut observations = Vec::new();
+    for repetition in 0..repetitions {
+        for workload in [
+            backend_e2e_support::Workload::CreateVertex,
+            backend_e2e_support::Workload::PointLookup,
+            backend_e2e_support::Workload::CountVertices,
+        ] {
+            for concurrency in [1, 8] {
+                observations.push(backend_e2e_support::RawObservation {
+                    backend,
+                    workload,
+                    concurrency,
+                    repetition,
+                    started_at_unix_ns: 10,
+                    finished_at_unix_ns: 20,
+                    warmup_finished_at_unix_ns: 15,
+                    measurement_started_at_unix_ns: 15,
+                    measurement_finished_at_unix_ns: 20,
+                    measured_duration_ns: 5,
+                    operations: 2,
+                    errors: 0,
+                    latency_samples_ns: vec![10, 20],
+                    row_count: u64::from(!workload.is_write()),
+                    result_digest: if workload.is_write() {
+                        String::new()
+                    } else {
+                        "stable-result".into()
+                    },
+                    query_digest: format!("{workload:?}"),
+                });
+            }
+        }
+    }
+    observations
 }
 
 async fn serve_fake_bolt_session(socket: &mut TcpStream, exchanges: usize) {

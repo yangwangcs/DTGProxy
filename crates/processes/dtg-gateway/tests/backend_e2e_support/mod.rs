@@ -7,7 +7,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 pub use artifact::{
-    Backend, CellSpec, RawObservation, Summary, Workload, percentile_ns, summarize,
+    Backend, CellSpec, QuickDiagnosticArtifact, RawObservation, Summary, Workload, percentile_ns,
+    summarize, write_quick_artifact,
 };
 pub use bolt::{BoltResult, BoltSession, BoltValue, measure_cell as measure_cell_with_durations};
 pub use cluster::{DiagnosticCluster, DiagnosticRuntime};
