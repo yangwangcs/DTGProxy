@@ -141,6 +141,8 @@ struct RecordingWriteTransport {
     events: Mutex<Vec<&'static str>>,
     requests: Mutex<Vec<GatewayWriteRequest>>,
     apply_calls: AtomicUsize,
+    apply_barrier: Option<Arc<Barrier>>,
+    reverse_apply_replay: bool,
     resolve_calls: AtomicUsize,
     resolve_failures: AtomicUsize,
     resolve_barrier: Option<Arc<Barrier>>,
@@ -157,6 +159,16 @@ impl RecordingWriteTransport {
 
     fn synchronize_two_resolutions() -> Self {
         Self {
+            resolve_barrier: Some(Arc::new(Barrier::new(2))),
+            synchronize_after_resolve: Some(0),
+            ..Self::default()
+        }
+    }
+
+    fn synchronize_with_reversed_apply_receipts() -> Self {
+        Self {
+            apply_barrier: Some(Arc::new(Barrier::new(2))),
+            reverse_apply_replay: true,
             resolve_barrier: Some(Arc::new(Barrier::new(2))),
             synchronize_after_resolve: Some(0),
             ..Self::default()
@@ -199,7 +211,18 @@ impl GatewayWriteTransport for RecordingWriteTransport {
         self.events.lock().unwrap().push("apply");
         self.requests.lock().unwrap().push(request);
         let call = self.apply_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move { Ok(GatewayWriteReceipt::new(38 + call as u64, call > 0)) })
+        let barrier = self.apply_barrier.clone();
+        let replayed = if self.reverse_apply_replay {
+            call == 0
+        } else {
+            call > 0
+        };
+        Box::pin(async move {
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
+            Ok(GatewayWriteReceipt::new(38 + call as u64, replayed))
+        })
     }
 
     fn resolve_committed(
@@ -326,6 +349,44 @@ fn overlapping_initial_creates_advance_the_scan_bound_once() {
 
     block_on(execution.execute_statement(
         GatewayRequestContext::new(7, 94, u64::MAX, Vec::new()).unwrap(),
+        count_statement(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+    assert_eq!(logical_scan_bound(&queries), 129);
+}
+
+#[test]
+fn overlapping_initial_creates_account_the_non_replayed_receipt_regardless_of_owner() {
+    let writes = Arc::new(RecordingWriteTransport::synchronize_with_reversed_apply_receipts());
+    let queries = Arc::new(CapturingClusterTransport::default());
+    let execution = Arc::new(GatewayExecution::for_process_with_writes(
+        queries.clone(),
+        writes,
+        planning_context(),
+    ));
+    let calls: Vec<_> = (0..2)
+        .map(|_| {
+            let execution = execution.clone();
+            std::thread::spawn(move || {
+                block_on(execution.execute_statement(
+                    GatewayRequestContext::new(7, 97, u64::MAX, Vec::new()).unwrap(),
+                    create_statement(),
+                    BTreeMap::new(),
+                    None,
+                    &GatewayCancellationToken::new(),
+                ))
+            })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.join().unwrap().unwrap(), GatewayResponse::Acknowledged);
+    }
+
+    block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 98, u64::MAX, Vec::new()).unwrap(),
         count_statement(),
         BTreeMap::new(),
         None,

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dtg_analytics::{
@@ -3178,14 +3178,13 @@ async fn execute_process_create(
         commit_time,
         command,
     );
-    let capacity_reservation = reserve_process_write_capacity(write_accounting, transaction_id)?;
+    reserve_process_write_capacity(write_accounting, transaction_id)?;
     let receipt = match transport.apply_single_shard(request).await {
         Ok(receipt) => receipt,
         Err(error) => {
             complete_process_write_attempt(
                 write_accounting,
                 transaction_id,
-                capacity_reservation,
                 error.retry() == GatewayRetry::Safe,
             )?;
             if error.retry() == GatewayRetry::Never {
@@ -3194,12 +3193,7 @@ async fn execute_process_create(
             return Err(error);
         }
     };
-    complete_process_write_attempt(
-        write_accounting,
-        transaction_id,
-        capacity_reservation,
-        !receipt.replayed(),
-    )?;
+    complete_process_write_attempt(write_accounting, transaction_id, !receipt.replayed())?;
     transport.resolve_committed(&route, transaction_id).await?;
     Ok(ProcessWriteOutcome {
         transaction_id,
@@ -3223,7 +3217,7 @@ const PROCESS_WRITE_ACCOUNTING_LIMIT: usize = 4_096;
 
 #[derive(Clone, Copy)]
 enum ProcessWriteAccountingState {
-    Reserved,
+    Reserved { in_flight: usize },
     Pending,
     Accounting,
     Accounted,
@@ -3232,7 +3226,6 @@ enum ProcessWriteAccountingState {
 #[derive(Default)]
 struct ProcessWriteAccounting {
     state: Mutex<ProcessWriteAccountingStateMachine>,
-    receipt_ready: Condvar,
 }
 
 #[derive(Default)]
@@ -3248,7 +3241,10 @@ impl ProcessWriteAccountingStateMachine {
         &mut self,
         transaction_id: TransactionId,
     ) -> Result<bool, GatewayExecutionError> {
-        if self.states.contains_key(&transaction_id) {
+        if let Some(state) = self.states.get_mut(&transaction_id) {
+            if let ProcessWriteAccountingState::Reserved { in_flight } = state {
+                *in_flight = in_flight.saturating_add(1);
+            }
             return Ok(false);
         }
         if self.pending_count + self.capacity_reservations >= PROCESS_WRITE_ACCOUNTING_LIMIT {
@@ -3257,30 +3253,40 @@ impl ProcessWriteAccountingStateMachine {
             ));
         }
         self.capacity_reservations += 1;
-        self.states
-            .insert(transaction_id, ProcessWriteAccountingState::Reserved);
+        self.states.insert(
+            transaction_id,
+            ProcessWriteAccountingState::Reserved { in_flight: 1 },
+        );
         Ok(true)
     }
 
-    fn complete_attempt(
-        &mut self,
-        transaction_id: TransactionId,
-        used_capacity: bool,
-        retain_pending: bool,
-    ) {
-        if !used_capacity {
+    fn complete_attempt(&mut self, transaction_id: TransactionId, retain_pending: bool) {
+        let Some(ProcessWriteAccountingState::Reserved { in_flight }) =
+            self.states.get(&transaction_id).copied()
+        else {
             return;
-        }
-        self.capacity_reservations = self
-            .capacity_reservations
-            .checked_sub(1)
-            .expect("capacity reservation exists");
+        };
         if retain_pending {
             self.states
                 .insert(transaction_id, ProcessWriteAccountingState::Pending);
+            self.capacity_reservations = self
+                .capacity_reservations
+                .checked_sub(1)
+                .expect("capacity reservation exists");
             self.pending_count += 1;
-        } else {
+        } else if in_flight == 1 {
             self.states.remove(&transaction_id);
+            self.capacity_reservations = self
+                .capacity_reservations
+                .checked_sub(1)
+                .expect("capacity reservation exists");
+        } else {
+            self.states.insert(
+                transaction_id,
+                ProcessWriteAccountingState::Reserved {
+                    in_flight: in_flight - 1,
+                },
+            );
         }
     }
 
@@ -3313,27 +3319,13 @@ fn reserve_process_write_capacity(
 fn complete_process_write_attempt(
     write_accounting: &ProcessWriteAccounting,
     transaction_id: TransactionId,
-    used_capacity: bool,
     retain_pending: bool,
 ) -> Result<(), GatewayExecutionError> {
-    let mut accounting = write_accounting
+    write_accounting
         .state
         .lock()
-        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?;
-    if used_capacity {
-        accounting.complete_attempt(transaction_id, true, retain_pending);
-        write_accounting.receipt_ready.notify_all();
-    } else {
-        while matches!(
-            accounting.states.get(&transaction_id),
-            Some(ProcessWriteAccountingState::Reserved)
-        ) {
-            accounting = write_accounting
-                .receipt_ready
-                .wait(accounting)
-                .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?;
-        }
-    }
+        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?
+        .complete_attempt(transaction_id, retain_pending);
     Ok(())
 }
 
@@ -3357,7 +3349,7 @@ fn account_process_write(
             true
         }
         Some(ProcessWriteAccountingState::Accounted) | None => false,
-        Some(ProcessWriteAccountingState::Reserved) => {
+        Some(ProcessWriteAccountingState::Reserved { .. }) => {
             return Err(process_write_error(
                 "process write accounting receipt was not classified",
             ));
@@ -3748,7 +3740,7 @@ mod write_receipt_tests {
         for id in 1..=u128::try_from(PROCESS_WRITE_ACCOUNTING_LIMIT).unwrap() {
             let transaction_id = TransactionId::new(id).unwrap();
             assert!(reserve_process_write_capacity(&accounting, transaction_id).unwrap());
-            complete_process_write_attempt(&accounting, transaction_id, true, true).unwrap();
+            complete_process_write_attempt(&accounting, transaction_id, true).unwrap();
         }
         assert!(matches!(
             accounting.state.lock().unwrap().states.get(&first),
