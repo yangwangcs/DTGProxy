@@ -42,6 +42,7 @@ pub struct BoltSession {
 impl BoltSession {
     pub async fn connect(address: SocketAddr) -> io::Result<Self> {
         let mut socket = TcpStream::connect(address).await?;
+        socket.set_nodelay(true)?;
         socket
             .write_all(&[
                 BOLT_MAGIC[0],
@@ -75,6 +76,10 @@ impl BoltSession {
         let hello = read_message(&mut socket).await?;
         let _ = decode_success(&hello)?;
         Ok(Self { socket })
+    }
+
+    pub fn nodelay(&self) -> io::Result<bool> {
+        self.socket.nodelay()
     }
 
     pub async fn run(
@@ -302,13 +307,14 @@ fn check_identity(
 }
 
 async fn write_message(socket: &mut TcpStream, message: &[u8]) -> io::Result<()> {
+    let chunk_count = message.len().div_ceil(usize::from(u16::MAX));
+    let mut encoded = Vec::with_capacity(message.len() + chunk_count * 2 + 2);
     for chunk in message.chunks(usize::from(u16::MAX)) {
-        socket
-            .write_all(&(chunk.len() as u16).to_be_bytes())
-            .await?;
-        socket.write_all(chunk).await?;
+        encoded.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(chunk);
     }
-    socket.write_all(&[0, 0]).await
+    encoded.extend_from_slice(&[0, 0]);
+    socket.write_all(&encoded).await
 }
 
 async fn read_message(socket: &mut TcpStream) -> io::Result<Vec<u8>> {

@@ -23,11 +23,18 @@ pub async fn serve_bolt(
 ) -> Result<(), io::Error> {
     loop {
         let (socket, _) = listener.accept().await?;
+        if configure_bolt_socket(&socket).is_err() {
+            continue;
+        }
         let service = Arc::clone(&service);
         tokio::spawn(async move {
             let _ = serve_connection(socket, service).await;
         });
     }
+}
+
+fn configure_bolt_socket(socket: &TcpStream) -> Result<(), io::Error> {
+    socket.set_nodelay(true)
 }
 
 async fn serve_connection(
@@ -206,13 +213,18 @@ async fn read_chunked_message(socket: &mut TcpStream) -> Result<Option<Vec<u8>>,
 }
 
 async fn write_chunked_message(socket: &mut TcpStream, message: &[u8]) -> Result<(), io::Error> {
+    socket.write_all(&encode_chunked_message(message)).await
+}
+
+fn encode_chunked_message(message: &[u8]) -> Vec<u8> {
+    let chunk_count = message.len().div_ceil(usize::from(u16::MAX));
+    let mut encoded = Vec::with_capacity(message.len() + chunk_count * 2 + 2);
     for chunk in message.chunks(usize::from(u16::MAX)) {
-        socket
-            .write_all(&(chunk.len() as u16).to_be_bytes())
-            .await?;
-        socket.write_all(chunk).await?;
+        encoded.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(chunk);
     }
-    socket.write_all(&[0, 0]).await
+    encoded.extend_from_slice(&[0, 0]);
+    encoded
 }
 
 enum PackValue {
@@ -877,3 +889,29 @@ impl fmt::Display for BoltError {
 }
 
 impl std::error::Error for BoltError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{configure_bolt_socket, encode_chunked_message};
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn bolt_socket_configuration_disables_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::spawn(TcpStream::connect(listener.local_addr().unwrap()));
+        let (server, _) = listener.accept().await.unwrap();
+        let _client = client.await.unwrap().unwrap();
+
+        configure_bolt_socket(&server).unwrap();
+
+        assert!(server.nodelay().unwrap());
+    }
+
+    #[test]
+    fn bolt_frame_is_encoded_as_one_contiguous_buffer() {
+        assert_eq!(
+            encode_chunked_message(&[0xb1, 0x70, 0xa0]),
+            vec![0, 3, 0xb1, 0x70, 0xa0, 0, 0]
+        );
+    }
+}

@@ -176,6 +176,7 @@ async fn bolt_session_reuses_a_single_socket_and_keeps_read_identity_stable() {
     let mut session = backend_e2e_support::BoltSession::connect(address)
         .await
         .unwrap();
+    assert!(session.nodelay().unwrap());
     let first: backend_e2e_support::BoltResult = session
         .run(
             "MATCH (n) WHERE n.id = $id RETURN n.id",
