@@ -336,6 +336,8 @@ fn stage_metrics_window_requires_valid_bracketing_cumulative_snapshots() {
     assert_eq!(window.after.sequence, 3);
     assert_eq!(window.delta.stages[0].success, 4);
     assert_eq!(window.delta.stages[0].buckets[0], 4);
+    let delta = serde_json::to_value(&window.delta.stages[0]).unwrap();
+    assert!(delta.get("max_nanoseconds").is_none());
 }
 
 #[test]

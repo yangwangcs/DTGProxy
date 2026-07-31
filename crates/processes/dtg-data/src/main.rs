@@ -1,8 +1,7 @@
 use dtg_data::{DataNodeBuilder, DataProcessConfig};
 use dtg_execution::cluster_protocol::proto::data_service_server::DataServiceServer;
 use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayServiceServer;
-use dtg_execution::{RequestStageMetrics, encode_request_metrics_snapshot};
-use std::io::Write;
+use dtg_execution::{RequestMetricsSink, RequestStageMetrics, encode_request_metrics_snapshot};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::MissedTickBehavior;
@@ -15,7 +14,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DataProcessConfig::from_env()?;
     let rpc_addr = config.rpc_addr();
     let node = DataNodeBuilder::from_config(config).start().await?;
-    let metrics_exporter = spawn_metrics_exporter("data", node.request_metrics());
+    let metrics_exporter = spawn_metrics_exporter(
+        "data",
+        node.request_metrics(),
+        RequestMetricsSink::stderr()?,
+    );
     let service = node.rpc_service();
     let shutdown = service.clone();
 
@@ -37,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn spawn_metrics_exporter(
     role: &'static str,
     metrics: Arc<RequestStageMetrics>,
+    sink: RequestMetricsSink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -54,8 +58,7 @@ fn spawn_metrics_exporter(
             if let Ok(encoded) =
                 encode_request_metrics_snapshot(role, timestamp, sequence, &metrics.snapshot())
             {
-                let mut stderr = std::io::stderr().lock();
-                let _ = writeln!(stderr, "{REQUEST_METRICS_PREFIX}{encoded}");
+                sink.try_write(format!("{REQUEST_METRICS_PREFIX}{encoded}"));
             }
         }
     })

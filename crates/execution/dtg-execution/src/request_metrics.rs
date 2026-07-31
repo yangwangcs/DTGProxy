@@ -1,5 +1,7 @@
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
@@ -254,12 +256,71 @@ pub fn encode_request_metrics_snapshot(
     }))
 }
 
+pub struct RequestMetricsSink {
+    sender: SyncSender<String>,
+}
+
+impl RequestMetricsSink {
+    pub fn stderr() -> io::Result<Self> {
+        Self::spawn_with_writer(|line| {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr, "{line}");
+        })
+    }
+
+    pub fn try_write(&self, line: String) {
+        let _ = self.sender.try_send(line);
+    }
+
+    fn spawn_with_writer(mut writer: impl FnMut(String) + Send + 'static) -> io::Result<Self> {
+        let (sender, receiver) = sync_channel::<String>(1);
+        std::thread::Builder::new()
+            .name("dtg-request-metrics".into())
+            .spawn(move || {
+                for line in receiver {
+                    writer(line);
+                }
+            })?;
+        Ok(Self { sender })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
     use std::thread;
+    use std::time::{Duration, Instant};
 
-    use super::{RequestStage, RequestStageMetrics, StageOutcome, encode_request_metrics_snapshot};
+    use super::{
+        RequestMetricsSink, RequestStage, RequestStageMetrics, StageOutcome,
+        encode_request_metrics_snapshot,
+    };
+
+    #[test]
+    fn bounded_metrics_sink_never_waits_for_a_blocked_writer() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = RequestMetricsSink::spawn_with_writer(move |_| {
+            if entered_tx.send(thread::current().id()).is_ok() {
+                let _ = release_rx.recv();
+            }
+        })
+        .unwrap();
+
+        let caller = thread::current().id();
+        sink.try_write("first".into());
+        let writer = entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(caller, writer);
+
+        let started = Instant::now();
+        for ordinal in 0..10_000 {
+            sink.try_write(format!("queued-{ordinal}"));
+        }
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        drop(sink);
+        release_tx.send(()).unwrap();
+    }
 
     #[test]
     fn encoded_snapshot_has_stable_process_schema_without_request_content() {

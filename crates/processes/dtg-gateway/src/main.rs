@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 use dtg_execution::{
-    GatewayExecution, GatewayExecutionTransportFactory, TonicGatewayProtocolV2TransportFactory,
-    TonicGatewayWriteTransport, encode_request_metrics_snapshot,
+    GatewayExecution, GatewayExecutionTransportFactory, RequestMetricsSink,
+    TonicGatewayProtocolV2TransportFactory, TonicGatewayWriteTransport,
+    encode_request_metrics_snapshot,
 };
 use dtg_gateway::{GatewayConfig, GatewayService, build_gateway_runtime};
-use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -29,7 +29,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         GatewayExecution::for_process_with_writes(transport, write_transport, planning_context);
     let bind_addr = config.bind_addr();
     let service = Arc::new(GatewayService::new(config, execution));
-    let metrics_exporter = spawn_metrics_exporter("gateway", service.request_metrics());
+    let metrics_exporter = spawn_metrics_exporter(
+        "gateway",
+        service.request_metrics(),
+        RequestMetricsSink::stderr()?,
+    );
     let listener = TcpListener::bind(bind_addr).await?;
     let result = tokio::select! {
         result = dtg_gateway::serve_bolt(listener, service) => result,
@@ -44,6 +48,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn spawn_metrics_exporter(
     role: &'static str,
     metrics: Arc<dtg_execution::RequestStageMetrics>,
+    sink: RequestMetricsSink,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -61,8 +66,7 @@ fn spawn_metrics_exporter(
             if let Ok(encoded) =
                 encode_request_metrics_snapshot(role, timestamp, sequence, &metrics.snapshot())
             {
-                let mut stderr = std::io::stderr().lock();
-                let _ = writeln!(stderr, "{REQUEST_METRICS_PREFIX}{encoded}");
+                sink.try_write(format!("{REQUEST_METRICS_PREFIX}{encoded}"));
             }
         }
     })

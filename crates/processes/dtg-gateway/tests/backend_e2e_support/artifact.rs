@@ -125,7 +125,17 @@ pub struct ProcessMetricsSnapshot {
 pub struct StageMetricsDelta {
     pub before_sequence: u64,
     pub after_sequence: u64,
-    pub stages: Vec<StageMetricSnapshot>,
+    pub stages: Vec<StageMetricDelta>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StageMetricDelta {
+    pub stage: String,
+    pub buckets: Vec<u64>,
+    pub success: u64,
+    pub error: u64,
+    pub cancelled: u64,
+    pub total_nanoseconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -246,7 +256,7 @@ fn metric_delta(
         .stages
         .iter()
         .zip(&after.stages)
-        .map(|(before, after)| StageMetricSnapshot {
+        .map(|(before, after)| StageMetricDelta {
             stage: after.stage.clone(),
             buckets: after
                 .buckets
@@ -258,7 +268,6 @@ fn metric_delta(
             error: after.error - before.error,
             cancelled: after.cancelled - before.cancelled,
             total_nanoseconds: after.total_nanoseconds - before.total_nanoseconds,
-            max_nanoseconds: after.max_nanoseconds - before.max_nanoseconds,
         })
         .collect();
     StageMetricsDelta {

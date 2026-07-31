@@ -38,8 +38,8 @@ pub use meta_raft::{
     MetaCommittedEntry, MetaRaftError, MetaRaftHost, MetaRaftProgress, MetaRaftRole,
 };
 pub use request_metrics::{
-    RequestMetricsSnapshot, RequestStage, RequestStageMetrics, RequestStageSnapshot, StageOutcome,
-    StageTimer, encode_request_metrics_snapshot,
+    RequestMetricsSink, RequestMetricsSnapshot, RequestStage, RequestStageMetrics,
+    RequestStageSnapshot, StageOutcome, StageTimer, encode_request_metrics_snapshot,
 };
 pub use write::{
     PHYSICAL_WRITE_VERSION, PhysicalWriteError, PhysicalWriteFragment, PhysicalWritePlan,
