@@ -208,6 +208,7 @@ pub struct DataExecution {
     providers: ProviderResolverSet,
     stores: Mutex<BTreeMap<ReplicaKey, ResolvedReplicaStore>>,
     read_views: Mutex<BTreeMap<ReplicaKey, CachedReadView>>,
+    vertex_counts: Mutex<BTreeMap<ReplicaKey, CachedVertexCount>>,
     request_metrics: Arc<RequestStageMetrics>,
 }
 
@@ -264,6 +265,21 @@ struct CachedReadView {
     store: Arc<dyn ReplicaStateStore>,
     fence: ReadFence,
     view: Arc<dyn TemporalReadView>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct VertexCountScope {
+    transaction_time: TransactionTime,
+    valid_at: i64,
+    after: Option<VertexId>,
+    limit: u32,
+}
+
+struct CachedVertexCount {
+    store: Arc<dyn ReplicaStateStore>,
+    fence: ReadFence,
+    scope: VertexCountScope,
+    count: i64,
 }
 
 impl DataExecution {
@@ -501,12 +517,9 @@ impl DataExecution {
             let store = self.runtime_store(key)?;
             let binding = store.state().binding().clone();
             let read = decode_fragment_read(encoded)?;
+            let fence = ReadFence::new(binding, applied_index);
             let view = self
-                .read_view(
-                    key,
-                    store.state().clone(),
-                    ReadFence::new(binding, applied_index),
-                )
+                .read_view(key, store.state().clone(), fence.clone())
                 .await?;
             let diagnostics_before = view.diagnostics();
             let scan = matches!(
@@ -537,17 +550,43 @@ impl DataExecution {
                     .collect::<Vec<_>>(),
                 ),
                 FragmentRead::Count { after, limit } => {
-                    let count = view
-                        .scan_vertices(
-                            VertexScan::new(valid_at, transaction_time, after, limit)
-                                .map_err(data_storage_error)?,
-                        )
-                        .await
-                        .map_err(data_storage_error)?
-                        .rows()
-                        .len();
+                    let scope = VertexCountScope {
+                        transaction_time,
+                        valid_at,
+                        after,
+                        limit,
+                    };
                     let count =
-                        i64::try_from(count).map_err(|_| data_error("vertex count exceeds i64"))?;
+                        match self.cached_vertex_count(key, store.state(), &fence, &scope)? {
+                            Some(count) => count,
+                            None => {
+                                let count = view
+                                    .scan_vertices(
+                                        VertexScan::new(
+                                            scope.valid_at,
+                                            scope.transaction_time,
+                                            scope.after,
+                                            scope.limit,
+                                        )
+                                        .map_err(data_storage_error)?,
+                                    )
+                                    .await
+                                    .map_err(data_storage_error)?
+                                    .rows()
+                                    .len();
+                                let count = i64::try_from(count)
+                                    .map_err(|_| data_error("vertex count exceeds i64"))?;
+                                self.cache_vertex_count(
+                                    key,
+                                    store.state(),
+                                    &fence,
+                                    &view,
+                                    scope,
+                                    count,
+                                )?;
+                                count
+                            }
+                        };
                     (
                         PARTIAL_VERTEX_COUNT_FIELD,
                         vec![vec![GatewayValue::Integer(count)]],
@@ -680,10 +719,81 @@ impl DataExecution {
         }))
     }
 
+    fn cached_vertex_count(
+        &self,
+        key: ReplicaKey,
+        store: &Arc<dyn ReplicaStateStore>,
+        fence: &ReadFence,
+        scope: &VertexCountScope,
+    ) -> Result<Option<i64>, GatewayExecutionError> {
+        let vertex_counts = self
+            .vertex_counts
+            .lock()
+            .map_err(|_| data_error("vertex count cache mutex is poisoned"))?;
+        Ok(vertex_counts.get(&key).and_then(|cached| {
+            (Arc::ptr_eq(&cached.store, store) && cached.fence == *fence && cached.scope == *scope)
+                .then_some(cached.count)
+        }))
+    }
+
+    fn cache_vertex_count(
+        &self,
+        key: ReplicaKey,
+        store: &Arc<dyn ReplicaStateStore>,
+        fence: &ReadFence,
+        view: &Arc<dyn TemporalReadView>,
+        scope: VertexCountScope,
+        count: i64,
+    ) -> Result<(), GatewayExecutionError> {
+        // Preserve the same lifecycle ordering as read-view publication, then bind the scalar
+        // to that exact cached view so a removed replica cannot repopulate the count cache.
+        let stores = self
+            .stores
+            .lock()
+            .map_err(|_| data_error("replica store mutex is poisoned"))?;
+        if !stores
+            .get(&key)
+            .is_some_and(|runtime| Arc::ptr_eq(runtime.state(), store))
+        {
+            return Ok(());
+        }
+        let read_views = self
+            .read_views
+            .lock()
+            .map_err(|_| data_error("read view cache mutex is poisoned"))?;
+        if !read_views.get(&key).is_some_and(|cached| {
+            Arc::ptr_eq(&cached.store, store)
+                && cached.fence == *fence
+                && Arc::ptr_eq(&cached.view, view)
+        }) {
+            return Ok(());
+        }
+        let mut vertex_counts = self
+            .vertex_counts
+            .lock()
+            .map_err(|_| data_error("vertex count cache mutex is poisoned"))?;
+        vertex_counts.insert(
+            key,
+            CachedVertexCount {
+                store: Arc::clone(store),
+                fence: fence.clone(),
+                scope,
+                count,
+            },
+        );
+        Ok(())
+    }
+
     fn clear_read_view(&self, key: ReplicaKey) -> Result<(), ShardError> {
         self.read_views
             .lock()
             .map_err(|_| ShardError::InvalidLifecycle("read view cache mutex is poisoned".into()))?
+            .remove(&key);
+        self.vertex_counts
+            .lock()
+            .map_err(|_| {
+                ShardError::InvalidLifecycle("vertex count cache mutex is poisoned".into())
+            })?
             .remove(&key);
         Ok(())
     }
@@ -1262,6 +1372,7 @@ impl DataExecutionBuilder {
             providers: self.providers,
             stores: Mutex::new(BTreeMap::new()),
             read_views: Mutex::new(BTreeMap::new()),
+            vertex_counts: Mutex::new(BTreeMap::new()),
             request_metrics: self.request_metrics,
         })
     }

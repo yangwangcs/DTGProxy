@@ -102,8 +102,7 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
                 ProtocolFixture::PartialVertexCount => request
                     .fragments
                     .iter()
-                    .enumerate()
-                    .map(|(_, fragment)| {
+                    .map(|fragment| {
                         let fragment_id = u128::from_be_bytes(
                             fragment.fragment_id.as_slice().try_into().unwrap(),
                         );

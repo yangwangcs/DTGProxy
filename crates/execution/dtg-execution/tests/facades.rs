@@ -183,6 +183,7 @@ struct CountingReadStore {
     binding: ReplicaBinding,
     applied_index: AtomicU64,
     begin_read_view_calls: AtomicUsize,
+    scan_vertices_calls: Arc<AtomicUsize>,
     returned_fence: Option<ReadFence>,
 }
 
@@ -217,6 +218,7 @@ impl CountingReadStore {
             binding,
             applied_index: AtomicU64::new(applied_index),
             begin_read_view_calls: AtomicUsize::new(0),
+            scan_vertices_calls: Arc::new(AtomicUsize::new(0)),
             returned_fence: None,
         }
     }
@@ -247,7 +249,13 @@ impl ReplicaStateStore for CountingReadStore {
     fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
         self.begin_read_view_calls.fetch_add(1, Ordering::SeqCst);
         let returned_fence = self.returned_fence.clone().unwrap_or(fence);
-        Box::pin(async move { Ok(Box::new(EmptyReadView { returned_fence }) as Box<_>) })
+        let scan_vertices_calls = Arc::clone(&self.scan_vertices_calls);
+        Box::pin(async move {
+            Ok(Box::new(EmptyReadView {
+                returned_fence,
+                scan_vertices_calls,
+            }) as Box<_>)
+        })
     }
 }
 
@@ -279,6 +287,7 @@ impl ReplicaStateStore for PausingReadStore {
         Box::pin(async move {
             Ok(Box::new(EmptyReadView {
                 returned_fence: fence,
+                scan_vertices_calls: Arc::new(AtomicUsize::new(0)),
             }) as Box<_>)
         })
     }
@@ -286,6 +295,7 @@ impl ReplicaStateStore for PausingReadStore {
 
 struct EmptyReadView {
     returned_fence: ReadFence,
+    scan_vertices_calls: Arc<AtomicUsize>,
 }
 
 impl TemporalReadView for EmptyReadView {
@@ -321,6 +331,7 @@ impl TemporalReadView for EmptyReadView {
         &self,
         _request: VertexScan,
     ) -> StoreFuture<'_, ScanPage<VertexVersion, VertexId>> {
+        self.scan_vertices_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(ScanPage::new(Vec::new(), None)) })
     }
 
@@ -605,6 +616,27 @@ fn point_fragment_body(vertex_id: u128) -> Vec<u8> {
     body
 }
 
+fn count_fragment_body() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u64.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.push(1);
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.push(2);
+    body.extend_from_slice(&10_i64.to_be_bytes());
+    body.extend_from_slice(&41_i64.to_be_bytes());
+    body.push(0);
+    body.extend_from_slice(&4096_u32.to_be_bytes());
+    body.push(0x1f);
+    body.push(0);
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body
+}
+
 fn read_runtime<T>(binding: ReplicaBinding, store: Arc<T>) -> (DataExecution, dtg_shard::ReplicaKey)
 where
     T: ReplicaStateStore + 'static,
@@ -637,6 +669,86 @@ fn read_view_cache_reuses_an_exact_fence_for_two_point_reads() {
         .unwrap();
 
     assert_eq!(store.begin_read_view_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn vertex_count_cache_reuses_an_exact_temporal_snapshot() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "vertex-count-cache");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let count = count_fragment_body();
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &count))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &count))
+        .unwrap();
+
+    assert_eq!(store.scan_vertices_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn vertex_count_cache_reopens_for_a_new_temporal_snapshot() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "vertex-count-cache-time");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let count = count_fragment_body();
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &count))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(24).unwrap(), 17, &count))
+        .unwrap();
+
+    assert_eq!(store.scan_vertices_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn vertex_count_cache_reopens_for_a_new_applied_index() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "vertex-count-cache-index");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let count = count_fragment_body();
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &count))
+        .unwrap();
+    store.applied_index.store(10, Ordering::SeqCst);
+    block_on(runtime.execute_fragment(key, 10, TransactionTime::new(23).unwrap(), 17, &count))
+        .unwrap();
+
+    assert_eq!(store.scan_vertices_calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn vertex_count_cache_does_not_survive_replica_replacement() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "vertex-count-cache-replacement");
+    let first = Arc::new(CountingReadStore::new(binding.clone(), 0));
+    let (runtime, key) = read_runtime(binding.clone(), Arc::clone(&first));
+    let count = count_fragment_body();
+    runtime.start_replica(key).unwrap();
+
+    block_on(runtime.execute_fragment(key, 0, TransactionTime::new(23).unwrap(), 17, &count))
+        .unwrap();
+    runtime.remove_replica(key).unwrap();
+
+    let replacement = Arc::new(CountingReadStore::new(binding.clone(), 0));
+    let replacement_store: Arc<dyn ReplicaStateStore> = replacement.clone();
+    let replacement_key = runtime
+        .add_replica_runtime(
+            Arc::new(BindingConsensus { binding }),
+            ResolvedReplicaStore::state_only(replacement_store),
+        )
+        .unwrap();
+    assert_eq!(key, replacement_key);
+    block_on(runtime.execute_fragment(
+        replacement_key,
+        0,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &count,
+    ))
+    .unwrap();
+
+    assert_eq!(first.scan_vertices_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.scan_vertices_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
