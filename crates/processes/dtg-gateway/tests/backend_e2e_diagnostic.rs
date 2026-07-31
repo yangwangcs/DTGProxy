@@ -316,6 +316,26 @@ fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
     assert_eq!(artifact.repetitions, 3);
     assert_eq!(artifact.observations.len(), 18);
     assert_eq!(artifact.summaries.len(), 6);
+    let serialized = serde_json::to_value(&artifact).unwrap();
+    assert_eq!(serialized["format_version"], 1);
+    assert_eq!(serialized["backend"], "fjall");
+    assert_eq!(serialized["revision"], "test-revision");
+    assert_eq!(serialized["repetitions"], 3);
+    assert_eq!(serialized["observations"].as_array().unwrap().len(), 18);
+    assert_eq!(serialized["summaries"].as_array().unwrap().len(), 6);
+    let summary = serialized["summaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|summary| summary["workload"] == "point_lookup" && summary["concurrency"] == 8)
+        .unwrap();
+    assert_eq!(summary["latency_samples"], 6);
+    assert_eq!(summary["operations"], 6);
+    assert_eq!(summary["measured_duration_ns"], 15);
+    assert_eq!(summary["throughput_ops_per_second"], 400_000_000.0);
+    assert_eq!(summary["p50_ns"], 10);
+    assert_eq!(summary["p95_ns"], 20);
+    assert_eq!(summary["p99_ns"], 20);
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("quick.json");
     backend_e2e_support::write_quick_artifact(&output, &artifact).unwrap();
@@ -342,6 +362,11 @@ fn quick_artifact_rejects_incomplete_matrix_and_changed_read_identity() {
     observation.result_digest = "changed-result".into();
     let error = backend_e2e_support::QuickDiagnosticArtifact::new("revision", changed).unwrap_err();
     assert!(error.to_string().contains("read identity changed"));
+
+    let mut errors = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    errors[0].errors = 1;
+    let error = backend_e2e_support::QuickDiagnosticArtifact::new("revision", errors).unwrap_err();
+    assert!(error.to_string().contains("contains errors"));
 }
 
 fn complete_quick_observations(
