@@ -454,13 +454,23 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
     cursor.u32()?;
     let read = match cursor.u8()? {
         0 => match cursor.u8()? {
-            0 => FragmentRead::VertexPoint(
-                VertexId::new(cursor.u128()?).map_err(|error| data_error(error.to_string()))?,
-            ),
-            1 => FragmentRead::VertexScan {
-                after: None,
-                limit: decode_logical_scan_limit(&mut cursor)?,
-            },
+            0 => {
+                let id =
+                    VertexId::new(cursor.u128()?).map_err(|error| data_error(error.to_string()))?;
+                decode_logical_read_scope(&mut cursor)?;
+                if cursor.u32()? != 1 {
+                    return Err(data_error("logical point row bound must equal one"));
+                }
+                FragmentRead::VertexPoint(id)
+            }
+            1 => {
+                decode_logical_read_scope(&mut cursor)?;
+                let limit = cursor.u32()?;
+                if limit == 0 {
+                    return Err(data_error("logical scan limit is zero"));
+                }
+                FragmentRead::VertexScan { after: None, limit }
+            }
             _ => {
                 return Err(data_error(
                     "physical logical access is not executable by the Data worker",
@@ -520,9 +530,7 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
     Ok(read)
 }
 
-fn decode_logical_scan_limit(
-    cursor: &mut FragmentCursor<'_>,
-) -> Result<u32, GatewayExecutionError> {
+fn decode_logical_read_scope(cursor: &mut FragmentCursor<'_>) -> Result<(), GatewayExecutionError> {
     match cursor.u8()? {
         0 => {}
         1 => match cursor.u8()? {
@@ -548,11 +556,7 @@ fn decode_logical_scan_limit(
         },
         _ => return Err(data_error("unsupported valid-time fragment predicate")),
     }
-    let limit = cursor.u32()?;
-    if limit == 0 {
-        return Err(data_error("logical scan limit is zero"));
-    }
-    Ok(limit)
+    Ok(())
 }
 
 fn vertex_row(vertex: &dtg_storage::VertexVersion) -> Vec<GatewayValue> {

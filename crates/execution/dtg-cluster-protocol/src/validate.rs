@@ -237,10 +237,10 @@ pub fn validate_column_batch(wire: proto::ColumnBatch) -> Result<ValidatedPayloa
         .ok_or(ProtocolError::MissingContext)?
         .try_into()?;
     require_nonzero_id(&wire.fragment_id)?;
-    if wire.sequence == 0 || wire.row_count == 0 || wire.row_count > MAX_BATCH_ROWS {
+    if wire.sequence == 0 || wire.row_count > MAX_BATCH_ROWS {
         return Err(ProtocolError::ItemLimit);
     }
-    let payload = validate_payload(wire.payload, MAX_BATCH_BYTES, MAX_BATCH_ROWS)?;
+    let payload = validate_payload_allow_empty(wire.payload, MAX_BATCH_BYTES, MAX_BATCH_ROWS)?;
     if payload.item_count != wire.row_count {
         return Err(ProtocolError::LengthMismatch);
     }
@@ -344,11 +344,28 @@ fn validate_payload(
     max_bytes: usize,
     max_items: u32,
 ) -> Result<ValidatedPayload, ProtocolError> {
+    validate_payload_items(payload, max_bytes, max_items, false)
+}
+
+fn validate_payload_allow_empty(
+    payload: Option<proto::BoundedPayload>,
+    max_bytes: usize,
+    max_items: u32,
+) -> Result<ValidatedPayload, ProtocolError> {
+    validate_payload_items(payload, max_bytes, max_items, true)
+}
+
+fn validate_payload_items(
+    payload: Option<proto::BoundedPayload>,
+    max_bytes: usize,
+    max_items: u32,
+    allow_empty: bool,
+) -> Result<ValidatedPayload, ProtocolError> {
     let payload = payload.ok_or(ProtocolError::MissingPayload)?;
     if payload.format_version != CURRENT_FORMAT_VERSION {
         return Err(ProtocolError::FormatVersion);
     }
-    if payload.item_count == 0 || payload.item_count > max_items {
+    if (!allow_empty && payload.item_count == 0) || payload.item_count > max_items {
         return Err(ProtocolError::ItemLimit);
     }
     let declared_len =

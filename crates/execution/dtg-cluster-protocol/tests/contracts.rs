@@ -172,6 +172,40 @@ fn all_bounded_v2_message_families_validate() {
 }
 
 #[test]
+fn explicit_empty_column_batch_is_valid_but_malformed_batches_still_fail_closed() {
+    let mut empty = valid_batch();
+    empty.row_count = 0;
+    empty.payload = Some(payload(b"schema-and-zero-rows", 0));
+    assert_eq!(
+        validate_column_batch(empty.clone()).unwrap().item_count(),
+        0
+    );
+
+    let mut count_mismatch = empty.clone();
+    count_mismatch.payload.as_mut().unwrap().item_count = 1;
+    assert_eq!(
+        validate_column_batch(count_mismatch).unwrap_err().code(),
+        "DTG-PROTOCOL-LENGTH"
+    );
+
+    let mut corrupt = empty;
+    corrupt.payload.as_mut().unwrap().checksum[0] ^= 1;
+    assert_eq!(
+        validate_column_batch(corrupt).unwrap_err().code(),
+        "DTG-PROTOCOL-CHECKSUM"
+    );
+
+    let mut malformed_nonempty = valid_batch();
+    malformed_nonempty.payload.as_mut().unwrap().item_count = 0;
+    assert_eq!(
+        validate_column_batch(malformed_nonempty)
+            .unwrap_err()
+            .code(),
+        "DTG-PROTOCOL-LENGTH"
+    );
+}
+
+#[test]
 fn gateway_request_fails_closed_when_its_execution_envelope_is_tampered() {
     let mut request = valid_gateway_request();
     request.execution_request.as_mut().unwrap().checksum[0] ^= 1;

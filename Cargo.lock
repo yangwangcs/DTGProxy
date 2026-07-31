@@ -387,6 +387,7 @@ name = "dtg-data"
 version = "1.0.0"
 dependencies = [
  "dtg-execution",
+ "dtg-language-ir",
  "dtg-storage-fjall",
  "dtg-storage-neo4j",
  "dtg-storage-postgres",

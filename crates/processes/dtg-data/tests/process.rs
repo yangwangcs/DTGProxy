@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::{collections::BTreeMap, ffi::OsString};
 
 use dtg_data::{
-    CredentialProfile, DataNodeBuilder, DataProcessConfig, EndpointProfile, LifecycleState,
+    CredentialProfile, DataNodeBuilder, DataProcessConfig, DataRpcService, EndpointProfile,
+    LifecycleState,
 };
-use dtg_execution::ProviderKind;
 use dtg_execution::cluster_protocol::PROTOCOL_MAJOR;
 use dtg_execution::cluster_protocol::checksum_bytes;
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
@@ -14,11 +14,23 @@ use dtg_execution::cluster_protocol::proto::{
     RaftMessageKind, RequestContext, ShardContext, StatusCode, TransactionOperation,
     TransactionRequest,
 };
+use dtg_execution::planning::{
+    CatalogShard, CatalogSnapshot, Planner, PlanningContext, SnapshotRequirements, StorageAccess,
+};
 use dtg_execution::shard::{CommitSingleShard, ShardCommand};
 use dtg_execution::storage::{
     BackendClass, BindingRole, CapabilityManifest, CommandId, LogicalMutation, Properties,
     ReplicaBinding, StorageTckFactory, TransactionTime, ValidInterval, Version, VertexId,
     VertexVersion,
+};
+use dtg_execution::{
+    GatewayCancellationToken, GatewayExecution, GatewayExecutionError, GatewayFuture,
+    GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
+    GatewayRetry, ProviderKind, encode_physical_fragment_body,
+};
+use dtg_language_ir::{
+    Field, GraphScope, LogicalExpr, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
+    LogicalProgram, LogicalStatement, LogicalType, ReadScope, RowSchema, Value, VertexLookup,
 };
 use dtg_storage_fjall::FjallStorageTckFactory;
 use dtg_storage_remote::{ReferenceServerConfig, ReferenceStorageServer};
@@ -27,13 +39,24 @@ use tokio_stream::StreamExt;
 use tonic::{Code, Request};
 
 fn fjall_binding(namespace: &str) -> ReplicaBinding {
-    let capabilities = CapabilityManifest::from_names([
+    let capabilities = fjall_capabilities();
+    fjall_binding_with_capabilities(namespace, &capabilities)
+}
+
+fn fjall_capabilities() -> CapabilityManifest {
+    CapabilityManifest::from_names([
         "adjacency",
         "immutable-read-view",
         "logical-snapshot",
         "point",
     ])
-    .unwrap();
+    .unwrap()
+}
+
+fn fjall_binding_with_capabilities(
+    namespace: &str,
+    capabilities: &CapabilityManifest,
+) -> ReplicaBinding {
     let class = BackendClass::new(
         ProviderKind::Fjall,
         1,
@@ -59,6 +82,106 @@ fn fjall_binding(namespace: &str) -> ReplicaBinding {
         .role(BindingRole::Active)
         .build()
         .unwrap()
+}
+
+fn planning_context(
+    binding: ReplicaBinding,
+    capabilities: CapabilityManifest,
+    applied_index: u64,
+) -> PlanningContext {
+    PlanningContext::new(
+        CatalogSnapshot::new(
+            Version::new(29),
+            Version::new(31),
+            vec![CatalogShard::new(binding, applied_index)],
+        )
+        .unwrap(),
+        capabilities,
+        SnapshotRequirements::fixed(TransactionTime::new(41).unwrap(), 10),
+        Some(128),
+    )
+    .unwrap()
+}
+
+fn logical_vertex_point_body(
+    binding: &ReplicaBinding,
+    capabilities: &CapabilityManifest,
+    applied_index: u64,
+) -> Vec<u8> {
+    let physical = Planner
+        .plan(
+            &LogicalProgram {
+                version: dtg_language_ir::IrVersion::CURRENT,
+                graph_scope: GraphScope::Explicit(binding.graph_id()),
+                parameters: Vec::new(),
+                statement: LogicalStatement::Query(LogicalPlan {
+                    root: LogicalNodeId::new(1),
+                    nodes: vec![LogicalNode {
+                        id: LogicalNodeId::new(1),
+                        kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                            variable: "n".into(),
+                            id: LogicalExpr::Literal(Value::Integer(37)),
+                            labels: Vec::new(),
+                            read_scope: ReadScope::current(),
+                        }),
+                    }],
+                }),
+                result_schema: RowSchema {
+                    fields: vec![Field {
+                        name: "n".into(),
+                        data_type: LogicalType::Vertex,
+                        nullable: false,
+                    }],
+                },
+            },
+            &planning_context(binding.clone(), capabilities.clone(), applied_index),
+        )
+        .unwrap();
+    let [StorageAccess::Logical(read)] = physical.fragments()[0].storage_accesses() else {
+        panic!("test requires a logical vertex-point access")
+    };
+    assert_eq!(read.row_bound(), 1);
+    encode_physical_fragment_body(&physical, &physical.fragments()[0])
+}
+
+#[derive(Clone)]
+struct InProcessDataGatewayClient {
+    service: DataRpcService,
+}
+
+impl GatewayProtocolV2Client for InProcessDataGatewayClient {
+    fn execute(
+        &self,
+        request: GatewayRequest,
+    ) -> GatewayFuture<
+        '_,
+        Result<Vec<dtg_execution::cluster_protocol::proto::GatewayResponse>, GatewayExecutionError>,
+    > {
+        let service = self.service.clone();
+        Box::pin(async move {
+            let mut stream = ClusterGatewayService::execute(&service, Request::new(request))
+                .await
+                .map_err(|error| {
+                    GatewayExecutionError::new(
+                        "DTG-TEST-DATA-RPC",
+                        error.to_string(),
+                        GatewayRetry::Never,
+                    )
+                })?
+                .into_inner();
+            let mut responses = Vec::new();
+            while let Some(response) = stream.next().await {
+                responses.push(response.map_err(|error| {
+                    GatewayExecutionError::new(
+                        "DTG-TEST-DATA-STREAM",
+                        error.to_string(),
+                        GatewayRetry::Never,
+                    )
+                })?);
+            }
+            Ok(responses)
+        })
+    }
 }
 
 #[tokio::test]
@@ -327,6 +450,131 @@ async fn execute_fragment_reads_the_fenced_replica_store() {
 }
 
 #[tokio::test]
+async fn gateway_encoder_logical_vertex_point_reaches_the_data_service() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-logical-point", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let vertex = VertexVersion::new(
+        VertexId::new(37).unwrap(),
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(41).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(81).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .unwrap(),
+    );
+    let command_body = command.encode_current().unwrap();
+    node.rpc_service()
+        .apply_transaction(Request::new(TransactionRequest {
+            context: Some(shard_context(&binding)),
+            transaction_id: 82_u128.to_be_bytes().to_vec(),
+            operation: TransactionOperation::Commit.into(),
+            idempotency_key: 81_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: command_body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&command_body).to_vec(),
+                body: command_body,
+            }),
+        }))
+        .await
+        .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let body = logical_vertex_point_body(&binding, &capabilities, applied_index);
+    let mut stream = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 83_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index,
+            transaction_time: 41,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert_eq!(batch.row_count, 1);
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn logical_vertex_point_rejects_a_non_unit_row_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-logical-point-bound", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let mut body = logical_vertex_point_body(&binding, &capabilities, applied_index);
+    let point_id_end = body
+        .windows(16)
+        .position(|bytes| bytes == 37_u128.to_be_bytes())
+        .unwrap()
+        + 16;
+    body[point_id_end + 2..point_id_end + 6].copy_from_slice(&2_u32.to_be_bytes());
+
+    let result = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 85_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index,
+            transaction_time: 41,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await;
+    let error = match result {
+        Ok(_) => panic!("invalid logical point bound returned a response stream"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("logical point row bound"));
+}
+
+#[tokio::test]
 async fn gateway_v2_rpc_executes_a_real_fenced_fragment() {
     let root = tempfile::tempdir().unwrap();
     let binding = fjall_binding("gateway-v2-fragment");
@@ -452,6 +700,46 @@ async fn execute_fragment_preserves_a_present_zero_row_fragment() {
     assert_eq!(batch.fragment_id, 72_u128.to_be_bytes());
     assert_eq!(batch.row_count, 0);
     assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn present_zero_row_fragment_round_trips_from_data_to_gateway() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-empty-fragment", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            InProcessDataGatewayClient {
+                service: node.rpc_service(),
+            },
+        ))),
+        planning_context(binding, capabilities, applied_index),
+    );
+
+    let response = execution
+        .execute_statement(
+            GatewayRequestContext::new(7, 84, u64::MAX, Vec::new()).unwrap(),
+            "MATCH (n) RETURN n.id".into(),
+            BTreeMap::new(),
+            None,
+            &GatewayCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let GatewayResponse::Rows(rows) = response else {
+        panic!("expected query rows")
+    };
+    assert_eq!(rows.fields(), &["n.id"]);
+    assert!(rows.rows().is_empty());
 }
 
 fn scan_fragment_body() -> Vec<u8> {

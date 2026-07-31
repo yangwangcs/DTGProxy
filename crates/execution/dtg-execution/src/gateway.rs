@@ -1314,7 +1314,7 @@ fn encode_physical_fragment(
     }
 }
 
-fn encode_physical_fragment_body(
+pub fn encode_physical_fragment_body(
     plan: &PhysicalPlan,
     fragment: &dtg_plan::PlanFragment,
 ) -> Vec<u8> {

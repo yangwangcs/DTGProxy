@@ -25,5 +25,6 @@ tokio-stream = "=0.1.18"
 tonic = { version = "=0.14.6", features = ["transport"] }
 
 [dev-dependencies]
+dtg-language-ir = { path = "../../language/dtg-language-ir" }
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall", features = ["tck"] }
 tempfile = "=3.27.0"
