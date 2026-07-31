@@ -149,7 +149,11 @@ pub async fn measure_cell(
     warmup: Duration,
     measurement: Duration,
 ) -> io::Result<RawObservation> {
+    let phase_started = Instant::now();
     let started_at_unix_ns = unix_time_nanos();
+    let warmup_deadline = phase_started + warmup;
+    let measurement_deadline = warmup_deadline + measurement;
+    let measurement_started_at_unix_ns = started_at_unix_ns.saturating_add(nanos_u64(warmup));
     let (statement, parameters) = workload_request(cell.workload);
     let query_digest = query_digest(statement, &parameters);
     let mut workers = JoinSet::new();
@@ -162,8 +166,8 @@ pub async fn measure_cell(
                 cell.workload,
                 statement,
                 parameters,
-                warmup,
-                measurement,
+                warmup_deadline,
+                measurement_deadline,
             )
             .await
         });
@@ -171,7 +175,6 @@ pub async fn measure_cell(
 
     let mut latency_samples_ns = Vec::new();
     let mut operations = 0_u64;
-    let mut errors = 0_u64;
     let mut measured_duration_ns = 0_u64;
     let mut identity = None;
     while let Some(worker) = workers.join_next().await {
@@ -179,7 +182,6 @@ pub async fn measure_cell(
             .map_err(|error| invalid_data(format!("measurement worker failed: {error}")))??;
         latency_samples_ns.extend(worker.latency_samples_ns);
         operations += worker.operations;
-        errors += worker.errors;
         measured_duration_ns = measured_duration_ns.max(worker.measured_duration_ns);
         if let Some(result) = worker.identity {
             let candidate = (
@@ -199,16 +201,20 @@ pub async fn measure_cell(
         }
     }
     let (_, row_count, result_digest) = identity.unwrap_or((Vec::new(), 0, String::new()));
+    let measurement_finished_at_unix_ns = unix_time_nanos();
     Ok(RawObservation {
         backend: cell.backend,
         workload: cell.workload,
         concurrency: cell.concurrency,
         repetition: cell.repetition,
         started_at_unix_ns,
-        finished_at_unix_ns: unix_time_nanos(),
+        finished_at_unix_ns: measurement_finished_at_unix_ns,
+        warmup_finished_at_unix_ns: measurement_started_at_unix_ns,
+        measurement_started_at_unix_ns,
+        measurement_finished_at_unix_ns,
         measured_duration_ns,
         operations,
-        errors,
+        errors: 0,
         latency_samples_ns,
         row_count,
         result_digest,
@@ -219,7 +225,6 @@ pub async fn measure_cell(
 struct WorkerMeasurement {
     latency_samples_ns: Vec<u64>,
     operations: u64,
-    errors: u64,
     measured_duration_ns: u64,
     identity: Option<BoltResult>,
 }
@@ -229,12 +234,10 @@ async fn measure_worker(
     workload: Workload,
     statement: String,
     parameters: BTreeMap<String, BoltValue>,
-    warmup: Duration,
-    measurement: Duration,
+    warmup_deadline: Instant,
+    measurement_deadline: Instant,
 ) -> io::Result<WorkerMeasurement> {
     let mut session = BoltSession::connect(address).await?;
-    let warmup_deadline = Instant::now() + warmup;
-    let measurement_deadline = warmup_deadline + measurement;
     let mut identity = None;
     while Instant::now() < warmup_deadline {
         let result = session.run(&statement, parameters.clone()).await?;
@@ -242,30 +245,22 @@ async fn measure_worker(
         check_identity(workload, &mut identity, result)?;
     }
 
-    let measurement_started = Instant::now();
     let mut latency_samples_ns = Vec::new();
     let mut operations = 0_u64;
-    let mut errors = 0_u64;
     while Instant::now() < measurement_deadline {
         let operation_started = Instant::now();
-        match session.run(&statement, parameters.clone()).await {
-            Ok(result) => {
-                validate_result(workload, &result)?;
-                check_identity(workload, &mut identity, result)?;
-                latency_samples_ns.push(nanos_u64(operation_started.elapsed()));
-                operations += 1;
-            }
-            Err(_) => {
-                errors += 1;
-                break;
-            }
-        }
+        let result = session.run(&statement, parameters.clone()).await?;
+        validate_result(workload, &result)?;
+        check_identity(workload, &mut identity, result)?;
+        latency_samples_ns.push(nanos_u64(operation_started.elapsed()));
+        operations += 1;
     }
     Ok(WorkerMeasurement {
         latency_samples_ns,
         operations,
-        errors,
-        measured_duration_ns: nanos_u64(measurement_started.elapsed()),
+        measured_duration_ns: nanos_u64(
+            measurement_deadline.saturating_duration_since(warmup_deadline),
+        ),
         identity,
     })
 }

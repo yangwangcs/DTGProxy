@@ -87,6 +87,44 @@ async fn measure_cell_records_each_measured_read_on_one_worker_connection() {
     assert_eq!(observation.row_count, 1);
     assert_eq!(observation.result_digest.len(), 64);
     assert_eq!(observation.query_digest.len(), 64);
+    let artifact = serde_json::to_value(&observation).unwrap();
+    let warmup_finished_at_unix_ns = artifact["warmup_finished_at_unix_ns"].as_u64().unwrap();
+    let measurement_started_at_unix_ns =
+        artifact["measurement_started_at_unix_ns"].as_u64().unwrap();
+    let measurement_finished_at_unix_ns = artifact["measurement_finished_at_unix_ns"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(warmup_finished_at_unix_ns, measurement_started_at_unix_ns);
+    assert!(measurement_finished_at_unix_ns >= measurement_started_at_unix_ns);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn measure_cell_returns_an_error_when_a_measurement_bolt_operation_fails() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        serve_fake_bolt_failure_during_measurement(&mut socket).await;
+    });
+    let cell = backend_e2e_support::CellSpec {
+        backend: backend_e2e_support::Backend::Fjall,
+        workload: backend_e2e_support::Workload::PointLookup,
+        concurrency: 1,
+        repetition: 0,
+    };
+
+    let error =
+        backend_e2e_support::measure_cell(address, cell, Duration::ZERO, Duration::from_millis(10))
+            .await
+            .expect_err("a Bolt failure in the measurement window must reject the cell");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error
+            .to_string()
+            .contains("Neo.ClientError.Statement.SyntaxError")
+    );
     server.await.unwrap();
 }
 
@@ -99,6 +137,9 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
         repetition: 0,
         started_at_unix_ns: 10,
         finished_at_unix_ns: 20,
+        warmup_finished_at_unix_ns: 15,
+        measurement_started_at_unix_ns: 15,
+        measurement_finished_at_unix_ns: 20,
         measured_duration_ns: 10,
         operations: 3,
         errors: 0,
@@ -186,6 +227,29 @@ async fn serve_fake_bolt_until_closed(socket: &mut TcpStream) {
         )
         .await;
     }
+}
+
+async fn serve_fake_bolt_failure_during_measurement(socket: &mut TcpStream) {
+    let mut handshake = [0_u8; 20];
+    socket.read_exact(&mut handshake).await.unwrap();
+    socket.write_all(&[0, 0, 4, 5]).await.unwrap();
+    let hello = read_bolt_message(socket).await;
+    assert_eq!(hello[1], 0x01);
+    write_bolt_message(socket, &[0xb1, 0x70, 0xa0]).await;
+
+    let run = read_bolt_message(socket).await;
+    assert_eq!(run[1], 0x10);
+    write_bolt_message(
+        socket,
+        &[
+            0xb1, 0x7f, 0xa2, 0x84, b'c', b'o', b'd', b'e', 0xd0, 0x25, b'N', b'e', b'o', b'.',
+            b'C', b'l', b'i', b'e', b'n', b't', b'E', b'r', b'r', b'o', b'r', b'.', b'S', b't',
+            b'a', b't', b'e', b'm', b'e', b'n', b't', b'.', b'S', b'y', b'n', b't', b'a', b'x',
+            b'E', b'r', b'r', b'o', b'r', 0x87, b'm', b'e', b's', b's', b'a', b'g', b'e', 0x84,
+            b'b', b'o', b'o', b'm',
+        ],
+    )
+    .await;
 }
 
 async fn read_bolt_message(socket: &mut TcpStream) -> Vec<u8> {
