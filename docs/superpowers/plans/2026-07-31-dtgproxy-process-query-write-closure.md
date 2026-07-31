@@ -274,52 +274,77 @@ git commit -m "feat(gateway): execute remote physical query plans"
 ### Task 4: Implement real process-mode auto-commit CREATE
 
 **Files:**
+- Modify: `crates/execution/dtg-cluster-protocol/proto/dtg_cluster_v2.proto`
+- Modify: `crates/execution/dtg-cluster-protocol/src/validate.rs`
+- Test: `crates/execution/dtg-cluster-protocol/tests/contracts.rs`
+- Modify: `crates/processes/dtg-meta/src/service.rs`
+- Test: `crates/processes/dtg-meta/tests/process.rs`
 - Modify: `crates/execution/dtg-execution/src/gateway.rs`
 - Test: `crates/execution/dtg-execution/tests/gateway_process.rs`
+- Modify: `crates/processes/dtg-gateway/src/config.rs`
+- Modify: `crates/processes/dtg-gateway/src/main.rs`
+- Test: `crates/processes/dtg-gateway/src/config.rs`
 - Test: `crates/processes/dtg-data/tests/process.rs`
 - Test: `crates/processes/dtg-gateway/tests/backend_e2e_diagnostic.rs`
 
 **Interfaces:**
-- Extends `GatewayProtocolV2Client` with `apply_transaction(proto::TransactionRequest)` and implements it with the existing `DataServiceClient::apply_transaction` RPC on the same Data endpoint.
-- Consumes normalized `LogicalWrite`, the first active `CatalogShard`, `ShardCommand::CommitSingleShard`, and the existing Data transaction RPC.
+- Adds `TransactionOperation::ResolveCommitted` as an explicit idempotent Meta operation distinct from commit-time reservation.
+- Extends the process transport with Meta timestamp calls and Data `ApplyTransaction` on separate configured endpoints.
+- Consumes normalized `LogicalWrite`, a singleton active `CatalogShard`, `ShardCommand::CommitSingleShardTransaction`, and the existing Meta/Data RPCs.
 - Produces durable empty-row acknowledgement for the exact fixed CREATE statement.
 
 - [ ] **Step 1: Record the existing write-path evidence in the task brief**
 
-The implementer must read `.superpowers/sdd/write-path-investigation.md` first. The existing
-production surface is `DataService::ApplyTransaction(TransactionRequest)`, which decodes a current
-`ShardCommand`, checks placement/backend fences, proposes it through Shard Raft, and returns status
-only after `apply_transaction_command` succeeds. Use that surface; do not add a provider call.
+The implementer must read `.superpowers/sdd/write-path-investigation.md` first. Reuse
+`MetaService::SubmitTransaction`, `DataService::ApplyTransaction`,
+`CommitSingleShardTransaction`, and the Shard state-machine replay contract. Do not add a provider
+call or cite the existing fake empty-OK Gateway write test as durability evidence.
 
 - [ ] **Step 2: Write a failing process CREATE test**
 
-Execute `CREATE (n:Bench {value: 1}) VALID FROM 1` through process `GatewayExecution` with a
-protocol-faithful client. Assert the current trait has no transaction submission and the statement
-cannot receive an acknowledgement. Retain that result as the required RED evidence.
+First add a Meta RPC test proving operation 2 only reserves commit time and cannot represent
+committed resolution. Add a process Gateway test for the exact CREATE using protocol-faithful Meta
+and Data clients; assert the current request discards `LogicalWrite` and cannot produce a mutation.
+Retain both failures as RED evidence.
 
 - [ ] **Step 3: Implement the minimal production transaction path**
 
-Support the general input-free single-vertex CREATE subset and fail closed for other normalized
-writes. Use the nonzero request ID as the transaction ID, command ID, idempotency key, and new
-`VertexId`; this keeps retry identity stable for one request and avoids a process-local allocator.
-Resolve the first active catalog Shard and its placement/backend fences, convert literal properties
-recursively to storage values, require literal valid time, create a version-1 `VertexVersion` with
-the planning snapshot transaction time and open-ended valid interval, encode a current
-`ShardCommand::CommitSingleShard`, and submit:
+Implement this in two reviewed subcommits inside the task.
+
+First, add enum operation 5 `RESOLVE_COMMITTED` to the protocol and validator. In Meta service,
+look up the reservation and call:
 
 ```rust
-proto::TransactionRequest {
-    context: Some(shard_context_from_catalog(request.context(), shard)),
-    transaction_id: request.context().request_id().to_be_bytes().to_vec(),
-    operation: proto::TransactionOperation::Commit.into(),
-    idempotency_key: request.context().request_id().to_be_bytes().to_vec(),
-    payload: Some(bounded_current_shard_command(command)?),
-}
+timestamps.resolve_commit_time(
+    transaction_id,
+    reservation.commit_time(),
+    CommitResolution::Committed,
+).await
 ```
 
-Validate the typed success status and acknowledge only after the Data RPC returns. Treat every
-other status or transport ambiguity as an error. Labels remain accepted language metadata because
-the current vertex storage contract has no label field; no hidden benchmark property is added.
+Return the reserved commit time, make repeats idempotent, and reject a later opposite resolution.
+
+Second, add `DTG_GATEWAY_META_ENDPOINT` to Gateway configuration and construct one tonic channel for
+Meta plus one for Data. Support only input-free single-vertex CREATE against exactly one active
+catalog Shard; reject every other write shape and multi-Shard catalog. Derive transaction, command,
+vertex, and idempotency identities with domain-separated SHA-256 prefixes over request ID and
+mutation ordinal. Bind literal/parameter properties and literal valid time. Encode labels as an
+ordered string list in reserved property `\u{0}dtg.labels`, rejecting any colliding user property.
+
+The RPC sequence is exact:
+
+1. Meta PREWRITE allocates start time.
+2. Meta COMMIT reserves commit time.
+3. Gateway builds a version-1 `VertexVersion` valid on `[valid_from, i64::MAX)` at the reserved
+   commit time and wraps it in `ShardCommand::CommitSingleShardTransaction`, including transaction
+   ID, start time, catalog applied-index snapshot, and the command digest.
+4. Data `ApplyTransaction` submits the fenced command. In the supported RF=1 diagnostic topology,
+   the response is accepted only after the state machine has applied it; tests must prove the
+   applied index and transaction metadata advanced before return.
+5. Meta RESOLVE_COMMITTED records the terminal resolution.
+
+On definitive Data failure, call Meta ABORT. On ambiguous transport/status outcome, return an error
+without claiming success. Return `GatewayResponse::Acknowledged` only after step 5.
 
 - [ ] **Step 4: Add live Bolt write verification**
 
@@ -333,8 +358,12 @@ cargo test --locked -p dtg-execution --test gateway_process process_create_ -- -
 cargo test --locked -p dtg-data --test process -- --test-threads=1
 cargo test --locked -p dtg-gateway --test backend_e2e_diagnostic -- --test-threads=1
 git diff --check
-git add crates/execution/dtg-execution/src/gateway.rs \
+git add crates/execution/dtg-cluster-protocol \
+  crates/processes/dtg-meta \
+  crates/execution/dtg-execution/src/gateway.rs \
   crates/execution/dtg-execution/tests/gateway_process.rs \
+  crates/processes/dtg-gateway/src/config.rs \
+  crates/processes/dtg-gateway/src/main.rs \
   crates/processes/dtg-data/tests/process.rs \
   crates/processes/dtg-gateway/tests/backend_e2e_diagnostic.rs
 git commit -m "feat(gateway): dispatch process writes transactionally"

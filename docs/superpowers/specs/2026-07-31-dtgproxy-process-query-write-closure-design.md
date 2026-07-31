@@ -38,10 +38,16 @@ Gateway process package.
 Global `COUNT(*)` is represented as an aggregate with zero grouping keys and one non-distinct
 count-star function. It emits exactly one integer row, including `0` for empty input.
 
-Process writes use the existing distributed transaction and Shard command contracts. Gateway
-normalizes the CREATE statement into deterministic logical mutations, begins the transaction,
-dispatches the participant write to Data, commits, and acknowledges Bolt only after the durable
-outcome. Data does not receive a benchmark-specific create command.
+Process writes use the existing Meta timestamp authority and Shard transaction command contracts.
+Gateway normalizes the CREATE statement into deterministic logical mutations, allocates a start
+time, reserves a commit time, dispatches a replay-stable single-Shard transaction command to Data,
+and records committed resolution in Meta. It acknowledges Bolt only after both the Shard application
+and Meta committed resolution succeed. Data does not receive a benchmark-specific create command.
+
+The current storage vertex type has no label field. Until a first-class label column exists, the
+language-to-storage mapping preserves labels in the reserved property `\u{0}dtg.labels` as an ordered
+list of strings. TCypher identifiers cannot construct a property name containing NUL, so user input
+cannot collide with this representation. Gateway rejects user maps containing the reserved name.
 
 ## Alternatives rejected
 
@@ -77,14 +83,19 @@ the exact result is one integer value `4096` after preload.
 ## Write data flow
 
 1. Bolt sends the fixed auto-commit CREATE statement.
-2. Gateway compiles the write and constructs a transaction using the current catalog/topology and
-   provider fences.
-3. Gateway maps the normalized create operation to a unique vertex identity and the canonical
-   temporal mutation set.
-4. Gateway dispatches the participant through the existing Data/Shard transaction RPC path.
-5. Gateway commits and waits for the durable outcome.
-6. Bolt receives an empty-row success summary only after commit. Abort or uncertain outcomes remain
-   failures and are not counted.
+2. Gateway compiles the write and accepts only an input-free single-vertex CREATE against a
+   singleton active-Shard catalog; unsupported writes and unresolved routing fail closed.
+3. Gateway derives replay-stable transaction, command, and vertex identities from the request ID
+   plus domain-separated mutation ordinals, binds properties/valid time, and encodes labels under
+   `\u{0}dtg.labels`.
+4. Gateway asks Meta to allocate the start time and reserve the commit time.
+5. Gateway sends `CommitSingleShardTransaction` through Data `ApplyTransaction` using the catalog's
+   placement, backend-generation, and snapshot-applied-index fences.
+6. After Data confirms the supported RF=1 Shard application, Gateway asks Meta to resolve the
+   reservation as committed. A definitive Data failure resolves aborted; an ambiguous outcome is
+   returned as an error.
+7. Bolt receives an empty-row success summary only after committed resolution. Abort or uncertain
+   outcomes remain failures and are not counted.
 
 Warmup writes occur in a fresh cell and are discarded with that cell, preserving isolation.
 
@@ -97,6 +108,8 @@ Warmup writes occur in a fresh cell and are discarded with that cell, preserving
   digest.
 - Count validation checks the exact scalar integer `4096`.
 - CREATE validation requires a successful durable acknowledgement and zero returned rows.
+- Meta commit reservation is not equivalent to committed resolution; resolution is explicit,
+  idempotent, and cannot change to the opposite outcome.
 - Any Bolt, planning, binding, transport, transaction, or semantic validation error invalidates the
   cell and prevents combined summary publication.
 
