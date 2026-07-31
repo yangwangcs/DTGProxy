@@ -16,8 +16,8 @@ use dtg_cluster_v2::{
 };
 use dtg_language::{EmptySchemaCatalog, Language, LanguageError, LogicalProgram};
 use dtg_language_ir::{
-    LogicalExpr, LogicalNodeKind, LogicalPlan, LogicalStatement, TemporalScope, TimeExpr,
-    ValidTimeExpr, ValidTimePredicate,
+    AggregateKind, LogicalExpr, LogicalNodeKind, LogicalPlan, LogicalStatement, TemporalScope,
+    TimeExpr, ValidTimeExpr, ValidTimePredicate,
 };
 use dtg_plan::{
     CatalogShard, CatalogSnapshot, ExchangeKind, LogicalReadOperation, LogicalReadRequest,
@@ -45,6 +45,8 @@ use sha2::{Digest, Sha256};
 use tonic::transport::Channel;
 
 use crate::{ExecutionBuildError, RequestDetail, RequestStage, RequestStageMetrics, StageOutcome};
+
+const PARTIAL_VERTEX_COUNT_FIELD: &str = "__dtg_partial_vertex_count";
 
 trait AnalyticsRuntime: Send + Sync {
     fn tick(
@@ -1336,6 +1338,20 @@ impl GatewayExecution {
                 _ => (None, None),
             };
             let (physical_plan, executable_plan) = planned;
+            let partial_vertex_count_alias = physical_plan
+                .as_ref()
+                .and_then(partial_vertex_count_alias)
+                .map(str::to_owned);
+            let partial_vertex_count_fragments = physical_plan
+                .as_ref()
+                .filter(|_| partial_vertex_count_alias.is_some())
+                .map(|plan| {
+                    plan.fragments()
+                        .iter()
+                        .map(|fragment| fragment.id().get())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let request = GatewayClusterRequest {
                 context,
                 operation,
@@ -1366,13 +1382,20 @@ impl GatewayExecution {
                 match remote {
                     GatewayQueryResponse::Final(response) => response,
                     GatewayQueryResponse::Materialized(fragment_batches) => {
-                        let timer = self
-                            .request_metrics
-                            .start(RequestStage::GatewayLocalExecution);
-                        let detail_timer = self
-                            .request_metrics
-                            .start_detail(RequestDetail::GatewayQueryLocalMaterialize);
-                        let local = async {
+                        if let Some(alias) = partial_vertex_count_alias.as_deref() {
+                            partial_vertex_count_response(
+                                fragment_batches,
+                                &partial_vertex_count_fragments,
+                                alias,
+                            )?
+                        } else {
+                            let timer = self
+                                .request_metrics
+                                .start(RequestStage::GatewayLocalExecution);
+                            let detail_timer = self
+                                .request_metrics
+                                .start_detail(RequestDetail::GatewayQueryLocalMaterialize);
+                            let local = async {
                             let query_cancellation = QueryCancellationToken::new();
                             if cancellation.is_cancelled() {
                                 query_cancellation.cancel();
@@ -1427,8 +1450,9 @@ impl GatewayExecution {
                             Ok(GatewayResponse::Rows(GatewayRows::new(fields, rows)?))
                         }
                         .await;
-                        let local = detail_timer.finish_result(local)?;
-                        timer.finish_result(Ok::<_, GatewayExecutionError>(local))?
+                            let local = detail_timer.finish_result(local)?;
+                            timer.finish_result(Ok::<_, GatewayExecutionError>(local))?
+                        }
                     }
                 }
             } else {
@@ -1856,8 +1880,9 @@ pub fn encode_physical_fragment_body(
     body.extend_from_slice(&plan.root_operator().get().to_be_bytes());
     encode_row_schema(plan.result_schema(), &mut body);
     encode_u32(fragment.storage_accesses().len(), &mut body);
+    let partial_vertex_count = partial_vertex_count_alias(plan).is_some();
     for access in fragment.storage_accesses() {
-        encode_storage_access(access, &mut body);
+        encode_storage_access(access, partial_vertex_count, &mut body);
     }
     encode_u32(plan.operators().len(), &mut body);
     for operator in plan.operators() {
@@ -1866,12 +1891,12 @@ pub fn encode_physical_fragment_body(
     body
 }
 
-fn encode_storage_access(access: &StorageAccess, output: &mut Vec<u8>) {
+fn encode_storage_access(access: &StorageAccess, partial_vertex_count: bool, output: &mut Vec<u8>) {
     output.extend_from_slice(&access.node().get().to_be_bytes());
     match access {
         StorageAccess::Logical(request) => {
             output.push(0);
-            encode_logical_read_operation(request.operation(), output);
+            encode_logical_read_operation(request.operation(), partial_vertex_count, output);
             encode_read_scope(request.read_scope(), output);
             output.extend_from_slice(&request.row_bound().to_be_bytes());
         }
@@ -1896,7 +1921,7 @@ fn encode_storage_access(access: &StorageAccess, output: &mut Vec<u8>) {
                     output.extend_from_slice(&read.transaction_at().get().to_be_bytes());
                 }
                 PushdownOperation::VertexScan(scan) => {
-                    output.push(1);
+                    output.push(if partial_vertex_count { 2 } else { 1 });
                     output.extend_from_slice(&scan.valid_at().to_be_bytes());
                     output.extend_from_slice(&scan.transaction_at().get().to_be_bytes());
                     match scan.after() {
@@ -1929,13 +1954,17 @@ fn semantic_flags(guarantee: dtg_plan::PushdownGuarantee) -> u8 {
         | (u8::from(guarantee.snapshot()) << 4)
 }
 
-fn encode_logical_read_operation(operation: &LogicalReadOperation, output: &mut Vec<u8>) {
+fn encode_logical_read_operation(
+    operation: &LogicalReadOperation,
+    partial_vertex_count: bool,
+    output: &mut Vec<u8>,
+) {
     match operation {
         LogicalReadOperation::VertexPoint(id) => {
             output.push(0);
             output.extend_from_slice(&id.get().to_be_bytes());
         }
-        LogicalReadOperation::VertexScan => output.push(1),
+        LogicalReadOperation::VertexScan => output.push(if partial_vertex_count { 2 } else { 1 }),
         LogicalReadOperation::EdgePoint(id) => {
             output.push(2);
             output.extend_from_slice(&id.get().to_be_bytes());
@@ -1950,6 +1979,143 @@ fn encode_logical_read_operation(operation: &LogicalReadOperation, output: &mut 
             });
         }
     }
+}
+
+fn partial_vertex_count_alias(plan: &PhysicalPlan) -> Option<&str> {
+    let aggregate = plan.operator(plan.root_operator())?;
+    let dtg_plan::PhysicalOperatorKind::Aggregate {
+        input,
+        groups,
+        aggregates,
+    } = aggregate.kind()
+    else {
+        return None;
+    };
+    let [aggregate] = aggregates.as_slice() else {
+        return None;
+    };
+    if aggregate.function != AggregateKind::Count
+        || aggregate.argument.is_some()
+        || aggregate.distinct
+        || !groups.is_empty()
+    {
+        return None;
+    }
+    let source = plan.operator(*input)?;
+    let dtg_plan::PhysicalOperatorKind::Source { logical_node, .. } = source.kind() else {
+        return None;
+    };
+    let [field] = plan.result_schema().fields.as_slice() else {
+        return None;
+    };
+    if field.name != aggregate.alias || plan.fragments().is_empty() {
+        return None;
+    }
+    plan.fragments()
+        .iter()
+        .all(|fragment| partial_vertex_count_access(fragment.storage_accesses(), *logical_node))
+        .then_some(aggregate.alias.as_str())
+}
+
+fn partial_vertex_count_access(
+    accesses: &[StorageAccess],
+    logical_node: dtg_language_ir::LogicalNodeId,
+) -> bool {
+    match accesses {
+        [StorageAccess::Logical(request)] => {
+            request.node() == logical_node
+                && matches!(request.operation(), LogicalReadOperation::VertexScan)
+        }
+        [
+            StorageAccess::Pushdown {
+                node,
+                request,
+                residual: None,
+                ..
+            },
+        ] => {
+            *node == logical_node && matches!(request.operation(), PushdownOperation::VertexScan(_))
+        }
+        _ => false,
+    }
+}
+
+fn partial_vertex_count_response(
+    mut fragments: BTreeMap<u32, Vec<QueryColumnBatch>>,
+    expected_fragment_ids: &[u32],
+    alias: &str,
+) -> Result<GatewayResponse, GatewayExecutionError> {
+    let mut total = 0_i64;
+    for fragment_id in expected_fragment_ids {
+        let batches = fragments.remove(fragment_id).ok_or_else(|| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count omitted an expected fragment",
+                GatewayRetry::Safe,
+            )
+        })?;
+        let [batch] = batches.as_slice() else {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count fragment must contain exactly one batch",
+                GatewayRetry::Safe,
+            ));
+        };
+        let [field] = batch.schema().fields.as_slice() else {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count batch must contain exactly one field",
+                GatewayRetry::Safe,
+            ));
+        };
+        if field.name != PARTIAL_VERTEX_COUNT_FIELD {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count batch has an unexpected field",
+                GatewayRetry::Safe,
+            ));
+        }
+        let rows = batch.rows();
+        let [row] = rows.as_slice() else {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count batch must contain exactly one row",
+                GatewayRetry::Safe,
+            ));
+        };
+        let [QueryValue::Integer(value)] = row.as_slice() else {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count row must contain one non-negative integer",
+                GatewayRetry::Safe,
+            ));
+        };
+        if *value < 0 {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count row must contain one non-negative integer",
+                GatewayRetry::Safe,
+            ));
+        }
+        total = total.checked_add(*value).ok_or_else(|| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-PARTIAL-COUNT",
+                "partial vertex count exceeds the supported integer range",
+                GatewayRetry::Never,
+            )
+        })?;
+    }
+    if !fragments.is_empty() {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-PARTIAL-COUNT",
+            "partial vertex count included an unknown fragment",
+            GatewayRetry::Safe,
+        ));
+    }
+    Ok(GatewayResponse::Rows(GatewayRows::new(
+        vec![alias.into()],
+        vec![vec![GatewayValue::Integer(total)]],
+    )?))
 }
 
 fn encode_read_scope(scope: &dtg_language_ir::ReadScope, output: &mut Vec<u8>) {

@@ -956,6 +956,97 @@ async fn present_zero_row_fragment_round_trips_from_data_to_gateway() {
     assert!(rows.rows().is_empty());
 }
 
+#[tokio::test]
+async fn current_vertex_count_round_trips_as_one_scalar_from_data() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-partial-vertex-count", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let vertices = [91_u128, 92]
+        .into_iter()
+        .map(|id| {
+            VertexVersion::new(
+                VertexId::new(id).unwrap(),
+                Version::new(1),
+                ValidInterval::new(1, 100).unwrap(),
+                TransactionTime::new(41).unwrap(),
+                Properties::new(),
+            )
+            .unwrap()
+        })
+        .map(LogicalMutation::PutVertex)
+        .collect();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(91).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            vertices,
+        )
+        .unwrap(),
+    );
+    let command_body = command.encode_current().unwrap();
+    node.rpc_service()
+        .apply_transaction(Request::new(TransactionRequest {
+            context: Some(shard_context(&binding)),
+            transaction_id: 91_u128.to_be_bytes().to_vec(),
+            operation: TransactionOperation::Commit.into(),
+            idempotency_key: 91_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: command_body.len() as u64,
+                item_count: 2,
+                checksum: checksum_bytes(&command_body).to_vec(),
+                body: command_body,
+            }),
+        }))
+        .await
+        .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            InProcessDataGatewayClient {
+                service: node.rpc_service(),
+            },
+        ))),
+        planning_context(binding, capabilities, applied_index),
+    );
+
+    let response = execution
+        .execute_statement(
+            GatewayRequestContext::new(7, 91, u64::MAX, Vec::new()).unwrap(),
+            "MATCH (n) RETURN COUNT(*)".into(),
+            BTreeMap::new(),
+            None,
+            &GatewayCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let GatewayResponse::Rows(rows) = response else {
+        panic!("expected count rows")
+    };
+    assert_eq!(rows.fields(), &["COUNT(*)"]);
+    assert_eq!(
+        rows.rows(),
+        &[vec![dtg_execution::GatewayValue::Integer(2)]]
+    );
+    assert_eq!(
+        execution
+            .request_metrics()
+            .snapshot()
+            .stage(RequestStage::GatewayLocalExecution)
+            .success,
+        0
+    );
+}
+
 fn scan_fragment_body() -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&1_u64.to_be_bytes());

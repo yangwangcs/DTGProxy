@@ -32,7 +32,7 @@ enum ProtocolFixture {
     #[default]
     RawTwo,
     RawPoint,
-    RawCount,
+    PartialVertexCount,
     UnknownFragment,
     MalformedFragment,
     DuplicateBatch,
@@ -99,16 +99,19 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
                     };
                     vec![encoded_batch(1, encoded_vertex_rows(rows), row_count)]
                 }
-                ProtocolFixture::RawCount => request
+                ProtocolFixture::PartialVertexCount => request
                     .fragments
                     .iter()
                     .enumerate()
-                    .map(|(index, fragment)| {
-                        let start = i64::try_from(index).unwrap() * 2048 + 1;
+                    .map(|(_, fragment)| {
                         let fragment_id = u128::from_be_bytes(
                             fragment.fragment_id.as_slice().try_into().unwrap(),
                         );
-                        encoded_batch(fragment_id, encoded_vertex_rows(start..start + 2048), 2048)
+                        encoded_batch(
+                            fragment_id,
+                            encoded_integer_rows("__dtg_partial_vertex_count", 2048),
+                            1,
+                        )
                     })
                     .collect::<Vec<_>>(),
                 ProtocolFixture::UnknownFragment => {
@@ -1021,9 +1024,9 @@ fn dropped_process_query_future_records_internal_rpc_cancellation() {
 }
 
 #[test]
-fn process_executes_remote_count_query_globally_at_gateway() {
+fn process_merges_scalar_vertex_counts_from_data_fragments() {
     let client = Arc::new(RecordingProtocolClient::with_fixture(
-        ProtocolFixture::RawCount,
+        ProtocolFixture::PartialVertexCount,
     ));
     let execution = GatewayExecution::for_process(
         Arc::new(GatewayProtocolV2Transport::new(client)),
@@ -1039,7 +1042,7 @@ fn process_executes_remote_count_query_globally_at_gateway() {
         + 5_000;
 
     let response = block_on(execution.execute_statement(
-        GatewayRequestContext::new(7, 102, deadline, Vec::new()).unwrap(),
+        GatewayRequestContext::new(7, 105, deadline, Vec::new()).unwrap(),
         "MATCH (n) RETURN COUNT(*)".into(),
         BTreeMap::new(),
         None,
@@ -1052,6 +1055,14 @@ fn process_executes_remote_count_query_globally_at_gateway() {
     };
     assert_eq!(count.fields(), &["COUNT(*)"]);
     assert_eq!(count.rows(), &[vec![GatewayValue::Integer(4096)]]);
+    assert_eq!(
+        execution
+            .request_metrics()
+            .snapshot()
+            .stage(RequestStage::GatewayLocalExecution)
+            .success,
+        0
+    );
 }
 
 #[test]
@@ -1508,5 +1519,16 @@ fn encoded_vertex_rows(ids: impl IntoIterator<Item = i64>) -> Vec<u8> {
         body.push(7);
         body.extend_from_slice(&0_u32.to_be_bytes());
     }
+    body
+}
+
+fn encoded_integer_rows(field: &str, value: i64) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(field.as_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.push(2);
+    body.extend_from_slice(&value.to_be_bytes());
     body
 }

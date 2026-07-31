@@ -19,6 +19,8 @@ use crate::{
     RequestStageMetrics, StageOutcome,
 };
 
+const PARTIAL_VERTEX_COUNT_FIELD: &str = "__dtg_partial_vertex_count";
+
 #[derive(Clone)]
 pub struct ResolvedReplicaStore {
     state: Arc<dyn ReplicaStateStore>,
@@ -507,17 +509,23 @@ impl DataExecution {
                 )
                 .await?;
             let diagnostics_before = view.diagnostics();
-            let scan = matches!(&read, FragmentRead::VertexScan { .. });
-            let rows = match read {
-                FragmentRead::VertexPoint(id) => view
-                    .get_vertex(VertexRead::new(id, valid_at, transaction_time))
-                    .await
-                    .map_err(data_storage_error)?
-                    .into_iter()
-                    .map(|vertex| vertex_row(&vertex))
-                    .collect(),
-                FragmentRead::VertexScan { after, limit } => view
-                    .scan_vertices(
+            let scan = matches!(
+                &read,
+                FragmentRead::Scan { .. } | FragmentRead::Count { .. }
+            );
+            let (field, rows) = match read {
+                FragmentRead::Point(id) => (
+                    "value",
+                    view.get_vertex(VertexRead::new(id, valid_at, transaction_time))
+                        .await
+                        .map_err(data_storage_error)?
+                        .into_iter()
+                        .map(|vertex| vertex_row(&vertex))
+                        .collect::<Vec<_>>(),
+                ),
+                FragmentRead::Scan { after, limit } => (
+                    "value",
+                    view.scan_vertices(
                         VertexScan::new(valid_at, transaction_time, after, limit)
                             .map_err(data_storage_error)?,
                     )
@@ -526,14 +534,32 @@ impl DataExecution {
                     .rows()
                     .iter()
                     .map(vertex_row)
-                    .collect(),
+                    .collect::<Vec<_>>(),
+                ),
+                FragmentRead::Count { after, limit } => {
+                    let count = view
+                        .scan_vertices(
+                            VertexScan::new(valid_at, transaction_time, after, limit)
+                                .map_err(data_storage_error)?,
+                        )
+                        .await
+                        .map_err(data_storage_error)?
+                        .rows()
+                        .len();
+                    let count =
+                        i64::try_from(count).map_err(|_| data_error("vertex count exceeds i64"))?;
+                    (
+                        PARTIAL_VERTEX_COUNT_FIELD,
+                        vec![vec![GatewayValue::Integer(count)]],
+                    )
+                }
             };
             self.record_temporal_read_view_diagnostics(
                 diagnostics_before,
                 view.diagnostics(),
                 scan,
             );
-            GatewayRows::new(vec!["value".into()], rows)
+            GatewayRows::new(vec![field.into()], rows)
         })
     }
 
@@ -709,8 +735,9 @@ fn elapsed_nanoseconds(started: Instant) -> u64 {
 }
 
 enum FragmentRead {
-    VertexPoint(VertexId),
-    VertexScan { after: Option<VertexId>, limit: u32 },
+    Point(VertexId),
+    Scan { after: Option<VertexId>, limit: u32 },
+    Count { after: Option<VertexId>, limit: u32 },
 }
 
 fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecutionError> {
@@ -734,7 +761,7 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
                 if cursor.u32()? != 1 {
                     return Err(data_error("logical point row bound must equal one"));
                 }
-                FragmentRead::VertexPoint(id)
+                FragmentRead::Point(id)
             }
             1 => {
                 decode_logical_read_scope(&mut cursor)?;
@@ -742,7 +769,15 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
                 if limit == 0 {
                     return Err(data_error("logical scan limit is zero"));
                 }
-                FragmentRead::VertexScan { after: None, limit }
+                FragmentRead::Scan { after: None, limit }
+            }
+            2 => {
+                decode_logical_read_scope(&mut cursor)?;
+                let limit = cursor.u32()?;
+                if limit == 0 {
+                    return Err(data_error("logical count row bound is zero"));
+                }
+                FragmentRead::Count { after: None, limit }
             }
             _ => {
                 return Err(data_error(
@@ -764,7 +799,7 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
                         .map_err(|error| data_error(error.to_string()))?;
                     cursor.i64()?;
                     cursor.i64()?;
-                    FragmentRead::VertexPoint(id)
+                    FragmentRead::Point(id)
                 }
                 1 => {
                     cursor.i64()?;
@@ -781,7 +816,24 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
                     if limit == 0 {
                         return Err(data_error("pushdown scan limit is zero"));
                     }
-                    FragmentRead::VertexScan { after, limit }
+                    FragmentRead::Scan { after, limit }
+                }
+                2 => {
+                    cursor.i64()?;
+                    cursor.i64()?;
+                    let after = match cursor.u8()? {
+                        0 => None,
+                        1 => Some(
+                            VertexId::new(cursor.u128()?)
+                                .map_err(|error| data_error(error.to_string()))?,
+                        ),
+                        _ => return Err(data_error("pushdown count cursor tag is invalid")),
+                    };
+                    let limit = cursor.u32()?;
+                    if limit == 0 {
+                        return Err(data_error("pushdown count row bound is zero"));
+                    }
+                    FragmentRead::Count { after, limit }
                 }
                 _ => return Err(data_error("unknown physical pushdown operation")),
             };
