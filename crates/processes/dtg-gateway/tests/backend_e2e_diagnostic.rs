@@ -9,6 +9,23 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use backend_e2e_support::{
+    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, Workload, measure_cell,
+};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires release DTGProxy binaries"]
+async fn fjall_cell_uses_real_four_process_bolt_path() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let spec = CellSpec::one(Backend::Fjall, Workload::PointLookup, 1, 1);
+    let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+    cluster.seed_read_dataset(4_096).await.unwrap();
+    let observation = measure_cell(cluster.bolt_address(), spec).await.unwrap();
+    assert_eq!(observation.errors, 0);
+    assert_eq!(observation.row_count, 1);
+    cluster.shutdown().await.unwrap();
+}
+
 #[test]
 fn matrix_has_exact_diagnostic_cells() {
     let cells = backend_e2e_support::CellSpec::matrix(4_923_929_926_749_575_257);
@@ -78,10 +95,14 @@ async fn measure_cell_records_each_measured_read_on_one_worker_connection() {
     };
 
     let warmup = Duration::from_millis(10);
-    let observation =
-        backend_e2e_support::measure_cell(address, cell, warmup, Duration::from_millis(10))
-            .await
-            .unwrap();
+    let observation = backend_e2e_support::measure_cell_with_durations(
+        address,
+        cell,
+        warmup,
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap();
 
     assert!(observation.operations > 0);
     assert_eq!(observation.errors, 0);
@@ -122,10 +143,14 @@ async fn measure_cell_returns_an_error_when_a_measurement_bolt_operation_fails()
         repetition: 0,
     };
 
-    let error =
-        backend_e2e_support::measure_cell(address, cell, Duration::ZERO, Duration::from_millis(10))
-            .await
-            .expect_err("a Bolt failure in the measurement window must reject the cell");
+    let error = backend_e2e_support::measure_cell_with_durations(
+        address,
+        cell,
+        Duration::ZERO,
+        Duration::from_millis(10),
+    )
+    .await
+    .expect_err("a Bolt failure in the measurement window must reject the cell");
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(
