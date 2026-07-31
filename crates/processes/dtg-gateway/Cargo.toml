@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 dtg-execution = { path = "../../execution/dtg-execution" }
-tokio = { version = "=1.53.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "=1.53.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 dtg-controller = { path = "../dtg-controller" }
@@ -23,6 +23,8 @@ dtg-meta = { path = "../dtg-meta" }
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall", features = ["tck"] }
 dtg-storage-neo4j = { path = "../../storage/dtg-storage-neo4j" }
 dtg-storage-postgres = { path = "../../storage/dtg-storage-postgres" }
+serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
+sha2 = "=0.11.0"
 tempfile = "=3.27.0"
 tonic = { version = "=0.14.6", features = ["transport"] }
