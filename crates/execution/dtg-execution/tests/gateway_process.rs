@@ -22,9 +22,31 @@ use dtg_storage::{
     Version,
 };
 
+#[derive(Clone, Copy, Default)]
+enum ProtocolFixture {
+    #[default]
+    RawTwo,
+    RawPoint,
+    RawCount,
+    UnknownFragment,
+    MalformedFragment,
+    DuplicateBatch,
+    MissingFragment,
+}
+
 #[derive(Default)]
 struct RecordingProtocolClient {
     requests: Mutex<Vec<proto::GatewayRequest>>,
+    fixture: ProtocolFixture,
+}
+
+impl RecordingProtocolClient {
+    fn with_fixture(fixture: ProtocolFixture) -> Self {
+        Self {
+            requests: Mutex::new(Vec::new()),
+            fixture,
+        }
+    }
 }
 
 impl GatewayProtocolV2Client for RecordingProtocolClient {
@@ -50,28 +72,61 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
                 }
             }),
         };
-        let batch = (request.execution_request.as_ref().unwrap().body[0] == 1).then(|| {
-            let body = encoded_rows();
-            proto::ColumnBatch {
-                request: request.request.clone(),
-                fragment_id: 1_u128.to_be_bytes().to_vec(),
-                sequence: 1,
-                row_count: 2,
-                payload: Some(proto::BoundedPayload {
-                    format_version: 1,
-                    declared_len: body.len() as u64,
-                    item_count: 2,
-                    checksum: checksum_bytes(&body).to_vec(),
-                    body,
-                }),
-            }
-        });
+        let mut batches = (request.execution_request.as_ref().unwrap().body[0] == 1)
+            .then(|| match self.fixture {
+                ProtocolFixture::RawTwo => {
+                    vec![encoded_batch(1, encoded_vertex_rows(1..=2), 2)]
+                }
+                ProtocolFixture::RawPoint => {
+                    vec![encoded_batch(1, encoded_vertex_rows(1..=4096), 4096)]
+                }
+                ProtocolFixture::RawCount => request
+                    .fragments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fragment)| {
+                        let start = i64::try_from(index).unwrap() * 2048 + 1;
+                        let fragment_id = u128::from_be_bytes(
+                            fragment.fragment_id.as_slice().try_into().unwrap(),
+                        );
+                        encoded_batch(fragment_id, encoded_vertex_rows(start..start + 2048), 2048)
+                    })
+                    .collect::<Vec<_>>(),
+                ProtocolFixture::UnknownFragment => {
+                    vec![encoded_batch(2, encoded_vertex_rows(1..=1), 1)]
+                }
+                ProtocolFixture::MalformedFragment => {
+                    let mut batch = encoded_batch(1, encoded_vertex_rows(1..=1), 1);
+                    batch.fragment_id.pop();
+                    vec![batch]
+                }
+                ProtocolFixture::DuplicateBatch => vec![
+                    encoded_batch(1, encoded_vertex_rows(1..=1), 1),
+                    encoded_batch(1, encoded_vertex_rows(2..=2), 1),
+                ],
+                ProtocolFixture::MissingFragment => {
+                    vec![encoded_batch(1, encoded_vertex_rows(1..=1), 1)]
+                }
+            })
+            .unwrap_or_default();
+        for batch in &mut batches {
+            batch.request = request.request.clone();
+        }
         self.requests.lock().unwrap().push(request);
         Box::pin(async move {
-            Ok(vec![proto::GatewayResponse {
-                status: Some(status),
-                batch,
-            }])
+            if batches.is_empty() {
+                return Ok(vec![proto::GatewayResponse {
+                    status: Some(status),
+                    batch: None,
+                }]);
+            }
+            Ok(batches
+                .into_iter()
+                .map(|batch| proto::GatewayResponse {
+                    status: Some(status.clone()),
+                    batch: Some(batch),
+                })
+                .collect())
         })
     }
 }
@@ -98,6 +153,27 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn planning_context() -> PlanningContext {
     planning_context_with_fence(29, 17, 23)
+}
+
+fn two_shard_planning_context() -> PlanningContext {
+    let first = planning_context().catalog().shards()[0].clone();
+    let second_binding = first
+        .binding()
+        .clone()
+        .to_builder()
+        .shard_id(14)
+        .replica_id(20)
+        .namespace_id("gateway-wire-fixture-second-shard")
+        .build()
+        .unwrap();
+    let second = CatalogShard::new(second_binding, 37);
+    PlanningContext::new(
+        CatalogSnapshot::new(Version::new(29), Version::new(31), vec![first, second]).unwrap(),
+        planning_context().capabilities().clone(),
+        SnapshotRequirements::fixed(TransactionTime::new(41).unwrap(), 43),
+        Some(128),
+    )
+    .unwrap()
 }
 
 fn planning_context_with_fence(
@@ -244,7 +320,7 @@ fn query_wire_carries_versioned_physical_fragments_and_every_planning_fence() {
     .unwrap()
         + 5_000;
     let context = GatewayRequestContext::new(7, 8, deadline, Vec::new()).unwrap();
-    let source = "MATCH (n) RETURN n.id ORDER BY n.id";
+    let source = "MATCH (n) RETURN n.id";
 
     block_on(execution.execute_statement(
         context,
@@ -334,7 +410,7 @@ fn process_execution_decodes_protocol_v2_typed_rows() {
     let context = GatewayRequestContext::new(7, 10, deadline, Vec::new()).unwrap();
     let response = block_on(execution.execute_statement(
         context,
-        "MATCH (n) RETURN n.id ORDER BY n.id".into(),
+        "MATCH (n) RETURN n.id".into(),
         BTreeMap::new(),
         None,
         &GatewayCancellationToken::new(),
@@ -354,6 +430,139 @@ fn process_execution_decodes_protocol_v2_typed_rows() {
             .unwrap()
         )
     );
+}
+
+#[test]
+fn process_executes_remote_point_query_at_gateway() {
+    let client = Arc::new(RecordingProtocolClient::with_fixture(
+        ProtocolFixture::RawPoint,
+    ));
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client)),
+        planning_context(),
+    );
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+
+    let response = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 101, deadline, Vec::new()).unwrap(),
+        "MATCH (n) WHERE n.id = $id RETURN n.id".into(),
+        BTreeMap::from([("id".into(), GatewayValue::Integer(2048))]),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    let GatewayResponse::Rows(point) = response else {
+        panic!("expected point rows")
+    };
+    assert_eq!(point.fields(), &["n.id"]);
+    assert_eq!(point.rows(), &[vec![GatewayValue::Integer(2048)]]);
+}
+
+#[test]
+fn process_executes_remote_count_query_globally_at_gateway() {
+    let client = Arc::new(RecordingProtocolClient::with_fixture(
+        ProtocolFixture::RawCount,
+    ));
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client)),
+        two_shard_planning_context(),
+    );
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+
+    let response = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 102, deadline, Vec::new()).unwrap(),
+        "MATCH (n) RETURN COUNT(*)".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+
+    let GatewayResponse::Rows(count) = response else {
+        panic!("expected count rows")
+    };
+    assert_eq!(count.fields(), &["COUNT(*)"]);
+    assert_eq!(count.rows(), &[vec![GatewayValue::Integer(4096)]]);
+}
+
+#[test]
+fn process_rejects_unknown_remote_fragment() {
+    assert_remote_fragment_error(
+        ProtocolFixture::UnknownFragment,
+        planning_context(),
+        "DTG-EXECUTION-QUERY",
+    );
+}
+
+#[test]
+fn process_rejects_malformed_remote_fragment_id() {
+    assert_remote_fragment_error(
+        ProtocolFixture::MalformedFragment,
+        planning_context(),
+        "DTG-PROTOCOL-ROW-CODEC",
+    );
+}
+
+#[test]
+fn process_rejects_duplicate_remote_fragment_batch() {
+    assert_remote_fragment_error(
+        ProtocolFixture::DuplicateBatch,
+        planning_context(),
+        "DTG-PROTOCOL-ROW-CODEC",
+    );
+}
+
+#[test]
+fn process_rejects_missing_remote_fragment() {
+    assert_remote_fragment_error(
+        ProtocolFixture::MissingFragment,
+        two_shard_planning_context(),
+        "DTG-EXECUTION-QUERY",
+    );
+}
+
+fn assert_remote_fragment_error(
+    fixture: ProtocolFixture,
+    planning_context: PlanningContext,
+    expected_code: &str,
+) {
+    let client = Arc::new(RecordingProtocolClient::with_fixture(fixture));
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client)),
+        planning_context,
+    );
+    let deadline = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        + 5_000;
+    let error = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 103, deadline, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap_err();
+    assert_eq!(error.code(), expected_code);
 }
 
 #[test]
@@ -710,15 +919,40 @@ fn process_execution_decodes_protocol_v2_transaction_boundaries() {
     );
 }
 
-fn encoded_rows() -> Vec<u8> {
+fn encoded_batch(fragment_id: u128, body: Vec<u8>, row_count: u32) -> proto::ColumnBatch {
+    proto::ColumnBatch {
+        request: None,
+        fragment_id: fragment_id.to_be_bytes().to_vec(),
+        sequence: 1,
+        row_count,
+        payload: Some(proto::BoundedPayload {
+            format_version: 1,
+            declared_len: body.len() as u64,
+            item_count: row_count,
+            checksum: checksum_bytes(&body).to_vec(),
+            body,
+        }),
+    }
+}
+
+fn encoded_vertex_rows(ids: impl IntoIterator<Item = i64>) -> Vec<u8> {
+    let ids = ids.into_iter().collect::<Vec<_>>();
     let mut body = Vec::new();
     body.extend_from_slice(&1_u32.to_be_bytes());
-    body.extend_from_slice(&4_u32.to_be_bytes());
-    body.extend_from_slice(b"n.id");
-    body.extend_from_slice(&2_u32.to_be_bytes());
-    body.push(2);
-    body.extend_from_slice(&1_i64.to_be_bytes());
-    body.push(2);
-    body.extend_from_slice(&2_i64.to_be_bytes());
+    body.extend_from_slice(&5_u32.to_be_bytes());
+    body.extend_from_slice(b"value");
+    body.extend_from_slice(&u32::try_from(ids.len()).unwrap().to_be_bytes());
+    for id in ids {
+        body.push(7);
+        body.extend_from_slice(&2_u32.to_be_bytes());
+        body.extend_from_slice(&2_u32.to_be_bytes());
+        body.extend_from_slice(b"id");
+        body.push(2);
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(&10_u32.to_be_bytes());
+        body.extend_from_slice(b"properties");
+        body.push(7);
+        body.extend_from_slice(&0_u32.to_be_bytes());
+    }
     body
 }

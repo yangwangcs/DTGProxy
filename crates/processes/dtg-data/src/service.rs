@@ -731,7 +731,12 @@ fn encode_fragment_batches(
     rows: GatewayRows,
 ) -> Result<Vec<ColumnBatch>, &'static str> {
     let mut batches = Vec::new();
-    for (index, chunk) in rows.rows().chunks(1024).enumerate() {
+    let chunks = if rows.rows().is_empty() {
+        vec![&[][..]]
+    } else {
+        rows.rows().chunks(1024).collect()
+    };
+    for (index, chunk) in chunks.into_iter().enumerate() {
         let mut body = Vec::new();
         encode_wire_len(rows.fields().len(), &mut body)?;
         for field in rows.fields() {

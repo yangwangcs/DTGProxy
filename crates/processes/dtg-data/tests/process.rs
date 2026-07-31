@@ -297,22 +297,7 @@ async fn execute_fragment_reads_the_fenced_replica_store() {
         .await
         .unwrap();
     let applied_index = node.replica_observations().await[0].applied_index();
-    let mut body = Vec::new();
-    body.extend_from_slice(&1_u64.to_be_bytes());
-    body.extend_from_slice(&1_u32.to_be_bytes());
-    body.extend_from_slice(&0_u32.to_be_bytes());
-    body.extend_from_slice(&1_u32.to_be_bytes());
-    body.extend_from_slice(&1_u32.to_be_bytes());
-    body.push(1);
-    body.extend_from_slice(&1_u32.to_be_bytes());
-    body.extend_from_slice(&0_u32.to_be_bytes());
-    body.push(1);
-    body.extend_from_slice(&10_i64.to_be_bytes());
-    body.extend_from_slice(&41_i64.to_be_bytes());
-    body.push(0);
-    body.extend_from_slice(&10_u32.to_be_bytes());
-    body.push(0x1f);
-    body.push(0);
+    let body = scan_fragment_body();
     let mut stream = node
         .rpc_service()
         .execute_fragment(Request::new(ExecutionFragment {
@@ -429,6 +414,46 @@ async fn gateway_v2_rpc_executes_a_real_fenced_fragment() {
     assert!(stream.next().await.is_none());
 }
 
+#[tokio::test]
+async fn execute_fragment_preserves_a_present_zero_row_fragment() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("rpc-empty-fragment");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let body = scan_fragment_body();
+    let mut stream = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 72_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 2,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index: 1,
+            transaction_time: 41,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert_eq!(batch.fragment_id, 72_u128.to_be_bytes());
+    assert_eq!(batch.row_count, 0);
+    assert!(stream.next().await.is_none());
+}
+
 fn scan_fragment_body() -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&1_u64.to_be_bytes());
@@ -446,7 +471,76 @@ fn scan_fragment_body() -> Vec<u8> {
     body.extend_from_slice(&10_u32.to_be_bytes());
     body.push(0x1f);
     body.push(0);
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.push(0);
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&5_u32.to_be_bytes());
+    body.extend_from_slice(b"value");
     body
+}
+
+#[tokio::test]
+async fn fragment_rejects_two_storage_accesses() {
+    let mut body = scan_fragment_body();
+    body[16..20].copy_from_slice(&2_u32.to_be_bytes());
+    let access_end = 57;
+    let access = body[20..access_end].to_vec();
+    body.splice(access_end..access_end, access);
+    assert_fragment_failed_precondition("fragment-two-accesses", body).await;
+}
+
+#[tokio::test]
+async fn fragment_rejects_truncated_operator_section() {
+    let mut body = scan_fragment_body();
+    body.pop();
+    assert_fragment_failed_precondition("fragment-truncated-operator", body).await;
+}
+
+#[tokio::test]
+async fn fragment_rejects_trailing_bytes() {
+    let mut body = scan_fragment_body();
+    body.push(0);
+    assert_fragment_failed_precondition("fragment-trailing-bytes", body).await;
+}
+
+async fn assert_fragment_failed_precondition(namespace: &str, body: Vec<u8>) {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding(namespace);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let result = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 73_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index: 1,
+            transaction_time: 41,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await;
+    let error = match result {
+        Ok(_) => panic!("malformed fragment returned a plausible response stream"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::FailedPrecondition);
 }
 
 #[tokio::test]

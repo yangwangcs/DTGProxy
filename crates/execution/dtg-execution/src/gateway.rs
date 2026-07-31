@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dtg_analytics::{
     AnalyticsArtifactRepository, AnalyticsJobError, AnalyticsLedger, AnalyticsProjectionProvider,
@@ -24,11 +24,11 @@ use dtg_plan::{
     PlanningContext, SemanticRequirements, StorageAccess,
 };
 use dtg_query::{
-    CancellationToken as QueryCancellationToken, ExecutableAccess, ExecutableAggregate,
-    ExecutableFragment, ExecutableOperator, ExecutableOperatorKind, ExecutablePlan,
-    ExecutableProjection, ExecutableSortKey, ExecutionFence, Expression, LogicalRead, QueryBudget,
-    QueryError, QueryOverlay, QueryRuntime, QueryStorage, QueryStream, ReadOperation,
-    ResidualPredicate, SnapshotGuard, SnapshotShardFence,
+    CancellationToken as QueryCancellationToken, ColumnBatch as QueryColumnBatch, ExecutableAccess,
+    ExecutableAggregate, ExecutableFragment, ExecutableOperator, ExecutableOperatorKind,
+    ExecutablePlan, ExecutableProjection, ExecutableSortKey, ExecutionFence, Expression,
+    LogicalRead, QueryBudget, QueryError, QueryOverlay, QueryRuntime, QueryStorage, QueryStream,
+    QueryValue, ReadOperation, ResidualPredicate, SnapshotGuard, SnapshotShardFence,
 };
 use dtg_storage::{PushdownOperation, ShardId, TransactionId, Value, Version};
 use dtg_transaction::{
@@ -363,6 +363,18 @@ pub trait GatewayExecutionTransport: Send + Sync {
         &self,
         request: GatewayClusterRequest,
     ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>>;
+
+    fn execute_query(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        Box::pin(async move { self.execute(request).await.map(GatewayQueryResponse::Final) })
+    }
+}
+
+pub enum GatewayQueryResponse {
+    Materialized(BTreeMap<u32, Vec<QueryColumnBatch>>),
+    Final(GatewayResponse),
 }
 
 pub trait GatewayProtocolV2Client: Send + Sync {
@@ -472,6 +484,17 @@ impl GatewayExecutionTransport for GatewayProtocolV2Transport {
             decode_protocol_v2_responses(responses, &operation)
         })
     }
+
+    fn execute_query(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        let wire_request = encode_protocol_v2_request(&request);
+        Box::pin(async move {
+            let responses = self.client.execute(wire_request).await?;
+            decode_protocol_v2_query_responses(responses).map(GatewayQueryResponse::Materialized)
+        })
+    }
 }
 
 enum GatewayExecutionMode {
@@ -483,6 +506,7 @@ enum GatewayExecutionMode {
     },
     Process {
         planner: Planner,
+        query: QueryRuntime,
         planning_context: Arc<RwLock<PlanningContext>>,
         transport: Arc<dyn GatewayExecutionTransport>,
     },
@@ -506,6 +530,7 @@ impl GatewayExecution {
             language: Language::new(Arc::new(EmptySchemaCatalog)),
             mode: GatewayExecutionMode::Process {
                 planner: Planner,
+                query: QueryRuntime::new(1024),
                 planning_context: Arc::new(RwLock::new(planning_context)),
                 transport,
             },
@@ -793,9 +818,10 @@ impl GatewayExecution {
                 }
                 _ => None,
             };
-            if let Some(plan) = &physical_plan {
-                self.lower_plan_with_parameters(plan, &parameters)?;
-            }
+            let executable_plan = physical_plan
+                .as_ref()
+                .map(|plan| self.lower_plan_with_parameters(plan, &parameters))
+                .transpose()?;
             let request = GatewayClusterRequest {
                 context,
                 operation,
@@ -805,14 +831,79 @@ impl GatewayExecution {
                 result_fields,
                 temporal_mode,
             };
-            let GatewayExecutionMode::Process { transport, .. } = &self.mode else {
+            let query_deadline = request.context.deadline_unix_ms();
+            let expected_result_fields = request.result_fields.clone();
+            let GatewayExecutionMode::Process {
+                query, transport, ..
+            } = &self.mode
+            else {
                 return Err(GatewayExecutionError::new(
                     "DTG-EXECUTION-PROCESS-TRANSPORT",
                     "GatewayExecution was not constructed for process execution",
                     GatewayRetry::Never,
                 ));
             };
-            let response = transport.execute(request).await?;
+            let response = if let Some(executable_plan) = executable_plan {
+                match transport.execute_query(request).await? {
+                    GatewayQueryResponse::Final(response) => response,
+                    GatewayQueryResponse::Materialized(fragment_batches) => {
+                        let query_cancellation = QueryCancellationToken::new();
+                        if cancellation.is_cancelled() {
+                            query_cancellation.cancel();
+                        }
+                        let budget = process_query_budget(query_deadline)?;
+                        let mut stream = query
+                            .execute_materialized(
+                                &executable_plan,
+                                fragment_batches,
+                                budget,
+                                query_cancellation.clone(),
+                            )
+                            .await
+                            .map_err(gateway_query_error)?;
+                        let mut result_rows = Vec::new();
+                        while let Some(batch) = {
+                            if cancellation.is_cancelled() {
+                                query_cancellation.cancel();
+                            }
+                            stream.next_batch().await.map_err(gateway_query_error)?
+                        } {
+                            if batch.schema() != executable_plan.result_schema() {
+                                return Err(GatewayExecutionError::new(
+                                    "DTG-EXECUTION-RESULT-SCHEMA",
+                                    "query runtime batch schema differs from the executable plan",
+                                    GatewayRetry::Never,
+                                ));
+                            }
+                            result_rows.extend(batch.rows());
+                        }
+                        let fields = executable_plan
+                            .result_schema()
+                            .fields
+                            .iter()
+                            .map(|field| field.name.clone())
+                            .collect::<Vec<_>>();
+                        if fields != expected_result_fields {
+                            return Err(GatewayExecutionError::new(
+                                "DTG-EXECUTION-RESULT-SCHEMA",
+                                "query runtime result schema differs from planned result fields",
+                                GatewayRetry::Never,
+                            ));
+                        }
+                        let rows = result_rows
+                            .into_iter()
+                            .map(|row| {
+                                row.into_iter()
+                                    .map(query_value_to_gateway)
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        GatewayResponse::Rows(GatewayRows::new(fields, rows)?)
+                    }
+                }
+            } else {
+                transport.execute(request).await?
+            };
             validate_process_request_end(cancellation)?;
             Ok(response)
         })
@@ -1873,6 +1964,97 @@ fn decode_protocol_v2_responses(
     }
 }
 
+fn decode_protocol_v2_query_responses(
+    responses: Vec<proto::GatewayResponse>,
+) -> Result<BTreeMap<u32, Vec<QueryColumnBatch>>, GatewayExecutionError> {
+    if responses.is_empty() {
+        return Err(GatewayExecutionError::new(
+            "DTG-PROTOCOL-EMPTY-RESPONSE",
+            "protocol v2 client returned no response",
+            GatewayRetry::Safe,
+        ));
+    }
+    let mut batches = BTreeMap::<u32, Vec<(u64, QueryColumnBatch)>>::new();
+    for response in responses {
+        let status = response.status.ok_or_else(|| {
+            GatewayExecutionError::new(
+                "DTG-PROTOCOL-MISSING-STATUS",
+                "protocol v2 response omitted typed status",
+                GatewayRetry::Safe,
+            )
+        })?;
+        let validated = validate_typed_status(status.clone()).map_err(|error| {
+            GatewayExecutionError::new(error.code(), error.to_string(), GatewayRetry::Never)
+        })?;
+        if status.code != 1 {
+            return Err(protocol_status_error(status));
+        }
+        if validated.details().is_some() {
+            return Err(wire_codec_error(
+                "protocol v2 query response contained control details",
+            ));
+        }
+        let batch = response
+            .batch
+            .ok_or_else(|| wire_codec_error("protocol v2 query response omitted a batch"))?;
+        let fragment_bytes: [u8; 16] = batch
+            .fragment_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| wire_codec_error("protocol v2 fragment ID must contain 16 bytes"))?;
+        let fragment_id = u32::try_from(u128::from_be_bytes(fragment_bytes))
+            .map_err(|_| wire_codec_error("protocol v2 fragment ID exceeds u32"))?;
+        let sequence = batch.sequence;
+        let row_count = batch.row_count;
+        let payload = validate_column_batch(batch).map_err(|error| {
+            GatewayExecutionError::new(error.code(), error.to_string(), GatewayRetry::Never)
+        })?;
+        let decoded = decode_gateway_rows(payload.body(), row_count)?;
+        let schema = dtg_language_ir::RowSchema {
+            fields: decoded
+                .fields()
+                .iter()
+                .map(|name| dtg_language_ir::Field {
+                    name: name.clone(),
+                    data_type: dtg_language_ir::LogicalType::Any,
+                    nullable: true,
+                })
+                .collect(),
+        };
+        let rows = decoded
+            .rows()
+            .iter()
+            .map(|row| row.iter().cloned().map(gateway_value_to_query).collect())
+            .collect();
+        let query_batch = QueryColumnBatch::from_rows(schema, rows).map_err(gateway_query_error)?;
+        let fragment = batches.entry(fragment_id).or_default();
+        if fragment.iter().any(|(existing, _)| *existing == sequence) {
+            return Err(wire_codec_error(
+                "protocol v2 fragment repeated a batch sequence",
+            ));
+        }
+        fragment.push((sequence, query_batch));
+    }
+    batches
+        .into_iter()
+        .map(|(fragment_id, mut fragment)| {
+            fragment.sort_by_key(|(sequence, _)| *sequence);
+            for (index, (sequence, _)) in fragment.iter().enumerate() {
+                let expected = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+                if *sequence != expected {
+                    return Err(wire_codec_error(
+                        "protocol v2 fragment batch sequence is not contiguous",
+                    ));
+                }
+            }
+            Ok((
+                fragment_id,
+                fragment.into_iter().map(|(_, batch)| batch).collect(),
+            ))
+        })
+        .collect()
+}
+
 fn protocol_status_error(status: proto::TypedStatus) -> GatewayExecutionError {
     let code = match status.code {
         2 => "DTG-CLUSTER-INVALID-REQUEST",
@@ -2084,6 +2266,97 @@ impl<'a> WireCursor<'a> {
 
 fn wire_codec_error(message: impl Into<String>) -> GatewayExecutionError {
     GatewayExecutionError::new("DTG-PROTOCOL-ROW-CODEC", message, GatewayRetry::Never)
+}
+
+fn process_query_budget(deadline_unix_ms: u64) -> Result<QueryBudget, GatewayExecutionError> {
+    let now_unix_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| {
+                GatewayExecutionError::new(
+                    "DTG-EXECUTION-CLOCK",
+                    "system clock precedes Unix epoch",
+                    GatewayRetry::Safe,
+                )
+            })?
+            .as_millis(),
+    )
+    .map_err(|_| {
+        GatewayExecutionError::new(
+            "DTG-EXECUTION-CLOCK",
+            "system clock exceeds u64 milliseconds",
+            GatewayRetry::Safe,
+        )
+    })?;
+    let remaining = deadline_unix_ms.checked_sub(now_unix_ms).ok_or_else(|| {
+        GatewayExecutionError::new(
+            "DTG-EXECUTION-DEADLINE",
+            "Gateway request deadline elapsed before query execution",
+            GatewayRetry::Safe,
+        )
+    })?;
+    Ok(QueryBudget {
+        max_rows: 1_000_000,
+        max_scan_bytes: 256 * 1024 * 1024,
+        max_memory_bytes: 256 * 1024 * 1024,
+        max_network_bytes: 256 * 1024 * 1024,
+        max_spill_bytes: 1024 * 1024 * 1024,
+        deadline: Instant::now() + Duration::from_millis(remaining),
+    })
+}
+
+fn gateway_query_error(error: QueryError) -> GatewayExecutionError {
+    GatewayExecutionError::new(
+        "DTG-EXECUTION-QUERY",
+        error.to_string(),
+        GatewayRetry::Never,
+    )
+}
+
+fn gateway_value_to_query(value: GatewayValue) -> QueryValue {
+    match value {
+        GatewayValue::Null => QueryValue::Null,
+        GatewayValue::Boolean(value) => QueryValue::Boolean(value),
+        GatewayValue::Integer(value) => QueryValue::Integer(value),
+        GatewayValue::FloatBits(value) => QueryValue::FloatBits(value),
+        GatewayValue::Bytes(value) => QueryValue::Bytes(value),
+        GatewayValue::String(value) => QueryValue::String(value),
+        GatewayValue::List(values) => {
+            QueryValue::List(values.into_iter().map(gateway_value_to_query).collect())
+        }
+        GatewayValue::Map(values) => QueryValue::Map(
+            values
+                .into_iter()
+                .map(|(name, value)| (name, gateway_value_to_query(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn query_value_to_gateway(value: QueryValue) -> Result<GatewayValue, GatewayExecutionError> {
+    match value {
+        QueryValue::Null => Ok(GatewayValue::Null),
+        QueryValue::Boolean(value) => Ok(GatewayValue::Boolean(value)),
+        QueryValue::Integer(value) => Ok(GatewayValue::Integer(value)),
+        QueryValue::FloatBits(value) => Ok(GatewayValue::FloatBits(value)),
+        QueryValue::Bytes(value) => Ok(GatewayValue::Bytes(value)),
+        QueryValue::String(value) => Ok(GatewayValue::String(value)),
+        QueryValue::List(values) => values
+            .into_iter()
+            .map(query_value_to_gateway)
+            .collect::<Result<Vec<_>, _>>()
+            .map(GatewayValue::List),
+        QueryValue::Map(values) => values
+            .into_iter()
+            .map(|(name, value)| Ok((name, query_value_to_gateway(value)?)))
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(GatewayValue::Map),
+        QueryValue::Vertex(_) | QueryValue::Relationship(_) => Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-QUERY-VALUE",
+            "query runtime produced an unsupported graph value",
+            GatewayRetry::Never,
+        )),
+    }
 }
 
 fn validate_exchanges(plan: &PhysicalPlan) -> Result<(), QueryError> {

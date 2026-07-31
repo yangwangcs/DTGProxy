@@ -446,22 +446,26 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
         return Err(data_error("physical fragment version or root is zero"));
     }
     cursor.skip_row_schema()?;
-    if cursor.u32()? == 0 {
-        return Err(data_error("physical fragment has no storage access"));
+    if cursor.u32()? != 1 {
+        return Err(data_error(
+            "physical fragment must contain exactly one storage access",
+        ));
     }
     cursor.u32()?;
-    match cursor.u8()? {
+    let read = match cursor.u8()? {
         0 => match cursor.u8()? {
-            0 => Ok(FragmentRead::VertexPoint(
+            0 => FragmentRead::VertexPoint(
                 VertexId::new(cursor.u128()?).map_err(|error| data_error(error.to_string()))?,
-            )),
-            1 => Ok(FragmentRead::VertexScan {
+            ),
+            1 => FragmentRead::VertexScan {
                 after: None,
                 limit: decode_logical_scan_limit(&mut cursor)?,
-            }),
-            _ => Err(data_error(
-                "physical logical access is not executable by the Data worker",
-            )),
+            },
+            _ => {
+                return Err(data_error(
+                    "physical logical access is not executable by the Data worker",
+                ));
+            }
         },
         1 => {
             if cursor.u32()? == 0 {
@@ -471,13 +475,13 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
             for _ in 0..capability_count {
                 cursor.string()?;
             }
-            match cursor.u8()? {
+            let read = match cursor.u8()? {
                 0 => {
                     let id = VertexId::new(cursor.u128()?)
                         .map_err(|error| data_error(error.to_string()))?;
                     cursor.i64()?;
                     cursor.i64()?;
-                    Ok(FragmentRead::VertexPoint(id))
+                    FragmentRead::VertexPoint(id)
                 }
                 1 => {
                     cursor.i64()?;
@@ -494,13 +498,26 @@ fn decode_fragment_read(encoded: &[u8]) -> Result<FragmentRead, GatewayExecution
                     if limit == 0 {
                         return Err(data_error("pushdown scan limit is zero"));
                     }
-                    Ok(FragmentRead::VertexScan { after, limit })
+                    FragmentRead::VertexScan { after, limit }
                 }
-                _ => Err(data_error("unknown physical pushdown operation")),
+                _ => return Err(data_error("unknown physical pushdown operation")),
+            };
+            if cursor.u8()? & !0x1f != 0 {
+                return Err(data_error("pushdown semantic flags are invalid"));
             }
+            if cursor.flag("pushdown residual")? {
+                cursor.skip_physical_expr(0)?;
+            }
+            read
         }
-        _ => Err(data_error("unknown physical storage access")),
+        _ => return Err(data_error("unknown physical storage access")),
+    };
+    let operator_count = cursor.len()?;
+    for _ in 0..operator_count {
+        cursor.skip_operator()?;
     }
+    cursor.finish()?;
+    Ok(read)
 }
 
 fn decode_logical_scan_limit(
@@ -668,6 +685,196 @@ impl<'a> FragmentCursor<'a> {
             0..=5 | 7..=10 => Ok(()),
             6 => self.skip_type(depth + 1),
             _ => Err(data_error("fragment logical type tag is invalid")),
+        }
+    }
+
+    fn finish(&self) -> Result<(), GatewayExecutionError> {
+        if self.offset != self.bytes.len() {
+            return Err(data_error("physical fragment contains trailing bytes"));
+        }
+        Ok(())
+    }
+
+    fn flag(&mut self, name: &str) -> Result<bool, GatewayExecutionError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(data_error(format!("fragment {name} flag is invalid"))),
+        }
+    }
+
+    fn skip_operator(&mut self) -> Result<(), GatewayExecutionError> {
+        self.u32()?;
+        match self.u8()? {
+            0 => {
+                self.u32()?;
+                let fragments = self.len()?;
+                for _ in 0..fragments {
+                    self.u32()?;
+                }
+                self.string()?;
+            }
+            1 => {
+                self.u32()?;
+                self.skip_physical_expr(0)?;
+            }
+            2 => {
+                self.u32()?;
+                self.skip_projections(0)?;
+            }
+            3 => {
+                self.u32()?;
+                self.u32()?;
+                if self.u8()? > 3 {
+                    return Err(data_error("fragment join kind is invalid"));
+                }
+                if self.flag("join predicate")? {
+                    self.skip_physical_expr(0)?;
+                }
+            }
+            4 => {
+                self.u32()?;
+                self.skip_projections(0)?;
+                let aggregates = self.len()?;
+                for _ in 0..aggregates {
+                    if self.u8()? > 5 {
+                        return Err(data_error("fragment aggregate kind is invalid"));
+                    }
+                    if self.flag("aggregate argument")? {
+                        self.skip_logical_expr(0)?;
+                    }
+                    self.string()?;
+                    self.flag("aggregate distinct")?;
+                }
+            }
+            5 => {
+                self.u32()?;
+                let keys = self.len()?;
+                for _ in 0..keys {
+                    self.skip_logical_expr(0)?;
+                    if self.u8()? > 1 {
+                        return Err(data_error("fragment sort direction is invalid"));
+                    }
+                }
+            }
+            6 => {
+                self.u32()?;
+                self.u64()?;
+                if self.flag("limit")? {
+                    self.u64()?;
+                }
+            }
+            7 => {
+                self.u32()?;
+                self.skip_physical_expr(0)?;
+                self.string()?;
+            }
+            _ => return Err(data_error("fragment physical operator tag is invalid")),
+        }
+        Ok(())
+    }
+
+    fn skip_projections(&mut self, depth: usize) -> Result<(), GatewayExecutionError> {
+        let projections = self.len()?;
+        for _ in 0..projections {
+            self.skip_logical_expr(depth + 1)?;
+            self.string()?;
+        }
+        Ok(())
+    }
+
+    fn skip_physical_expr(&mut self, depth: usize) -> Result<(), GatewayExecutionError> {
+        if depth > 64 {
+            return Err(data_error("fragment expression nesting exceeds 64"));
+        }
+        match self.u8()? {
+            0 => self.skip_logical_expr(depth + 1),
+            1 => {
+                self.u32()?;
+                if self.u8()? & !0x1f != 0 {
+                    return Err(data_error("fragment semantic flags are invalid"));
+                }
+                Ok(())
+            }
+            _ => Err(data_error("fragment physical expression tag is invalid")),
+        }
+    }
+
+    fn skip_logical_expr(&mut self, depth: usize) -> Result<(), GatewayExecutionError> {
+        if depth > 64 {
+            return Err(data_error("fragment expression nesting exceeds 64"));
+        }
+        match self.u8()? {
+            0 => self.skip_value(depth + 1),
+            1 | 2 => self.string().map(|_| ()),
+            3 => {
+                self.skip_logical_expr(depth + 1)?;
+                self.string()?;
+                Ok(())
+            }
+            4 => {
+                if self.u8()? > 2 {
+                    return Err(data_error("fragment unary operator is invalid"));
+                }
+                self.skip_logical_expr(depth + 1)
+            }
+            5 => {
+                if self.u8()? > 12 {
+                    return Err(data_error("fragment binary operator is invalid"));
+                }
+                self.skip_logical_expr(depth + 1)?;
+                self.skip_logical_expr(depth + 1)
+            }
+            6 => {
+                let values = self.len()?;
+                for _ in 0..values {
+                    self.skip_logical_expr(depth + 1)?;
+                }
+                Ok(())
+            }
+            7 => {
+                let values = self.len()?;
+                for _ in 0..values {
+                    self.string()?;
+                    self.skip_logical_expr(depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Err(data_error("fragment logical expression tag is invalid")),
+        }
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Result<(), GatewayExecutionError> {
+        if depth > 64 {
+            return Err(data_error("fragment value nesting exceeds 64"));
+        }
+        match self.u8()? {
+            0 => Ok(()),
+            1 => {
+                self.flag("boolean value")?;
+                Ok(())
+            }
+            2 | 3 => self.exact(8).map(|_| ()),
+            4 | 5 => {
+                let length = self.len()?;
+                self.exact(length).map(|_| ())
+            }
+            6 => {
+                let values = self.len()?;
+                for _ in 0..values {
+                    self.skip_value(depth + 1)?;
+                }
+                Ok(())
+            }
+            7 => {
+                let values = self.len()?;
+                for _ in 0..values {
+                    self.string()?;
+                    self.skip_value(depth + 1)?;
+                }
+                Ok(())
+            }
+            _ => Err(data_error("fragment value tag is invalid")),
         }
     }
 }
