@@ -378,6 +378,66 @@ async fn apply_transaction_proposes_the_typed_shard_command() {
 
     assert_eq!(response.code, StatusCode::Ok as i32);
     assert!(node.replica_observations().await[0].applied_index() >= 2);
+
+    let metrics = node.request_metrics().snapshot();
+    for stage in [
+        RequestStage::DataValidation,
+        RequestStage::DataRouting,
+        RequestStage::DataRaftApply,
+    ] {
+        let stage = metrics.stage(stage);
+        assert_eq!(stage.success, 1);
+        assert_eq!(stage.error, 0);
+        assert_eq!(stage.cancelled, 0);
+    }
+}
+
+#[tokio::test]
+async fn execute_fragment_rejects_invalid_transaction_time_before_provider_timing() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("rpc-invalid-fragment-time");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let body = scan_fragment_body();
+
+    let result = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 74_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 2,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index: 1,
+            transaction_time: -1,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await;
+    let error = match result {
+        Ok(_) => panic!("invalid transaction time produced a fragment response"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    let provider = node
+        .request_metrics()
+        .snapshot()
+        .stage(RequestStage::DataProviderExecution);
+    assert_eq!(provider.success, 0);
+    assert_eq!(provider.error, 0);
+    assert_eq!(provider.cancelled, 0);
 }
 
 #[tokio::test]

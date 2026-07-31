@@ -728,6 +728,8 @@ impl DataRpcService {
         {
             return Err(self.execution_failure("fragment capability digest drifted"));
         }
+        let transaction_time = dtg_execution::storage::TransactionTime::new(wire.transaction_time)
+            .map_err(|error| self.execution_failure(error))?;
         let timer = self
             .request_metrics
             .start(RequestStage::DataProviderExecution);
@@ -736,8 +738,7 @@ impl DataRpcService {
                 .execute_fragment(
                     key,
                     wire.applied_index,
-                    dtg_execution::storage::TransactionTime::new(wire.transaction_time)
-                        .map_err(|error| self.execution_failure(error))?,
+                    transaction_time,
                     wire.valid_at,
                     payload.body(),
                 )

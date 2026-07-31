@@ -1269,7 +1269,6 @@ impl GatewayExecution {
                 .collect();
             let planned = match &program.statement {
                 LogicalStatement::Query(_) => {
-                    let timer = self.request_metrics.start(RequestStage::GatewayPlan);
                     let GatewayExecutionMode::Process {
                         planner,
                         planning_context,
@@ -1282,6 +1281,7 @@ impl GatewayExecution {
                             GatewayRetry::Never,
                         ));
                     };
+                    let timer = self.request_metrics.start(RequestStage::GatewayPlan);
                     let result = (|| {
                         let planning_context = planning_context.read().map_err(|_| {
                             GatewayExecutionError::new(
