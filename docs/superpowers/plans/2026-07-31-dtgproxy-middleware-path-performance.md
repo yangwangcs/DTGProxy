@@ -523,3 +523,57 @@ git diff --check
 git add docs/audit/performance/2026-07-31-middleware-path-optimization.md
 git commit -m "docs: report middleware path optimization"
 ```
+
+---
+
+### Task 7: Reuse Exact Immutable Data Read Views
+
+**Evidence:** On the real four-process Fjall point path, compile and planning are below 0.05 ms per
+request while `DataProviderExecution` is about 37.5 ms. `FjallReadView::load` rebuilds an immutable
+snapshot by decoding the complete history and temporal-change index for every fragment. The fix
+belongs in the middleware lifecycle, not in a provider's data model.
+
+**Files:**
+- Modify: `crates/execution/dtg-execution/src/data.rs`
+- Test: `crates/execution/dtg-execution/tests/facades.rs`
+
+**Interface:** `DataExecution` owns at most one cached `Arc<dyn TemporalReadView>` per local
+`ReplicaKey`. A hit requires the complete `ReadFence` to compare equal, including binding, applied
+index, and capability digest.
+
+- [ ] **Step 1: Write failing behavior tests**
+
+Use a counting `ReplicaStateStore` through the real `DataExecution::execute_fragment` path. Require
+two reads at the same fence to call `begin_read_view` once; a higher applied index to open and
+publish a new view; a removed/re-added replica not to inherit the old view; and a provider-returned
+view with a different fence to fail closed. Confirm the RED failure is the repeated construction,
+not fixture setup.
+
+- [ ] **Step 2: Implement the bounded exact-fence cache**
+
+Look up the cache under a short mutex, release it before `begin_read_view().await`, validate that the
+returned view carries the requested fence, convert it to `Arc`, then recheck before publication so
+concurrent cold misses reuse an already-published exact view. Keep at most one entry per replica.
+For one unchanged binding, an older request completing late must not displace a higher applied-index
+entry. Verify that the runtime store is still the registered store before publishing a newly opened
+view. Clear the entry after successful replica addition and on replica removal. Never hold the
+store, ShardHost, or read-view cache mutex across an await.
+
+- [ ] **Step 3: Verify correctness and isolation**
+
+```bash
+cargo test --locked -p dtg-execution --test facades read_view_cache_ -- --nocapture
+cargo test --locked -p dtg-execution --test facades -- --test-threads=1
+cargo test --locked -p dtg-data --test process -- --test-threads=1
+cargo clippy --locked -p dtg-execution -p dtg-data --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+```
+
+- [ ] **Step 4: Commit and measure**
+
+Commit only the two task files. Build the four release processes, then produce a new three-repetition
+Fjall artifact with a new absolute output path. Require 18 observations, six summaries, zero errors,
+stable read identities, and valid metric brackets. Compare it to the post-Bolt/runtime artifact.
+Only after Fjall is complete, start PostgreSQL and Neo4j one at a time for the same quick diagnostic;
+do not run migration tests.
