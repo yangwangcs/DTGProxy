@@ -8,18 +8,9 @@ license.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = []
-test-support = ["dtg-execution/test-support"]
-
 [[bin]]
 name = "dtgproxy-data"
 path = "src/main.rs"
-
-[[test]]
-name = "process"
-path = "tests/process.rs"
-required-features = ["test-support"]
 
 [dependencies]
 dtg-execution = { path = "../../execution/dtg-execution" }
@@ -34,6 +25,7 @@ tokio-stream = "=0.1.18"
 tonic = { version = "=0.14.6", features = ["transport"] }
 
 [dev-dependencies]
+dtg-execution = { path = "../../execution/dtg-execution", features = ["test-support"] }
 dtg-language-ir = { path = "../../language/dtg-language-ir" }
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall", features = ["tck"] }
 tempfile = "=3.27.0"
