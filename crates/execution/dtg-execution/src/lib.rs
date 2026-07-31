@@ -27,8 +27,9 @@ pub use gateway::{
     GatewayExecutionTransportFactory, GatewayFuture, GatewayOperation, GatewayProtocolV2Client,
     GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse, GatewayRetry, GatewayRows,
     GatewayTemporalMode, GatewayTime, GatewayValue, TonicGatewayProtocolV2TransportFactory,
-    encode_physical_fragment_body,
 };
+#[cfg(feature = "test-support")]
+pub use gateway::encode_physical_fragment_body;
 pub use meta::{MetaExecution, MetaExecutionBuilder};
 pub use meta_raft::{
     MetaCommittedEntry, MetaRaftError, MetaRaftHost, MetaRaftProgress, MetaRaftRole,

@@ -8,9 +8,18 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+test-support = ["dtg-execution/test-support"]
+
 [[bin]]
 name = "dtgproxy-data"
 path = "src/main.rs"
+
+[[test]]
+name = "process"
+path = "tests/process.rs"
+required-features = ["test-support"]
 
 [dependencies]
 dtg-execution = { path = "../../execution/dtg-execution" }

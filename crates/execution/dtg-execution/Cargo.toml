@@ -8,6 +8,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 dtg-analytics = { path = "../dtg-analytics" }
 dtg-cluster-protocol = { path = "../dtg-cluster-protocol" }
