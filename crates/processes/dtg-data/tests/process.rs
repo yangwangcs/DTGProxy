@@ -420,12 +420,20 @@ async fn single_shard_transaction_is_applied_once_with_durable_metadata() {
             body: body.clone(),
         }),
     };
-    node.rpc_service()
+    let status = node
+        .rpc_service()
         .apply_transaction(Request::new(request()))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
     let applied = node.replica_observations().await[0].applied_index();
     assert!(applied > 1);
+    let details = status.details.unwrap().body;
+    assert_eq!(
+        u64::from_be_bytes(details[..8].try_into().unwrap()),
+        applied
+    );
+    assert_eq!(details[8], 0);
 
     let mut stream = node
         .rpc_service()
@@ -451,11 +459,20 @@ async fn single_shard_transaction_is_applied_once_with_durable_metadata() {
         .into_inner();
     assert_eq!(stream.next().await.unwrap().unwrap().row_count, 1);
 
-    node.rpc_service()
+    let replay = node
+        .rpc_service()
         .apply_transaction(Request::new(request()))
         .await
-        .unwrap();
-    assert!(node.replica_observations().await[0].applied_index() > applied);
+        .unwrap()
+        .into_inner();
+    let replayed_applied = node.replica_observations().await[0].applied_index();
+    assert!(replayed_applied > applied);
+    let details = replay.details.unwrap().body;
+    assert_eq!(
+        u64::from_be_bytes(details[..8].try_into().unwrap()),
+        replayed_applied
+    );
+    assert_eq!(details[8], 1);
 }
 
 #[tokio::test]

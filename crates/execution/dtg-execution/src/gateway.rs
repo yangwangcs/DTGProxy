@@ -20,8 +20,9 @@ use dtg_language_ir::{
     ValidTimeExpr, ValidTimePredicate,
 };
 use dtg_plan::{
-    ExchangeKind, LogicalReadOperation, LogicalReadRequest, PhysicalExpr, PhysicalPlan, Planner,
-    PlanningContext, SemanticRequirements, StorageAccess,
+    CatalogShard, CatalogSnapshot, ExchangeKind, LogicalReadOperation, LogicalReadRequest,
+    PhysicalExpr, PhysicalPlan, Planner, PlanningContext, SemanticRequirements,
+    SnapshotRequirements, StorageAccess,
 };
 use dtg_query::{
     CancellationToken as QueryCancellationToken, ColumnBatch as QueryColumnBatch, ExecutableAccess,
@@ -423,6 +424,29 @@ pub struct GatewayWriteRequest {
     command: ShardCommand,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GatewayWriteReceipt {
+    applied_index: u64,
+    replayed: bool,
+}
+
+impl GatewayWriteReceipt {
+    pub const fn new(applied_index: u64, replayed: bool) -> Self {
+        Self {
+            applied_index,
+            replayed,
+        }
+    }
+
+    pub const fn applied_index(self) -> u64 {
+        self.applied_index
+    }
+
+    pub const fn replayed(self) -> bool {
+        self.replayed
+    }
+}
+
 impl GatewayWriteRequest {
     fn new(
         route: GatewayWriteRoute,
@@ -484,7 +508,7 @@ pub trait GatewayWriteTransport: Send + Sync {
     fn apply_single_shard(
         &self,
         request: GatewayWriteRequest,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>>;
+    ) -> GatewayFuture<'_, Result<GatewayWriteReceipt, GatewayExecutionError>>;
 
     fn resolve_committed(
         &self,
@@ -572,7 +596,7 @@ impl GatewayWriteTransport for TonicGatewayWriteTransport {
     fn apply_single_shard(
         &self,
         request: GatewayWriteRequest,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+    ) -> GatewayFuture<'_, Result<GatewayWriteReceipt, GatewayExecutionError>> {
         Box::pin(async move {
             let command = request.command().encode_current().map_err(|error| {
                 GatewayExecutionError::new(
@@ -593,7 +617,34 @@ impl GatewayWriteTransport for TonicGatewayWriteTransport {
                 .await
                 .map_err(cluster_rpc_error)?
                 .into_inner();
-            status_details(status).map(|_| ())
+            let details = status_details(status)?;
+            let bytes: [u8; 9] = details.as_slice().try_into().map_err(|_| {
+                GatewayExecutionError::new(
+                    "DTG-EXECUTION-WRITE-RECEIPT",
+                    "Data write response is not an applied receipt",
+                    GatewayRetry::Safe,
+                )
+            })?;
+            let applied_index = u64::from_be_bytes(bytes[..8].try_into().expect("length checked"));
+            if applied_index == 0 {
+                return Err(GatewayExecutionError::new(
+                    "DTG-EXECUTION-WRITE-RECEIPT",
+                    "Data write response contains a zero applied index",
+                    GatewayRetry::Safe,
+                ));
+            }
+            let replayed = match bytes[8] {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(GatewayExecutionError::new(
+                        "DTG-EXECUTION-WRITE-RECEIPT",
+                        "Data write response contains an invalid replay flag",
+                        GatewayRetry::Safe,
+                    ));
+                }
+            };
+            Ok(GatewayWriteReceipt::new(applied_index, replayed))
         })
     }
 
@@ -1148,7 +1199,7 @@ impl GatewayExecution {
                         )
                     })?
                     .clone();
-                execute_process_create(
+                let outcome = execute_process_create(
                     transport.as_ref(),
                     context,
                     write,
@@ -1156,6 +1207,15 @@ impl GatewayExecution {
                     &planning_context,
                 )
                 .await?;
+                advance_process_snapshot(
+                    match &self.mode {
+                        GatewayExecutionMode::Process {
+                            planning_context, ..
+                        } => planning_context,
+                        GatewayExecutionMode::Composed { .. } => unreachable!(),
+                    },
+                    &outcome,
+                )?;
                 validate_process_request_end(cancellation)?;
                 return Ok(GatewayResponse::Acknowledged);
             }
@@ -2984,7 +3044,7 @@ async fn execute_process_create(
     write: &dtg_language_ir::LogicalWrite,
     parameters: &BTreeMap<String, GatewayValue>,
     planning_context: &PlanningContext,
-) -> Result<(), GatewayExecutionError> {
+) -> Result<ProcessWriteOutcome, GatewayExecutionError> {
     let [catalog_shard] = planning_context.catalog().shards() else {
         return Err(GatewayExecutionError::new(
             "DTG-EXECUTION-WRITE-ROUTING",
@@ -3082,13 +3142,86 @@ async fn execute_process_create(
         commit_time,
         command,
     );
-    if let Err(error) = transport.apply_single_shard(request).await {
-        if error.retry() == GatewayRetry::Never {
-            transport.abort(&route, transaction_id).await?;
+    let receipt = match transport.apply_single_shard(request).await {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            if error.retry() == GatewayRetry::Never {
+                transport.abort(&route, transaction_id).await?;
+            }
+            return Err(error);
         }
-        return Err(error);
+    };
+    transport.resolve_committed(&route, transaction_id).await?;
+    Ok(ProcessWriteOutcome {
+        binding: route.binding,
+        applied_index: receipt.applied_index(),
+        replayed: receipt.replayed(),
+        commit_time,
+    })
+}
+
+struct ProcessWriteOutcome {
+    binding: dtg_storage::ReplicaBinding,
+    applied_index: u64,
+    replayed: bool,
+    commit_time: dtg_storage::TransactionTime,
+}
+
+fn advance_process_snapshot(
+    planning_context: &RwLock<PlanningContext>,
+    outcome: &ProcessWriteOutcome,
+) -> Result<(), GatewayExecutionError> {
+    let mut current = planning_context.write().map_err(|_| {
+        GatewayExecutionError::new(
+            "DTG-EXECUTION-CATALOG-LOCK",
+            "Gateway planning catalog lock is poisoned",
+            GatewayRetry::Safe,
+        )
+    })?;
+    let [shard] = current.catalog().shards() else {
+        return Err(process_write_error(
+            "process CREATE completed outside a singleton catalog",
+        ));
+    };
+    if shard.binding() != &outcome.binding {
+        return Ok(());
     }
-    transport.resolve_committed(&route, transaction_id).await
+    let applied_index = shard.applied_index().max(outcome.applied_index);
+    let transaction_time = current
+        .snapshot_requirements()
+        .transaction_time()
+        .max(outcome.commit_time);
+    let logical_scan_bound = current.logical_scan_bound().map(|bound| {
+        if outcome.replayed {
+            bound
+        } else {
+            bound.saturating_add(1)
+        }
+    });
+    if applied_index == shard.applied_index()
+        && transaction_time == current.snapshot_requirements().transaction_time()
+        && logical_scan_bound == current.logical_scan_bound()
+    {
+        return Ok(());
+    }
+    let catalog = CatalogSnapshot::new(
+        current.catalog().version(),
+        current.catalog().schema_version(),
+        vec![CatalogShard::new(outcome.binding.clone(), applied_index)],
+    )
+    .map_err(|error| process_write_error(error.to_string()))?;
+    *current = PlanningContext::new(
+        catalog,
+        current.capabilities().clone(),
+        SnapshotRequirements::new(
+            transaction_time,
+            current.snapshot_requirements().valid_at(),
+            current.snapshot_requirements().immutable(),
+        ),
+        logical_scan_bound,
+    )
+    .map_err(|error| process_write_error(error.to_string()))?;
+    Ok(())
 }
 
 fn lower_process_create_vertex(

@@ -28,8 +28,9 @@ pub use gateway::{
     GatewayExecutionBuilder, GatewayExecutionError, GatewayExecutionTransport,
     GatewayExecutionTransportFactory, GatewayFuture, GatewayOperation, GatewayProtocolV2Client,
     GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse, GatewayRetry, GatewayRows,
-    GatewayTemporalMode, GatewayTime, GatewayValue, GatewayWriteRequest, GatewayWriteRoute,
-    GatewayWriteTransport, TonicGatewayProtocolV2TransportFactory, TonicGatewayWriteTransport,
+    GatewayTemporalMode, GatewayTime, GatewayValue, GatewayWriteReceipt, GatewayWriteRequest,
+    GatewayWriteRoute, GatewayWriteTransport, TonicGatewayProtocolV2TransportFactory,
+    TonicGatewayWriteTransport,
 };
 pub use meta::{MetaExecution, MetaExecutionBuilder};
 pub use meta_raft::{

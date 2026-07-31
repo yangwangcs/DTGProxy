@@ -330,8 +330,8 @@ impl DiagnosticCluster {
     fn start_gateway(&mut self, applied_index: u64) -> io::Result<()> {
         let shard = gateway_shard_spec(&self.binding, applied_index);
         let logical_scan_bound = match self.spec.workload {
-            Workload::PointLookup => "1",
-            Workload::CreateVertex | Workload::CountVertices => "4096",
+            Workload::PointLookup | Workload::CountVertices => "4096",
+            Workload::CreateVertex => "1",
         };
         let environment = vec![
             ("DTG_GATEWAY_BIND", self.gateway_address.to_string()),
@@ -620,6 +620,10 @@ fn point_fragment_body(vertex_id: u128) -> Vec<u8> {
     body.push(0);
     body.push(0);
     body.extend_from_slice(&vertex_id.to_be_bytes());
+    body.push(0);
+    body.push(0);
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
     body
 }
 

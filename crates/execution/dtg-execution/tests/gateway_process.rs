@@ -8,7 +8,7 @@ use dtg_cluster_v2::{checksum_bytes, proto};
 use dtg_execution::{
     GatewayCancellationToken, GatewayExecution, GatewayExecutionError, GatewayFuture,
     GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
-    GatewayValue, GatewayWriteRequest, GatewayWriteTransport,
+    GatewayValue, GatewayWriteReceipt, GatewayWriteRequest, GatewayWriteTransport,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -159,10 +159,10 @@ impl GatewayWriteTransport for RecordingWriteTransport {
     fn apply_single_shard(
         &self,
         request: GatewayWriteRequest,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+    ) -> GatewayFuture<'_, Result<GatewayWriteReceipt, GatewayExecutionError>> {
         self.events.lock().unwrap().push("apply");
         self.requests.lock().unwrap().push(request);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(GatewayWriteReceipt::new(38, false)) })
     }
 
     fn resolve_committed(
@@ -187,10 +187,9 @@ impl GatewayWriteTransport for RecordingWriteTransport {
 #[test]
 fn process_create_requires_transaction_dispatch() {
     let writes = Arc::new(RecordingWriteTransport::default());
+    let client = Arc::new(RecordingProtocolClient::default());
     let execution = GatewayExecution::for_process_with_writes(
-        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
-            RecordingProtocolClient::default(),
-        ))),
+        Arc::new(GatewayProtocolV2Transport::new(client.clone())),
         writes.clone(),
         planning_context(),
     );
@@ -246,6 +245,19 @@ fn process_create_requires_transaction_dispatch() {
     );
     assert_eq!(vertex.valid_time().start(), 1);
     assert_eq!(vertex.valid_time().end(), i64::MAX);
+    drop(requests);
+
+    block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 82, u64::MAX, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap();
+    let queries = client.requests.lock().unwrap();
+    assert_eq!(queries[0].fragments[0].applied_index, 38);
+    assert_eq!(queries[0].fragments[0].transaction_time, 43);
 }
 
 struct ThreadWake;

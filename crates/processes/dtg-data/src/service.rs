@@ -875,6 +875,7 @@ impl DataService for DataRpcService {
         {
             return Err(self.execution_failure("transaction command and request fence differ"));
         }
+        let command_id = command.header().command_id().get();
         let key = self
             .execution
             .locate_replica(
@@ -886,16 +887,38 @@ impl DataService for DataRpcService {
                 None,
             )
             .map_err(|error| self.execution_failure(error))?;
-        self.execution
+        let progress = self
+            .execution
             .apply_transaction_command(key, command)
             .map_err(|error| self.execution_failure(error))?;
+        let mut matching = progress
+            .receipts()
+            .iter()
+            .filter(|receipt| receipt.command_id() == command_id);
+        let receipt = matching
+            .next()
+            .ok_or_else(|| self.execution_failure("transaction command produced no receipt"))?;
+        if matching.next().is_some() {
+            return Err(self.execution_failure("transaction command produced duplicate receipts"));
+        }
+        if receipt.rejection().is_some() {
+            return Err(self.execution_failure("transaction command was rejected"));
+        }
+        let mut body = receipt.index().to_be_bytes().to_vec();
+        body.push(u8::from(receipt.replayed()));
         Ok(Response::new(TypedStatus {
             request: response_context,
             code: StatusCode::Ok.into(),
             retry: RetryDisposition::Never.into(),
             message: "transaction command accepted by Shard Raft".into(),
             idempotency_key: wire.idempotency_key,
-            details: None,
+            details: Some(dtg_execution::cluster_protocol::proto::BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
         }))
     }
 
