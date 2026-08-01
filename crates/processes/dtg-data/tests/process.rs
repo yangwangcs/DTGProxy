@@ -19,18 +19,19 @@ use dtg_execution::planning::{
 };
 use dtg_execution::shard::{CommitSingleShard, CommitSingleShardTransaction, ShardCommand};
 use dtg_execution::storage::{
-    BackendClass, BindingRole, CapabilityManifest, CommandId, LogicalMutation, Properties,
-    ReplicaBinding, StorageTckFactory, TransactionTime, ValidInterval, Version, VertexId,
-    VertexVersion,
+    BackendClass, BindingRole, CapabilityManifest, CommandId, EdgeId, EdgeVersion, LogicalMutation,
+    Properties, ReplicaBinding, StorageTckFactory, TransactionTime, ValidInterval, Version,
+    VertexId, VertexVersion,
 };
 use dtg_execution::{
     GatewayCancellationToken, GatewayExecution, GatewayExecutionError, GatewayFuture,
     GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse,
-    GatewayRetry, ProviderKind, RequestStage, encode_physical_fragment_body,
+    GatewayRetry, ProviderKind, RequestDetail, RequestStage, encode_physical_fragment_body,
 };
 use dtg_language_ir::{
-    Field, GraphScope, LogicalExpr, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
-    LogicalProgram, LogicalStatement, LogicalType, ReadScope, RowSchema, Value, VertexLookup,
+    Expand, ExpandDirection, Field, GraphScope, LogicalExpr, LogicalNode, LogicalNodeId,
+    LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement, LogicalType, ReadScope,
+    RowSchema, TemporalScope, TimeExpr, Value, VertexLookup,
 };
 use dtg_storage_fjall::FjallStorageTckFactory;
 use dtg_storage_remote::{ReferenceServerConfig, ReferenceStorageServer};
@@ -141,6 +142,140 @@ fn logical_vertex_point_body(
         panic!("test requires a logical vertex-point access")
     };
     assert_eq!(read.row_bound(), 1);
+    encode_physical_fragment_body(&physical, &physical.fragments()[0])
+}
+
+fn logical_adjacency_body(
+    binding: &ReplicaBinding,
+    capabilities: &CapabilityManifest,
+    applied_index: u64,
+) -> Vec<u8> {
+    logical_adjacency_body_with_scope(binding, capabilities, applied_index, ReadScope::current())
+}
+
+fn logical_adjacency_body_with_scope(
+    binding: &ReplicaBinding,
+    capabilities: &CapabilityManifest,
+    applied_index: u64,
+    read_scope: ReadScope,
+) -> Vec<u8> {
+    let physical = Planner
+        .plan(
+            &LogicalProgram {
+                version: dtg_language_ir::IrVersion::CURRENT,
+                graph_scope: GraphScope::Explicit(binding.graph_id()),
+                parameters: Vec::new(),
+                statement: LogicalStatement::Query(LogicalPlan {
+                    root: LogicalNodeId::new(2),
+                    nodes: vec![
+                        LogicalNode {
+                            id: LogicalNodeId::new(1),
+                            kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                                variable: "source".into(),
+                                id: LogicalExpr::Literal(Value::Integer(41)),
+                                labels: Vec::new(),
+                                read_scope: read_scope.clone(),
+                            }),
+                        },
+                        LogicalNode {
+                            id: LogicalNodeId::new(2),
+                            kind: LogicalNodeKind::Expand(Expand {
+                                input: LogicalNodeId::new(1),
+                                source: "source".into(),
+                                relationship: "relationship".into(),
+                                destination: "destination".into(),
+                                destination_labels: Vec::new(),
+                                direction: ExpandDirection::Outgoing,
+                                relationship_types: Vec::new(),
+                                read_scope,
+                            }),
+                        },
+                    ],
+                }),
+                result_schema: RowSchema {
+                    fields: vec![Field {
+                        name: "relationship".into(),
+                        data_type: LogicalType::Relationship,
+                        nullable: false,
+                    }],
+                },
+            },
+            &planning_context(binding.clone(), capabilities.clone(), applied_index),
+        )
+        .unwrap();
+    let [StorageAccess::Logical(read)] = physical.fragments()[0].storage_accesses() else {
+        panic!("test requires a logical adjacency access")
+    };
+    assert_eq!(read.node(), LogicalNodeId::new(2));
+    encode_physical_fragment_body(&physical, &physical.fragments()[0])
+}
+
+fn logical_two_hop_traversal_body(
+    binding: &ReplicaBinding,
+    capabilities: &CapabilityManifest,
+    applied_index: u64,
+) -> Vec<u8> {
+    let physical = Planner
+        .plan(
+            &LogicalProgram {
+                version: dtg_language_ir::IrVersion::CURRENT,
+                graph_scope: GraphScope::Explicit(binding.graph_id()),
+                parameters: Vec::new(),
+                statement: LogicalStatement::Query(LogicalPlan {
+                    root: LogicalNodeId::new(3),
+                    nodes: vec![
+                        LogicalNode {
+                            id: LogicalNodeId::new(1),
+                            kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                                variable: "source".into(),
+                                id: LogicalExpr::Literal(Value::Integer(41)),
+                                labels: Vec::new(),
+                                read_scope: ReadScope::current(),
+                            }),
+                        },
+                        LogicalNode {
+                            id: LogicalNodeId::new(2),
+                            kind: LogicalNodeKind::Expand(Expand {
+                                input: LogicalNodeId::new(1),
+                                source: "source".into(),
+                                relationship: "first".into(),
+                                destination: "middle".into(),
+                                destination_labels: Vec::new(),
+                                direction: ExpandDirection::Outgoing,
+                                relationship_types: Vec::new(),
+                                read_scope: ReadScope::current(),
+                            }),
+                        },
+                        LogicalNode {
+                            id: LogicalNodeId::new(3),
+                            kind: LogicalNodeKind::Expand(Expand {
+                                input: LogicalNodeId::new(2),
+                                source: "middle".into(),
+                                relationship: "second".into(),
+                                destination: "destination".into(),
+                                destination_labels: Vec::new(),
+                                direction: ExpandDirection::Outgoing,
+                                relationship_types: Vec::new(),
+                                read_scope: ReadScope::current(),
+                            }),
+                        },
+                    ],
+                }),
+                result_schema: RowSchema {
+                    fields: vec![Field {
+                        name: "second".into(),
+                        data_type: LogicalType::Relationship,
+                        nullable: false,
+                    }],
+                },
+            },
+            &planning_context(binding.clone(), capabilities.clone(), applied_index),
+        )
+        .unwrap();
+    let [StorageAccess::Logical(read)] = physical.fragments()[0].storage_accesses() else {
+        panic!("test requires a logical traversal access")
+    };
+    assert_eq!(read.node(), LogicalNodeId::new(3));
     encode_physical_fragment_body(&physical, &physical.fragments()[0])
 }
 
@@ -390,6 +525,89 @@ async fn apply_transaction_proposes_the_typed_shard_command() {
         assert_eq!(stage.error, 0);
         assert_eq!(stage.cancelled, 0);
     }
+    for detail in [
+        RequestDetail::DataRaftBatchAdmission,
+        RequestDetail::DataRaftBatchQueue,
+        RequestDetail::DataRaftBlockingDispatch,
+    ] {
+        let snapshot = metrics
+            .details()
+            .find_map(|(recorded, snapshot)| (recorded == detail).then_some(snapshot))
+            .unwrap();
+        assert_eq!(snapshot.success, 1);
+    }
+}
+
+fn transaction_request(
+    binding: &ReplicaBinding,
+    command_id: u128,
+    vertex_id: u128,
+) -> TransactionRequest {
+    let vertex = VertexVersion::new(
+        VertexId::new(vertex_id).unwrap(),
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(41).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(command_id).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .unwrap(),
+    );
+    let body = command.encode_current().unwrap();
+    TransactionRequest {
+        context: Some(shard_context(binding)),
+        transaction_id: command_id.to_be_bytes().to_vec(),
+        operation: TransactionOperation::Commit.into(),
+        idempotency_key: command_id.to_be_bytes().to_vec(),
+        payload: Some(BoundedPayload {
+            format_version: 1,
+            declared_len: body.len() as u64,
+            item_count: 1,
+            checksum: checksum_bytes(&body).to_vec(),
+            body,
+        }),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_same_shard_writes_share_one_raft_ready_drive() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("rpc-transaction-batch");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let service = node.rpc_service();
+    let first = transaction_request(&binding, 143, 137);
+    let second = transaction_request(&binding, 144, 138);
+
+    let (first, second) = tokio::join!(
+        service.apply_transaction(Request::new(first)),
+        service.apply_transaction(Request::new(second)),
+    );
+
+    assert_eq!(first.unwrap().into_inner().code, StatusCode::Ok as i32);
+    assert_eq!(second.unwrap().into_inner().code, StatusCode::Ok as i32);
+    assert!(node.replica_observations().await[0].applied_index() >= 3);
+    let drive_ready = node
+        .request_metrics()
+        .snapshot()
+        .details()
+        .find_map(|(detail, snapshot)| {
+            (detail == RequestDetail::DataRaftDriveReady).then_some(snapshot)
+        })
+        .unwrap();
+    assert_eq!(drive_ready.success, 1);
 }
 
 #[tokio::test]
@@ -689,6 +907,366 @@ async fn gateway_encoder_logical_vertex_point_reaches_the_data_service() {
     let batch = stream.next().await.unwrap().unwrap();
     assert_eq!(batch.row_count, 1);
     assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn gateway_encoder_logical_adjacency_reaches_the_data_service() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-logical-adjacency", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let vertices = [41_u128, 42]
+        .into_iter()
+        .map(|id| {
+            VertexVersion::new(
+                VertexId::new(id).unwrap(),
+                Version::new(1),
+                ValidInterval::new(1, 100).unwrap(),
+                TransactionTime::new(41).unwrap(),
+                Properties::new(),
+            )
+            .unwrap()
+        })
+        .map(LogicalMutation::PutVertex);
+    let edge = EdgeVersion::new(
+        EdgeId::new(73).unwrap(),
+        VertexId::new(41).unwrap(),
+        VertexId::new(42).unwrap(),
+        "KNOWS",
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(41).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(84).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            vertices
+                .chain(std::iter::once(LogicalMutation::PutEdge(edge)))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let command_body = command.encode_current().unwrap();
+    node.rpc_service()
+        .apply_transaction(Request::new(TransactionRequest {
+            context: Some(shard_context(&binding)),
+            transaction_id: 84_u128.to_be_bytes().to_vec(),
+            operation: TransactionOperation::Commit.into(),
+            idempotency_key: 84_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: command_body.len() as u64,
+                item_count: 3,
+                checksum: checksum_bytes(&command_body).to_vec(),
+                body: command_body,
+            }),
+        }))
+        .await
+        .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let body = logical_adjacency_body(&binding, &capabilities, applied_index);
+    let mut stream = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 84_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index,
+            transaction_time: 41,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert_eq!(batch.row_count, 1);
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn gateway_encoder_logical_two_hop_traversal_reaches_the_data_service() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-logical-two-hop", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let vertices = [41_u128, 42, 43]
+        .into_iter()
+        .map(|id| {
+            VertexVersion::new(
+                VertexId::new(id).unwrap(),
+                Version::new(1),
+                ValidInterval::new(1, 100).unwrap(),
+                TransactionTime::new(41).unwrap(),
+                Properties::new(),
+            )
+            .unwrap()
+        })
+        .map(LogicalMutation::PutVertex);
+    let first = EdgeVersion::new(
+        EdgeId::new(73).unwrap(),
+        VertexId::new(41).unwrap(),
+        VertexId::new(42).unwrap(),
+        "KNOWS",
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(41).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let second = EdgeVersion::new(
+        EdgeId::new(74).unwrap(),
+        VertexId::new(42).unwrap(),
+        VertexId::new(43).unwrap(),
+        "KNOWS",
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(41).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(87).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            vertices
+                .chain([
+                    LogicalMutation::PutEdge(first),
+                    LogicalMutation::PutEdge(second),
+                ])
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let command_body = command.encode_current().unwrap();
+    node.rpc_service()
+        .apply_transaction(Request::new(TransactionRequest {
+            context: Some(shard_context(&binding)),
+            transaction_id: 87_u128.to_be_bytes().to_vec(),
+            operation: TransactionOperation::Commit.into(),
+            idempotency_key: 87_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: command_body.len() as u64,
+                item_count: 5,
+                checksum: checksum_bytes(&command_body).to_vec(),
+                body: command_body,
+            }),
+        }))
+        .await
+        .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let body = logical_two_hop_traversal_body(&binding, &capabilities, applied_index);
+    let mut stream = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 87_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index,
+            transaction_time: 41,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert_eq!(batch.row_count, 1);
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn logical_adjacency_rejects_a_temporal_scope_that_drifts_from_the_execution_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-logical-adjacency-drift", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let body = logical_adjacency_body_with_scope(
+        &binding,
+        &capabilities,
+        applied_index,
+        ReadScope {
+            transaction_time: TemporalScope::AsOf(TimeExpr::Literal(
+                TransactionTime::new(40).unwrap(),
+            )),
+            valid_time: None,
+        },
+    );
+
+    let result = node
+        .rpc_service()
+        .execute_fragment(Request::new(ExecutionFragment {
+            context: Some(shard_context(&binding)),
+            fragment_id: 86_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 1,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+            schema_version: 31,
+            capability_digest: binding.capability_digest().get().to_vec(),
+            applied_index,
+            transaction_time: 41,
+            valid_at: 10,
+            snapshot_immutable: true,
+        }))
+        .await;
+    let error = match result {
+        Ok(_) => panic!("temporal scope drift returned a fragment stream"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("scope diverges"));
+}
+
+#[tokio::test]
+async fn gateway_executes_a_point_anchored_one_hop_query() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("gateway-one-hop-query", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let vertices = [41_u128, 42]
+        .into_iter()
+        .map(|id| {
+            VertexVersion::new(
+                VertexId::new(id).unwrap(),
+                Version::new(1),
+                ValidInterval::new(1, 100).unwrap(),
+                TransactionTime::new(41).unwrap(),
+                Properties::new(),
+            )
+            .unwrap()
+        })
+        .map(LogicalMutation::PutVertex);
+    let edge = EdgeVersion::new(
+        EdgeId::new(73).unwrap(),
+        VertexId::new(41).unwrap(),
+        VertexId::new(42).unwrap(),
+        "KNOWS",
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(41).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(85).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            vertices
+                .chain(std::iter::once(LogicalMutation::PutEdge(edge)))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let command_body = command.encode_current().unwrap();
+    node.rpc_service()
+        .apply_transaction(Request::new(TransactionRequest {
+            context: Some(shard_context(&binding)),
+            transaction_id: 85_u128.to_be_bytes().to_vec(),
+            operation: TransactionOperation::Commit.into(),
+            idempotency_key: 85_u128.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: command_body.len() as u64,
+                item_count: 3,
+                checksum: checksum_bytes(&command_body).to_vec(),
+                body: command_body,
+            }),
+        }))
+        .await
+        .unwrap();
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            InProcessDataGatewayClient {
+                service: node.rpc_service(),
+            },
+        ))),
+        planning_context(binding, capabilities, applied_index),
+    );
+
+    let response = execution
+        .execute_statement(
+            GatewayRequestContext::new(7, 85, u64::MAX, Vec::new()).unwrap(),
+            "MATCH (a)-[r]->(b) WHERE a.id = $id RETURN r".into(),
+            BTreeMap::from([("id".into(), dtg_execution::GatewayValue::Integer(41))]),
+            None,
+            &GatewayCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let GatewayResponse::Rows(rows) = response else {
+        panic!("expected relationship rows")
+    };
+    assert_eq!(rows.fields(), &["r"]);
+    assert_eq!(
+        rows.rows(),
+        &[vec![dtg_execution::GatewayValue::Map(BTreeMap::from([
+            ("id".into(), dtg_execution::GatewayValue::Integer(73)),
+            ("source".into(), dtg_execution::GatewayValue::Integer(41)),
+            ("target".into(), dtg_execution::GatewayValue::Integer(42)),
+            (
+                "type".into(),
+                dtg_execution::GatewayValue::String("KNOWS".into()),
+            ),
+            (
+                "properties".into(),
+                dtg_execution::GatewayValue::Map(BTreeMap::new()),
+            ),
+        ]))]]
+    );
 }
 
 #[tokio::test]

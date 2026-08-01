@@ -110,6 +110,7 @@ async fn four_process_functional_probes_and_real_bolt_query() {
 
     let gateway_bind = gateway_addr.to_string();
     let data_endpoint = format!("http://{data_addr}");
+    let meta_endpoint = format!("http://{meta_addr}");
     let shard_spec = format!(
         "{}:{}:{}:{}:{}:fjall:1:1:{}",
         binding.shard_id().get(),
@@ -127,6 +128,7 @@ async fn four_process_functional_probes_and_real_bolt_query() {
             ("DTG_GATEWAY_CLUSTER_ID", "9001"),
             ("DTG_GATEWAY_REQUEST_TIMEOUT_MS", "10000"),
             ("DTG_GATEWAY_CLUSTER_ENDPOINT", data_endpoint.as_str()),
+            ("DTG_GATEWAY_META_ENDPOINT", meta_endpoint.as_str()),
             ("DTG_GATEWAY_GRAPH_ID", "11"),
             ("DTG_GATEWAY_CATALOG_VERSION", "31"),
             ("DTG_GATEWAY_SCHEMA_VERSION", "31"),

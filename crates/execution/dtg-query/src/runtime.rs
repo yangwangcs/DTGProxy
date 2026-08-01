@@ -26,7 +26,7 @@ enum RuntimeSpill {
 
 enum FragmentSources<'a> {
     Local(&'a BTreeMap<u32, (&'a ExecutableFragment, QueryStorage)>),
-    Materialized(&'a BTreeMap<u32, (&'a ExecutableFragment, Vec<ColumnBatch>)>),
+    Materialized(&'a mut BTreeMap<u32, (&'a ExecutableFragment, Vec<ColumnBatch>)>),
 }
 
 impl QueryRuntime {
@@ -85,11 +85,11 @@ impl QueryRuntime {
             .collect::<BTreeMap<_, _>>();
         let mut visiting = BTreeSet::new();
         let mut built = BTreeSet::new();
-        let sources = FragmentSources::Local(&fragment_storage);
+        let mut sources = FragmentSources::Local(&fragment_storage);
         let mut root = self.build_operator(
             plan.root_operator(),
             &definitions,
-            &sources,
+            &mut sources,
             &mut visiting,
             &mut built,
         )?;
@@ -167,7 +167,7 @@ impl QueryRuntime {
             .iter()
             .map(|fragment| (fragment.id(), fragment))
             .collect::<BTreeMap<_, _>>();
-        let fragments = fragment_batches
+        let mut fragments = fragment_batches
             .into_iter()
             .map(|(fragment_id, batches)| {
                 (
@@ -189,11 +189,11 @@ impl QueryRuntime {
             .collect::<BTreeMap<_, _>>();
         let mut visiting = BTreeSet::new();
         let mut built = BTreeSet::new();
-        let sources = FragmentSources::Materialized(&fragments);
+        let mut sources = FragmentSources::Materialized(&mut fragments);
         let root = self.build_operator(
             plan.root_operator(),
             &definitions,
-            &sources,
+            &mut sources,
             &mut visiting,
             &mut built,
         )?;
@@ -214,7 +214,7 @@ impl QueryRuntime {
         &self,
         id: u32,
         definitions: &BTreeMap<u32, ExecutableOperatorKind>,
-        sources: &FragmentSources<'_>,
+        sources: &mut FragmentSources<'_>,
         visiting: &mut BTreeSet<u32>,
         built: &mut BTreeSet<u32>,
     ) -> Result<Box<dyn Operator>, QueryError> {
@@ -391,7 +391,7 @@ impl QueryRuntime {
         logical_node: u32,
         fragments: &[u32],
         output: &str,
-        fragment_sources: &FragmentSources<'_>,
+        fragment_sources: &mut FragmentSources<'_>,
     ) -> Result<Box<dyn Operator>, QueryError> {
         if fragments.is_empty() || output.is_empty() {
             return Err(QueryError::InvalidPlan(
@@ -430,20 +430,20 @@ impl QueryRuntime {
                 }
                 FragmentSources::Materialized(fragment_batches) => {
                     let (fragment, batches) =
-                        fragment_batches.get(fragment_id).ok_or_else(|| {
+                        fragment_batches.get_mut(fragment_id).ok_or_else(|| {
                             QueryError::InvalidPlan(format!(
                                 "physical source references missing fragment {fragment_id}"
                             ))
                         })?;
-                    let access = fragment.access(logical_node).ok_or_else(|| {
+                    let access = fragment.access(logical_node).cloned().ok_or_else(|| {
                         QueryError::InvalidPlan(format!(
                             "fragment {fragment_id} is missing logical source {logical_node}"
                         ))
                     })?;
                     let batches = if batches.is_empty() {
-                        vec![ColumnBatch::empty(materialized_access_schema(access))]
+                        vec![ColumnBatch::empty(materialized_access_schema(&access))]
                     } else {
-                        batches.clone()
+                        std::mem::take(batches)
                     };
                     Box::new(BatchOperator::new(batches))
                 }
@@ -684,7 +684,7 @@ impl QueryStream {
 
     pub fn collect(&mut self) -> QueryFuture<'_, ColumnBatch> {
         Box::pin(async move {
-            let mut rows = Vec::new();
+            let mut batches = Vec::new();
             while let Some(batch) = self.next_batch().await? {
                 self.context.checkpoint()?;
                 if batch.schema() != &self.schema {
@@ -692,9 +692,9 @@ impl QueryStream {
                         "query stream schema changed between batches".into(),
                     ));
                 }
-                rows.extend(batch.rows());
+                batches.push(batch);
             }
-            ColumnBatch::from_rows(self.schema.clone(), rows)
+            ColumnBatch::concatenate(self.schema.clone(), batches)
         })
     }
 }

@@ -1,4 +1,5 @@
 /target/
+/artifacts/
 .worktrees/
 .DS_Store
 .idea/

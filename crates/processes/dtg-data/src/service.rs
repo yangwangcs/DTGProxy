@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -6,19 +7,21 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
 
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
 use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayService;
 use dtg_execution::cluster_protocol::proto::{
     ColumnBatch, ExecutionFragment, GatewayRequest, GatewayResponse as GatewayWireResponse,
-    LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind, RetryDisposition, StatusCode,
-    TransactionRequest, TypedStatus,
+    GatewaySessionResponse, LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind, RequestContext,
+    RetryDisposition, StatusCode, TransactionRequest, TypedStatus,
 };
 use dtg_execution::cluster_protocol::{
     PROTOCOL_MAJOR, ProtocolError, ShardRequestContext, checksum_bytes,
     validate_execution_fragment, validate_gateway_request, validate_raft_envelope,
     validate_replica_snapshot, validate_transaction_request,
 };
+use dtg_execution::shard::{ProposalReceipt, ReplicaKey, ShardCommand};
 use dtg_execution::storage::{
     BackendClass, BindingRole, CapabilityManifest, ConsensusStore, StorageError,
 };
@@ -27,11 +30,21 @@ use dtg_execution::{
     ReplicaBinding, RequestStage, RequestStageMetrics,
 };
 use dtg_storage_fjall::FjallConsensusStore;
+#[cfg(test)]
+use futures_util::TryStreamExt as _;
+use futures_util::{StreamExt as _, stream};
 use prost_011::Message as _;
-use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::time::{Instant, timeout_at};
+use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tonic::{Request, Response, Status, Streaming};
 
 use crate::{DataProcessConfig, FjallResolver, Neo4jResolver, PostgresResolver, RemoteResolver};
+
+const APPLY_BATCH_WINDOW: Duration = Duration::from_micros(250);
+const APPLY_BATCH_MAX_COMMANDS: usize = 64;
+const MAX_GATEWAY_FRAGMENT_CONCURRENCY: usize = 32;
+const MAX_GATEWAY_SESSION_IN_FLIGHT: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaFailure {
@@ -301,6 +314,7 @@ impl DataNodeBuilder {
         let execution = Arc::new(execution);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(Vec::new()));
+        let apply_batchers = Arc::new(Mutex::new(BTreeMap::new()));
         for binding in self.assignments {
             match add_assignment(&execution, &self.consensus_root, binding.clone()).await {
                 Ok(()) => {
@@ -336,6 +350,7 @@ impl DataNodeBuilder {
             failures,
             state,
             request_metrics,
+            apply_batchers,
             driver_stop,
         })
     }
@@ -496,6 +511,109 @@ fn spawn_raft_driver(
     });
 }
 
+struct PendingApply {
+    command_id: u128,
+    command: ShardCommand,
+    queued_at: Instant,
+    completion: oneshot::Sender<Result<BatchedApplyReceipt, String>>,
+}
+
+#[derive(Clone)]
+struct BatchedApplyReceipt {
+    receipt: ProposalReceipt,
+}
+
+async fn run_apply_batcher(
+    execution: Arc<DataExecution>,
+    request_metrics: Arc<RequestStageMetrics>,
+    key: ReplicaKey,
+    mut receiver: mpsc::Receiver<PendingApply>,
+) {
+    while let Some(first) = receiver.recv().await {
+        let mut batch = vec![first];
+        let deadline = Instant::now() + APPLY_BATCH_WINDOW;
+        while batch.len() < APPLY_BATCH_MAX_COMMANDS {
+            match timeout_at(deadline, receiver.recv()).await {
+                Ok(Some(request)) => batch.push(request),
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let command_ids = batch
+            .iter()
+            .map(|request| request.command_id)
+            .collect::<Vec<_>>();
+        let commands = batch
+            .iter()
+            .map(|request| request.command.clone())
+            .collect::<Vec<_>>();
+        for request in &batch {
+            request_metrics.record_detail(
+                dtg_execution::RequestDetail::DataRaftBatchQueue,
+                dtg_execution::StageOutcome::Success,
+                elapsed_nanoseconds(request.queued_at),
+            );
+        }
+        let execution = Arc::clone(&execution);
+        let dispatch_started = Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            let dispatch_nanoseconds = elapsed_nanoseconds(dispatch_started);
+            execution
+                .apply_transaction_commands_timed(key, commands)
+                .map(|timing| (dispatch_nanoseconds, timing))
+        })
+        .await;
+        let completions = match result {
+            Ok(Ok((dispatch_nanoseconds, timing))) => {
+                for _ in &batch {
+                    request_metrics.record_detail(
+                        dtg_execution::RequestDetail::DataRaftBlockingDispatch,
+                        dtg_execution::StageOutcome::Success,
+                        dispatch_nanoseconds,
+                    );
+                }
+                request_metrics.record_detail(
+                    dtg_execution::RequestDetail::DataRaftLockWait,
+                    dtg_execution::StageOutcome::Success,
+                    timing.lock_wait_nanoseconds(),
+                );
+                request_metrics.record_detail(
+                    dtg_execution::RequestDetail::DataRaftPropose,
+                    dtg_execution::StageOutcome::Success,
+                    timing.propose_nanoseconds(),
+                );
+                request_metrics.record_detail(
+                    dtg_execution::RequestDetail::DataRaftDriveReady,
+                    dtg_execution::StageOutcome::Success,
+                    timing.drive_ready_nanoseconds(),
+                );
+                let receipts = timing.into_progress().receipts().to_vec();
+                if receipts.len() != batch.len()
+                    || receipts
+                        .iter()
+                        .zip(&command_ids)
+                        .any(|(receipt, command_id)| receipt.command_id() != *command_id)
+                {
+                    vec![
+                        Err("Raft batch receipts do not match proposed commands".into());
+                        batch.len()
+                    ]
+                } else {
+                    receipts
+                        .into_iter()
+                        .map(|receipt| Ok(BatchedApplyReceipt { receipt }))
+                        .collect()
+                }
+            }
+            Ok(Err(error)) => vec![Err(error.to_string()); batch.len()],
+            Err(error) => vec![Err(format!("Raft batch worker failed: {error}")); batch.len()],
+        };
+        for (request, completion) in batch.into_iter().zip(completions) {
+            let _ = request.completion.send(completion);
+        }
+    }
+}
+
 pub struct DataNode {
     execution: Arc<DataExecution>,
     consensus_root: PathBuf,
@@ -503,6 +621,7 @@ pub struct DataNode {
     failures: Arc<Mutex<Vec<ReplicaFailure>>>,
     state: Arc<ProcessState>,
     request_metrics: Arc<RequestStageMetrics>,
+    apply_batchers: Arc<Mutex<BTreeMap<ReplicaKey, mpsc::Sender<PendingApply>>>>,
     driver_stop: Arc<AtomicBool>,
 }
 
@@ -620,6 +739,7 @@ impl DataNode {
             state: self.state.clone(),
             execution: self.execution.clone(),
             request_metrics: Arc::clone(&self.request_metrics),
+            apply_batchers: Arc::clone(&self.apply_batchers),
         }
     }
 
@@ -644,6 +764,7 @@ pub struct DataRpcService {
     state: Arc<ProcessState>,
     execution: Arc<DataExecution>,
     request_metrics: Arc<RequestStageMetrics>,
+    apply_batchers: Arc<Mutex<BTreeMap<ReplicaKey, mpsc::Sender<PendingApply>>>>,
 }
 
 impl DataRpcService {
@@ -665,6 +786,55 @@ impl DataRpcService {
 
     pub fn begin_draining(&self) {
         self.state.set_lifecycle(LifecycleState::Draining);
+    }
+
+    fn apply_batch_sender(&self, key: ReplicaKey) -> Result<mpsc::Sender<PendingApply>, Status> {
+        let mut batchers = self
+            .apply_batchers
+            .lock()
+            .map_err(|_| self.execution_failure("Raft apply batch registry is poisoned"))?;
+        if let Some(sender) = batchers.get(&key) {
+            return Ok(sender.clone());
+        }
+        let (sender, receiver) = mpsc::channel(APPLY_BATCH_MAX_COMMANDS);
+        tokio::spawn(run_apply_batcher(
+            Arc::clone(&self.execution),
+            Arc::clone(&self.request_metrics),
+            key,
+            receiver,
+        ));
+        batchers.insert(key, sender.clone());
+        Ok(sender)
+    }
+
+    async fn apply_transaction_batched(
+        &self,
+        key: ReplicaKey,
+        command: ShardCommand,
+    ) -> Result<BatchedApplyReceipt, Status> {
+        let command_id = command.header().command_id().get();
+        let sender = self.apply_batch_sender(key)?;
+        let (completion, response) = oneshot::channel();
+        let admission_started = Instant::now();
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| self.execution_failure("Raft apply batch worker stopped"))?;
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataRaftBatchAdmission,
+            dtg_execution::StageOutcome::Success,
+            elapsed_nanoseconds(admission_started),
+        );
+        permit.send(PendingApply {
+            command_id,
+            command,
+            queued_at: Instant::now(),
+            completion,
+        });
+        response
+            .await
+            .map_err(|_| self.execution_failure("Raft apply batch worker dropped its response"))?
+            .map_err(|error| self.execution_failure(error))
     }
 
     fn begin_request(&self) -> Result<(), Status> {
@@ -762,6 +932,10 @@ impl DataRpcService {
     }
 }
 
+fn elapsed_nanoseconds(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn encode_fragment_batches(
     request: Option<dtg_execution::cluster_protocol::proto::RequestContext>,
     fragment_id: Vec<u8>,
@@ -803,6 +977,129 @@ fn encode_fragment_batches(
         });
     }
     Ok(batches)
+}
+
+#[cfg(test)]
+async fn collect_fragment_results_bounded<T, R, E, F, Fut>(
+    fragments: Vec<T>,
+    concurrency: usize,
+    execute: F,
+) -> Result<Vec<(usize, R)>, E>
+where
+    F: Fn(T) -> Fut,
+    Fut: Future<Output = Result<R, E>>,
+{
+    debug_assert!(concurrency > 0);
+    let mut results = stream::iter(fragments.into_iter().enumerate())
+        .map(move |(ordinal, fragment)| {
+            let execution = execute(fragment);
+            async move { execution.await.map(|result| (ordinal, result)) }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    results.sort_by_key(|(ordinal, _)| *ordinal);
+    Ok(results)
+}
+
+fn stream_fragment_results_bounded<T, R, E, F, Fut>(
+    fragments: Vec<T>,
+    concurrency: usize,
+    execute: F,
+) -> ReceiverStream<Result<(usize, R), E>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    E: Send + 'static,
+    F: Fn(T) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<R, E>> + Send + 'static,
+{
+    debug_assert!(concurrency > 0);
+    let (sender, receiver) = mpsc::channel(concurrency);
+    tokio::spawn(async move {
+        let mut results = stream::iter(fragments.into_iter().enumerate())
+            .map(move |(ordinal, fragment)| {
+                let execution = execute(fragment);
+                async move { execution.await.map(|result| (ordinal, result)) }
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(result) = results.next().await {
+            if sender.send(result).await.is_err() {
+                return;
+            }
+        }
+    });
+    ReceiverStream::new(receiver)
+}
+
+fn gateway_query_responses(
+    response_context: Option<RequestContext>,
+    batches: Vec<ColumnBatch>,
+) -> Vec<GatewayWireResponse> {
+    if batches.is_empty() {
+        return vec![GatewayWireResponse {
+            status: Some(TypedStatus {
+                request: response_context,
+                code: StatusCode::Ok.into(),
+                retry: RetryDisposition::Never.into(),
+                message: "query completed with zero rows".into(),
+                idempotency_key: Vec::new(),
+                details: None,
+            }),
+            batch: None,
+        }];
+    }
+    batches
+        .into_iter()
+        .map(|batch| GatewayWireResponse {
+            status: Some(TypedStatus {
+                request: response_context.clone(),
+                code: StatusCode::Ok.into(),
+                retry: RetryDisposition::Never.into(),
+                message: "query fragment executed".into(),
+                idempotency_key: Vec::new(),
+                details: None,
+            }),
+            batch: Some(batch),
+        })
+        .collect()
+}
+
+fn gateway_session_frame(
+    request: RequestContext,
+    responses: Vec<GatewayWireResponse>,
+) -> GatewaySessionResponse {
+    GatewaySessionResponse {
+        request: Some(request),
+        responses,
+    }
+}
+
+fn gateway_session_error(request: RequestContext, error: Status) -> GatewaySessionResponse {
+    let (code, retry) = match error.code() {
+        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+            (StatusCode::InvalidRequest, RetryDisposition::Never)
+        }
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+            (StatusCode::Unavailable, RetryDisposition::Safe)
+        }
+        _ => (StatusCode::Internal, RetryDisposition::Safe),
+    };
+    gateway_session_frame(
+        request.clone(),
+        vec![GatewayWireResponse {
+            status: Some(TypedStatus {
+                request: Some(request),
+                code: code.into(),
+                retry: retry.into(),
+                message: error.message().to_owned(),
+                idempotency_key: Vec::new(),
+                details: None,
+            }),
+            batch: None,
+        }],
+    )
 }
 
 fn encode_wire_len(value: usize, output: &mut Vec<u8>) -> Result<(), &'static str> {
@@ -943,36 +1240,10 @@ impl DataService for DataRpcService {
         );
         let key = lookup.key();
         let timer = self.request_metrics.start(RequestStage::DataRaftApply);
-        let apply = timer.finish_result(
-            self.execution
-                .apply_transaction_command_timed(key, command)
-                .map_err(|error| self.execution_failure(error)),
-        )?;
-        self.request_metrics.record_detail(
-            dtg_execution::RequestDetail::DataRaftLockWait,
-            dtg_execution::StageOutcome::Success,
-            apply.lock_wait_nanoseconds(),
-        );
-        self.request_metrics.record_detail(
-            dtg_execution::RequestDetail::DataRaftPropose,
-            dtg_execution::StageOutcome::Success,
-            apply.propose_nanoseconds(),
-        );
-        self.request_metrics.record_detail(
-            dtg_execution::RequestDetail::DataRaftDriveReady,
-            dtg_execution::StageOutcome::Success,
-            apply.drive_ready_nanoseconds(),
-        );
-        let progress = apply.into_progress();
-        let mut matching = progress
-            .receipts()
-            .iter()
-            .filter(|receipt| receipt.command_id() == command_id);
-        let receipt = matching
-            .next()
-            .ok_or_else(|| self.execution_failure("transaction command produced no receipt"))?;
-        if matching.next().is_some() {
-            return Err(self.execution_failure("transaction command produced duplicate receipts"));
+        let apply = timer.finish_result(self.apply_transaction_batched(key, command).await)?;
+        let receipt = apply.receipt;
+        if receipt.command_id() != command_id {
+            return Err(self.execution_failure("transaction command receipt identifier differs"));
         }
         if receipt.rejection().is_some() {
             return Err(self.execution_failure("transaction command was rejected"));
@@ -1106,6 +1377,8 @@ impl DataService for DataRpcService {
 impl GatewayService for DataRpcService {
     type ExecuteStream =
         Pin<Box<dyn Stream<Item = Result<GatewayWireResponse, Status>> + Send + 'static>>;
+    type ExecuteSessionStream =
+        Pin<Box<dyn Stream<Item = Result<GatewaySessionResponse, Status>> + Send + 'static>>;
 
     async fn execute(
         &self,
@@ -1121,37 +1394,290 @@ impl GatewayService for DataRpcService {
                 "Data GatewayService currently accepts only planned query fragments",
             ));
         }
-        let mut responses = Vec::new();
-        for fragment in wire.fragments {
-            for batch in self.execute_fragment_wire(fragment).await? {
-                responses.push(GatewayWireResponse {
-                    status: Some(TypedStatus {
-                        request: response_context.clone(),
-                        code: StatusCode::Ok.into(),
-                        retry: RetryDisposition::Never.into(),
-                        message: "query fragment executed".into(),
-                        idempotency_key: Vec::new(),
-                        details: None,
-                    }),
-                    batch: Some(batch),
-                });
+        if wire.fragments.len() == 1 {
+            let fragment = wire
+                .fragments
+                .into_iter()
+                .next()
+                .expect("fragment count was checked");
+            let batches = self.execute_fragment_wire(fragment).await?;
+            let responses = gateway_query_responses(response_context, batches);
+            return Ok(Response::new(Box::pin(tokio_stream::iter(
+                responses.into_iter().map(Ok),
+            ))));
+        }
+        let service = self.clone();
+        let mut fragment_results = stream_fragment_results_bounded(
+            wire.fragments,
+            MAX_GATEWAY_FRAGMENT_CONCURRENCY,
+            move |fragment| {
+                let service = service.clone();
+                async move { service.execute_fragment_wire(fragment).await }
+            },
+        );
+        let (sender, receiver) = mpsc::channel(MAX_GATEWAY_FRAGMENT_CONCURRENCY);
+        tokio::spawn(async move {
+            let mut emitted_batch = false;
+            while let Some(result) = fragment_results.next().await {
+                match result {
+                    Ok((_, batches)) => {
+                        for batch in batches {
+                            emitted_batch = true;
+                            let response = GatewayWireResponse {
+                                status: Some(TypedStatus {
+                                    request: response_context.clone(),
+                                    code: StatusCode::Ok.into(),
+                                    retry: RetryDisposition::Never.into(),
+                                    message: "query fragment executed".into(),
+                                    idempotency_key: Vec::new(),
+                                    details: None,
+                                }),
+                                batch: Some(batch),
+                            };
+                            if sender.send(Ok(response)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(status) => {
+                        let _ = sender.send(Err(status)).await;
+                        return;
+                    }
+                }
             }
+            if !emitted_batch {
+                let _ = sender
+                    .send(Ok(GatewayWireResponse {
+                        status: Some(TypedStatus {
+                            request: response_context,
+                            code: StatusCode::Ok.into(),
+                            retry: RetryDisposition::Never.into(),
+                            message: "query completed with zero rows".into(),
+                            idempotency_key: Vec::new(),
+                            details: None,
+                        }),
+                        batch: None,
+                    }))
+                    .await;
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+
+    async fn execute_session(
+        &self,
+        request: Request<Streaming<GatewayRequest>>,
+    ) -> Result<Response<Self::ExecuteSessionStream>, Status> {
+        let mut requests = request.into_inner();
+        let service = self.clone();
+        let (sender, receiver) = mpsc::channel(MAX_GATEWAY_SESSION_IN_FLIGHT);
+        tokio::spawn(async move {
+            let permits = Arc::new(Semaphore::new(MAX_GATEWAY_SESSION_IN_FLIGHT));
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut input_open = true;
+            loop {
+                if input_open {
+                    tokio::select! {
+                        request = requests.message() => match request {
+                            Ok(Some(request)) => {
+                                let permit = match Arc::clone(&permits).acquire_owned().await {
+                                    Ok(permit) => permit,
+                                    Err(_) => return,
+                                };
+                                let service = service.clone();
+                                tasks.spawn(async move {
+                                    let _permit = permit;
+                                    execute_gateway_session_request(service, request).await
+                                });
+                            }
+                            Ok(None) => input_open = false,
+                            Err(error) => {
+                                let _ = sender.send(Err(Status::invalid_argument(error.to_string()))).await;
+                                return;
+                            }
+                        },
+                        completed = tasks.join_next(), if !tasks.is_empty() => {
+                            if let Some(result) = completed {
+                                match result {
+                                    Ok(frame) => {
+                                        if sender.send(Ok(frame)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let Some(result) = tasks.join_next().await else {
+                        return;
+                    };
+                    match result {
+                        Ok(frame) => {
+                            if sender.send(Ok(frame)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+}
+
+async fn execute_gateway_session_request(
+    service: DataRpcService,
+    wire: GatewayRequest,
+) -> GatewaySessionResponse {
+    let Some(request) = wire.request.clone() else {
+        return GatewaySessionResponse {
+            request: None,
+            responses: Vec::new(),
+        };
+    };
+    if let Err(error) = service.begin_request() {
+        return gateway_session_error(request, error);
+    }
+    let result = async {
+        let validated =
+            validate_gateway_request(wire.clone()).map_err(|error| service.invalid(error))?;
+        if validated.execution().body().first() != Some(&1) || wire.fragments.len() != 1 {
+            return Err(Status::failed_precondition(
+                "Data Gateway session accepts only one planned query fragment per request",
+            ));
         }
-        if responses.is_empty() {
-            responses.push(GatewayWireResponse {
-                status: Some(TypedStatus {
-                    request: response_context,
-                    code: StatusCode::Ok.into(),
-                    retry: RetryDisposition::Never.into(),
-                    message: "query completed with zero rows".into(),
-                    idempotency_key: Vec::new(),
-                    details: None,
-                }),
-                batch: None,
-            });
-        }
-        Ok(Response::new(Box::pin(tokio_stream::iter(
-            responses.into_iter().map(Ok),
-        ))))
+        let fragment = wire
+            .fragments
+            .into_iter()
+            .next()
+            .expect("fragment count was checked");
+        let batches = service.execute_fragment_wire(fragment).await?;
+        Ok(gateway_session_frame(
+            request.clone(),
+            gateway_query_responses(Some(request.clone()), batches),
+        ))
+    }
+    .await;
+    match result {
+        Ok(frame) => frame,
+        Err(error) => gateway_session_error(request, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures_util::StreamExt as _;
+    use tokio::sync::Barrier;
+
+    use super::{
+        ColumnBatch, PROTOCOL_MAJOR, RequestContext, StatusCode, collect_fragment_results_bounded,
+        gateway_query_responses, gateway_session_frame, stream_fragment_results_bounded,
+    };
+
+    #[test]
+    fn single_fragment_responses_preserve_batches_and_emit_an_empty_completion() {
+        let batch = ColumnBatch {
+            request: None,
+            fragment_id: 7_u128.to_be_bytes().to_vec(),
+            sequence: 1,
+            row_count: 0,
+            payload: None,
+        };
+
+        let responses = gateway_query_responses(None, vec![batch]);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].status.as_ref().unwrap().code,
+            StatusCode::Ok as i32
+        );
+        assert_eq!(
+            responses[0].batch.as_ref().unwrap().fragment_id,
+            7_u128.to_be_bytes()
+        );
+
+        let empty = gateway_query_responses(None, Vec::new());
+        assert_eq!(empty.len(), 1);
+        assert_eq!(
+            empty[0].status.as_ref().unwrap().code,
+            StatusCode::Ok as i32
+        );
+        assert!(empty[0].batch.is_none());
+    }
+
+    #[test]
+    fn gateway_session_frame_preserves_the_request_identity_and_batches() {
+        let request = RequestContext {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: 1,
+            cluster_id: 7_u64.to_be_bytes().to_vec(),
+            request_id: 11_u128.to_be_bytes().to_vec(),
+            deadline_unix_ms: 1,
+            trace_context: Vec::new(),
+        };
+        let batch = ColumnBatch {
+            request: Some(request.clone()),
+            fragment_id: 7_u128.to_be_bytes().to_vec(),
+            sequence: 1,
+            row_count: 0,
+            payload: None,
+        };
+        let responses = gateway_query_responses(Some(request.clone()), vec![batch]);
+
+        let frame = gateway_session_frame(request.clone(), responses);
+        assert_eq!(frame.request, Some(request));
+        assert_eq!(frame.responses.len(), 1);
+        assert!(frame.responses[0].batch.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fragment_collection_starts_ready_work_concurrently() {
+        let barrier = Arc::new(Barrier::new(2));
+        let results = tokio::time::timeout(
+            Duration::from_millis(100),
+            collect_fragment_results_bounded(vec![1_u8, 2], 2, {
+                let barrier = Arc::clone(&barrier);
+                move |value| {
+                    let barrier = Arc::clone(&barrier);
+                    async move {
+                        barrier.wait().await;
+                        Ok::<_, ()>(value)
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("both fragment tasks must start before either completes")
+        .unwrap();
+
+        assert_eq!(results, vec![(0, 1), (1, 2)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_fragment_stream_emits_ready_work_without_waiting_for_slow_work() {
+        let mut results = stream_fragment_results_bounded(vec![1_u8, 2], 2, |value| async move {
+            if value == 1 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok::<_, ()>(value)
+        });
+
+        let first = tokio::time::timeout(Duration::from_millis(50), results.next())
+            .await
+            .expect("ready fragment was delayed behind slow work")
+            .expect("stream ended before emitting the ready fragment")
+            .unwrap();
+        assert_eq!(first, (1, 2));
     }
 }

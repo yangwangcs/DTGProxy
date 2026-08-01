@@ -1,12 +1,12 @@
 use dtg_language_ir::{
-    Aggregate, AggregateFunction, AggregateKind, GraphScope, Join, JoinKind, Limit, LogicalExpr,
-    LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan, LogicalProgram, LogicalStatement,
-    Projection, ReadScope, RowSchema, Sort, SortDirection, SortKey, Subquery, Unwind, Value,
-    VertexLookup,
+    Aggregate, AggregateFunction, AggregateKind, Expand, ExpandDirection, GraphScope, Join,
+    JoinKind, Limit, LogicalExpr, LogicalNode, LogicalNodeId, LogicalNodeKind, LogicalPlan,
+    LogicalProgram, LogicalStatement, Projection, ReadScope, RowSchema, Sort, SortDirection,
+    SortKey, Subquery, Unwind, Value, VertexLookup,
 };
 use dtg_plan::{
-    CatalogShard, CatalogSnapshot, PhysicalOperatorKind, PlanError, PlanningContext,
-    SnapshotRequirements, plan,
+    CatalogShard, CatalogSnapshot, LogicalReadOperation, PhysicalOperatorKind, PlanError,
+    PlanningContext, SnapshotRequirements, StorageAccess, plan,
 };
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, TransactionTime,
@@ -66,6 +66,91 @@ fn point_query() -> LogicalProgram {
                     read_scope: ReadScope::current(),
                 }),
             }],
+        }),
+        result_schema: RowSchema::empty(),
+    }
+}
+
+fn point_expand_query() -> LogicalProgram {
+    LogicalProgram {
+        version: dtg_language_ir::IrVersion::CURRENT,
+        graph_scope: GraphScope::Explicit(dtg_storage::GraphId::new(9).unwrap()),
+        parameters: Vec::new(),
+        statement: LogicalStatement::Query(LogicalPlan {
+            root: LogicalNodeId::new(2),
+            nodes: vec![
+                LogicalNode {
+                    id: LogicalNodeId::new(1),
+                    kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                        variable: "source".into(),
+                        id: LogicalExpr::Literal(Value::Integer(41)),
+                        labels: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(2),
+                    kind: LogicalNodeKind::Expand(Expand {
+                        input: LogicalNodeId::new(1),
+                        source: "source".into(),
+                        relationship: "relationship".into(),
+                        destination: "destination".into(),
+                        destination_labels: Vec::new(),
+                        direction: ExpandDirection::Outgoing,
+                        relationship_types: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+            ],
+        }),
+        result_schema: RowSchema::empty(),
+    }
+}
+
+fn point_two_hop_expand_query() -> LogicalProgram {
+    LogicalProgram {
+        version: dtg_language_ir::IrVersion::CURRENT,
+        graph_scope: GraphScope::Explicit(dtg_storage::GraphId::new(9).unwrap()),
+        parameters: Vec::new(),
+        statement: LogicalStatement::Query(LogicalPlan {
+            root: LogicalNodeId::new(3),
+            nodes: vec![
+                LogicalNode {
+                    id: LogicalNodeId::new(1),
+                    kind: LogicalNodeKind::VertexLookup(VertexLookup {
+                        variable: "source".into(),
+                        id: LogicalExpr::Literal(Value::Integer(41)),
+                        labels: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(2),
+                    kind: LogicalNodeKind::Expand(Expand {
+                        input: LogicalNodeId::new(1),
+                        source: "source".into(),
+                        relationship: "first".into(),
+                        destination: "middle".into(),
+                        destination_labels: Vec::new(),
+                        direction: ExpandDirection::Outgoing,
+                        relationship_types: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+                LogicalNode {
+                    id: LogicalNodeId::new(3),
+                    kind: LogicalNodeKind::Expand(Expand {
+                        input: LogicalNodeId::new(2),
+                        source: "middle".into(),
+                        relationship: "second".into(),
+                        destination: "destination".into(),
+                        destination_labels: Vec::new(),
+                        direction: ExpandDirection::Outgoing,
+                        relationship_types: Vec::new(),
+                        read_scope: ReadScope::current(),
+                    }),
+                },
+            ],
         }),
         result_schema: RowSchema::empty(),
     }
@@ -173,6 +258,147 @@ fn operator_query() -> LogicalProgram {
         }),
         result_schema: RowSchema::empty(),
     }
+}
+
+#[test]
+fn planner_lowers_a_point_anchored_expand_to_one_adjacency_source() {
+    let plan = plan(&point_expand_query(), &fixture_context()).unwrap();
+
+    for fragment in plan.fragments() {
+        assert_eq!(fragment.storage_accesses().len(), 1);
+        assert_eq!(fragment.storage_accesses()[0].node(), LogicalNodeId::new(2));
+        assert!(matches!(
+            &fragment.storage_accesses()[0],
+            StorageAccess::Logical(request)
+                if matches!(
+                    request.operation(),
+                    LogicalReadOperation::Adjacency {
+                        vertex_id,
+                        direction: ExpandDirection::Outgoing,
+                    } if vertex_id.get() == 41
+                )
+        ));
+    }
+    assert!(matches!(
+        plan.operators(),
+        [operator]
+            if operator.id() == LogicalNodeId::new(2)
+                && matches!(
+                    operator.kind(),
+                    PhysicalOperatorKind::Source { output, .. } if output == "relationship"
+                )
+    ));
+}
+
+#[test]
+fn planner_lowers_a_point_anchored_two_hop_expand_to_one_traversal_source() {
+    let plan = plan(&point_two_hop_expand_query(), &fixture_context()).unwrap();
+
+    for fragment in plan.fragments() {
+        assert_eq!(fragment.storage_accesses().len(), 1);
+        assert_eq!(fragment.storage_accesses()[0].node(), LogicalNodeId::new(3));
+        assert!(matches!(
+            &fragment.storage_accesses()[0],
+            StorageAccess::Logical(request)
+                if matches!(
+                    request.operation(),
+                    LogicalReadOperation::Traversal {
+                        vertex_id,
+                        directions,
+                    } if vertex_id.get() == 41
+                        && directions == &[ExpandDirection::Outgoing, ExpandDirection::Outgoing]
+                )
+        ));
+    }
+    assert!(matches!(
+        plan.operators(),
+        [operator]
+            if operator.id() == LogicalNodeId::new(3)
+                && matches!(
+                    operator.kind(),
+                    PhysicalOperatorKind::Source { output, .. } if output == "second"
+                )
+    ));
+}
+
+#[test]
+fn point_anchored_traversal_rejects_an_intermediate_relationship_projection() {
+    let mut program = point_two_hop_expand_query();
+    let LogicalStatement::Query(logical_plan) = &mut program.statement else {
+        panic!()
+    };
+    logical_plan.nodes.push(LogicalNode {
+        id: LogicalNodeId::new(4),
+        kind: LogicalNodeKind::Project {
+            input: LogicalNodeId::new(2),
+            projections: vec![Projection {
+                expression: LogicalExpr::Column("first".into()),
+                alias: "first".into(),
+            }],
+        },
+    });
+    logical_plan.root = LogicalNodeId::new(4);
+
+    assert!(matches!(
+        plan(&program, &fixture_context()),
+        Err(PlanError::UnsupportedNode { node, reason })
+            if node == LogicalNodeId::new(2)
+                && reason.contains("intermediate relationship")
+    ));
+}
+
+#[test]
+fn point_anchored_traversal_rejects_a_branching_intermediate_expand() {
+    let mut program = point_two_hop_expand_query();
+    let LogicalStatement::Query(logical_plan) = &mut program.statement else {
+        panic!()
+    };
+    logical_plan.nodes.push(LogicalNode {
+        id: LogicalNodeId::new(4),
+        kind: LogicalNodeKind::Expand(Expand {
+            input: LogicalNodeId::new(2),
+            source: "middle".into(),
+            relationship: "alternate".into(),
+            destination: "other_destination".into(),
+            destination_labels: Vec::new(),
+            direction: ExpandDirection::Outgoing,
+            relationship_types: Vec::new(),
+            read_scope: ReadScope::current(),
+        }),
+    });
+
+    assert!(matches!(
+        plan(&program, &fixture_context()),
+        Err(PlanError::UnsupportedNode { node, reason })
+            if node == LogicalNodeId::new(2)
+                && reason.contains("branching")
+    ));
+}
+
+#[test]
+fn point_anchored_expand_rejects_a_projection_of_unmaterialized_vertices() {
+    let mut program = point_expand_query();
+    let LogicalStatement::Query(logical_plan) = &mut program.statement else {
+        panic!()
+    };
+    logical_plan.nodes.push(LogicalNode {
+        id: LogicalNodeId::new(3),
+        kind: LogicalNodeKind::Project {
+            input: LogicalNodeId::new(2),
+            projections: vec![Projection {
+                expression: LogicalExpr::Column("destination".into()),
+                alias: "destination".into(),
+            }],
+        },
+    });
+    logical_plan.root = LogicalNodeId::new(3);
+
+    assert!(matches!(
+        plan(&program, &fixture_context()),
+        Err(PlanError::UnsupportedNode { node, reason })
+            if node == LogicalNodeId::new(2)
+                && reason.contains("does not materialize source or destination")
+    ));
 }
 
 fn fixture_context() -> PlanningContext {

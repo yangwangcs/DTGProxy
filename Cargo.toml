@@ -14,6 +14,7 @@ members = [
     "crates/execution/dtg-transaction",
     "crates/execution/dtg-shard",
     "crates/execution/dtg-analytics",
+    "crates/execution/dtg-snapshot-csr",
     "crates/execution/dtg-control",
     "crates/execution/dtg-cluster-protocol",
     "crates/execution/dtg-execution",

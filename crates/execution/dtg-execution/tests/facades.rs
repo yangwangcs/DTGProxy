@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
@@ -22,8 +22,8 @@ use dtg_control::{
 use dtg_execution::{
     ControlActionExecutor, ControllerExecution, DataExecution, GatewayCancellationToken,
     GatewayExecution, GatewayRequestContext, GatewayValue, MetaExecution, ProviderKind,
-    ProviderResolver, ReplicaBinding, ReplicaStateStore, RequestStage, ResolvedReplicaStore,
-    StoreFuture,
+    ProviderResolver, ReplicaBinding, ReplicaStateStore, RequestDetail, RequestStage,
+    ResolvedReplicaStore, StoreFuture,
 };
 use dtg_language::{EmptySchemaCatalog, Language};
 use dtg_plan::{
@@ -34,13 +34,13 @@ use dtg_query::{
     CancellationToken as QueryCancellationToken, ExecutableAccess, ExecutableOperatorKind,
     QueryBudget, QueryRuntime, ReadOperation, ResidualPredicate,
 };
-use dtg_shard::ShardError;
+use dtg_shard::{ShardError, ShardHost};
 use dtg_storage::{
     AdjacencyRead, ApplyReceipt, BackendClass, BackendGeneration, BindingRole, CapabilityManifest,
-    ChangePage, ChangeRecord, ChangesRead, CommittedShardBatch, ConsensusEntry,
+    ChangeCursor, ChangePage, ChangeRecord, ChangesRead, CommittedShardBatch, ConsensusEntry,
     ConsensusSnapshotInstall, ConsensusSnapshotMetadata, ConsensusStore, EdgeHistoryRead, EdgeRead,
-    EdgeScan, EdgeVersion, PlacementEpoch, RaftHardState, RaftMembership, ReadFence,
-    ReplicaMetadata, ScanPage, ShardId, StorageError, TemporalReadView, TransactionId,
+    EdgeScan, EdgeVersion, LogicalMutation, PlacementEpoch, RaftHardState, RaftMembership,
+    ReadFence, ReplicaMetadata, ScanPage, ShardId, StorageError, TemporalReadView, TransactionId,
     TransactionTime, Version, VertexHistoryRead, VertexId, VertexRead, VertexScan, VertexVersion,
 };
 use dtg_transaction::{
@@ -184,7 +184,15 @@ struct CountingReadStore {
     applied_index: AtomicU64,
     begin_read_view_calls: AtomicUsize,
     scan_vertices_calls: Arc<AtomicUsize>,
+    scan_edges_calls: Arc<AtomicUsize>,
+    expand_calls: Arc<AtomicUsize>,
+    edges: Vec<EdgeVersion>,
+    edges_by_fence: BTreeMap<u64, Vec<EdgeVersion>>,
+    changes: Vec<ChangeRecord>,
+    fail_first_changes: Arc<AtomicBool>,
     first_scan_gate: Option<Arc<FirstScanGate>>,
+    first_edge_scan_gate: Option<Arc<FirstScanGate>>,
+    first_expand_gate: Option<Arc<FirstScanGate>>,
     returned_fence: Option<ReadFence>,
 }
 
@@ -225,7 +233,15 @@ impl CountingReadStore {
             applied_index: AtomicU64::new(applied_index),
             begin_read_view_calls: AtomicUsize::new(0),
             scan_vertices_calls: Arc::new(AtomicUsize::new(0)),
+            scan_edges_calls: Arc::new(AtomicUsize::new(0)),
+            expand_calls: Arc::new(AtomicUsize::new(0)),
+            edges: Vec::new(),
+            edges_by_fence: BTreeMap::new(),
+            changes: Vec::new(),
+            fail_first_changes: Arc::new(AtomicBool::new(false)),
             first_scan_gate: None,
+            first_edge_scan_gate: None,
+            first_expand_gate: None,
             returned_fence: None,
         }
     }
@@ -235,12 +251,56 @@ impl CountingReadStore {
         self
     }
 
+    fn with_edges(mut self, edges: Vec<EdgeVersion>) -> Self {
+        self.edges = edges;
+        self
+    }
+
+    fn with_edges_at(mut self, applied_index: u64, edges: Vec<EdgeVersion>) -> Self {
+        self.edges_by_fence.insert(applied_index, edges);
+        self
+    }
+
+    fn with_changes(mut self, changes: Vec<ChangeRecord>) -> Self {
+        self.changes = changes;
+        self
+    }
+
+    fn fail_first_changes(mut self) -> Self {
+        self.fail_first_changes = Arc::new(AtomicBool::new(true));
+        self
+    }
+
     fn blocking_first_scan(
         mut self,
         entered: mpsc::SyncSender<()>,
         resume: mpsc::Receiver<()>,
     ) -> Self {
         self.first_scan_gate = Some(Arc::new(FirstScanGate {
+            entered,
+            resume: Mutex::new(resume),
+        }));
+        self
+    }
+
+    fn blocking_first_expand(
+        mut self,
+        entered: mpsc::SyncSender<()>,
+        resume: mpsc::Receiver<()>,
+    ) -> Self {
+        self.first_expand_gate = Some(Arc::new(FirstScanGate {
+            entered,
+            resume: Mutex::new(resume),
+        }));
+        self
+    }
+
+    fn blocking_first_edge_scan(
+        mut self,
+        entered: mpsc::SyncSender<()>,
+        resume: mpsc::Receiver<()>,
+    ) -> Self {
+        self.first_edge_scan_gate = Some(Arc::new(FirstScanGate {
             entered,
             resume: Mutex::new(resume),
         }));
@@ -269,12 +329,30 @@ impl ReplicaStateStore for CountingReadStore {
         self.begin_read_view_calls.fetch_add(1, Ordering::SeqCst);
         let returned_fence = self.returned_fence.clone().unwrap_or(fence);
         let scan_vertices_calls = Arc::clone(&self.scan_vertices_calls);
+        let scan_edges_calls = Arc::clone(&self.scan_edges_calls);
+        let expand_calls = Arc::clone(&self.expand_calls);
+        let edges = self
+            .edges_by_fence
+            .get(&returned_fence.applied_index())
+            .cloned()
+            .unwrap_or_else(|| self.edges.clone());
+        let changes = self.changes.clone();
+        let fail_first_changes = Arc::clone(&self.fail_first_changes);
         let first_scan_gate = self.first_scan_gate.clone();
+        let first_edge_scan_gate = self.first_edge_scan_gate.clone();
+        let first_expand_gate = self.first_expand_gate.clone();
         Box::pin(async move {
             Ok(Box::new(EmptyReadView {
                 returned_fence,
                 scan_vertices_calls,
+                scan_edges_calls,
+                expand_calls,
+                edges,
+                changes,
+                fail_first_changes,
                 first_scan_gate,
+                first_edge_scan_gate,
+                first_expand_gate,
             }) as Box<_>)
         })
     }
@@ -309,7 +387,14 @@ impl ReplicaStateStore for PausingReadStore {
             Ok(Box::new(EmptyReadView {
                 returned_fence: fence,
                 scan_vertices_calls: Arc::new(AtomicUsize::new(0)),
+                scan_edges_calls: Arc::new(AtomicUsize::new(0)),
+                expand_calls: Arc::new(AtomicUsize::new(0)),
+                edges: Vec::new(),
+                changes: Vec::new(),
+                fail_first_changes: Arc::new(AtomicBool::new(false)),
                 first_scan_gate: None,
+                first_edge_scan_gate: None,
+                first_expand_gate: None,
             }) as Box<_>)
         })
     }
@@ -318,7 +403,14 @@ impl ReplicaStateStore for PausingReadStore {
 struct EmptyReadView {
     returned_fence: ReadFence,
     scan_vertices_calls: Arc<AtomicUsize>,
+    scan_edges_calls: Arc<AtomicUsize>,
+    expand_calls: Arc<AtomicUsize>,
+    edges: Vec<EdgeVersion>,
+    changes: Vec<ChangeRecord>,
+    fail_first_changes: Arc<AtomicBool>,
     first_scan_gate: Option<Arc<FirstScanGate>>,
+    first_edge_scan_gate: Option<Arc<FirstScanGate>>,
+    first_expand_gate: Option<Arc<FirstScanGate>>,
 }
 
 impl TemporalReadView for EmptyReadView {
@@ -343,11 +435,27 @@ impl TemporalReadView for EmptyReadView {
     }
 
     fn expand(&self, _request: AdjacencyRead) -> StoreFuture<'_, Vec<EdgeVersion>> {
+        let ordinal = self.expand_calls.fetch_add(1, Ordering::SeqCst);
+        if ordinal == 0
+            && let Some(gate) = &self.first_expand_gate
+        {
+            gate.entered.send(()).unwrap();
+            gate.resume.lock().unwrap().recv().unwrap();
+        }
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn changes(&self, _request: ChangesRead) -> StoreFuture<'_, ChangePage> {
-        Box::pin(async { Ok(ChangePage::new(Vec::new(), None)) })
+    fn changes(&self, request: ChangesRead) -> StoreFuture<'_, ChangePage> {
+        if self.fail_first_changes.swap(false, Ordering::SeqCst) {
+            return Box::pin(async { Err(StorageError::Unsupported) });
+        }
+        let matching = self
+            .changes
+            .iter()
+            .filter(|change| request.includes(change.cursor()))
+            .cloned()
+            .collect::<Vec<_>>();
+        Box::pin(async move { Ok(ChangePage::new(matching, None)) })
     }
 
     fn scan_vertices(
@@ -366,9 +474,27 @@ impl TemporalReadView for EmptyReadView {
 
     fn scan_edges(
         &self,
-        _request: EdgeScan,
+        request: EdgeScan,
     ) -> StoreFuture<'_, ScanPage<EdgeVersion, dtg_storage::EdgeId>> {
-        Box::pin(async { Ok(ScanPage::new(Vec::new(), None)) })
+        let ordinal = self.scan_edges_calls.fetch_add(1, Ordering::SeqCst);
+        if ordinal == 0
+            && let Some(gate) = &self.first_edge_scan_gate
+        {
+            gate.entered.send(()).unwrap();
+            gate.resume.lock().unwrap().recv().unwrap();
+        }
+        let mut rows = self
+            .edges
+            .iter()
+            .filter(|edge| request.includes(edge))
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|edge| edge.id());
+        let limit = request.limit() as usize;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next_after = has_more.then(|| rows.last().map(EdgeVersion::id)).flatten();
+        Box::pin(async move { Ok(ScanPage::new(rows, next_after)) })
     }
 }
 
@@ -676,6 +802,43 @@ fn count_fragment_body_with_scan(after: Option<u128>, limit: u32) -> Vec<u8> {
     body
 }
 
+fn adjacency_fragment_body(vertex_id: u128, direction: u8, limit: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u64.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.push(0);
+    body.push(4);
+    body.extend_from_slice(&vertex_id.to_be_bytes());
+    body.push(direction);
+    body.push(0);
+    body.push(0);
+    body.extend_from_slice(&limit.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body
+}
+
+fn traversal_fragment_body(vertex_id: u128, directions: &[u8], limit: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1_u64.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.extend_from_slice(&1_u32.to_be_bytes());
+    body.push(0);
+    body.push(5);
+    body.extend_from_slice(&vertex_id.to_be_bytes());
+    body.extend_from_slice(&(directions.len() as u32).to_be_bytes());
+    body.extend_from_slice(directions);
+    body.push(0);
+    body.push(0);
+    body.extend_from_slice(&limit.to_be_bytes());
+    body.extend_from_slice(&0_u32.to_be_bytes());
+    body
+}
+
 fn read_runtime<T>(binding: ReplicaBinding, store: Arc<T>) -> (DataExecution, dtg_shard::ReplicaKey)
 where
     T: ReplicaStateStore + 'static,
@@ -696,6 +859,135 @@ where
 }
 
 #[test]
+fn data_execution_uses_a_full_fence_route_cache_for_one_local_replica() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "route-cache-single");
+    let (runtime, key) = read_runtime(
+        binding.clone(),
+        Arc::new(CountingReadStore::new(binding.clone(), 0)),
+    );
+
+    let lookup = runtime
+        .locate_replica_timed(
+            binding.cluster_id(),
+            binding.graph_id(),
+            binding.shard_id(),
+            binding.placement_epoch(),
+            binding.backend_generation(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(lookup.key(), key);
+    assert!(lookup.cache_hit());
+}
+
+#[test]
+fn data_execution_route_cache_preserves_multi_replica_ambiguity_and_removal() {
+    let first = binding(ProviderKind::Fjall, 5, 6, "route-cache-first");
+    let second = binding(ProviderKind::Fjall, 5, 7, "route-cache-second");
+    let runtime = DataExecution::builder()
+        .with_provider(ProviderKind::Fjall, resolver(ProviderKind::Fjall))
+        .build()
+        .unwrap();
+    let first_key = runtime
+        .add_replica(
+            Arc::new(BindingConsensus {
+                binding: first.clone(),
+            }),
+            Arc::new(BindingStore {
+                binding: first.clone(),
+            }),
+        )
+        .unwrap();
+    runtime
+        .add_replica(
+            Arc::new(BindingConsensus {
+                binding: second.clone(),
+            }),
+            Arc::new(BindingStore {
+                binding: second.clone(),
+            }),
+        )
+        .unwrap();
+
+    assert!(
+        runtime
+            .locate_replica(
+                first.cluster_id(),
+                first.graph_id(),
+                first.shard_id(),
+                first.placement_epoch(),
+                first.backend_generation(),
+                None,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        runtime
+            .locate_replica(
+                first.cluster_id(),
+                first.graph_id(),
+                first.shard_id(),
+                first.placement_epoch(),
+                first.backend_generation(),
+                Some(first.replica_id()),
+            )
+            .unwrap(),
+        first_key
+    );
+
+    runtime.start_replica(first_key).unwrap();
+    runtime.remove_replica(first_key).unwrap();
+    assert!(
+        runtime
+            .locate_replica(
+                first.cluster_id(),
+                first.graph_id(),
+                first.shard_id(),
+                first.placement_epoch(),
+                first.backend_generation(),
+                Some(first.replica_id()),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn data_execution_builds_route_cache_for_preconfigured_replicas() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "route-cache-preconfigured");
+    let mut shards = ShardHost::new();
+    let key = shards
+        .add(
+            Arc::new(BindingConsensus {
+                binding: binding.clone(),
+            }),
+            Arc::new(BindingStore {
+                binding: binding.clone(),
+            }),
+        )
+        .unwrap();
+    let runtime = DataExecution::builder()
+        .with_provider(ProviderKind::Fjall, resolver(ProviderKind::Fjall))
+        .with_shards(shards)
+        .build()
+        .unwrap();
+
+    let lookup = runtime
+        .locate_replica_timed(
+            binding.cluster_id(),
+            binding.graph_id(),
+            binding.shard_id(),
+            binding.placement_epoch(),
+            binding.backend_generation(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(lookup.key(), key);
+    assert!(lookup.cache_hit());
+}
+
+#[test]
 fn read_view_cache_reuses_an_exact_fence_for_two_point_reads() {
     let binding = binding(ProviderKind::Fjall, 5, 6, "read-view-cache");
     let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
@@ -708,6 +1000,536 @@ fn read_view_cache_reuses_an_exact_fence_for_two_point_reads() {
         .unwrap();
 
     assert_eq!(store.begin_read_view_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn adjacency_cache_reuses_an_exact_temporal_scope() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "adjacency-cache");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let adjacency = adjacency_fragment_body(17, 0, 63);
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &adjacency))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &adjacency))
+        .unwrap();
+
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 1);
+    let metrics = runtime.request_metrics().snapshot();
+    assert_eq!(
+        metrics
+            .details()
+            .find(|(detail, _)| *detail == RequestDetail::DataAdjacencyCacheHit)
+            .unwrap()
+            .1
+            .success,
+        1
+    );
+    assert_eq!(
+        metrics
+            .details()
+            .find(|(detail, _)| *detail == RequestDetail::DataAdjacencyCacheMiss)
+            .unwrap()
+            .1
+            .success,
+        1
+    );
+    assert_eq!(
+        metrics
+            .details()
+            .find(|(detail, _)| *detail == RequestDetail::DataAdjacencyBackendExpand)
+            .unwrap()
+            .1
+            .success,
+        1
+    );
+}
+
+#[test]
+fn two_hop_traversal_builds_and_reuses_a_snapshot_csr_instead_of_expanding_each_frontier() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "snapshot-csr-two-hop");
+    let edges = [(71_u128, 10_u128, 20_u128), (72_u128, 20_u128, 30_u128)]
+        .into_iter()
+        .map(|(id, source, target)| {
+            EdgeVersion::new(
+                dtg_storage::EdgeId::new(id).unwrap(),
+                VertexId::new(source).unwrap(),
+                VertexId::new(target).unwrap(),
+                "LINK",
+                Version::new(1),
+                dtg_storage::ValidInterval::new(1, 100).unwrap(),
+                TransactionTime::new(23).unwrap(),
+                dtg_storage::Properties::new(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9).with_edges(edges));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let traversal = traversal_fragment_body(10, &[0, 0], 64);
+
+    let first = block_on(runtime.execute_fragment(
+        key,
+        9,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &traversal,
+    ))
+    .unwrap();
+    let second = block_on(runtime.execute_fragment(
+        key,
+        9,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &traversal,
+    ))
+    .unwrap();
+
+    assert_eq!(first.rows().len(), 1);
+    assert_eq!(second.rows().len(), 1);
+    assert_eq!(store.scan_edges_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 0);
+    let metrics = runtime.request_metrics().snapshot();
+    for detail in [
+        RequestDetail::DataSnapshotCsrCacheHit,
+        RequestDetail::DataSnapshotCsrCacheMiss,
+        RequestDetail::DataSnapshotCsrBuild,
+    ] {
+        assert_eq!(
+            metrics
+                .details()
+                .find(|(candidate, _)| *candidate == detail)
+                .unwrap()
+                .1
+                .success,
+            1
+        );
+    }
+}
+
+#[test]
+fn one_hop_adjacency_builds_and_reuses_a_snapshot_csr_for_a_large_row_bound() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "snapshot-csr-one-hop");
+    let edge = EdgeVersion::new(
+        dtg_storage::EdgeId::new(71).unwrap(),
+        VertexId::new(10).unwrap(),
+        VertexId::new(20).unwrap(),
+        "LINK",
+        Version::new(1),
+        dtg_storage::ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(23).unwrap(),
+        dtg_storage::Properties::new(),
+    )
+    .unwrap();
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9).with_edges(vec![edge]));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let adjacency = adjacency_fragment_body(10, 0, 64);
+
+    let first = block_on(runtime.execute_fragment(
+        key,
+        9,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &adjacency,
+    ))
+    .unwrap();
+    let second = block_on(runtime.execute_fragment(
+        key,
+        9,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &adjacency,
+    ))
+    .unwrap();
+
+    assert_eq!(first.rows().len(), 1);
+    assert_eq!(second.rows().len(), 1);
+    assert_eq!(store.scan_edges_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 0);
+    let metrics = runtime.request_metrics().snapshot();
+    for detail in [
+        RequestDetail::DataSnapshotCsrCacheHit,
+        RequestDetail::DataSnapshotCsrCacheMiss,
+        RequestDetail::DataSnapshotCsrBuild,
+    ] {
+        assert_eq!(
+            metrics
+                .details()
+                .find(|(candidate, _)| *candidate == detail)
+                .unwrap()
+                .1
+                .success,
+            1
+        );
+    }
+}
+
+#[test]
+fn a_contiguous_committed_edge_delta_extends_the_previous_snapshot_csr_without_a_rescan() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "snapshot-csr-overlay");
+    let base_edge = EdgeVersion::new(
+        dtg_storage::EdgeId::new(71).unwrap(),
+        VertexId::new(10).unwrap(),
+        VertexId::new(20).unwrap(),
+        "LINK",
+        Version::new(1),
+        dtg_storage::ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(23).unwrap(),
+        dtg_storage::Properties::new(),
+    )
+    .unwrap();
+    let added_edge = EdgeVersion::new(
+        dtg_storage::EdgeId::new(72).unwrap(),
+        VertexId::new(20).unwrap(),
+        VertexId::new(30).unwrap(),
+        "LINK",
+        Version::new(1),
+        dtg_storage::ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(23).unwrap(),
+        dtg_storage::Properties::new(),
+    )
+    .unwrap();
+    let store = Arc::new(
+        CountingReadStore::new(binding.clone(), 9)
+            .with_edges(vec![base_edge])
+            .with_edges_at(
+                10,
+                vec![
+                    EdgeVersion::new(
+                        dtg_storage::EdgeId::new(71).unwrap(),
+                        VertexId::new(10).unwrap(),
+                        VertexId::new(20).unwrap(),
+                        "LINK",
+                        Version::new(1),
+                        dtg_storage::ValidInterval::new(1, 100).unwrap(),
+                        TransactionTime::new(23).unwrap(),
+                        dtg_storage::Properties::new(),
+                    )
+                    .unwrap(),
+                    added_edge.clone(),
+                ],
+            )
+            .with_changes(vec![ChangeRecord::new(
+                ChangeCursor::new(10, 0),
+                LogicalMutation::PutEdge(added_edge),
+            )])
+            .fail_first_changes(),
+    );
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let traversal = traversal_fragment_body(10, &[0, 0], 64);
+
+    assert_eq!(
+        block_on(runtime.execute_fragment(
+            key,
+            9,
+            TransactionTime::new(23).unwrap(),
+            17,
+            &traversal,
+        ))
+        .unwrap()
+        .rows()
+        .len(),
+        0
+    );
+    store.applied_index.store(10, Ordering::SeqCst);
+    assert!(
+        block_on(runtime.execute_fragment(
+            key,
+            10,
+            TransactionTime::new(23).unwrap(),
+            17,
+            &traversal,
+        ))
+        .is_err()
+    );
+    assert_eq!(
+        block_on(runtime.execute_fragment(
+            key,
+            10,
+            TransactionTime::new(23).unwrap(),
+            17,
+            &traversal,
+        ))
+        .unwrap()
+        .rows()
+        .len(),
+        1
+    );
+
+    assert_eq!(store.scan_edges_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn snapshot_csr_uses_the_requested_historical_transaction_time() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "snapshot-csr-history");
+    let edges = [
+        (71_u128, 10_u128, 20_u128, 20_i64),
+        (72_u128, 20_u128, 30_u128, 25_i64),
+    ]
+    .into_iter()
+    .map(|(id, source, target, transaction_time)| {
+        EdgeVersion::new(
+            dtg_storage::EdgeId::new(id).unwrap(),
+            VertexId::new(source).unwrap(),
+            VertexId::new(target).unwrap(),
+            "LINK",
+            Version::new(1),
+            dtg_storage::ValidInterval::new(1, 100).unwrap(),
+            TransactionTime::new(transaction_time).unwrap(),
+            dtg_storage::Properties::new(),
+        )
+        .unwrap()
+    })
+    .collect();
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9).with_edges(edges));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let traversal = traversal_fragment_body(10, &[0, 0], 64);
+
+    assert_eq!(
+        block_on(runtime.execute_fragment(
+            key,
+            9,
+            TransactionTime::new(23).unwrap(),
+            17,
+            &traversal,
+        ))
+        .unwrap()
+        .rows()
+        .len(),
+        0
+    );
+    assert_eq!(
+        block_on(runtime.execute_fragment(
+            key,
+            9,
+            TransactionTime::new(25).unwrap(),
+            17,
+            &traversal,
+        ))
+        .unwrap()
+        .rows()
+        .len(),
+        1
+    );
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn small_two_hop_traversal_uses_the_bounded_adjacency_path() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "snapshot-csr-small-fallback");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let traversal = traversal_fragment_body(10, &[0, 0], 63);
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &traversal))
+        .unwrap();
+
+    assert_eq!(store.scan_edges_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn snapshot_csr_cache_keeps_a_bounded_number_of_exact_snapshot_images() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "snapshot-csr-capacity");
+    let edges = [(71_u128, 10_u128, 20_u128), (72_u128, 20_u128, 30_u128)]
+        .into_iter()
+        .map(|(id, source, target)| {
+            EdgeVersion::new(
+                dtg_storage::EdgeId::new(id).unwrap(),
+                VertexId::new(source).unwrap(),
+                VertexId::new(target).unwrap(),
+                "LINK",
+                Version::new(1),
+                dtg_storage::ValidInterval::new(1, 100).unwrap(),
+                TransactionTime::new(23).unwrap(),
+                dtg_storage::Properties::new(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9).with_edges(edges));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let traversal = traversal_fragment_body(10, &[0, 0], 64);
+
+    for valid_at in [17, 18, 19, 19] {
+        block_on(runtime.execute_fragment(
+            key,
+            9,
+            TransactionTime::new(23).unwrap(),
+            valid_at,
+            &traversal,
+        ))
+        .unwrap();
+    }
+
+    assert_eq!(store.scan_edges_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_two_hop_cold_starts_share_one_snapshot_csr_build() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "snapshot-csr-concurrent");
+    let edges = [(71_u128, 10_u128, 20_u128), (72_u128, 20_u128, 30_u128)]
+        .into_iter()
+        .map(|(id, source, target)| {
+            EdgeVersion::new(
+                dtg_storage::EdgeId::new(id).unwrap(),
+                VertexId::new(source).unwrap(),
+                VertexId::new(target).unwrap(),
+                "LINK",
+                Version::new(1),
+                dtg_storage::ValidInterval::new(1, 100).unwrap(),
+                TransactionTime::new(23).unwrap(),
+                dtg_storage::Properties::new(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let (entered, first_scan_entered) = mpsc::sync_channel(1);
+    let (resume, first_scan_resume) = mpsc::channel();
+    let store = Arc::new(
+        CountingReadStore::new(binding.clone(), 9)
+            .with_edges(edges)
+            .blocking_first_edge_scan(entered, first_scan_resume),
+    );
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let runtime = Arc::new(runtime);
+    let traversal = traversal_fragment_body(10, &[0, 0], 64);
+
+    let first = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let traversal = traversal.clone();
+        async move {
+            runtime
+                .execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &traversal)
+                .await
+        }
+    });
+    first_scan_entered.recv().unwrap();
+    let second = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        async move {
+            runtime
+                .execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &traversal)
+                .await
+        }
+    });
+    for _ in 0..100 {
+        if store.scan_edges_calls.load(Ordering::SeqCst) > 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let scan_calls = store.scan_edges_calls.load(Ordering::SeqCst);
+    resume.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    assert_eq!(scan_calls, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adjacency_cache_merges_concurrent_exact_scope_misses() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "adjacency-cache-concurrent");
+    let (entered, first_expand_entered) = mpsc::sync_channel(1);
+    let (resume, first_expand_resume) = mpsc::channel();
+    let store = Arc::new(
+        CountingReadStore::new(binding.clone(), 9)
+            .blocking_first_expand(entered, first_expand_resume),
+    );
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let runtime = Arc::new(runtime);
+    let adjacency = adjacency_fragment_body(17, 0, 63);
+
+    let first = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let adjacency = adjacency.clone();
+        async move {
+            runtime
+                .execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &adjacency)
+                .await
+        }
+    });
+    first_expand_entered.recv().unwrap();
+    let second = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        let adjacency = adjacency.clone();
+        async move {
+            runtime
+                .execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &adjacency)
+                .await
+        }
+    });
+
+    for _ in 0..100 {
+        if store.expand_calls.load(Ordering::SeqCst) > 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let expand_calls = store.expand_calls.load(Ordering::SeqCst);
+    resume.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(expand_calls, 1);
+}
+
+#[test]
+fn adjacency_cache_distinguishes_direction_limit_and_valid_time() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "adjacency-cache-scope");
+    let store = Arc::new(CountingReadStore::new(binding.clone(), 9));
+    let (runtime, key) = read_runtime(binding, Arc::clone(&store));
+    let outgoing = adjacency_fragment_body(17, 0, 63);
+    let incoming = adjacency_fragment_body(17, 1, 63);
+    let limited = adjacency_fragment_body(17, 0, 32);
+
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &outgoing))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &incoming))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 17, &limited))
+        .unwrap();
+    block_on(runtime.execute_fragment(key, 9, TransactionTime::new(23).unwrap(), 18, &outgoing))
+        .unwrap();
+
+    assert_eq!(store.expand_calls.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn adjacency_cache_does_not_survive_replica_replacement() {
+    let binding = binding(ProviderKind::Fjall, 5, 6, "adjacency-cache-replacement");
+    let first = Arc::new(CountingReadStore::new(binding.clone(), 0));
+    let (runtime, key) = read_runtime(binding.clone(), Arc::clone(&first));
+    let adjacency = adjacency_fragment_body(17, 0, 63);
+    runtime.start_replica(key).unwrap();
+
+    block_on(runtime.execute_fragment(key, 0, TransactionTime::new(23).unwrap(), 17, &adjacency))
+        .unwrap();
+    runtime.remove_replica(key).unwrap();
+
+    let replacement = Arc::new(CountingReadStore::new(binding.clone(), 0));
+    let replacement_store: Arc<dyn ReplicaStateStore> = replacement.clone();
+    let replacement_key = runtime
+        .add_replica_runtime(
+            Arc::new(BindingConsensus { binding }),
+            ResolvedReplicaStore::state_only(replacement_store),
+        )
+        .unwrap();
+    assert_eq!(key, replacement_key);
+    runtime.start_replica(replacement_key).unwrap();
+
+    block_on(runtime.execute_fragment(
+        replacement_key,
+        0,
+        TransactionTime::new(23).unwrap(),
+        17,
+        &adjacency,
+    ))
+    .unwrap();
+
+    assert_eq!(first.expand_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.expand_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

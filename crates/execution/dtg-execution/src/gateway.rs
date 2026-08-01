@@ -16,8 +16,8 @@ use dtg_cluster_v2::{
 };
 use dtg_language::{EmptySchemaCatalog, Language, LanguageError, LogicalProgram};
 use dtg_language_ir::{
-    AggregateKind, LogicalExpr, LogicalNodeKind, LogicalPlan, LogicalStatement, TemporalScope,
-    TimeExpr, ValidTimeExpr, ValidTimePredicate,
+    AggregateKind, Field, LogicalExpr, LogicalNodeKind, LogicalPlan, LogicalStatement, LogicalType,
+    RowSchema, TemporalScope, TimeExpr, ValidTimeExpr, ValidTimePredicate,
 };
 use dtg_plan::{
     CatalogShard, CatalogSnapshot, ExchangeKind, LogicalReadOperation, LogicalReadRequest,
@@ -42,6 +42,8 @@ use dtg_transaction::{
     TransactionContext, TransactionOutcome, TxnFuture,
 };
 use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 
 use crate::{ExecutionBuildError, RequestDetail, RequestStage, RequestStageMetrics, StageOutcome};
@@ -314,6 +316,10 @@ impl GatewayRows {
     pub fn rows(&self) -> &[Vec<GatewayValue>] {
         &self.rows
     }
+
+    pub fn into_parts(self) -> (Vec<String>, Vec<Vec<GatewayValue>>) {
+        (self.fields, self.rows)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,6 +521,23 @@ pub trait GatewayWriteTransport: Send + Sync {
         transaction_id: TransactionId,
     ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>>;
 
+    fn prepare_write_times(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<
+        '_,
+        Result<(dtg_storage::TransactionTime, dtg_storage::TransactionTime), GatewayExecutionError>,
+    > {
+        let route = route.clone();
+        Box::pin(async move {
+            tokio::try_join!(
+                self.allocate_start_time(&route, transaction_id),
+                self.reserve_commit_time(&route, transaction_id),
+            )
+        })
+    }
+
     fn apply_single_shard(
         &self,
         request: GatewayWriteRequest,
@@ -588,6 +611,61 @@ impl TonicGatewayWriteTransport {
             )
         })
     }
+
+    async fn prepare_write_times_rpc(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> Result<(dtg_storage::TransactionTime, dtg_storage::TransactionTime), GatewayExecutionError>
+    {
+        let request = transaction_rpc_request(route, transaction_id, 6, None)?;
+        let mut client = self.meta.clone();
+        let status = client
+            .submit_transaction(request)
+            .await
+            .map_err(cluster_rpc_error)?
+            .into_inner();
+        let details = status_details(status)?.ok_or_else(|| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-TIMESTAMP",
+                "Meta write preparation response is missing details",
+                GatewayRetry::Safe,
+            )
+        })?;
+        let bytes: [u8; 16] = details.body().try_into().map_err(|_| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-TIMESTAMP",
+                "Meta write preparation response is not two i64 values",
+                GatewayRetry::Safe,
+            )
+        })?;
+        let start =
+            dtg_storage::TransactionTime::new(i64::from_be_bytes(bytes[..8].try_into().unwrap()))
+                .map_err(|error| {
+                GatewayExecutionError::new(
+                    "DTG-EXECUTION-TIMESTAMP",
+                    error.to_string(),
+                    GatewayRetry::Safe,
+                )
+            })?;
+        let commit =
+            dtg_storage::TransactionTime::new(i64::from_be_bytes(bytes[8..].try_into().unwrap()))
+                .map_err(|error| {
+                GatewayExecutionError::new(
+                    "DTG-EXECUTION-TIMESTAMP",
+                    error.to_string(),
+                    GatewayRetry::Safe,
+                )
+            })?;
+        if commit <= start {
+            return Err(GatewayExecutionError::new(
+                "DTG-EXECUTION-TIMESTAMP",
+                "Meta write preparation returned a non-increasing timestamp pair",
+                GatewayRetry::Safe,
+            ));
+        }
+        Ok((start, commit))
+    }
 }
 
 impl GatewayWriteTransport for TonicGatewayWriteTransport {
@@ -607,6 +685,18 @@ impl GatewayWriteTransport for TonicGatewayWriteTransport {
     ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>> {
         let route = route.clone();
         Box::pin(async move { self.timestamp(&route, transaction_id, 2).await })
+    }
+
+    fn prepare_write_times(
+        &self,
+        route: &GatewayWriteRoute,
+        transaction_id: TransactionId,
+    ) -> GatewayFuture<
+        '_,
+        Result<(dtg_storage::TransactionTime, dtg_storage::TransactionTime), GatewayExecutionError>,
+    > {
+        let route = route.clone();
+        Box::pin(async move { self.prepare_write_times_rpc(&route, transaction_id).await })
     }
 
     fn apply_single_shard(
@@ -779,11 +869,29 @@ pub enum GatewayQueryResponse {
     Final(GatewayResponse),
 }
 
+type GatewaySessionResponses = Result<Vec<proto::GatewayResponse>, GatewayExecutionError>;
+type GatewaySessionPending = Arc<Mutex<BTreeMap<u128, oneshot::Sender<GatewaySessionResponses>>>>;
+
 pub trait GatewayProtocolV2Client: Send + Sync {
     fn execute(
         &self,
         request: proto::GatewayRequest,
     ) -> GatewayFuture<'_, Result<Vec<proto::GatewayResponse>, GatewayExecutionError>>;
+
+    fn execute_query(
+        &self,
+        request: proto::GatewayRequest,
+    ) -> GatewayFuture<'_, Result<BTreeMap<u32, Vec<QueryColumnBatch>>, GatewayExecutionError>>
+    {
+        Box::pin(async move { decode_protocol_v2_query_responses(self.execute(request).await?) })
+    }
+
+    fn execute_session(
+        &self,
+        _request: proto::GatewayRequest,
+    ) -> GatewayFuture<'_, Result<Option<Vec<proto::GatewayResponse>>, GatewayExecutionError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 pub trait GatewayExecutionTransportFactory: Send + Sync {
@@ -811,18 +919,24 @@ impl GatewayExecutionTransportFactory for TonicGatewayProtocolV2TransportFactory
         endpoint: &'a str,
     ) -> GatewayFuture<'a, Result<Arc<dyn GatewayExecutionTransport>, GatewayExecutionError>> {
         Box::pin(async move {
-            let client =
-                proto::gateway_service_client::GatewayServiceClient::connect(endpoint.to_owned())
-                    .await
-                    .map_err(|error| {
-                        GatewayExecutionError::new(
-                            "DTG-CLUSTER-CONNECT",
-                            error.to_string(),
-                            GatewayRetry::Safe,
-                        )
-                    })?;
+            let channel = Channel::from_shared(endpoint.to_owned())
+                .map_err(|error| {
+                    GatewayExecutionError::new(
+                        "DTG-CLUSTER-CONNECT",
+                        error.to_string(),
+                        GatewayRetry::Safe,
+                    )
+                })?
+                .connect()
+                .await
+                .map_err(cluster_connect_error)?;
+            let client = proto::gateway_service_client::GatewayServiceClient::new(channel);
+            let session = TonicGatewaySessionClient::connect(client.clone())
+                .await
+                .ok()
+                .map(Arc::new);
             let client: Arc<dyn GatewayProtocolV2Client> =
-                Arc::new(TonicGatewayProtocolV2Client { client });
+                Arc::new(TonicGatewayProtocolV2Client { client, session });
             Ok(Arc::new(GatewayProtocolV2Transport::new(client))
                 as Arc<dyn GatewayExecutionTransport>)
         })
@@ -832,6 +946,195 @@ impl GatewayExecutionTransportFactory for TonicGatewayProtocolV2TransportFactory
 #[derive(Clone)]
 struct TonicGatewayProtocolV2Client {
     client: proto::gateway_service_client::GatewayServiceClient<Channel>,
+    session: Option<Arc<TonicGatewaySessionClient>>,
+}
+
+struct TonicGatewaySessionClient {
+    sender: mpsc::Sender<proto::GatewayRequest>,
+    pending: GatewaySessionPending,
+    active: Arc<AtomicBool>,
+}
+
+impl TonicGatewaySessionClient {
+    async fn connect(
+        mut client: proto::gateway_service_client::GatewayServiceClient<Channel>,
+    ) -> Result<Self, GatewayExecutionError> {
+        let (sender, receiver) = mpsc::channel(32);
+        let responses = client
+            .execute_session(ReceiverStream::new(receiver))
+            .await
+            .map_err(cluster_rpc_error)?
+            .into_inner();
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let active = Arc::new(AtomicBool::new(true));
+        tokio::spawn(read_gateway_session_responses(
+            responses,
+            Arc::clone(&pending),
+            Arc::clone(&active),
+        ));
+        Ok(Self {
+            sender,
+            pending,
+            active,
+        })
+    }
+
+    async fn execute(
+        &self,
+        request: proto::GatewayRequest,
+    ) -> Result<Vec<proto::GatewayResponse>, GatewayExecutionError> {
+        let request_id = gateway_session_request_id(request.request.as_ref())?;
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().map_err(|_| {
+                GatewayExecutionError::new(
+                    "DTG-CLUSTER-SESSION",
+                    "Gateway session pending-request lock is poisoned",
+                    GatewayRetry::Safe,
+                )
+            })?;
+            if !self.active.load(Ordering::Acquire) {
+                return Err(gateway_session_unavailable("Gateway session is closed"));
+            }
+            if pending.insert(request_id, sender).is_some() {
+                return Err(GatewayExecutionError::new(
+                    "DTG-CLUSTER-SESSION-ID",
+                    "Gateway session received a duplicate in-flight request ID",
+                    GatewayRetry::Safe,
+                ));
+            }
+        }
+        if self.sender.send(request).await.is_err() {
+            let mut pending = self.pending.lock().map_err(|_| {
+                GatewayExecutionError::new(
+                    "DTG-CLUSTER-SESSION",
+                    "Gateway session pending-request lock is poisoned",
+                    GatewayRetry::Safe,
+                )
+            })?;
+            pending.remove(&request_id);
+            return Err(gateway_session_unavailable(
+                "Gateway session request stream is closed",
+            ));
+        }
+        receiver.await.map_err(|_| {
+            gateway_session_unavailable("Gateway session response dispatcher stopped")
+        })?
+    }
+}
+
+async fn read_gateway_session_responses(
+    mut responses: tonic::Streaming<proto::GatewaySessionResponse>,
+    pending: GatewaySessionPending,
+    active: Arc<AtomicBool>,
+) {
+    loop {
+        let frame = match responses.message().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                fail_gateway_session(
+                    &pending,
+                    &active,
+                    gateway_session_unavailable("Gateway session response stream closed"),
+                );
+                return;
+            }
+            Err(error) => {
+                fail_gateway_session(
+                    &pending,
+                    &active,
+                    GatewayExecutionError::new(
+                        "DTG-CLUSTER-STREAM",
+                        error.to_string(),
+                        GatewayRetry::Safe,
+                    ),
+                );
+                return;
+            }
+        };
+        let request_id = match gateway_session_request_id(frame.request.as_ref()) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                fail_gateway_session(&pending, &active, error);
+                return;
+            }
+        };
+        let sender = match pending.lock() {
+            Ok(mut pending) => pending.remove(&request_id),
+            Err(_) => {
+                fail_gateway_session(
+                    &pending,
+                    &active,
+                    GatewayExecutionError::new(
+                        "DTG-CLUSTER-SESSION",
+                        "Gateway session pending-request lock is poisoned",
+                        GatewayRetry::Safe,
+                    ),
+                );
+                return;
+            }
+        };
+        let Some(sender) = sender else {
+            fail_gateway_session(
+                &pending,
+                &active,
+                GatewayExecutionError::new(
+                    "DTG-CLUSTER-SESSION-ID",
+                    "Gateway session response did not match an in-flight request",
+                    GatewayRetry::Safe,
+                ),
+            );
+            return;
+        };
+        let _ = sender.send(Ok(frame.responses));
+    }
+}
+
+fn gateway_session_request_id(
+    context: Option<&proto::RequestContext>,
+) -> Result<u128, GatewayExecutionError> {
+    let context = context.ok_or_else(|| {
+        GatewayExecutionError::new(
+            "DTG-CLUSTER-SESSION-ID",
+            "Gateway session frame omitted request identity",
+            GatewayRetry::Safe,
+        )
+    })?;
+    let bytes: [u8; 16] = context.request_id.as_slice().try_into().map_err(|_| {
+        GatewayExecutionError::new(
+            "DTG-CLUSTER-SESSION-ID",
+            "Gateway session request identity must contain 16 bytes",
+            GatewayRetry::Safe,
+        )
+    })?;
+    let request_id = u128::from_be_bytes(bytes);
+    if request_id == 0 {
+        return Err(GatewayExecutionError::new(
+            "DTG-CLUSTER-SESSION-ID",
+            "Gateway session request identity must be non-zero",
+            GatewayRetry::Safe,
+        ));
+    }
+    Ok(request_id)
+}
+
+fn gateway_session_unavailable(message: impl Into<String>) -> GatewayExecutionError {
+    GatewayExecutionError::new("DTG-CLUSTER-SESSION", message, GatewayRetry::Safe)
+}
+
+fn fail_gateway_session(
+    pending: &GatewaySessionPending,
+    active: &Arc<AtomicBool>,
+    error: GatewayExecutionError,
+) {
+    active.store(false, Ordering::Release);
+    let entries = match pending.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending),
+        Err(_) => return,
+    };
+    for (_, sender) in entries {
+        let _ = sender.send(Err(error.clone()));
+    }
 }
 
 impl GatewayProtocolV2Client for TonicGatewayProtocolV2Client {
@@ -872,6 +1175,19 @@ impl GatewayProtocolV2Client for TonicGatewayProtocolV2Client {
             Ok(responses)
         })
     }
+
+    fn execute_session(
+        &self,
+        request: proto::GatewayRequest,
+    ) -> GatewayFuture<'_, Result<Option<Vec<proto::GatewayResponse>>, GatewayExecutionError>> {
+        let session = self.session.clone();
+        Box::pin(async move {
+            let Some(session) = session else {
+                return Ok(None);
+            };
+            session.execute(request).await.map(Some)
+        })
+    }
 }
 
 impl GatewayExecutionTransport for GatewayProtocolV2Transport {
@@ -893,8 +1209,16 @@ impl GatewayExecutionTransport for GatewayProtocolV2Transport {
     ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
         let wire_request = encode_protocol_v2_request(&request);
         Box::pin(async move {
-            let responses = self.client.execute(wire_request).await?;
-            decode_protocol_v2_query_responses(responses).map(GatewayQueryResponse::Materialized)
+            if wire_request.fragments.len() == 1
+                && let Ok(Some(responses)) = self.client.execute_session(wire_request.clone()).await
+            {
+                return decode_protocol_v2_query_responses(responses)
+                    .map(GatewayQueryResponse::Materialized);
+            }
+            self.client
+                .execute_query(wire_request)
+                .await
+                .map(GatewayQueryResponse::Materialized)
         })
     }
 
@@ -908,7 +1232,17 @@ impl GatewayExecutionTransport for GatewayProtocolV2Transport {
         encode.finish(StageOutcome::Success);
         Box::pin(async move {
             let collect = metrics.start_detail(RequestDetail::GatewayQueryResponseCollect);
-            let responses = collect.finish_result(self.client.execute(wire_request).await)?;
+            let responses = async {
+                if wire_request.fragments.len() == 1
+                    && let Ok(Some(responses)) =
+                        self.client.execute_session(wire_request.clone()).await
+                {
+                    return Ok(responses);
+                }
+                self.client.execute(wire_request).await
+            }
+            .await;
+            let responses = collect.finish_result(responses)?;
             let decode = metrics.start_detail(RequestDetail::GatewayQueryResponseDecode);
             decode
                 .finish_result(decode_protocol_v2_query_responses(responses))
@@ -1046,7 +1380,7 @@ impl GatewayExecution {
             fragments,
             plan.root_operator().get(),
             operators,
-            plan.result_schema().clone(),
+            materialized_result_schema(plan.result_schema()),
         )
     }
 
@@ -1072,7 +1406,7 @@ impl GatewayExecution {
             fragments,
             plan.root_operator().get(),
             operators,
-            plan.result_schema().clone(),
+            materialized_result_schema(plan.result_schema()),
         )
         .map_err(gateway_lowering_error)
     }
@@ -1424,7 +1758,7 @@ impl GatewayExecution {
                                         GatewayRetry::Never,
                                     ));
                                 }
-                                result_rows.extend(batch.rows());
+                                result_rows.extend(batch.into_rows());
                             }
                             let fields = executable_plan
                                 .result_schema()
@@ -1970,14 +2304,33 @@ fn encode_logical_read_operation(
             output.extend_from_slice(&id.get().to_be_bytes());
         }
         LogicalReadOperation::EdgeScan => output.push(3),
-        LogicalReadOperation::Adjacency { direction } => {
+        LogicalReadOperation::Adjacency {
+            vertex_id,
+            direction,
+        } => {
             output.push(4);
-            output.push(match direction {
-                dtg_language_ir::ExpandDirection::Outgoing => 0,
-                dtg_language_ir::ExpandDirection::Incoming => 1,
-                dtg_language_ir::ExpandDirection::Either => 2,
-            });
+            output.extend_from_slice(&vertex_id.get().to_be_bytes());
+            output.push(encode_adjacency_direction(*direction));
         }
+        LogicalReadOperation::Traversal {
+            vertex_id,
+            directions,
+        } => {
+            output.push(5);
+            output.extend_from_slice(&vertex_id.get().to_be_bytes());
+            encode_u32(directions.len(), output);
+            for direction in directions {
+                output.push(encode_adjacency_direction(*direction));
+            }
+        }
+    }
+}
+
+fn encode_adjacency_direction(direction: dtg_language_ir::ExpandDirection) -> u8 {
+    match direction {
+        dtg_language_ir::ExpandDirection::Outgoing => 0,
+        dtg_language_ir::ExpandDirection::Incoming => 1,
+        dtg_language_ir::ExpandDirection::Either => 2,
     }
 }
 
@@ -2666,15 +3019,21 @@ fn decode_protocol_v2_responses(
 fn decode_protocol_v2_query_responses(
     responses: Vec<proto::GatewayResponse>,
 ) -> Result<BTreeMap<u32, Vec<QueryColumnBatch>>, GatewayExecutionError> {
-    if responses.is_empty() {
-        return Err(GatewayExecutionError::new(
-            "DTG-PROTOCOL-EMPTY-RESPONSE",
-            "protocol v2 client returned no response",
-            GatewayRetry::Safe,
-        ));
-    }
-    let mut batches = BTreeMap::<u32, Vec<(u64, QueryColumnBatch)>>::new();
+    let mut decoder = ProtocolV2QueryResponseDecoder::default();
     for response in responses {
+        decoder.push(response)?;
+    }
+    decoder.finish()
+}
+
+#[derive(Default)]
+struct ProtocolV2QueryResponseDecoder {
+    response_count: usize,
+    batches: BTreeMap<u32, Vec<(u64, QueryColumnBatch)>>,
+}
+
+impl ProtocolV2QueryResponseDecoder {
+    fn push(&mut self, response: proto::GatewayResponse) -> Result<(), GatewayExecutionError> {
         let status = response.status.ok_or_else(|| {
             GatewayExecutionError::new(
                 "DTG-PROTOCOL-MISSING-STATUS",
@@ -2696,6 +3055,18 @@ fn decode_protocol_v2_query_responses(
         let batch = response
             .batch
             .ok_or_else(|| wire_codec_error("protocol v2 query response omitted a batch"))?;
+        self.push_batch(batch)
+    }
+
+    fn push_batch(&mut self, batch: proto::ColumnBatch) -> Result<(), GatewayExecutionError> {
+        if self.response_count >= 65_536 {
+            return Err(GatewayExecutionError::new(
+                "DTG-CLUSTER-STREAM-LIMIT",
+                "protocol v2 response stream exceeds 65536 messages",
+                GatewayRetry::Never,
+            ));
+        }
+        self.response_count = self.response_count.saturating_add(1);
         let fragment_bytes: [u8; 16] = batch
             .fragment_id
             .as_slice()
@@ -2708,50 +3079,85 @@ fn decode_protocol_v2_query_responses(
         let payload = validate_column_batch(batch).map_err(|error| {
             GatewayExecutionError::new(error.code(), error.to_string(), GatewayRetry::Never)
         })?;
-        let decoded = decode_gateway_rows(payload.body(), row_count)?;
-        let schema = dtg_language_ir::RowSchema {
-            fields: decoded
-                .fields()
-                .iter()
-                .map(|name| dtg_language_ir::Field {
-                    name: name.clone(),
-                    data_type: dtg_language_ir::LogicalType::Any,
-                    nullable: true,
-                })
-                .collect(),
-        };
-        let rows = decoded
-            .rows()
-            .iter()
-            .map(|row| row.iter().cloned().map(gateway_value_to_query).collect())
-            .collect();
-        let query_batch = QueryColumnBatch::from_rows(schema, rows).map_err(gateway_query_error)?;
-        let fragment = batches.entry(fragment_id).or_default();
+        let query_batch = decode_query_column_batch(payload.body(), row_count)?;
+        let fragment = self.batches.entry(fragment_id).or_default();
         if fragment.iter().any(|(existing, _)| *existing == sequence) {
             return Err(wire_codec_error(
                 "protocol v2 fragment repeated a batch sequence",
             ));
         }
         fragment.push((sequence, query_batch));
+        Ok(())
     }
-    batches
-        .into_iter()
-        .map(|(fragment_id, mut fragment)| {
-            fragment.sort_by_key(|(sequence, _)| *sequence);
-            for (index, (sequence, _)) in fragment.iter().enumerate() {
-                let expected = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-                if *sequence != expected {
-                    return Err(wire_codec_error(
-                        "protocol v2 fragment batch sequence is not contiguous",
-                    ));
+
+    fn finish(self) -> Result<BTreeMap<u32, Vec<QueryColumnBatch>>, GatewayExecutionError> {
+        if self.response_count == 0 {
+            return Err(GatewayExecutionError::new(
+                "DTG-PROTOCOL-EMPTY-RESPONSE",
+                "protocol v2 client returned no response",
+                GatewayRetry::Safe,
+            ));
+        }
+        self.batches
+            .into_iter()
+            .map(|(fragment_id, mut fragment)| {
+                fragment.sort_by_key(|(sequence, _)| *sequence);
+                for (index, (sequence, _)) in fragment.iter().enumerate() {
+                    let expected = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+                    if *sequence != expected {
+                        return Err(wire_codec_error(
+                            "protocol v2 fragment batch sequence is not contiguous",
+                        ));
+                    }
                 }
-            }
-            Ok((
-                fragment_id,
-                fragment.into_iter().map(|(_, batch)| batch).collect(),
-            ))
-        })
-        .collect()
+                Ok((
+                    fragment_id,
+                    fragment.into_iter().map(|(_, batch)| batch).collect(),
+                ))
+            })
+            .collect()
+    }
+}
+
+fn decode_query_column_batch(
+    body: &[u8],
+    wire_row_count: u32,
+) -> Result<QueryColumnBatch, GatewayExecutionError> {
+    let mut cursor = WireCursor::new(body);
+    let field_count = cursor.read_len()?;
+    let fields = (0..field_count)
+        .map(|_| cursor.read_string())
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_count = cursor.read_len()?;
+    if row_count != wire_row_count as usize {
+        return Err(wire_codec_error(
+            "protocol v2 row count differs from the typed batch header",
+        ));
+    }
+    let mut columns = (0..field_count)
+        .map(|_| Vec::with_capacity(row_count))
+        .collect::<Vec<Vec<QueryValue>>>();
+    for _ in 0..row_count {
+        for column in &mut columns {
+            column.push(gateway_value_to_query(cursor.read_value(0)?));
+        }
+    }
+    if !cursor.is_empty() {
+        return Err(wire_codec_error(
+            "protocol v2 typed row payload has trailing bytes",
+        ));
+    }
+    let schema = RowSchema {
+        fields: fields
+            .into_iter()
+            .map(|name| Field {
+                name,
+                data_type: LogicalType::Any,
+                nullable: true,
+            })
+            .collect(),
+    };
+    QueryColumnBatch::try_new(schema, columns).map_err(gateway_query_error)
 }
 
 fn protocol_status_error(status: proto::TypedStatus) -> GatewayExecutionError {
@@ -3055,6 +3461,23 @@ fn query_value_to_gateway(value: QueryValue) -> Result<GatewayValue, GatewayExec
             "query runtime produced an unsupported graph value",
             GatewayRetry::Never,
         )),
+    }
+}
+
+fn materialized_result_schema(schema: &RowSchema) -> RowSchema {
+    RowSchema {
+        fields: schema
+            .fields
+            .iter()
+            .map(|field| match field.data_type {
+                LogicalType::Vertex | LogicalType::Relationship => Field {
+                    name: field.name.clone(),
+                    data_type: LogicalType::Any,
+                    nullable: true,
+                },
+                _ => field.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -3370,12 +3793,9 @@ async fn execute_process_create(
         0,
     ))
     .map_err(|error| process_write_error(error.to_string()))?;
-    let start_time = request_metrics
-        .start_detail(RequestDetail::GatewayMetaAllocateStart)
-        .finish_result(transport.allocate_start_time(&route, transaction_id).await)?;
-    let commit_time = request_metrics
-        .start_detail(RequestDetail::GatewayMetaReserveCommit)
-        .finish_result(transport.reserve_commit_time(&route, transaction_id).await)?;
+    let (start_time, commit_time) = request_metrics
+        .start_detail(RequestDetail::GatewayMetaPrepareWrite)
+        .finish_result(transport.prepare_write_times(&route, transaction_id).await)?;
     let command_id = CommandId::new(process_write_identity(
         b"dtg-gateway-create-command-v1",
         context.request_id(),
@@ -3820,11 +4240,20 @@ fn lower_logical_read(
         LogicalReadOperation::VertexScan => ReadOperation::VertexScan,
         LogicalReadOperation::EdgePoint(id) => ReadOperation::EdgePoint(*id),
         LogicalReadOperation::EdgeScan => ReadOperation::EdgeScan,
-        LogicalReadOperation::Adjacency { .. } => {
-            return Err(QueryError::Unsupported(
-                "logical adjacency identity is not executable".into(),
-            ));
-        }
+        LogicalReadOperation::Adjacency {
+            vertex_id,
+            direction,
+        } => ReadOperation::Adjacency {
+            vertex_id: *vertex_id,
+            direction: *direction,
+        },
+        LogicalReadOperation::Traversal {
+            vertex_id,
+            directions,
+        } => ReadOperation::Traversal {
+            vertex_id: *vertex_id,
+            directions: directions.clone(),
+        },
     };
     Ok(ExecutableAccess::Logical(LogicalRead::new(
         operation,
@@ -3978,6 +4407,70 @@ mod write_receipt_tests {
                 .unwrap_err()
                 .code(),
             "DTG-EXECUTION-WRITE-RECEIPT"
+        );
+    }
+
+    #[test]
+    fn query_response_decoder_accepts_batches_as_they_arrive() {
+        let body = [
+            0, 0, 0, 1, // one field
+            0, 0, 0, 1, b'n', // named "n"
+            0, 0, 0, 0, // zero rows
+        ];
+        let batch = proto::ColumnBatch {
+            request: Some(request_context()),
+            fragment_id: 1_u128.to_be_bytes().to_vec(),
+            sequence: 1,
+            row_count: 0,
+            payload: Some(proto::BoundedPayload {
+                format_version: 1,
+                declared_len: body.len() as u64,
+                item_count: 0,
+                checksum: checksum_bytes(&body).to_vec(),
+                body: body.to_vec(),
+            }),
+        };
+        let mut decoder = ProtocolV2QueryResponseDecoder::default();
+        decoder
+            .push(proto::GatewayResponse {
+                status: Some(proto::TypedStatus {
+                    request: Some(request_context()),
+                    code: proto::StatusCode::Ok as i32,
+                    retry: proto::RetryDisposition::Never as i32,
+                    message: "ok".into(),
+                    idempotency_key: Vec::new(),
+                    details: None,
+                }),
+                batch: Some(batch),
+            })
+            .unwrap();
+
+        let batches = decoder.finish().unwrap();
+        assert_eq!(batches[&1].len(), 1);
+        assert_eq!(batches[&1][0].row_count(), 0);
+    }
+
+    #[test]
+    fn query_batch_decoder_builds_columns_from_a_multi_row_payload() {
+        let body = [
+            0, 0, 0, 2, // two fields
+            0, 0, 0, 2, b'i', b'd', 0, 0, 0, 5, b'l', b'a', b'b', b'e', b'l', 0, 0, 0,
+            2, // two rows
+            2, 0, 0, 0, 0, 0, 0, 0, 7, // id = 7
+            5, 0, 0, 0, 5, b'f', b'i', b'r', b's', b't', 2, 0, 0, 0, 0, 0, 0, 0, 8, // id = 8
+            5, 0, 0, 0, 6, b's', b'e', b'c', b'o', b'n', b'd',
+        ];
+
+        let batch = decode_query_column_batch(&body, 2).unwrap();
+
+        assert_eq!(batch.schema().fields[0].name, "id");
+        assert_eq!(batch.schema().fields[1].name, "label");
+        assert_eq!(
+            batch.rows(),
+            vec![
+                vec![QueryValue::Integer(7), QueryValue::String("first".into())],
+                vec![QueryValue::Integer(8), QueryValue::String("second".into())],
+            ]
         );
     }
 

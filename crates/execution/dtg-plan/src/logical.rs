@@ -3,6 +3,7 @@ use dtg_language_ir::{
     RelationshipLookup, TimeExpr, ValidTimeExpr, ValidTimePredicate, Value, VertexLookup,
 };
 use dtg_storage::{EdgeId, TransactionTime, VertexId};
+use std::collections::BTreeSet;
 
 use crate::{PlanError, PlanningContext, PushdownKind};
 
@@ -12,7 +13,14 @@ pub enum LogicalReadOperation {
     VertexScan,
     EdgePoint(EdgeId),
     EdgeScan,
-    Adjacency { direction: ExpandDirection },
+    Adjacency {
+        vertex_id: VertexId,
+        direction: ExpandDirection,
+    },
+    Traversal {
+        vertex_id: VertexId,
+        directions: Vec<ExpandDirection>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,7 +68,8 @@ impl LogicalReadRequest {
             LogicalReadOperation::VertexScan => Some(PushdownKind::VertexScan),
             LogicalReadOperation::EdgePoint(_)
             | LogicalReadOperation::EdgeScan
-            | LogicalReadOperation::Adjacency { .. } => None,
+            | LogicalReadOperation::Adjacency { .. }
+            | LogicalReadOperation::Traversal { .. } => None,
         }
     }
 }
@@ -69,24 +78,155 @@ pub(crate) fn collect_reads(
     plan: &LogicalPlan,
     context: &PlanningContext,
 ) -> Result<Vec<LogicalReadRequest>, PlanError> {
+    let expanded_inputs = point_anchored_expand_inputs(plan)?;
     let mut reads = Vec::new();
-    collect_plan_reads(plan, context, &mut reads)?;
+    collect_plan_reads(plan, context, &expanded_inputs, &mut reads)?;
     Ok(reads)
+}
+
+fn point_anchored_expand_inputs(plan: &LogicalPlan) -> Result<BTreeSet<LogicalNodeId>, PlanError> {
+    let mut inputs = BTreeSet::new();
+    for node in &plan.nodes {
+        let LogicalNodeKind::Expand(expand) = &node.kind else {
+            continue;
+        };
+        point_anchored_expand_chain(plan, node.id, expand)?;
+        if plan.nodes.iter().any(|candidate| {
+            logical_node_uses_column(&candidate.kind, &expand.source)
+                || logical_node_uses_column(&candidate.kind, &expand.destination)
+        }) {
+            return Err(PlanError::UnsupportedNode {
+                node: node.id,
+                reason:
+                    "point-anchored Expand does not materialize source or destination variables"
+                        .into(),
+            });
+        }
+        inputs.insert(expand.input);
+    }
+    for node in &plan.nodes {
+        let LogicalNodeKind::Expand(expand) = &node.kind else {
+            continue;
+        };
+        let children = plan
+            .nodes
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    &candidate.kind,
+                    LogicalNodeKind::Expand(child) if child.input == node.id
+                )
+            })
+            .count();
+        if children > 1 {
+            return Err(PlanError::UnsupportedNode {
+                node: node.id,
+                reason: "point-anchored traversal does not support branching intermediate expands"
+                    .into(),
+            });
+        }
+        if inputs.contains(&node.id)
+            && plan
+                .nodes
+                .iter()
+                .any(|candidate| logical_node_uses_column(&candidate.kind, &expand.relationship))
+        {
+            return Err(PlanError::UnsupportedNode {
+                node: node.id,
+                reason: "point-anchored traversal does not materialize intermediate relationship variables"
+                    .into(),
+            });
+        }
+    }
+    Ok(inputs)
+}
+
+fn point_anchored_expand_chain(
+    plan: &LogicalPlan,
+    terminal: LogicalNodeId,
+    terminal_expand: &dtg_language_ir::Expand,
+) -> Result<(VertexId, Vec<ExpandDirection>), PlanError> {
+    let mut current_id = terminal;
+    let mut current = terminal_expand;
+    let mut directions = Vec::new();
+    loop {
+        if !current.destination_labels.is_empty() || !current.relationship_types.is_empty() {
+            return Err(PlanError::UnsupportedNode {
+                node: current_id,
+                reason: "point-anchored Expand does not yet support label or relationship-type predicates"
+                    .into(),
+            });
+        }
+        if current.read_scope != terminal_expand.read_scope {
+            return Err(PlanError::UnsupportedNode {
+                node: current_id,
+                reason: "point-anchored traversal hops must have one read scope".into(),
+            });
+        }
+        directions.push(current.direction);
+        let input = plan
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == current.input)
+            .ok_or(PlanError::UnsupportedNode {
+                node: current_id,
+                reason: "Expand input is absent from the logical plan".into(),
+            })?;
+        match &input.kind {
+            LogicalNodeKind::VertexLookup(lookup) => {
+                if lookup.variable != current.source {
+                    return Err(PlanError::UnsupportedNode {
+                        node: current_id,
+                        reason: "Expand source does not match its vertex lookup input".into(),
+                    });
+                }
+                if !lookup.labels.is_empty() {
+                    return Err(PlanError::UnsupportedNode {
+                        node: input.id,
+                        reason: "point-anchored Expand does not yet support label predicates"
+                            .into(),
+                    });
+                }
+                directions.reverse();
+                return Ok((vertex_id(input.id, lookup)?, directions));
+            }
+            LogicalNodeKind::Expand(previous) => {
+                if previous.destination != current.source {
+                    return Err(PlanError::UnsupportedNode {
+                        node: current_id,
+                        reason: "Expand source does not match its preceding destination".into(),
+                    });
+                }
+                current_id = input.id;
+                current = previous;
+            }
+            _ => {
+                return Err(PlanError::UnsupportedNode {
+                    node: current_id,
+                    reason: "Expand requires a point-anchored traversal input".into(),
+                });
+            }
+        }
+    }
 }
 
 fn collect_plan_reads(
     plan: &LogicalPlan,
     context: &PlanningContext,
+    expanded_inputs: &BTreeSet<LogicalNodeId>,
     reads: &mut Vec<LogicalReadRequest>,
 ) -> Result<(), PlanError> {
     for node in &plan.nodes {
         let request = match &node.kind {
-            LogicalNodeKind::VertexLookup(lookup) => Some(LogicalReadRequest::new(
-                node.id,
-                LogicalReadOperation::VertexPoint(vertex_id(node.id, lookup)?),
-                lookup.read_scope.clone(),
-                1,
-            )),
+            LogicalNodeKind::VertexLookup(lookup) if !expanded_inputs.contains(&node.id) => {
+                Some(LogicalReadRequest::new(
+                    node.id,
+                    LogicalReadOperation::VertexPoint(vertex_id(node.id, lookup)?),
+                    lookup.read_scope.clone(),
+                    1,
+                ))
+            }
+            LogicalNodeKind::VertexLookup(_) => None,
             LogicalNodeKind::NodeScan(scan) => Some(LogicalReadRequest::new(
                 node.id,
                 LogicalReadOperation::VertexScan,
@@ -105,8 +245,28 @@ fn collect_plan_reads(
                 scan.read_scope.clone(),
                 scan_bound(plan, node.id, context)?,
             )),
-            LogicalNodeKind::Expand(_)
-            | LogicalNodeKind::Subquery(_)
+            LogicalNodeKind::Expand(expand) if !expanded_inputs.contains(&node.id) => {
+                let (vertex_id, directions) = point_anchored_expand_chain(plan, node.id, expand)?;
+                let operation = if directions.len() == 1 {
+                    LogicalReadOperation::Adjacency {
+                        vertex_id,
+                        direction: directions[0],
+                    }
+                } else {
+                    LogicalReadOperation::Traversal {
+                        vertex_id,
+                        directions,
+                    }
+                };
+                Some(LogicalReadRequest::new(
+                    node.id,
+                    operation,
+                    expand.read_scope.clone(),
+                    scan_bound(plan, node.id, context)?,
+                ))
+            }
+            LogicalNodeKind::Expand(_) => None,
+            LogicalNodeKind::Subquery(_)
             | LogicalNodeKind::Filter { .. }
             | LogicalNodeKind::Project { .. }
             | LogicalNodeKind::Join(_)
@@ -120,6 +280,62 @@ fn collect_plan_reads(
         }
     }
     Ok(())
+}
+
+fn logical_node_uses_column(kind: &LogicalNodeKind, name: &str) -> bool {
+    match kind {
+        LogicalNodeKind::Filter { predicate, .. } => logical_expr_uses_column(predicate, name),
+        LogicalNodeKind::Project { projections, .. } => projections
+            .iter()
+            .any(|projection| logical_expr_uses_column(&projection.expression, name)),
+        LogicalNodeKind::Join(join) => join
+            .predicate
+            .as_ref()
+            .is_some_and(|predicate| logical_expr_uses_column(predicate, name)),
+        LogicalNodeKind::Aggregate(aggregate) => {
+            aggregate
+                .groups
+                .iter()
+                .any(|group| logical_expr_uses_column(&group.expression, name))
+                || aggregate.aggregates.iter().any(|aggregate| {
+                    aggregate
+                        .argument
+                        .as_ref()
+                        .is_some_and(|argument| logical_expr_uses_column(argument, name))
+                })
+        }
+        LogicalNodeKind::Sort(sort) => sort
+            .keys
+            .iter()
+            .any(|key| logical_expr_uses_column(&key.expression, name)),
+        LogicalNodeKind::Unwind(unwind) => logical_expr_uses_column(&unwind.expression, name),
+        LogicalNodeKind::NodeScan(_)
+        | LogicalNodeKind::RelationshipScan(_)
+        | LogicalNodeKind::VertexLookup(_)
+        | LogicalNodeKind::RelationshipLookup(_)
+        | LogicalNodeKind::Expand(_)
+        | LogicalNodeKind::Limit(_)
+        | LogicalNodeKind::Subquery(_) => false,
+    }
+}
+
+fn logical_expr_uses_column(expression: &LogicalExpr, name: &str) -> bool {
+    match expression {
+        LogicalExpr::Column(column) => column == name,
+        LogicalExpr::Property { input, .. } | LogicalExpr::Unary { input, .. } => {
+            logical_expr_uses_column(input, name)
+        }
+        LogicalExpr::Binary { left, right, .. } => {
+            logical_expr_uses_column(left, name) || logical_expr_uses_column(right, name)
+        }
+        LogicalExpr::List(values) => values
+            .iter()
+            .any(|value| logical_expr_uses_column(value, name)),
+        LogicalExpr::Map(values) => values
+            .iter()
+            .any(|(_, value)| logical_expr_uses_column(value, name)),
+        LogicalExpr::Literal(_) | LogicalExpr::Parameter(_) => false,
+    }
 }
 
 fn vertex_id(node: LogicalNodeId, lookup: &VertexLookup) -> Result<VertexId, PlanError> {

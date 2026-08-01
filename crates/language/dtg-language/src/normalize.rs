@@ -331,7 +331,7 @@ fn exact_vertex_lookup<'a>(
     let [matching] = matches else {
         return None;
     };
-    if matching.pattern.nodes.len() != 1 || !matching.pattern.relationships.is_empty() {
+    if matching.pattern.nodes.is_empty() {
         return None;
     }
     let variable = &matching.pattern.nodes[0].variable;

@@ -78,6 +78,42 @@ async fn meta_rpc_resolve_committed_is_idempotent_and_cannot_be_reversed() {
     assert_eq!(aborted.code, StatusCode::Conflict as i32);
 }
 
+#[tokio::test]
+async fn meta_rpc_prepares_start_and_commit_in_one_response() {
+    let root = tempfile::tempdir().unwrap();
+    let process = MetaProcess::open(MetaConfig::for_test(root.path(), 7, 1).unwrap())
+        .await
+        .unwrap();
+    let service = process.rpc_service();
+    let transaction_id = 92_u128.to_be_bytes().to_vec();
+
+    let prepared = MetaService::submit_transaction(
+        &service,
+        Request::new(transaction_request(transaction_id.clone(), 6)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(prepared.code, StatusCode::Ok as i32);
+    let bytes: [u8; 16] = prepared.details.unwrap().body.try_into().unwrap();
+    let start = i64::from_be_bytes(bytes[..8].try_into().unwrap());
+    let commit = i64::from_be_bytes(bytes[8..].try_into().unwrap());
+    assert!(commit > start);
+
+    let recovered = MetaService::submit_transaction(
+        &service,
+        Request::new(transaction_request(transaction_id, 4)),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(recovered.code, StatusCode::Ok as i32);
+    assert_eq!(
+        i64::from_be_bytes(recovered.details.unwrap().body.try_into().unwrap()),
+        commit
+    );
+}
+
 fn transaction_request(transaction_id: Vec<u8>, operation: i32) -> TransactionRequest {
     let body = vec![operation as u8];
     TransactionRequest {

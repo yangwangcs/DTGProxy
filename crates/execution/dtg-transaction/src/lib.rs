@@ -30,7 +30,9 @@ pub use participant::{
     TransactionHistory, TxnFuture,
 };
 pub use snapshot::{ShardSnapshotFence, SnapshotToken};
-pub use timestamp::{DurableTimestampAuthority, TimestampCommandLog, TimestampLogFuture};
+pub use timestamp::{
+    DurableTimestampAuthority, TimestampCommandLog, TimestampLogFuture, TimestampOperation,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TxnError {

@@ -73,6 +73,68 @@ fn normalizes_exact_node_id_predicate_to_a_vertex_lookup() {
 }
 
 #[test]
+fn normalizes_a_point_anchored_one_hop_expand_to_a_vertex_lookup() {
+    let program = compile(
+        "MATCH (a)-[r]->(b) WHERE a.id = 41 RETURN r",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = &program.statement else {
+        panic!()
+    };
+    let (lookup_id, lookup_variable) = plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            LogicalNodeKind::VertexLookup(lookup) => Some((node.id, lookup.variable.as_str())),
+            _ => None,
+        })
+        .expect("point-anchored relationship pattern must begin with a vertex lookup");
+    assert_eq!(lookup_variable, "a");
+    assert!(plan.nodes.iter().any(|node| matches!(
+        &node.kind,
+        LogicalNodeKind::Expand(expand) if expand.input == lookup_id && expand.relationship == "r"
+    )));
+    assert!(
+        !plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, LogicalNodeKind::Filter { .. }))
+    );
+}
+
+#[test]
+fn normalizes_a_point_anchored_two_hop_expand_to_a_vertex_lookup() {
+    let program = compile(
+        "MATCH (a)-[first]->(middle)-[second]->(destination) WHERE a.id = $id RETURN second",
+        &EmptySchemaCatalog,
+    )
+    .unwrap();
+    let LogicalStatement::Query(plan) = &program.statement else {
+        panic!()
+    };
+    let (lookup_id, lookup_variable) = plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            LogicalNodeKind::VertexLookup(lookup) => Some((node.id, lookup.variable.as_str())),
+            _ => None,
+        })
+        .expect("point-anchored multi-hop pattern must begin with a vertex lookup");
+    assert_eq!(lookup_variable, "a");
+    assert!(plan.nodes.iter().any(|node| matches!(
+        &node.kind,
+        LogicalNodeKind::Expand(expand) if expand.input == lookup_id && expand.relationship == "first"
+    )));
+    assert!(
+        !plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, LogicalNodeKind::Filter { .. }))
+    );
+}
+
+#[test]
 fn as_of_query_normalizes_to_explicit_scope() {
     let program = compile(
         "MATCH (n) FOR SYSTEM_TIME AS OF $t RETURN n",

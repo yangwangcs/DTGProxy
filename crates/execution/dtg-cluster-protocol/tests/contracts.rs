@@ -181,6 +181,15 @@ fn transaction_protocol_accepts_explicit_committed_resolution() {
 }
 
 #[test]
+fn transaction_protocol_accepts_atomic_write_preparation() {
+    let wire = proto::TransactionRequest {
+        operation: 6,
+        ..valid_transaction()
+    };
+    assert!(validate_transaction_request(wire).is_ok());
+}
+
+#[test]
 fn explicit_empty_column_batch_is_valid_but_malformed_batches_still_fail_closed() {
     let mut empty = valid_batch();
     empty.row_count = 0;

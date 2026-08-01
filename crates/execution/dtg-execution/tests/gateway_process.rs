@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,8 +11,8 @@ use dtg_cluster_v2::{checksum_bytes, proto};
 use dtg_execution::{
     GatewayCancellationToken, GatewayClusterRequest, GatewayExecution, GatewayExecutionError,
     GatewayExecutionTransport, GatewayFuture, GatewayProtocolV2Client, GatewayProtocolV2Transport,
-    GatewayRequestContext, GatewayResponse, GatewayValue, GatewayWriteReceipt, GatewayWriteRequest,
-    GatewayWriteTransport, RequestStage,
+    GatewayRequestContext, GatewayResponse, GatewayRows, GatewayValue, GatewayWriteReceipt,
+    GatewayWriteRequest, GatewayWriteTransport, RequestDetail, RequestStage,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -155,6 +156,78 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
 }
 
 #[derive(Default)]
+struct SessionRecordingProtocolClient {
+    session_requests: Mutex<Vec<proto::GatewayRequest>>,
+    direct_requests: Mutex<Vec<proto::GatewayRequest>>,
+    session_available: bool,
+}
+
+impl SessionRecordingProtocolClient {
+    fn unavailable() -> Self {
+        Self {
+            session_available: false,
+            ..Self::default()
+        }
+    }
+
+    fn available() -> Self {
+        Self {
+            session_available: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl GatewayProtocolV2Client for SessionRecordingProtocolClient {
+    fn execute(
+        &self,
+        request: proto::GatewayRequest,
+    ) -> GatewayFuture<'_, Result<Vec<proto::GatewayResponse>, GatewayExecutionError>> {
+        self.direct_requests.lock().unwrap().push(request.clone());
+        Box::pin(async move {
+            Ok(vec![session_gateway_response(
+                &request,
+                encoded_batch(1, encoded_vertex_rows(1..=1), 1),
+            )])
+        })
+    }
+
+    fn execute_session(
+        &self,
+        request: proto::GatewayRequest,
+    ) -> GatewayFuture<'_, Result<Option<Vec<proto::GatewayResponse>>, GatewayExecutionError>> {
+        self.session_requests.lock().unwrap().push(request.clone());
+        let session_available = self.session_available;
+        Box::pin(async move {
+            Ok(session_available.then(|| {
+                vec![session_gateway_response(
+                    &request,
+                    encoded_batch(1, encoded_vertex_rows(1..=1), 1),
+                )]
+            }))
+        })
+    }
+}
+
+fn session_gateway_response(
+    request: &proto::GatewayRequest,
+    mut batch: proto::ColumnBatch,
+) -> proto::GatewayResponse {
+    batch.request = request.request.clone();
+    proto::GatewayResponse {
+        status: Some(proto::TypedStatus {
+            request: request.request.clone(),
+            code: 1,
+            retry: 1,
+            message: "ok".into(),
+            idempotency_key: Vec::new(),
+            details: None,
+        }),
+        batch: Some(batch),
+    }
+}
+
+#[derive(Default)]
 struct RecordingWriteTransport {
     events: Mutex<Vec<&'static str>>,
     requests: Mutex<Vec<GatewayWriteRequest>>,
@@ -284,6 +357,100 @@ impl GatewayWriteTransport for RecordingWriteTransport {
     ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
         self.events.lock().unwrap().push("abort");
         Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Clone, Default)]
+struct ConcurrentTimestampTransport {
+    arrivals: Arc<AtomicUsize>,
+}
+
+impl GatewayWriteTransport for ConcurrentTimestampTransport {
+    fn allocate_start_time(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
+        Box::pin(ConcurrentTimestampFuture::new(
+            Arc::clone(&self.arrivals),
+            TransactionTime::new(41).unwrap(),
+        ))
+    }
+
+    fn reserve_commit_time(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
+        Box::pin(ConcurrentTimestampFuture::new(
+            Arc::clone(&self.arrivals),
+            TransactionTime::new(43).unwrap(),
+        ))
+    }
+
+    fn apply_single_shard(
+        &self,
+        _request: GatewayWriteRequest,
+    ) -> GatewayFuture<'_, Result<GatewayWriteReceipt, GatewayExecutionError>> {
+        Box::pin(async { Ok(GatewayWriteReceipt::new(38, false)) })
+    }
+
+    fn resolve_committed(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn abort(
+        &self,
+        _route: &dtg_execution::GatewayWriteRoute,
+        _transaction_id: TransactionId,
+    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct ConcurrentTimestampFuture {
+    arrivals: Arc<AtomicUsize>,
+    timestamp: TransactionTime,
+    registered: bool,
+    yielded: bool,
+}
+
+impl ConcurrentTimestampFuture {
+    fn new(arrivals: Arc<AtomicUsize>, timestamp: TransactionTime) -> Self {
+        Self {
+            arrivals,
+            timestamp,
+            registered: false,
+            yielded: false,
+        }
+    }
+}
+
+impl Future for ConcurrentTimestampFuture {
+    type Output = Result<TransactionTime, GatewayExecutionError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.registered {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            self.registered = true;
+        }
+        if self.arrivals.load(Ordering::SeqCst) == 2 {
+            return Poll::Ready(Ok(self.timestamp));
+        }
+        if self.yielded {
+            return Poll::Ready(Err(GatewayExecutionError::new(
+                "DTG-TEST-SERIAL-TIMESTAMPS",
+                "Gateway awaited a timestamp before dispatching its peer request",
+                dtg_execution::GatewayRetry::Never,
+            )));
+        }
+        self.yielded = true;
+        context.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -572,6 +739,17 @@ fn process_create_requires_transaction_dispatch() {
     .unwrap();
 
     assert_eq!(response, GatewayResponse::Acknowledged);
+    let prepare = execution
+        .request_metrics()
+        .snapshot()
+        .details()
+        .find_map(|(detail, snapshot)| {
+            (detail == RequestDetail::GatewayMetaPrepareWrite).then_some(snapshot)
+        })
+        .unwrap();
+    assert_eq!(prepare.success, 1);
+    assert_eq!(prepare.error, 0);
+    assert_eq!(prepare.cancelled, 0);
     assert_eq!(
         writes.events.lock().unwrap().as_slice(),
         ["prewrite", "commit", "apply", "resolve"]
@@ -626,6 +804,29 @@ fn process_create_requires_transaction_dispatch() {
     let queries = client.requests.lock().unwrap();
     assert_eq!(queries[0].fragments[0].applied_index, 38);
     assert_eq!(queries[0].fragments[0].transaction_time, 43);
+}
+
+#[test]
+fn process_create_dispatches_start_and_commit_timestamps_before_waiting() {
+    let writes = Arc::new(ConcurrentTimestampTransport::default());
+    let execution = GatewayExecution::for_process_with_writes(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            RecordingProtocolClient::default(),
+        ))),
+        Arc::clone(&writes) as Arc<dyn GatewayWriteTransport>,
+        planning_context(),
+    );
+
+    let response = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 181, u64::MAX, Vec::new()).unwrap(),
+        create_statement(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ));
+
+    assert_eq!(response.unwrap(), GatewayResponse::Acknowledged);
+    assert_eq!(writes.arrivals.load(Ordering::SeqCst), 2);
 }
 
 struct ThreadWake;
@@ -755,6 +956,58 @@ fn process_catalog_install_atomically_replaces_the_planning_fence() {
     assert_eq!(context.catalog_version, 30);
     assert_eq!(context.placement_epoch, 18);
     assert_eq!(context.backend_generation, 24);
+}
+
+#[test]
+fn single_fragment_query_prefers_the_session_and_falls_back_when_unavailable() {
+    for (client, expect_session) in [
+        (Arc::new(SessionRecordingProtocolClient::available()), true),
+        (
+            Arc::new(SessionRecordingProtocolClient::unavailable()),
+            false,
+        ),
+    ] {
+        let execution = GatewayExecution::for_process(
+            Arc::new(GatewayProtocolV2Transport::new(client.clone())),
+            planning_context(),
+        );
+        let response = block_on(execution.execute_statement(
+            GatewayRequestContext::new(7, 0x7654, u64::MAX, Vec::new()).unwrap(),
+            "MATCH (n) RETURN n.id".into(),
+            BTreeMap::new(),
+            None,
+            &GatewayCancellationToken::new(),
+        ));
+
+        assert_eq!(
+            response.unwrap(),
+            GatewayResponse::Rows(
+                GatewayRows::new(vec!["n.id".into()], vec![vec![GatewayValue::Integer(1)]])
+                    .unwrap()
+            )
+        );
+        assert_eq!(client.session_requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            client.direct_requests.lock().unwrap().len(),
+            usize::from(!expect_session)
+        );
+        for detail in [
+            RequestDetail::GatewayQueryResponseCollect,
+            RequestDetail::GatewayQueryResponseDecode,
+        ] {
+            assert_eq!(
+                execution
+                    .request_metrics()
+                    .snapshot()
+                    .details()
+                    .find_map(|(observed, snapshot)| (observed == detail).then_some(snapshot))
+                    .unwrap()
+                    .success,
+                1,
+                "{detail:?} must remain separately observable for session and fallback queries"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1242,6 +1495,35 @@ fn plans_a_literal_node_id_predicate_as_a_vertex_point() {
     assert!(!physical.operators().iter().any(|operator| matches!(
         operator.kind(),
         dtg_plan::PhysicalOperatorKind::Filter { .. }
+    )));
+}
+
+#[test]
+fn plans_a_point_anchored_one_hop_pattern_as_an_adjacency_read() {
+    let client = Arc::new(RecordingProtocolClient::default());
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(client)),
+        planning_context(),
+    );
+    let program = execution
+        .compile("MATCH (a)-[r]->(b) WHERE a.id = 2048 RETURN r")
+        .unwrap();
+    let physical = Planner.plan(&program, &planning_context()).unwrap();
+
+    for fragment in physical.fragments() {
+        let [StorageAccess::Logical(read)] = fragment.storage_accesses() else {
+            panic!("point-anchored one-hop pattern must have one logical adjacency access")
+        };
+        assert!(matches!(
+            read.operation(),
+            dtg_plan::LogicalReadOperation::Adjacency { vertex_id, direction }
+                if vertex_id.get() == 2048
+                    && *direction == dtg_language_ir::ExpandDirection::Outgoing
+        ));
+    }
+    assert!(physical.operators().iter().any(|operator| matches!(
+        operator.kind(),
+        dtg_plan::PhysicalOperatorKind::Source { output, .. } if output == "r"
     )));
 }
 

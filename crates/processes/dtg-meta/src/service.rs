@@ -22,14 +22,15 @@ use dtg_execution::storage::{
 };
 use dtg_execution::transaction::{
     CommitResolution, DurableTimestampAuthority, TimestampAuthority, TimestampCommandLog,
-    TimestampLogFuture, TransactionId, TxnError,
+    TimestampLogFuture, TimestampOperation, TransactionId, TransactionTime, TxnError,
 };
 use dtg_execution::{
     ExecutionBuildError, MetaExecution, MetaRaftError, MetaRaftHost, MetaRaftRole,
 };
 use dtg_storage_fjall::FjallConsensusStore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::time::{Duration, Instant, timeout_at};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
@@ -40,11 +41,14 @@ const CONSENSUS_FORMAT_VERSION: u32 = 1;
 const TIMESTAMP_LOG_TERM: u64 = 1;
 const CATALOG_GRAPH_ID: u64 = u64::MAX - 1;
 const TIMESTAMP_GRAPH_ID: u64 = u64::MAX - 2;
+const TIMESTAMP_BATCH_MAX_OPERATIONS: usize = 64;
+const TIMESTAMP_BATCH_WINDOW: Duration = Duration::from_micros(250);
 
 pub struct MetaProcess {
     config: MetaConfig,
     core: Arc<MetaCore>,
     timestamps: Arc<DurableTimestampAuthority>,
+    timestamp_batcher: Arc<TimestampRpcBatcher>,
 }
 
 struct MetaCore {
@@ -76,6 +80,11 @@ impl MetaProcess {
         .await?;
         let timestamp_log = Arc::new(FjallTimestampLog::open(timestamp_store).await?);
         let timestamps = Arc::new(DurableTimestampAuthority::open(timestamp_log).await?);
+        let timestamp_batcher = Arc::new(TimestampRpcBatcher::new(
+            timestamps.clone(),
+            TIMESTAMP_BATCH_MAX_OPERATIONS,
+            TIMESTAMP_BATCH_WINDOW,
+        ));
 
         let mut commands = Vec::new();
         let mut actions = ControlActionLedger::new();
@@ -117,6 +126,7 @@ impl MetaProcess {
                 catalog_revision,
             }),
             timestamps,
+            timestamp_batcher,
         })
     }
 
@@ -219,6 +229,7 @@ impl MetaProcess {
     pub fn rpc_service(&self) -> MetaRpcService {
         MetaRpcService {
             timestamps: self.timestamps.clone(),
+            timestamp_batcher: self.timestamp_batcher.clone(),
             cluster_id: self.config.cluster_id(),
             core: self.core.clone(),
         }
@@ -249,6 +260,7 @@ impl MetaProcess {
 #[derive(Clone)]
 pub struct MetaRpcService {
     timestamps: Arc<DurableTimestampAuthority>,
+    timestamp_batcher: Arc<TimestampRpcBatcher>,
     cluster_id: u64,
     core: Arc<MetaCore>,
 }
@@ -256,6 +268,122 @@ pub struct MetaRpcService {
 impl MetaRpcService {
     pub const fn protocol_major(&self) -> u32 {
         PROTOCOL_MAJOR
+    }
+}
+
+struct TimestampRpcRequest {
+    operations: Vec<TimestampOperation>,
+    response: oneshot::Sender<Vec<Result<TransactionTime, TxnError>>>,
+}
+
+struct TimestampRpcBatcher {
+    sender: mpsc::Sender<TimestampRpcRequest>,
+}
+
+impl TimestampRpcBatcher {
+    fn new(
+        timestamps: Arc<DurableTimestampAuthority>,
+        max_operations: usize,
+        window: Duration,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(max_operations);
+        tokio::spawn(run_timestamp_batcher(
+            timestamps,
+            receiver,
+            max_operations,
+            window,
+        ));
+        Self { sender }
+    }
+
+    async fn submit(&self, operation: TimestampOperation) -> Result<TransactionTime, TxnError> {
+        self.submit_operations(vec![operation])
+            .await
+            .into_iter()
+            .next()
+            .expect("one timestamp operation produces one result")
+    }
+
+    async fn submit_pair(
+        &self,
+        first: TimestampOperation,
+        second: TimestampOperation,
+    ) -> Result<(TransactionTime, TransactionTime), TxnError> {
+        let mut results = self
+            .submit_operations(vec![first, second])
+            .await
+            .into_iter();
+        let first = results
+            .next()
+            .expect("timestamp pair produces a first result")?;
+        let second = results
+            .next()
+            .expect("timestamp pair produces a second result")?;
+        Ok((first, second))
+    }
+
+    async fn submit_operations(
+        &self,
+        operations: Vec<TimestampOperation>,
+    ) -> Vec<Result<TransactionTime, TxnError>> {
+        let (response, receiver) = oneshot::channel();
+        if self
+            .sender
+            .send(TimestampRpcRequest {
+                operations,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            return vec![Err(TxnError::Storage("timestamp batcher stopped".into()))];
+        }
+        receiver
+            .await
+            .unwrap_or_else(|_| vec![Err(TxnError::Storage("timestamp batcher stopped".into()))])
+    }
+}
+
+async fn run_timestamp_batcher(
+    timestamps: Arc<DurableTimestampAuthority>,
+    mut receiver: mpsc::Receiver<TimestampRpcRequest>,
+    max_operations: usize,
+    window: Duration,
+) {
+    while let Some(first) = receiver.recv().await {
+        let mut requests = vec![first];
+        let deadline = Instant::now() + window;
+        while requests.len() < max_operations {
+            match timeout_at(deadline, receiver.recv()).await {
+                Ok(Some(request)) => requests.push(request),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let operation_counts = requests
+            .iter()
+            .map(|request| request.operations.len())
+            .collect::<Vec<_>>();
+        let mut results = timestamps
+            .apply_batch(
+                requests
+                    .iter()
+                    .flat_map(|request| request.operations.iter().copied())
+                    .collect(),
+            )
+            .await
+            .into_iter();
+        for (request, count) in requests.into_iter().zip(operation_counts) {
+            let response = (0..count)
+                .map(|_| {
+                    results.next().unwrap_or_else(|| {
+                        Err(TxnError::Storage(
+                            "timestamp batcher lost an operation result".into(),
+                        ))
+                    })
+                })
+                .collect();
+            let _ = request.response.send(response);
+        }
     }
 }
 
@@ -301,8 +429,16 @@ impl MetaService for MetaRpcService {
             }
         };
         let result = match wire.operation {
-            1 => self.timestamps.allocate_start_time(transaction_id).await,
-            2 => self.timestamps.reserve_commit_time(transaction_id).await,
+            1 => self
+                .timestamp_batcher
+                .submit(TimestampOperation::AllocateStart { transaction_id })
+                .await
+                .map(timestamp_response),
+            2 => self
+                .timestamp_batcher
+                .submit(TimestampOperation::ReserveCommit { transaction_id })
+                .await
+                .map(timestamp_response),
             3 => {
                 let reservation = self
                     .timestamps
@@ -310,14 +446,14 @@ impl MetaService for MetaRpcService {
                     .await;
                 match reservation {
                     Ok(Some(reservation)) => self
-                        .timestamps
-                        .resolve_commit_time(
+                        .timestamp_batcher
+                        .submit(TimestampOperation::ResolveCommit {
                             transaction_id,
-                            reservation.commit_time(),
-                            CommitResolution::Aborted,
-                        )
+                            commit_time: reservation.commit_time(),
+                            resolution: CommitResolution::Aborted,
+                        })
                         .await
-                        .map(|()| reservation.commit_time()),
+                        .map(timestamp_response),
                     Ok(None) => Err(TxnError::CorruptRecovery),
                     Err(error) => Err(error),
                 }
@@ -330,7 +466,8 @@ impl MetaService for MetaRpcService {
                     reservation
                         .map(|reservation| reservation.commit_time())
                         .ok_or(TxnError::CorruptRecovery)
-                }),
+                })
+                .map(timestamp_response),
             5 => {
                 let reservation = self
                     .timestamps
@@ -338,28 +475,34 @@ impl MetaService for MetaRpcService {
                     .await;
                 match reservation {
                     Ok(Some(reservation)) => self
-                        .timestamps
-                        .resolve_commit_time(
+                        .timestamp_batcher
+                        .submit(TimestampOperation::ResolveCommit {
                             transaction_id,
-                            reservation.commit_time(),
-                            CommitResolution::Committed,
-                        )
+                            commit_time: reservation.commit_time(),
+                            resolution: CommitResolution::Committed,
+                        })
                         .await
-                        .map(|()| reservation.commit_time()),
+                        .map(timestamp_response),
                     Ok(None) => Err(TxnError::CorruptRecovery),
                     Err(error) => Err(error),
                 }
             }
+            6 => self
+                .timestamp_batcher
+                .submit_pair(
+                    TimestampOperation::AllocateStart { transaction_id },
+                    TimestampOperation::ReserveCommit { transaction_id },
+                )
+                .await
+                .map(|(start, commit)| {
+                    let mut body = timestamp_response(start);
+                    body.extend_from_slice(&commit.get().to_be_bytes());
+                    body
+                }),
             _ => unreachable!("validated transaction operation"),
         };
         Ok(Response::new(match result {
-            Ok(timestamp) => status(
-                context,
-                StatusCode::Ok,
-                RetryDisposition::Never,
-                "ok",
-                timestamp.get().to_be_bytes().to_vec(),
-            ),
+            Ok(body) => status(context, StatusCode::Ok, RetryDisposition::Never, "ok", body),
             Err(error) => status(
                 context,
                 StatusCode::Conflict,
@@ -432,6 +575,10 @@ impl MetaService for MetaRpcService {
     }
 }
 
+fn timestamp_response(timestamp: TransactionTime) -> Vec<u8> {
+    timestamp.get().to_be_bytes().to_vec()
+}
+
 impl MetaCore {
     async fn catalog_snapshot(
         &self,
@@ -496,19 +643,115 @@ impl TimestampCommandLog for FjallTimestampLog {
         })
     }
 
-    fn append(&self, command: Vec<u8>) -> TimestampLogFuture<'_, ()> {
+    fn append_batch(&self, commands: Vec<Vec<u8>>) -> TimestampLogFuture<'_, ()> {
         Box::pin(async move {
+            if commands.is_empty() {
+                return Ok(());
+            }
             let mut next_index = self.next_index.lock().await;
-            let index = *next_index;
-            let entry = timestamp_consensus_entry(index, command)
-                .map_err(|error| TxnError::Storage(error.to_string()))?;
-            self.store
-                .append(vec![entry])
-                .await
-                .map_err(TxnError::from)?;
-            *next_index = index.checked_add(1).ok_or(TxnError::ResourceLimit)?;
+            let first_index = *next_index;
+            let entries = commands
+                .into_iter()
+                .enumerate()
+                .map(|(offset, command)| {
+                    let index = first_index
+                        .checked_add(offset as u64)
+                        .ok_or(TxnError::ResourceLimit)?;
+                    timestamp_consensus_entry(index, command)
+                        .map_err(|error| TxnError::Storage(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let next = first_index
+                .checked_add(entries.len() as u64)
+                .ok_or(TxnError::ResourceLimit)?;
+            self.store.append(entries).await.map_err(TxnError::from)?;
+            *next_index = next;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod timestamp_batcher_tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    use dtg_execution::transaction::{
+        DurableTimestampAuthority, TimestampCommandLog, TimestampLogFuture, TimestampOperation,
+        TransactionId,
+    };
+
+    use super::TimestampRpcBatcher;
+
+    #[derive(Default)]
+    struct MemoryTimestampLog {
+        batches: StdMutex<usize>,
+    }
+
+    impl TimestampCommandLog for MemoryTimestampLog {
+        fn replay(&self) -> TimestampLogFuture<'_, Vec<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn append_batch(&self, commands: Vec<Vec<u8>>) -> TimestampLogFuture<'_, ()> {
+            Box::pin(async move {
+                assert!(!commands.is_empty());
+                *self.batches.lock().unwrap() += 1;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timestamp_rpc_batcher_persists_concurrent_allocations_once() {
+        let log = Arc::new(MemoryTimestampLog::default());
+        let authority = Arc::new(DurableTimestampAuthority::open(log.clone()).await.unwrap());
+        let batcher = Arc::new(TimestampRpcBatcher::new(
+            authority,
+            64,
+            Duration::from_millis(20),
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let mut tasks = tokio::task::JoinSet::new();
+        for id in 1..=8 {
+            let batcher = batcher.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                batcher
+                    .submit(TimestampOperation::AllocateStart {
+                        transaction_id: TransactionId::new(id).unwrap(),
+                    })
+                    .await
+            });
+        }
+        barrier.wait().await;
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.unwrap().is_ok());
+        }
+        assert_eq!(*log.batches.lock().unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timestamp_rpc_batcher_prepares_start_and_commit_in_one_atomic_batch() {
+        let log = Arc::new(MemoryTimestampLog::default());
+        let authority = Arc::new(DurableTimestampAuthority::open(log.clone()).await.unwrap());
+        let batcher = TimestampRpcBatcher::new(authority, 64, Duration::from_millis(20));
+
+        let (start, commit) = batcher
+            .submit_pair(
+                TimestampOperation::AllocateStart {
+                    transaction_id: TransactionId::new(101).unwrap(),
+                },
+                TimestampOperation::ReserveCommit {
+                    transaction_id: TransactionId::new(101).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(commit > start);
+        assert_eq!(*log.batches.lock().unwrap(), 1);
     }
 }
 

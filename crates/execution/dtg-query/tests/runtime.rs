@@ -62,6 +62,29 @@ fn column_batches_enforce_types_and_preserve_temporal_entities() {
 }
 
 #[test]
+fn column_batches_concatenate_matching_schemas_in_batch_order() {
+    let schema = int_schema("value");
+    let first = ColumnBatch::from_rows(
+        schema.clone(),
+        vec![vec![QueryValue::Integer(1)], vec![QueryValue::Integer(2)]],
+    )
+    .unwrap();
+    let second =
+        ColumnBatch::from_rows(schema.clone(), vec![vec![QueryValue::Integer(3)]]).unwrap();
+
+    let combined = ColumnBatch::concatenate(schema, vec![first, second]).unwrap();
+
+    assert_eq!(
+        combined.rows(),
+        vec![
+            vec![QueryValue::Integer(1)],
+            vec![QueryValue::Integer(2)],
+            vec![QueryValue::Integer(3)],
+        ]
+    );
+}
+
+#[test]
 fn filter_project_sort_and_limit_are_columnar_and_deterministic() {
     let batch = ColumnBatch::from_rows(
         int_schema("score"),

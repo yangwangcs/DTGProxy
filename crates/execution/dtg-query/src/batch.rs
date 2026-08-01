@@ -258,6 +258,33 @@ impl ColumnBatch {
         }
     }
 
+    pub fn concatenate(schema: RowSchema, batches: Vec<Self>) -> Result<Self, QueryError> {
+        let mut row_count = 0_usize;
+        for batch in &batches {
+            if batch.schema != schema {
+                return Err(QueryError::InvalidBatch(
+                    "cannot concatenate batches with different schemas".into(),
+                ));
+            }
+            row_count = row_count.checked_add(batch.row_count).ok_or_else(|| {
+                QueryError::InvalidBatch("concatenated row count exceeds usize".into())
+            })?;
+        }
+        let mut columns = (0..schema.fields.len())
+            .map(|_| Vec::with_capacity(row_count))
+            .collect::<Vec<_>>();
+        for batch in batches {
+            for (column, values) in columns.iter_mut().zip(batch.columns) {
+                column.extend(values);
+            }
+        }
+        Ok(Self {
+            schema,
+            columns,
+            row_count,
+        })
+    }
+
     pub const fn schema(&self) -> &RowSchema {
         &self.schema
     }
@@ -282,7 +309,19 @@ impl ColumnBatch {
     }
 
     pub fn into_rows(self) -> Vec<Vec<QueryValue>> {
-        self.rows()
+        let mut columns = self
+            .columns
+            .into_iter()
+            .map(Vec::into_iter)
+            .collect::<Vec<_>>();
+        (0..self.row_count)
+            .map(|_| {
+                columns
+                    .iter_mut()
+                    .map(|column| column.next().expect("column length matches row count"))
+                    .collect()
+            })
+            .collect()
     }
 
     pub fn estimated_bytes(&self) -> u64 {

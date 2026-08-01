@@ -1,5 +1,12 @@
 # DTGProxy implementation progress
 
+Three-backend end-to-end diagnostic (2026-07-31):
+Task 1: complete (commits 53aaa02..d017df8, review clean)
+Task 2: complete (commits d017df8..89ec2fb, review clean)
+Task 3: needs fixes (commit 89ec2fb..4cd3613; Critical: process query path skips Filter/Project/Aggregate; Important: ports are not reserved through child startup)
+Closure Task 1: complete (commits 4988461..2ffd320, review clean)
+Closure Task 2: complete (commits 2ffd320..017c37b, review clean)
+
 Task 1: complete (uncommitted worktree; reviews fixed; shard-runtime 48/48; concurrent MERGE 20/20 twice)
 Task 2: complete (uncommitted worktree; multi-row atomic MERGE and explicit Bolt staging; relevant
 suite green; independent review clean)

@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 dtg-execution = { path = "../../execution/dtg-execution" }
+futures-util = "=0.3.33"
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
 dtg-storage-neo4j = { path = "../../storage/dtg-storage-neo4j" }
 dtg-storage-postgres = { path = "../../storage/dtg-storage-postgres" }

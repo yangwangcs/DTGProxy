@@ -256,7 +256,7 @@ pub fn validate_transaction_request(
         .try_into()?;
     require_nonzero_id(&wire.transaction_id)?;
     require_nonzero_id(&wire.idempotency_key)?;
-    if !(1..=5).contains(&wire.operation) {
+    if !(1..=6).contains(&wire.operation) {
         return Err(ProtocolError::UnknownEnum);
     }
     validate_payload(wire.payload, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_ITEMS)

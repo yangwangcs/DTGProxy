@@ -97,7 +97,7 @@ impl ExecutionFence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadOperation {
     VertexPoint(VertexId),
     VertexScan,
@@ -106,6 +106,10 @@ pub enum ReadOperation {
     Adjacency {
         vertex_id: VertexId,
         direction: ExpandDirection,
+    },
+    Traversal {
+        vertex_id: VertexId,
+        directions: Vec<ExpandDirection>,
     },
 }
 
@@ -137,8 +141,8 @@ impl LogicalRead {
         })
     }
 
-    pub const fn operation(&self) -> ReadOperation {
-        self.operation
+    pub fn operation(&self) -> ReadOperation {
+        self.operation.clone()
     }
 
     pub const fn row_bound(&self) -> u32 {
@@ -666,6 +670,24 @@ impl StorageSourceOperator {
                     .map(QueryValue::Relationship)
                     .collect()
             }
+            ReadOperation::Traversal {
+                vertex_id,
+                directions,
+            } => {
+                self.cursor = Cursor::Done;
+                traverse_logical_adjacency(
+                    self.storage.view.as_ref(),
+                    vertex_id,
+                    &directions,
+                    logical.valid_at(),
+                    logical.transaction_time(),
+                    limit,
+                )
+                .await?
+                .into_iter()
+                .map(QueryValue::Relationship)
+                .collect()
+            }
         };
         for value in &rows {
             context.checkpoint()?;
@@ -784,6 +806,83 @@ impl StorageSourceOperator {
             )
             .map(Some)
         }
+    }
+}
+
+async fn traverse_logical_adjacency(
+    view: &dyn TemporalReadView,
+    vertex_id: VertexId,
+    directions: &[ExpandDirection],
+    valid_at: i64,
+    transaction_time: TransactionTime,
+    limit: u32,
+) -> Result<Vec<dtg_storage::EdgeVersion>, QueryError> {
+    if directions.len() < 2 {
+        return Err(QueryError::InvalidPlan(
+            "logical traversal requires at least two hops".into(),
+        ));
+    }
+    let mut frontier = vec![vertex_id];
+    let mut output = Vec::new();
+    for (hop, direction) in directions.iter().copied().enumerate() {
+        let final_hop = hop + 1 == directions.len();
+        let mut remaining = limit;
+        let mut next = Vec::new();
+        for vertex in std::mem::take(&mut frontier) {
+            if remaining == 0 {
+                break;
+            }
+            let edges = view
+                .expand(AdjacencyRead::new(
+                    vertex,
+                    adjacency_direction(direction),
+                    valid_at,
+                    transaction_time,
+                    remaining,
+                )?)
+                .await?;
+            if edges.len() > remaining as usize {
+                return Err(QueryError::ProviderViolation(
+                    "adjacency traversal exceeded the requested bound".into(),
+                ));
+            }
+            remaining = remaining.saturating_sub(u32::try_from(edges.len()).unwrap_or(u32::MAX));
+            if final_hop {
+                output.extend(edges);
+            } else {
+                for edge in edges {
+                    next.push(traversal_next_vertex(vertex, &edge, direction)?);
+                }
+            }
+        }
+        if !final_hop {
+            frontier = next;
+        }
+    }
+    Ok(output)
+}
+
+fn adjacency_direction(direction: ExpandDirection) -> AdjacencyDirection {
+    match direction {
+        ExpandDirection::Outgoing => AdjacencyDirection::Outgoing,
+        ExpandDirection::Incoming => AdjacencyDirection::Incoming,
+        ExpandDirection::Either => AdjacencyDirection::Both,
+    }
+}
+
+fn traversal_next_vertex(
+    current: VertexId,
+    edge: &dtg_storage::EdgeVersion,
+    direction: ExpandDirection,
+) -> Result<VertexId, QueryError> {
+    match direction {
+        ExpandDirection::Outgoing if edge.source() == current => Ok(edge.target()),
+        ExpandDirection::Incoming if edge.target() == current => Ok(edge.source()),
+        ExpandDirection::Either if edge.source() == current => Ok(edge.target()),
+        ExpandDirection::Either if edge.target() == current => Ok(edge.source()),
+        _ => Err(QueryError::ProviderViolation(
+            "adjacency traversal returned an edge outside its requested direction".into(),
+        )),
     }
 }
 

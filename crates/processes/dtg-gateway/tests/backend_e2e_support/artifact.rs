@@ -19,7 +19,7 @@ const REQUEST_METRIC_STAGES: [&str; 10] = [
     "data_provider_execution",
 ];
 const HISTOGRAM_BUCKETS: usize = 64;
-const REQUEST_METRIC_DETAILS: [&str; 19] = [
+const REQUEST_METRIC_DETAILS_V2: [&str; 19] = [
     "gateway_query_request_encode",
     "gateway_query_response_collect",
     "gateway_query_response_decode",
@@ -40,6 +40,114 @@ const REQUEST_METRIC_DETAILS: [&str; 19] = [
     "data_temporal_scan_visibility",
     "data_raft_lock_wait",
 ];
+const REQUEST_METRIC_DETAILS_V3: [&str; 20] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "gateway_meta_prepare_write",
+];
+const REQUEST_METRIC_DETAILS_V4: [&str; 23] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "gateway_meta_prepare_write",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+];
+
+const REQUEST_METRIC_DETAILS_V5: [&str; 26] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "gateway_meta_prepare_write",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+    "data_adjacency_cache_hit",
+    "data_adjacency_cache_miss",
+    "data_adjacency_backend_expand",
+];
+
+const REQUEST_METRIC_DETAILS_V6: [&str; 29] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "gateway_meta_prepare_write",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+    "data_adjacency_cache_hit",
+    "data_adjacency_cache_miss",
+    "data_adjacency_backend_expand",
+    "data_snapshot_csr_cache_hit",
+    "data_snapshot_csr_cache_miss",
+    "data_snapshot_csr_build",
+];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,11 +167,19 @@ impl Backend {
 pub enum Workload {
     CreateVertex,
     PointLookup,
+    OneHopExpand,
+    TwoHopExpand,
     CountVertices,
 }
 
 impl Workload {
-    const ALL: [Self; 3] = [Self::CreateVertex, Self::PointLookup, Self::CountVertices];
+    const ALL: [Self; 5] = [
+        Self::CreateVertex,
+        Self::PointLookup,
+        Self::OneHopExpand,
+        Self::TwoHopExpand,
+        Self::CountVertices,
+    ];
 
     pub const fn is_write(self) -> bool {
         matches!(self, Self::CreateVertex)
@@ -80,7 +196,7 @@ pub struct CellSpec {
 
 impl CellSpec {
     pub fn matrix(seed: u64) -> Vec<Self> {
-        let mut cells = Vec::with_capacity(54);
+        let mut cells = Vec::with_capacity(90);
         for backend in Backend::ALL {
             for workload in Workload::ALL {
                 for concurrency in [1, 8] {
@@ -249,9 +365,9 @@ fn validate_metrics_snapshot(
     snapshot: &ProcessMetricsSnapshot,
     expected_role: &str,
 ) -> io::Result<()> {
-    if !matches!(snapshot.schema_version, 1 | 2) {
+    if !matches!(snapshot.schema_version, 1..=6) {
         return Err(invalid_data(
-            "request metrics schema version must be 1 or 2",
+            "request metrics schema version must be between 1 and 6",
         ));
     }
     if snapshot.process_role != expected_role {
@@ -276,18 +392,28 @@ fn validate_metrics_snapshot(
                 "schema v1 request metrics cannot contain details",
             ));
         }
-    } else if snapshot.details.len() != REQUEST_METRIC_DETAILS.len()
-        || snapshot
-            .details
-            .iter()
-            .zip(REQUEST_METRIC_DETAILS)
-            .any(|(detail, expected)| {
-                detail.detail != expected || detail.buckets.len() != HISTOGRAM_BUCKETS
-            })
-    {
-        return Err(invalid_data(
-            "request metrics detail snapshot is incomplete",
-        ));
+    } else {
+        let expected_details: &[&str] = match snapshot.schema_version {
+            2 => &REQUEST_METRIC_DETAILS_V2,
+            3 => &REQUEST_METRIC_DETAILS_V3,
+            4 => &REQUEST_METRIC_DETAILS_V4,
+            5 => &REQUEST_METRIC_DETAILS_V5,
+            6 => &REQUEST_METRIC_DETAILS_V6,
+            _ => unreachable!("schema v1 is handled above"),
+        };
+        if snapshot.details.len() != expected_details.len()
+            || snapshot
+                .details
+                .iter()
+                .zip(expected_details)
+                .any(|(detail, expected)| {
+                    detail.detail != *expected || detail.buckets.len() != HISTOGRAM_BUCKETS
+                })
+        {
+            return Err(invalid_data(
+                "request metrics detail snapshot is incomplete",
+            ));
+        }
     }
     Ok(())
 }
@@ -297,61 +423,60 @@ fn ensure_counters_do_not_regress(
     current: &ProcessMetricsSnapshot,
 ) -> io::Result<()> {
     for (previous, current) in previous.stages.iter().zip(&current.stages) {
-        if counters_regressed(
-            previous.buckets.iter().zip(&current.buckets),
-            previous.success,
-            current.success,
-            previous.error,
-            current.error,
-            previous.cancelled,
-            current.cancelled,
-            previous.total_nanoseconds,
-            current.total_nanoseconds,
-            previous.max_nanoseconds,
-            current.max_nanoseconds,
-        ) {
+        if counters_regressed(stage_counters(previous), stage_counters(current)) {
             return Err(invalid_data("request metrics counter regressed"));
         }
     }
     for (previous, current) in previous.details.iter().zip(&current.details) {
-        if counters_regressed(
-            previous.buckets.iter().zip(&current.buckets),
-            previous.success,
-            current.success,
-            previous.error,
-            current.error,
-            previous.cancelled,
-            current.cancelled,
-            previous.total_nanoseconds,
-            current.total_nanoseconds,
-            previous.max_nanoseconds,
-            current.max_nanoseconds,
-        ) {
+        if counters_regressed(detail_counters(previous), detail_counters(current)) {
             return Err(invalid_data("request metrics detail counter regressed"));
         }
     }
     Ok(())
 }
 
-fn counters_regressed<'a>(
-    mut buckets: impl Iterator<Item = (&'a u64, &'a u64)>,
-    previous_success: u64,
-    current_success: u64,
-    previous_error: u64,
-    current_error: u64,
-    previous_cancelled: u64,
-    current_cancelled: u64,
-    previous_total: u64,
-    current_total: u64,
-    previous_max: u64,
-    current_max: u64,
-) -> bool {
-    buckets.any(|(before, after)| after < before)
-        || current_success < previous_success
-        || current_error < previous_error
-        || current_cancelled < previous_cancelled
-        || current_total < previous_total
-        || current_max < previous_max
+struct MetricCounters<'a> {
+    buckets: &'a [u64],
+    success: u64,
+    error: u64,
+    cancelled: u64,
+    total_nanoseconds: u64,
+    max_nanoseconds: u64,
+}
+
+fn stage_counters(snapshot: &StageMetricSnapshot) -> MetricCounters<'_> {
+    MetricCounters {
+        buckets: &snapshot.buckets,
+        success: snapshot.success,
+        error: snapshot.error,
+        cancelled: snapshot.cancelled,
+        total_nanoseconds: snapshot.total_nanoseconds,
+        max_nanoseconds: snapshot.max_nanoseconds,
+    }
+}
+
+fn detail_counters(snapshot: &DetailMetricSnapshot) -> MetricCounters<'_> {
+    MetricCounters {
+        buckets: &snapshot.buckets,
+        success: snapshot.success,
+        error: snapshot.error,
+        cancelled: snapshot.cancelled,
+        total_nanoseconds: snapshot.total_nanoseconds,
+        max_nanoseconds: snapshot.max_nanoseconds,
+    }
+}
+
+fn counters_regressed(previous: MetricCounters<'_>, current: MetricCounters<'_>) -> bool {
+    previous
+        .buckets
+        .iter()
+        .zip(current.buckets)
+        .any(|(before, after)| after < before)
+        || current.success < previous.success
+        || current.error < previous.error
+        || current.cancelled < previous.cancelled
+        || current.total_nanoseconds < previous.total_nanoseconds
+        || current.max_nanoseconds < previous.max_nanoseconds
 }
 
 fn metric_delta(
@@ -476,6 +601,41 @@ impl QuickDiagnosticArtifact {
                     "quick diagnostic observation lacks bracketing stage metrics",
                 ));
             }
+            if matches!(
+                observation.workload,
+                Workload::OneHopExpand | Workload::TwoHopExpand
+            ) {
+                let details = &observation
+                    .data_stage_metrics
+                    .as_ref()
+                    .expect("data stage metrics were checked above")
+                    .delta
+                    .details;
+                let csr_hits = details
+                    .iter()
+                    .find(|detail| detail.detail == "data_snapshot_csr_cache_hit")
+                    .ok_or_else(|| {
+                        invalid_data(
+                            "quick diagnostic expand observation lacks snapshot CSR metrics",
+                        )
+                    })?;
+                if csr_hits.success == 0 {
+                    return Err(invalid_data(
+                        "quick diagnostic expand observation lacks snapshot CSR cache hits",
+                    ));
+                }
+                let adjacency_expands = details
+                    .iter()
+                    .find(|detail| detail.detail == "data_adjacency_backend_expand")
+                    .ok_or_else(|| {
+                        invalid_data("quick diagnostic expand observation lacks adjacency metrics")
+                    })?;
+                if adjacency_expands.success != 0 {
+                    return Err(invalid_data(
+                        "quick diagnostic expand observation used backend adjacency expansion",
+                    ));
+                }
+            }
             if !cells.insert((
                 observation.repetition,
                 observation.workload,
@@ -510,7 +670,8 @@ impl QuickDiagnosticArtifact {
             .iter()
             .map(|(repetition, _, _)| *repetition)
             .collect::<BTreeSet<_>>();
-        if repetitions != BTreeSet::from([0, 1, 2]) || observations.len() != 18 {
+        let expected_observations = Workload::ALL.len() * 2 * 3;
+        if repetitions != BTreeSet::from([0, 1, 2]) || observations.len() != expected_observations {
             return Err(invalid_data(
                 "quick diagnostic requires exactly three complete repetitions",
             ));

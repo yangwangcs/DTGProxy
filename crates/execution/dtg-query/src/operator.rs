@@ -86,7 +86,7 @@ impl Operator for FilterOperator {
                     return Ok(None);
                 };
                 let mut rows = Vec::new();
-                for row in batch.rows() {
+                for row in batch.into_rows() {
                     context.checkpoint()?;
                     if self.predicate.evaluate(&self.schema, &row)? == QueryValue::Boolean(true) {
                         rows.push(row);
@@ -164,7 +164,7 @@ impl Operator for ProjectOperator {
                 return Ok(None);
             };
             let mut rows = Vec::with_capacity(batch.row_count());
-            for row in batch.rows() {
+            for row in batch.into_rows() {
                 context.checkpoint()?;
                 rows.push(
                     self.projections
@@ -576,7 +576,7 @@ impl Operator for UnwindOperator {
                     break;
                 }
                 match self.input.next_batch(context).await? {
-                    Some(batch) => self.pending_rows = batch.rows().into(),
+                    Some(batch) => self.pending_rows = batch.into_rows().into(),
                     None => self.input_done = true,
                 }
             }
@@ -625,7 +625,7 @@ impl Operator for LimitOperator {
                     return Ok(None);
                 };
                 let mut output = Vec::new();
-                for row in batch.rows() {
+                for row in batch.into_rows() {
                     context.checkpoint()?;
                     if self.skipped < self.skip {
                         self.skipped += 1;
@@ -868,7 +868,7 @@ pub(crate) async fn collect_rows(
             break;
         };
         context.charge_memory(batch.estimated_bytes())?;
-        rows.extend(batch.rows());
+        rows.extend(batch.into_rows());
     }
     Ok((schema, rows))
 }

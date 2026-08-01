@@ -13,21 +13,25 @@ use dtg_execution::cluster_protocol::proto::data_service_client::DataServiceClie
 use dtg_execution::cluster_protocol::proto::meta_service_client::MetaServiceClient;
 use dtg_execution::cluster_protocol::proto::{
     BoundedPayload, CatalogWatchRequest, ControlObservation, ExecutionFragment, RequestContext,
-    ShardContext, StatusCode, TransactionOperation, TransactionRequest,
+    RetryDisposition, ShardContext, StatusCode, TransactionOperation, TransactionRequest,
+    TypedStatus,
 };
-use dtg_execution::cluster_protocol::{PROTOCOL_MAJOR, SUPPORTED_MINOR_MAX, checksum_bytes};
+use dtg_execution::cluster_protocol::{
+    PROTOCOL_MAJOR, SUPPORTED_MINOR_MAX, checksum_bytes, validate_typed_status,
+};
 use dtg_execution::shard::{CommitSingleShard, ShardCommand};
 use dtg_execution::storage::{
-    BackendClass, BindingRole, CapabilityManifest, CommandId, LogicalMutation, Properties,
-    ProviderKind, ReplicaBinding, TransactionTime, ValidInterval, Value, Version, VertexId,
-    VertexVersion,
+    BackendClass, BindingRole, CapabilityManifest, CommandId, EdgeId, EdgeVersion, LogicalMutation,
+    Properties, ProviderKind, ReplicaBinding, TransactionTime, ValidInterval, Value, Version,
+    VertexId, VertexVersion,
 };
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 
 use super::{
-    Backend, CellSpec, RawObservation, StageMetricsWindow, Workload, stage_metrics_window_from_log,
+    Backend, CellSpec, ProcessMetricsSnapshot, RawObservation, StageMetricsWindow, Workload,
+    stage_metrics_window_from_log,
 };
 
 const CAPABILITIES: &str = "adjacency,immutable-read-view,logical-snapshot,point";
@@ -236,6 +240,15 @@ impl DiagnosticCluster {
         if self.children.iter().any(|child| child.name == "gateway") {
             return Err(invalid_input("read data was already seeded for this cell"));
         }
+        if matches!(
+            self.spec.workload,
+            Workload::OneHopExpand | Workload::TwoHopExpand
+        ) && vertices < 4_096
+        {
+            return Err(invalid_input(
+                "expand dataset requires at least 4096 vertices",
+            ));
+        }
         let mutations = (1..=vertices)
             .map(|id| {
                 let mut properties = Properties::new();
@@ -256,7 +269,41 @@ impl DiagnosticCluster {
                 Ok(LogicalMutation::PutVertex(vertex))
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let edge_mutations = match self.spec.workload {
+            Workload::OneHopExpand => vec![bench_edge(1, 2048, 4096)?],
+            Workload::TwoHopExpand => vec![bench_edge(1, 2048, 3072)?, bench_edge(2, 3072, 4096)?],
+            Workload::CreateVertex | Workload::PointLookup | Workload::CountVertices => Vec::new(),
+        };
         let command_id = request_seed(self.binding.namespace_id().as_str());
+        let mut client = DataServiceClient::connect(format!("http://{}", self.data_address))
+            .await
+            .map_err(io_other)?;
+        let applied_index = self
+            .apply_seed_batch(&mut client, command_id, mutations)
+            .await?;
+        let applied_index = if edge_mutations.is_empty() {
+            applied_index
+        } else {
+            let edge_command_id = command_id.saturating_add(1);
+            self.apply_seed_batch(&mut client, edge_command_id, edge_mutations)
+                .await?
+        };
+        self.start_gateway(applied_index)?;
+        self.wait_for_port(self.gateway_address, "gateway").await
+    }
+
+    pub const fn bolt_address(&self) -> SocketAddr {
+        self.gateway_address
+    }
+
+    async fn apply_seed_batch(
+        &self,
+        client: &mut DataServiceClient<tonic::transport::Channel>,
+        command_id: u128,
+        mutations: Vec<LogicalMutation>,
+    ) -> io::Result<u64> {
+        let item_count = u32::try_from(mutations.len())
+            .map_err(|_| invalid_input("read dataset size exceeds protocol item count"))?;
         let command = ShardCommand::CommitSingleShard(
             CommitSingleShard::new(
                 CommandId::new(command_id).map_err(invalid_data)?,
@@ -267,40 +314,18 @@ impl DiagnosticCluster {
             .map_err(invalid_data)?,
         );
         let body = command.encode_current().map_err(invalid_data)?;
-        let mut client = DataServiceClient::connect(format!("http://{}", self.data_address))
-            .await
-            .map_err(io_other)?;
         let status = client
             .apply_transaction(TransactionRequest {
                 context: Some(shard_context(&self.binding, command_id)),
                 transaction_id: command_id.to_be_bytes().to_vec(),
                 operation: TransactionOperation::Commit.into(),
                 idempotency_key: command_id.to_be_bytes().to_vec(),
-                payload: Some(payload(
-                    body,
-                    u32::try_from(vertices).map_err(|_| {
-                        invalid_input("read dataset size exceeds protocol item count")
-                    })?,
-                )),
+                payload: Some(payload(body, item_count)),
             })
             .await
             .map_err(io_other)?
             .into_inner();
-        if status.code != StatusCode::Ok as i32 {
-            return Err(invalid_data(format!(
-                "Data seed failed with status {}: {}",
-                status.code, status.message
-            )));
-        }
-        let applied_index = self
-            .observe_applied_index(command_id.saturating_add(1))
-            .await?;
-        self.start_gateway(applied_index)?;
-        self.wait_for_port(self.gateway_address, "gateway").await
-    }
-
-    pub const fn bolt_address(&self) -> SocketAddr {
-        self.gateway_address
+        seed_applied_index(status)
     }
 
     pub async fn measure_cell(&self, spec: CellSpec) -> io::Result<RawObservation> {
@@ -322,6 +347,39 @@ impl DiagnosticCluster {
             .rev()
             .find_map(|line| line.strip_prefix(PREFIX).map(str::to_owned))
             .ok_or_else(|| invalid_data(format!("{process} did not export request metrics")))
+    }
+
+    pub async fn next_request_metrics_snapshot(
+        &self,
+        process: &str,
+        after_sequence: Option<u64>,
+    ) -> io::Result<ProcessMetricsSnapshot> {
+        let deadline = tokio::time::Instant::now() + POST_MEASUREMENT_METRICS_WAIT;
+        loop {
+            match self.last_request_metrics_line(process) {
+                Ok(line) => {
+                    let snapshot =
+                        serde_json::from_str::<ProcessMetricsSnapshot>(&line).map_err(|error| {
+                            invalid_data(format!(
+                                "{process} exported invalid request metrics: {error}"
+                            ))
+                        })?;
+                    if after_sequence.is_none_or(|sequence| snapshot.sequence > sequence) {
+                        return Ok(snapshot);
+                    }
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::InvalidData
+                        && error.to_string().contains("did not export request metrics") => {}
+                Err(error) => return Err(error),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(invalid_data(format!(
+                    "{process} did not export a newer request metrics snapshot"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     pub async fn shutdown(&mut self) -> io::Result<()> {
@@ -357,7 +415,10 @@ impl DiagnosticCluster {
     fn start_gateway(&mut self, applied_index: u64) -> io::Result<()> {
         let shard = gateway_shard_spec(&self.binding, applied_index);
         let logical_scan_bound = match self.spec.workload {
-            Workload::PointLookup | Workload::CountVertices => "4096",
+            Workload::PointLookup
+            | Workload::OneHopExpand
+            | Workload::TwoHopExpand
+            | Workload::CountVertices => "4096",
             Workload::CreateVertex => "1",
         };
         let environment = vec![
@@ -501,6 +562,22 @@ impl DiagnosticCluster {
         }
         Ok(())
     }
+}
+
+fn bench_edge(id: u128, source: u128, target: u128) -> io::Result<LogicalMutation> {
+    Ok(LogicalMutation::PutEdge(
+        EdgeVersion::new(
+            EdgeId::new(id).map_err(invalid_data)?,
+            VertexId::new(source).map_err(invalid_data)?,
+            VertexId::new(target).map_err(invalid_data)?,
+            "BENCH",
+            Version::new(1),
+            ValidInterval::new(1, 10_000).map_err(invalid_data)?,
+            TransactionTime::new(41).map_err(invalid_data)?,
+            Properties::new(),
+        )
+        .map_err(invalid_data)?,
+    ))
 }
 
 impl Drop for DiagnosticCluster {
@@ -815,6 +892,31 @@ fn retire_children(children: &mut Vec<ManagedChild>) -> io::Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+fn seed_applied_index(status: TypedStatus) -> io::Result<u64> {
+    if status.code != StatusCode::Ok as i32 {
+        return Err(invalid_data(format!(
+            "Data seed failed with status {}: {}",
+            status.code, status.message
+        )));
+    }
+    let status = validate_typed_status(status).map_err(invalid_data)?;
+    let details = status
+        .details()
+        .ok_or_else(|| invalid_data("Data seed status is missing the Raft receipt"))?;
+    if details.item_count() != 1 || details.body().len() != 9 {
+        return Err(invalid_data("Data seed Raft receipt has an invalid shape"));
+    }
+    let applied_index = u64::from_be_bytes(
+        details.body()[..8]
+            .try_into()
+            .map_err(|_| invalid_data("Data seed Raft receipt has an invalid index"))?,
+    );
+    if applied_index == 0 || !matches!(details.body()[8], 0 | 1) {
+        return Err(invalid_data("Data seed Raft receipt is invalid"));
+    }
+    Ok(applied_index)
+}
+
 fn parse_applied_index(message: &str) -> Option<u64> {
     message
         .split("applied index ")
@@ -882,4 +984,25 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 
 fn io_other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_receipt_uses_the_validated_applied_index_from_data() {
+        let mut body = 37_u64.to_be_bytes().to_vec();
+        body.push(0);
+        let status = TypedStatus {
+            request: Some(request_context(17, 19)),
+            code: StatusCode::Ok.into(),
+            retry: RetryDisposition::Never.into(),
+            message: "transaction command accepted by Shard Raft".into(),
+            idempotency_key: 19_u128.to_be_bytes().to_vec(),
+            details: Some(payload(body, 1)),
+        };
+
+        assert_eq!(seed_applied_index(status).unwrap(), 37);
+    }
 }

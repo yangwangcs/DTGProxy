@@ -13,8 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use backend_e2e_support::{
-    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, Workload, percentile_ns,
-    stage_metrics_window_from_log,
+    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, RawObservation, Workload,
+    percentile_ns, stage_metrics_window_from_log,
 };
 
 #[derive(serde::Serialize)]
@@ -28,6 +28,40 @@ struct QuickResult {
     p95_ms: f64,
     p99_ms: f64,
     errors: u64,
+}
+
+#[derive(serde::Serialize)]
+struct StageMean {
+    process: &'static str,
+    stage: String,
+    calls: u64,
+    mean_nanoseconds: u64,
+    errors: u64,
+}
+
+fn stage_means(observation: &RawObservation) -> Vec<StageMean> {
+    [
+        ("gateway", observation.gateway_stage_metrics.as_ref()),
+        ("data", observation.data_stage_metrics.as_ref()),
+    ]
+    .into_iter()
+    .flat_map(|(process, window)| {
+        window.into_iter().flat_map(move |window| {
+            window
+                .delta
+                .stages
+                .iter()
+                .filter(|stage| stage.success != 0)
+                .map(move |stage| StageMean {
+                    process,
+                    stage: stage.stage.clone(),
+                    calls: stage.success,
+                    mean_nanoseconds: stage.total_nanoseconds / stage.success,
+                    errors: stage.error,
+                })
+        })
+    })
+    .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -51,11 +85,13 @@ async fn quick_selected_backend_e2e_comparison() {
     } else {
         1
     };
-    let mut observations = Vec::with_capacity(usize::from(repetitions) * 6);
+    let mut observations = Vec::with_capacity(usize::from(repetitions) * 8);
     for repetition in 0..repetitions {
         for workload in [
             Workload::CreateVertex,
             Workload::PointLookup,
+            Workload::OneHopExpand,
+            Workload::TwoHopExpand,
             Workload::CountVertices,
         ] {
             for concurrency in [1, 8] {
@@ -141,6 +177,16 @@ async fn fjall_cell_uses_real_four_process_bolt_path() {
     let observation = cluster.measure_cell(spec).await.unwrap();
     assert_eq!(observation.errors, 0);
     assert_eq!(observation.row_count, 1);
+    let provider_execution = observation
+        .data_stage_metrics
+        .as_ref()
+        .unwrap()
+        .delta
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "data_provider_execution")
+        .unwrap();
+    assert_eq!(provider_execution.error, 0);
     println!(
         "DTG_GATEWAY_FINAL_METRICS={}",
         cluster.last_request_metrics_line("gateway").unwrap()
@@ -152,13 +198,205 @@ async fn fjall_cell_uses_real_four_process_bolt_path() {
     cluster.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires release DTGProxy binaries"]
+async fn fjall_one_hop_uses_the_real_four_process_bolt_path() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let spec = CellSpec::one(Backend::Fjall, Workload::OneHopExpand, 1, 1);
+    let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+    cluster.seed_read_dataset(4_096).await.unwrap();
+    let mut session = backend_e2e_support::BoltSession::connect(cluster.bolt_address())
+        .await
+        .unwrap();
+    let one_hop = session
+        .run(
+            "MATCH (a)-[r]->(b) WHERE a.id = $id RETURN r",
+            BTreeMap::from([("id".into(), backend_e2e_support::BoltValue::Integer(2048))]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(one_hop.rows.len(), 1);
+    let observation = cluster.measure_cell(spec).await.unwrap();
+    assert_eq!(observation.errors, 0);
+    let provider_execution = observation
+        .data_stage_metrics
+        .as_ref()
+        .unwrap()
+        .delta
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "data_provider_execution")
+        .unwrap();
+    assert_eq!(provider_execution.error, 0);
+    let details = &observation
+        .data_stage_metrics
+        .as_ref()
+        .unwrap()
+        .delta
+        .details;
+    assert!(
+        details
+            .iter()
+            .find(|detail| detail.detail == "data_snapshot_csr_cache_hit")
+            .unwrap()
+            .success
+            > 0
+    );
+    assert_eq!(
+        details
+            .iter()
+            .find(|detail| detail.detail == "data_adjacency_backend_expand")
+            .unwrap()
+            .success,
+        0
+    );
+    println!(
+        "DTG_BACKEND_E2E_QUICK_RESULT={}",
+        serde_json::to_string(&QuickResult {
+            backend: Backend::Fjall,
+            workload: Workload::OneHopExpand,
+            concurrency: 1,
+            operations: observation.operations,
+            throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
+                / observation.measured_duration_ns as f64,
+            p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
+            p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
+            p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
+            errors: observation.errors,
+        })
+        .unwrap()
+    );
+    println!(
+        "DTG_BACKEND_E2E_STAGE_MEANS={}",
+        serde_json::to_string(&stage_means(&observation)).unwrap()
+    );
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires release DTGProxy binaries"]
+async fn fjall_two_hop_uses_the_real_four_process_bolt_path() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let spec = CellSpec::one(Backend::Fjall, Workload::TwoHopExpand, 1, 1);
+    let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+    cluster.seed_read_dataset(4_096).await.unwrap();
+    let mut session = backend_e2e_support::BoltSession::connect(cluster.bolt_address())
+        .await
+        .unwrap();
+    let two_hop = session
+        .run(
+            "MATCH (a)-[first]->(middle)-[second]->(destination) WHERE a.id = $id RETURN second",
+            BTreeMap::from([("id".into(), backend_e2e_support::BoltValue::Integer(2048))]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(two_hop.rows.len(), 1);
+    let observation = cluster.measure_cell(spec).await.unwrap();
+    assert_eq!(observation.errors, 0);
+    let provider_execution = observation
+        .data_stage_metrics
+        .as_ref()
+        .unwrap()
+        .delta
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "data_provider_execution")
+        .unwrap();
+    assert_eq!(provider_execution.error, 0);
+    println!(
+        "DTG_BACKEND_E2E_QUICK_RESULT={}",
+        serde_json::to_string(&QuickResult {
+            backend: Backend::Fjall,
+            workload: Workload::TwoHopExpand,
+            concurrency: 1,
+            operations: observation.operations,
+            throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
+                / observation.measured_duration_ns as f64,
+            p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
+            p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
+            p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
+            errors: observation.errors,
+        })
+        .unwrap()
+    );
+    println!(
+        "DTG_BACKEND_E2E_STAGE_MEANS={}",
+        serde_json::to_string(&stage_means(&observation)).unwrap()
+    );
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires release DTGProxy binaries"]
+async fn fjall_two_hop_builds_a_snapshot_csr_once_then_reuses_it_over_bolt() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let spec = CellSpec::one(Backend::Fjall, Workload::TwoHopExpand, 1, 1);
+    let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+    cluster.seed_read_dataset(4_096).await.unwrap();
+    let mut session = backend_e2e_support::BoltSession::connect(cluster.bolt_address())
+        .await
+        .unwrap();
+    let query =
+        "MATCH (a)-[first]->(middle)-[second]->(destination) WHERE a.id = $id RETURN second";
+    let parameters = BTreeMap::from([("id".into(), backend_e2e_support::BoltValue::Integer(2048))]);
+
+    let before = cluster
+        .next_request_metrics_snapshot("data", None)
+        .await
+        .unwrap();
+    let cold = session.run(query, parameters.clone()).await.unwrap();
+    assert_eq!(cold.rows.len(), 1);
+    let after_cold = cluster
+        .next_request_metrics_snapshot("data", Some(before.sequence))
+        .await
+        .unwrap();
+    assert!(
+        detail_success(&after_cold, "data_snapshot_csr_cache_miss")
+            > detail_success(&before, "data_snapshot_csr_cache_miss")
+    );
+    assert!(
+        detail_success(&after_cold, "data_snapshot_csr_build")
+            > detail_success(&before, "data_snapshot_csr_build")
+    );
+
+    let warm = session.run(query, parameters).await.unwrap();
+    assert_eq!(warm.rows, cold.rows);
+    let after_warm = cluster
+        .next_request_metrics_snapshot("data", Some(after_cold.sequence))
+        .await
+        .unwrap();
+    assert!(
+        detail_success(&after_warm, "data_snapshot_csr_cache_hit")
+            > detail_success(&after_cold, "data_snapshot_csr_cache_hit")
+    );
+    assert_eq!(
+        detail_success(&after_warm, "data_snapshot_csr_build"),
+        detail_success(&after_cold, "data_snapshot_csr_build")
+    );
+    cluster.shutdown().await.unwrap();
+}
+
+fn detail_success(snapshot: &backend_e2e_support::ProcessMetricsSnapshot, detail: &str) -> u64 {
+    snapshot
+        .details
+        .iter()
+        .find(|candidate| candidate.detail == detail)
+        .unwrap_or_else(|| panic!("missing request detail {detail}"))
+        .success
+}
+
 #[test]
 fn matrix_has_exact_diagnostic_cells() {
     let cells = backend_e2e_support::CellSpec::matrix(4_923_929_926_749_575_257);
-    assert_eq!(cells.len(), 54);
+    assert_eq!(cells.len(), 90);
     assert_eq!(
         cells.iter().filter(|cell| cell.concurrency == 8).count(),
-        27
+        45
+    );
+    assert!(
+        cells
+            .iter()
+            .any(|cell| cell.workload == backend_e2e_support::Workload::TwoHopExpand)
     );
 }
 
@@ -376,6 +614,73 @@ fn stage_metrics_window_accepts_complete_schema_v2_details_and_rejects_incomplet
 }
 
 #[test]
+fn stage_metrics_window_accepts_schema_v3_prepare_write_detail() {
+    let first = stage_metrics_line_with_prepare_write_details("gateway", 10, 1, 1);
+    let second = stage_metrics_line_with_prepare_write_details("gateway", 20, 2, 2);
+    let window =
+        stage_metrics_window_from_log(&format!("{first}\n{second}\n"), "gateway", 15, 20).unwrap();
+
+    assert_eq!(window.delta.details.len(), 20);
+    assert_eq!(
+        window.delta.details.last().unwrap().detail,
+        "gateway_meta_prepare_write"
+    );
+    assert_eq!(window.delta.details.last().unwrap().success, 1);
+}
+
+#[test]
+fn stage_metrics_window_accepts_schema_v4_raft_batch_details() {
+    let first = stage_metrics_line_with_raft_queue_details("data", 10, 1, 1);
+    let second = stage_metrics_line_with_raft_queue_details("data", 20, 2, 2);
+    let window =
+        stage_metrics_window_from_log(&format!("{first}\n{second}\n"), "data", 15, 20).unwrap();
+
+    assert_eq!(window.delta.details.len(), 23);
+    assert_eq!(window.delta.details[20].detail, "data_raft_batch_admission");
+    assert_eq!(window.delta.details[20].success, 1);
+    assert_eq!(window.delta.details[21].detail, "data_raft_batch_queue");
+    assert_eq!(
+        window.delta.details[22].detail,
+        "data_raft_blocking_dispatch"
+    );
+}
+
+#[test]
+fn stage_metrics_window_accepts_schema_v5_adjacency_details() {
+    let first = stage_metrics_line_with_adjacency_details("data", 10, 1, 1);
+    let second = stage_metrics_line_with_adjacency_details("data", 20, 2, 2);
+    let window =
+        stage_metrics_window_from_log(&format!("{first}\n{second}\n"), "data", 15, 20).unwrap();
+
+    assert_eq!(window.delta.details.len(), 26);
+    assert_eq!(window.delta.details[23].detail, "data_adjacency_cache_hit");
+    assert_eq!(window.delta.details[24].detail, "data_adjacency_cache_miss");
+    assert_eq!(
+        window.delta.details[25].detail,
+        "data_adjacency_backend_expand"
+    );
+}
+
+#[test]
+fn stage_metrics_window_accepts_schema_v6_snapshot_csr_details() {
+    let first = stage_metrics_line_with_snapshot_csr_details("data", 10, 1, 1);
+    let second = stage_metrics_line_with_snapshot_csr_details("data", 20, 2, 2);
+    let window =
+        stage_metrics_window_from_log(&format!("{first}\n{second}\n"), "data", 15, 20).unwrap();
+
+    assert_eq!(window.delta.details.len(), 29);
+    assert_eq!(
+        window.delta.details[26].detail,
+        "data_snapshot_csr_cache_hit"
+    );
+    assert_eq!(
+        window.delta.details[27].detail,
+        "data_snapshot_csr_cache_miss"
+    );
+    assert_eq!(window.delta.details[28].detail, "data_snapshot_csr_build");
+}
+
+#[test]
 fn stage_metrics_window_rejects_invalid_or_unbracketed_snapshots() {
     let mut incomplete_snapshot = serde_json::from_str::<serde_json::Value>(
         stage_metrics_line("gateway", 10, 1, 1)
@@ -446,15 +751,15 @@ fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
     let artifact =
         backend_e2e_support::QuickDiagnosticArtifact::new("test-revision", observations).unwrap();
     assert_eq!(artifact.repetitions, 3);
-    assert_eq!(artifact.observations.len(), 18);
-    assert_eq!(artifact.summaries.len(), 6);
+    assert_eq!(artifact.observations.len(), 30);
+    assert_eq!(artifact.summaries.len(), 10);
     let serialized = serde_json::to_value(&artifact).unwrap();
     assert_eq!(serialized["format_version"], 1);
     assert_eq!(serialized["backend"], "fjall");
     assert_eq!(serialized["revision"], "test-revision");
     assert_eq!(serialized["repetitions"], 3);
-    assert_eq!(serialized["observations"].as_array().unwrap().len(), 18);
-    assert_eq!(serialized["summaries"].as_array().unwrap().len(), 6);
+    assert_eq!(serialized["observations"].as_array().unwrap().len(), 30);
+    assert_eq!(serialized["summaries"].as_array().unwrap().len(), 10);
     let summary = serialized["summaries"]
         .as_array()
         .unwrap()
@@ -505,6 +810,29 @@ fn quick_artifact_rejects_incomplete_matrix_and_changed_read_identity() {
     let error =
         backend_e2e_support::QuickDiagnosticArtifact::new("revision", missing_metrics).unwrap_err();
     assert!(error.to_string().contains("lacks bracketing stage metrics"));
+
+    let mut missing_csr = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    let observation = missing_csr
+        .iter_mut()
+        .find(|observation| {
+            observation.workload == backend_e2e_support::Workload::TwoHopExpand
+                && observation.concurrency == 1
+                && observation.repetition == 0
+        })
+        .unwrap();
+    observation
+        .data_stage_metrics
+        .as_mut()
+        .unwrap()
+        .delta
+        .details
+        .iter_mut()
+        .find(|detail| detail.detail == "data_snapshot_csr_cache_hit")
+        .unwrap()
+        .success = 0;
+    let error =
+        backend_e2e_support::QuickDiagnosticArtifact::new("revision", missing_csr).unwrap_err();
+    assert!(error.to_string().contains("lacks snapshot CSR cache hits"));
 }
 
 fn complete_quick_observations(
@@ -516,9 +844,25 @@ fn complete_quick_observations(
         for workload in [
             backend_e2e_support::Workload::CreateVertex,
             backend_e2e_support::Workload::PointLookup,
+            backend_e2e_support::Workload::OneHopExpand,
+            backend_e2e_support::Workload::TwoHopExpand,
             backend_e2e_support::Workload::CountVertices,
         ] {
             for concurrency in [1, 8] {
+                let mut data_stage_metrics = synthetic_stage_metrics_window_v6("data");
+                if matches!(
+                    workload,
+                    backend_e2e_support::Workload::OneHopExpand
+                        | backend_e2e_support::Workload::TwoHopExpand
+                ) {
+                    data_stage_metrics
+                        .delta
+                        .details
+                        .iter_mut()
+                        .find(|detail| detail.detail == "data_adjacency_backend_expand")
+                        .unwrap()
+                        .success = 0;
+                }
                 observations.push(backend_e2e_support::RawObservation {
                     backend,
                     workload,
@@ -541,7 +885,7 @@ fn complete_quick_observations(
                     },
                     query_digest: format!("{workload:?}"),
                     gateway_stage_metrics: Some(synthetic_stage_metrics_window("gateway")),
-                    data_stage_metrics: Some(synthetic_stage_metrics_window("data")),
+                    data_stage_metrics: Some(data_stage_metrics),
                 });
             }
         }
@@ -558,6 +902,15 @@ fn synthetic_stage_metrics_window(role: &str) -> backend_e2e_support::StageMetri
         "{}\n{}\n",
         stage_metrics_line(role, 10, 1, 1),
         stage_metrics_line(role, 20, 2, 2),
+    );
+    stage_metrics_window_from_log(&log, role, 15, 20).unwrap()
+}
+
+fn synthetic_stage_metrics_window_v6(role: &str) -> backend_e2e_support::StageMetricsWindow {
+    let log = format!(
+        "{}\n{}\n",
+        stage_metrics_line_with_snapshot_csr_details(role, 10, 1, 1),
+        stage_metrics_line_with_snapshot_csr_details(role, 20, 2, 2),
     );
     stage_metrics_window_from_log(&log, role, 15, 20).unwrap()
 }
@@ -656,6 +1009,136 @@ fn stage_metrics_line_with_details(
             })
             .collect(),
     );
+    format!("DTG_REQUEST_STAGE_METRICS={value}")
+}
+
+fn stage_metrics_line_with_prepare_write_details(
+    role: &str,
+    timestamp: u64,
+    sequence: u64,
+    success: u64,
+) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line_with_details(role, timestamp, sequence, success)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    value["schema_version"] = serde_json::Value::from(3);
+    value["details"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "detail": "gateway_meta_prepare_write",
+            "buckets": vec![success; 64],
+            "success": success,
+            "error": success,
+            "cancelled": success,
+            "total_nanoseconds": success,
+            "max_nanoseconds": success,
+        }));
+    format!("DTG_REQUEST_STAGE_METRICS={value}")
+}
+
+fn stage_metrics_line_with_raft_queue_details(
+    role: &str,
+    timestamp: u64,
+    sequence: u64,
+    success: u64,
+) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line_with_prepare_write_details(role, timestamp, sequence, success)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    value["schema_version"] = serde_json::Value::from(4);
+    for detail in [
+        "data_raft_batch_admission",
+        "data_raft_batch_queue",
+        "data_raft_blocking_dispatch",
+    ] {
+        value["details"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "detail": detail,
+                "buckets": vec![success; 64],
+                "success": success,
+                "error": success,
+                "cancelled": success,
+                "total_nanoseconds": success,
+                "max_nanoseconds": success,
+            }));
+    }
+    format!("DTG_REQUEST_STAGE_METRICS={value}")
+}
+
+fn stage_metrics_line_with_adjacency_details(
+    role: &str,
+    timestamp: u64,
+    sequence: u64,
+    success: u64,
+) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line_with_raft_queue_details(role, timestamp, sequence, success)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    value["schema_version"] = serde_json::Value::from(5);
+    for detail in [
+        "data_adjacency_cache_hit",
+        "data_adjacency_cache_miss",
+        "data_adjacency_backend_expand",
+    ] {
+        value["details"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "detail": detail,
+                "buckets": vec![success; 64],
+                "success": success,
+                "error": success,
+                "cancelled": success,
+                "total_nanoseconds": success,
+                "max_nanoseconds": success,
+            }));
+    }
+    format!("DTG_REQUEST_STAGE_METRICS={value}")
+}
+
+fn stage_metrics_line_with_snapshot_csr_details(
+    role: &str,
+    timestamp: u64,
+    sequence: u64,
+    success: u64,
+) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line_with_adjacency_details(role, timestamp, sequence, success)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    value["schema_version"] = serde_json::Value::from(6);
+    for detail in [
+        "data_snapshot_csr_cache_hit",
+        "data_snapshot_csr_cache_miss",
+        "data_snapshot_csr_build",
+    ] {
+        value["details"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "detail": detail,
+                "buckets": vec![success; 64],
+                "success": success,
+                "error": success,
+                "cancelled": success,
+                "total_nanoseconds": success,
+                "max_nanoseconds": success,
+            }));
+    }
     format!("DTG_REQUEST_STAGE_METRICS={value}")
 }
 

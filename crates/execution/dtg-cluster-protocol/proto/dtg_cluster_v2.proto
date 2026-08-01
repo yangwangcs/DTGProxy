@@ -55,6 +55,7 @@ enum TransactionOperation {
   TRANSACTION_OPERATION_ABORT = 3;
   TRANSACTION_OPERATION_RECOVER = 4;
   TRANSACTION_OPERATION_RESOLVE_COMMITTED = 5;
+  TRANSACTION_OPERATION_PREPARE_WRITE = 6;
 }
 
 message TransactionRequest {
@@ -151,8 +152,14 @@ message GatewayResponse {
   ColumnBatch batch = 2;
 }
 
+message GatewaySessionResponse {
+  RequestContext request = 1;
+  repeated GatewayResponse responses = 2;
+}
+
 service GatewayService {
   rpc Execute(GatewayRequest) returns (stream GatewayResponse);
+  rpc ExecuteSession(stream GatewayRequest) returns (stream GatewaySessionResponse);
 }
 
 service DataService {

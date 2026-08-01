@@ -282,6 +282,14 @@ fn workload_request(workload: Workload) -> (&'static str, BTreeMap<String, BoltV
             "MATCH (n) WHERE n.id = $id RETURN n.id",
             BTreeMap::from([("id".into(), BoltValue::Integer(2048))]),
         ),
+        Workload::OneHopExpand => (
+            "MATCH (a)-[r]->(b) WHERE a.id = $id RETURN r",
+            BTreeMap::from([("id".into(), BoltValue::Integer(2048))]),
+        ),
+        Workload::TwoHopExpand => (
+            "MATCH (a)-[first]->(middle)-[second]->(destination) WHERE a.id = $id RETURN second",
+            BTreeMap::from([("id".into(), BoltValue::Integer(2048))]),
+        ),
         Workload::CountVertices => ("MATCH (n) RETURN COUNT(*)", BTreeMap::new()),
     }
 }

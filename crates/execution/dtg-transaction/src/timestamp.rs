@@ -19,7 +19,8 @@ pub type TimestampLogFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TxnEr
 
 pub trait TimestampCommandLog: Send + Sync {
     fn replay(&self) -> TimestampLogFuture<'_, Vec<Vec<u8>>>;
-    fn append(&self, command: Vec<u8>) -> TimestampLogFuture<'_, ()>;
+    /// Atomically appends the complete ordered command batch, or none of it.
+    fn append_batch(&self, commands: Vec<Vec<u8>>) -> TimestampLogFuture<'_, ()>;
 }
 
 pub struct DurableTimestampAuthority {
@@ -39,52 +40,65 @@ impl DurableTimestampAuthority {
         })
     }
 
-    async fn append_and_apply(
+    /// Applies operations in arrival order and persists all newly-created commands as one atomic
+    /// log append. Invalid operations fail independently; an append failure leaves the in-memory
+    /// state untouched and fails every operation that depended on the append.
+    pub async fn apply_batch(
         &self,
-        state: &mut TimestampState,
-        command: TimestampCommand,
-    ) -> Result<(), TxnError> {
-        self.log.append(encode_command(command)).await?;
-        state.apply(command)
+        operations: Vec<TimestampOperation>,
+    ) -> Vec<Result<TransactionTime, TxnError>> {
+        let mut state = self.state.lock().await;
+        let mut staged = state.clone();
+        let mut commands = Vec::new();
+        let mut results = Vec::with_capacity(operations.len());
+        let mut persisted = Vec::with_capacity(operations.len());
+
+        for operation in operations {
+            let mut candidate = staged.clone();
+            match stage_operation(&mut candidate, operation) {
+                Ok((timestamp, command)) => {
+                    staged = candidate;
+                    if let Some(command) = command {
+                        commands.push(encode_command(command));
+                        persisted.push(results.len());
+                    }
+                    results.push(Ok(timestamp));
+                }
+                Err(error) => results.push(Err(error)),
+            }
+        }
+
+        if !commands.is_empty() {
+            if let Err(error) = self.log.append_batch(commands).await {
+                for index in persisted {
+                    results[index] = Err(error.clone());
+                }
+                return results;
+            }
+            *state = staged;
+        }
+        results
     }
 }
 
 impl TimestampAuthority for DurableTimestampAuthority {
     fn allocate_start_time(&self, transaction_id: TransactionId) -> TxnFuture<'_, TransactionTime> {
         Box::pin(async move {
-            let mut state = self.state.lock().await;
-            if let Some(timestamp) = state.start_times.get(&transaction_id) {
-                return Ok(*timestamp);
-            }
-            let timestamp = state.next_start_time()?;
-            self.append_and_apply(
-                &mut state,
-                TimestampCommand::AllocateStart {
-                    transaction_id,
-                    timestamp,
-                },
-            )
-            .await?;
-            Ok(timestamp)
+            self.apply_batch(vec![TimestampOperation::AllocateStart { transaction_id }])
+                .await
+                .into_iter()
+                .next()
+                .expect("one timestamp operation produces one result")
         })
     }
 
     fn reserve_commit_time(&self, transaction_id: TransactionId) -> TxnFuture<'_, TransactionTime> {
         Box::pin(async move {
-            let mut state = self.state.lock().await;
-            if let Some(reservation) = state.reservations.get(&transaction_id) {
-                return Ok(reservation.commit_time());
-            }
-            let timestamp = state.next_timestamp()?;
-            self.append_and_apply(
-                &mut state,
-                TimestampCommand::ReserveCommit {
-                    transaction_id,
-                    timestamp,
-                },
-            )
-            .await?;
-            Ok(timestamp)
+            self.apply_batch(vec![TimestampOperation::ReserveCommit { transaction_id }])
+                .await
+                .into_iter()
+                .next()
+                .expect("one timestamp operation produces one result")
         })
     }
 
@@ -110,7 +124,69 @@ impl TimestampAuthority for DurableTimestampAuthority {
         resolution: CommitResolution,
     ) -> TxnFuture<'_, ()> {
         Box::pin(async move {
-            let mut state = self.state.lock().await;
+            self.apply_batch(vec![TimestampOperation::ResolveCommit {
+                transaction_id,
+                commit_time,
+                resolution,
+            }])
+            .await
+            .into_iter()
+            .next()
+            .expect("one timestamp operation produces one result")
+            .map(|_| ())
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimestampOperation {
+    AllocateStart {
+        transaction_id: TransactionId,
+    },
+    ReserveCommit {
+        transaction_id: TransactionId,
+    },
+    ResolveCommit {
+        transaction_id: TransactionId,
+        commit_time: TransactionTime,
+        resolution: CommitResolution,
+    },
+}
+
+fn stage_operation(
+    state: &mut TimestampState,
+    operation: TimestampOperation,
+) -> Result<(TransactionTime, Option<TimestampCommand>), TxnError> {
+    match operation {
+        TimestampOperation::AllocateStart { transaction_id } => {
+            if let Some(timestamp) = state.start_times.get(&transaction_id) {
+                return Ok((*timestamp, None));
+            }
+            let timestamp = state.next_start_time()?;
+            let command = TimestampCommand::AllocateStart {
+                transaction_id,
+                timestamp,
+            };
+            state.apply(command)?;
+            Ok((timestamp, Some(command)))
+        }
+        TimestampOperation::ReserveCommit { transaction_id } => {
+            if let Some(reservation) = state.reservations.get(&transaction_id) {
+                return Ok((reservation.commit_time(), None));
+            }
+            let timestamp = state.next_timestamp()?;
+            let command = TimestampCommand::ReserveCommit {
+                transaction_id,
+                timestamp,
+            };
+            state.apply(command)?;
+            Ok((timestamp, Some(command)))
+        }
+        TimestampOperation::ResolveCommit {
+            transaction_id,
+            commit_time,
+            resolution,
+        } => {
             let reservation = state
                 .reservations
                 .get(&transaction_id)
@@ -120,20 +196,18 @@ impl TimestampAuthority for DurableTimestampAuthority {
                 return Err(TxnError::CorruptRecovery);
             }
             match reservation.resolution() {
-                Some(existing) if existing == resolution => return Ok(()),
+                Some(existing) if existing == resolution => return Ok((commit_time, None)),
                 Some(_) => return Err(TxnError::CorruptRecovery),
                 None => {}
             }
-            self.append_and_apply(
-                &mut state,
-                TimestampCommand::ResolveCommit {
-                    transaction_id,
-                    timestamp: commit_time,
-                    resolution,
-                },
-            )
-            .await
-        })
+            let command = TimestampCommand::ResolveCommit {
+                transaction_id,
+                timestamp: commit_time,
+                resolution,
+            };
+            state.apply(command)?;
+            Ok((commit_time, Some(command)))
+        }
     }
 }
 
@@ -172,7 +246,7 @@ impl TimestampCommand {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TimestampState {
     last_issued: i64,
     published_frontier: i64,

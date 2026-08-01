@@ -90,9 +90,18 @@ fn lower_operators(
     use dtg_language_ir::LogicalNodeKind;
 
     let fragment_ids: Vec<FragmentId> = fragments.iter().map(PlanFragment::id).collect();
+    let expanded_inputs = logical_plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            LogicalNodeKind::Expand(expand) => Some(expand.input),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     logical_plan
         .nodes
         .iter()
+        .filter(|node| !expanded_inputs.contains(&node.id))
         .map(|node| {
             let kind = match &node.kind {
                 LogicalNodeKind::NodeScan(scan) => PhysicalOperatorKind::Source {
@@ -148,7 +157,12 @@ fn lower_operators(
                     expression: PhysicalExpr::Evaluate(unwind.expression.clone()),
                     alias: unwind.alias.clone(),
                 },
-                LogicalNodeKind::Expand(_) | LogicalNodeKind::Subquery(_) => {
+                LogicalNodeKind::Expand(expand) => PhysicalOperatorKind::Source {
+                    logical_node: node.id,
+                    fragments: fragment_ids.clone(),
+                    output: expand.relationship.clone(),
+                },
+                LogicalNodeKind::Subquery(_) => {
                     return Err(PlanError::UnsupportedNode {
                         node: node.id,
                         reason: "logical operator has no bounded physical implementation".into(),
@@ -210,7 +224,8 @@ fn storage_access(
         )?),
         LogicalReadOperation::EdgePoint(_)
         | LogicalReadOperation::EdgeScan
-        | LogicalReadOperation::Adjacency { .. } => {
+        | LogicalReadOperation::Adjacency { .. }
+        | LogicalReadOperation::Traversal { .. } => {
             return Ok(StorageAccess::Logical(logical.clone()));
         }
     };

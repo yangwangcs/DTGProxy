@@ -6,7 +6,7 @@ use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
 const REQUEST_STAGES: usize = 10;
-const REQUEST_DETAILS: usize = 19;
+const REQUEST_DETAILS: usize = 29;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -79,6 +79,16 @@ pub enum RequestDetail {
     DataTemporalScanIdCollection,
     DataTemporalScanVisibility,
     DataRaftLockWait,
+    GatewayMetaPrepareWrite,
+    DataRaftBatchAdmission,
+    DataRaftBatchQueue,
+    DataRaftBlockingDispatch,
+    DataAdjacencyCacheHit,
+    DataAdjacencyCacheMiss,
+    DataAdjacencyBackendExpand,
+    DataSnapshotCsrCacheHit,
+    DataSnapshotCsrCacheMiss,
+    DataSnapshotCsrBuild,
 }
 
 impl RequestDetail {
@@ -102,6 +112,16 @@ impl RequestDetail {
         Self::DataTemporalScanIdCollection,
         Self::DataTemporalScanVisibility,
         Self::DataRaftLockWait,
+        Self::GatewayMetaPrepareWrite,
+        Self::DataRaftBatchAdmission,
+        Self::DataRaftBatchQueue,
+        Self::DataRaftBlockingDispatch,
+        Self::DataAdjacencyCacheHit,
+        Self::DataAdjacencyCacheMiss,
+        Self::DataAdjacencyBackendExpand,
+        Self::DataSnapshotCsrCacheHit,
+        Self::DataSnapshotCsrCacheMiss,
+        Self::DataSnapshotCsrBuild,
     ];
 
     const fn index(self) -> usize {
@@ -129,6 +149,16 @@ impl RequestDetail {
             Self::DataTemporalScanIdCollection => "data_temporal_scan_id_collection",
             Self::DataTemporalScanVisibility => "data_temporal_scan_visibility",
             Self::DataRaftLockWait => "data_raft_lock_wait",
+            Self::GatewayMetaPrepareWrite => "gateway_meta_prepare_write",
+            Self::DataRaftBatchAdmission => "data_raft_batch_admission",
+            Self::DataRaftBatchQueue => "data_raft_batch_queue",
+            Self::DataRaftBlockingDispatch => "data_raft_blocking_dispatch",
+            Self::DataAdjacencyCacheHit => "data_adjacency_cache_hit",
+            Self::DataAdjacencyCacheMiss => "data_adjacency_cache_miss",
+            Self::DataAdjacencyBackendExpand => "data_adjacency_backend_expand",
+            Self::DataSnapshotCsrCacheHit => "data_snapshot_csr_cache_hit",
+            Self::DataSnapshotCsrCacheMiss => "data_snapshot_csr_cache_miss",
+            Self::DataSnapshotCsrBuild => "data_snapshot_csr_build",
         }
     }
 }
@@ -402,7 +432,7 @@ pub fn encode_request_metrics_snapshot(
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 6,
         "process_role": process_role,
         "unix_timestamp_ns": unix_timestamp_ns,
         "sequence": sequence,
@@ -507,7 +537,7 @@ mod tests {
             encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 6);
         assert_eq!(value["process_role"], "gateway");
         assert_eq!(value["unix_timestamp_ns"], 7);
         assert_eq!(value["sequence"], 11);
@@ -515,9 +545,31 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "gateway_compile");
         assert_eq!(value["stages"][1]["success"], 1);
         assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
-        assert_eq!(value["details"].as_array().unwrap().len(), 19);
+        assert_eq!(value["details"].as_array().unwrap().len(), 29);
         assert_eq!(value["details"][12]["detail"], "data_read_view_cache_hit");
         assert_eq!(value["details"][12]["success"], 1);
+        assert_eq!(value["details"][19]["detail"], "gateway_meta_prepare_write");
+        assert_eq!(value["details"][20]["detail"], "data_raft_batch_admission");
+        assert_eq!(value["details"][21]["detail"], "data_raft_batch_queue");
+        assert_eq!(
+            value["details"][22]["detail"],
+            "data_raft_blocking_dispatch"
+        );
+        assert_eq!(value["details"][23]["detail"], "data_adjacency_cache_hit");
+        assert_eq!(value["details"][24]["detail"], "data_adjacency_cache_miss");
+        assert_eq!(
+            value["details"][25]["detail"],
+            "data_adjacency_backend_expand"
+        );
+        assert_eq!(
+            value["details"][26]["detail"],
+            "data_snapshot_csr_cache_hit"
+        );
+        assert_eq!(
+            value["details"][27]["detail"],
+            "data_snapshot_csr_cache_miss"
+        );
+        assert_eq!(value["details"][28]["detail"], "data_snapshot_csr_build");
         assert!(!encoded.contains("statement"));
         assert!(!encoded.contains("parameter"));
     }

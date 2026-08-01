@@ -21,6 +21,7 @@ dtg-language-ir = { path = "../../language/dtg-language-ir" }
 dtg-plan = { path = "../dtg-plan" }
 dtg-query = { path = "../dtg-query" }
 dtg-shard = { path = "../dtg-shard" }
+dtg-snapshot-csr = { path = "../dtg-snapshot-csr" }
 dtg-storage = { path = "../../storage/dtg-storage" }
 dtg-transaction = { path = "../dtg-transaction" }
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
@@ -29,7 +30,8 @@ tonic = { version = "=0.14.6", features = ["transport"] }
 slog = "=2.8.2"
 sha2 = "=0.11.0"
 serde_json = "=1.0.145"
-tokio = { version = "=1.53.0", features = ["sync"] }
+tokio = { version = "=1.53.0", features = ["rt", "sync"] }
+tokio-stream = "=0.1.18"
 
 [dev-dependencies]
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
