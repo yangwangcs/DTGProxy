@@ -383,20 +383,7 @@ async fn process_composes_official_providers_and_v2_lifecycle_metrics() {
             "postgres-primary",
             CredentialProfile::PostgreSql("user=dtg password=secret".into()),
         )
-        .with_endpoint_profile(
-            "neo4j-primary",
-            EndpointProfile::Neo4j {
-                endpoint: "http://127.0.0.1:7474".into(),
-                database: "neo4j".into(),
-            },
-        )
-        .with_credential_profile(
-            "neo4j-primary",
-            CredentialProfile::Neo4jBasic {
-                username: "neo4j".into(),
-                password: "secret".into(),
-            },
-        );
+        .with_kuzu_root(root.path().join("kuzu"));
     let node = DataNodeBuilder::from_config(config).start().await.unwrap();
 
     assert_eq!(
@@ -404,7 +391,7 @@ async fn process_composes_official_providers_and_v2_lifecycle_metrics() {
         vec![
             ProviderKind::Fjall,
             ProviderKind::PostgreSql,
-            ProviderKind::Neo4j,
+            ProviderKind::Kuzu,
         ]
     );
     assert_eq!(node.rpc_service().protocol_major(), PROTOCOL_MAJOR);

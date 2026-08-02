@@ -1,11 +1,10 @@
-use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dtg_execution::{
     GatewayClusterRequest, GatewayExecution, GatewayExecutionError, GatewayExecutionTransport,
-    GatewayFuture, GatewayOperation, GatewayResponse, GatewayRetry,
+    GatewayFuture, GatewayOperation, GatewayResponse,
 };
 use dtg_gateway::{GatewayConfig, GatewayService};
 use support::planning_context;
@@ -13,7 +12,6 @@ use support::planning_context;
 #[derive(Default)]
 struct TransactionTransport {
     next_transaction: Mutex<u128>,
-    writes: Mutex<BTreeMap<u128, usize>>,
     requests: Mutex<Vec<GatewayClusterRequest>>,
 }
 
@@ -30,22 +28,7 @@ impl GatewayExecutionTransport for TransactionTransport {
                     transaction_id: *next,
                 })
             }
-            GatewayOperation::Write => match request.transaction_id() {
-                Some(transaction_id) => {
-                    *self
-                        .writes
-                        .lock()
-                        .unwrap()
-                        .entry(transaction_id)
-                        .or_default() += 1;
-                    Ok(GatewayResponse::Acknowledged)
-                }
-                None => Err(GatewayExecutionError::new(
-                    "DTG-TXN-MISSING-CONTEXT",
-                    "write requires an explicit transaction",
-                    GatewayRetry::Never,
-                )),
-            },
+            GatewayOperation::Write => panic!("Gateway must reject explicit transaction writes"),
             GatewayOperation::CommitTransaction | GatewayOperation::RollbackTransaction => {
                 Ok(GatewayResponse::Acknowledged)
             }
@@ -68,43 +51,30 @@ fn gateway(transport: Arc<TransactionTransport>) -> GatewayService {
 }
 
 #[tokio::test]
-async fn single_and_multi_shard_transactions_share_execution_coordinator_boundaries() {
+async fn explicit_transactions_route_boundaries_but_reject_process_writes() {
     let transport = Arc::new(TransactionTransport::default());
     let gateway = gateway(transport.clone());
 
     let single = gateway.bolt().begin().await.unwrap();
-    single
+    let write = single
         .query("CREATE (n {id: 1}) VALID FROM 40")
         .execute()
         .await
-        .unwrap();
-    single.commit().await.unwrap();
+        .unwrap_err();
+    assert_eq!(write.code(), "DTG-EXECUTION-WRITE-TRANSACTION");
+    single.rollback().await.unwrap();
 
     let multi = gateway.bolt().begin().await.unwrap();
-    multi
-        .query("CREATE (n {id: 2}) VALID FROM 40")
-        .execute()
-        .await
-        .unwrap();
-    multi
-        .query("CREATE (n {id: 3}) VALID FROM 40")
-        .execute()
-        .await
-        .unwrap();
     multi.commit().await.unwrap();
 
-    let writes = transport.writes.lock().unwrap();
-    assert_eq!(writes.values().copied().collect::<Vec<_>>(), vec![1, 2]);
     let requests = transport.requests.lock().unwrap();
     assert!(matches!(
         requests.as_slice(),
-        [begin_one, write_one, commit_one, begin_two, write_two_a, write_two_b, commit_two]
+        [begin_one, rollback_one, begin_two, commit_two]
             if begin_one.operation() == &GatewayOperation::BeginTransaction
-                && write_one.transaction_id() == Some(1)
-                && commit_one.transaction_id() == Some(1)
+                && rollback_one.operation() == &GatewayOperation::RollbackTransaction
+                && rollback_one.transaction_id() == Some(1)
                 && begin_two.operation() == &GatewayOperation::BeginTransaction
-                && write_two_a.transaction_id() == Some(2)
-                && write_two_b.transaction_id() == Some(2)
                 && commit_two.transaction_id() == Some(2)
     ));
 }

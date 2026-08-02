@@ -22,7 +22,7 @@ dtg-kernel
   Shard/Raft, consistent reads, logical replica snapshots, Snapshot CSR algorithms, durable
   asynchronous analytics, the control plane, and generational online migration.
 - Storage exposes one logical replica contract with capability-controlled pushdown. Fjall,
-  PostgreSQL, and Neo4j are native in-process providers. Third-party providers use the versioned
+  PostgreSQL, and Kuzu are native in-process providers. Third-party providers use the versioned
   Remote protocol.
 - Gateway, Data, Meta, and Controller are thin process composition roots, not service copies of the
   three logical layers.
@@ -59,6 +59,11 @@ It writes a versioned JSON evidence manifest under `target/clean-break-certifica
 The deployment descriptors in `config/examples/clean-break-cluster/` define one Meta process, one
 Controller process, one Gateway process, and two Data processes. See [deployment](docs/deployment.md)
 for process configuration and [storage](docs/storage.md) for provider setup.
+
+For a disposable local cluster, `scripts/local-cluster.sh start --managed-postgres` starts a
+loopback-only PostgreSQL instance and the four DTG process roles. Fjall and Kuzu are embedded in
+the three Data processes; PostgreSQL is the only managed external service. Use
+`scripts/local-cluster.sh stop` to stop only processes recorded by that launcher.
 
 ## Documentation
 

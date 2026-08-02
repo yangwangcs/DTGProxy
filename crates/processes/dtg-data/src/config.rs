@@ -11,7 +11,6 @@ use dtg_execution::{ProviderKind, ReplicaBinding};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EndpointProfile {
     PostgreSql(String),
-    Neo4j { endpoint: String, database: String },
     Remote(String),
 }
 
@@ -19,7 +18,6 @@ pub enum EndpointProfile {
 pub enum CredentialProfile {
     None,
     PostgreSql(String),
-    Neo4jBasic { username: String, password: String },
     RemoteSignedToken([u8; 32]),
 }
 
@@ -28,11 +26,6 @@ impl fmt::Debug for CredentialProfile {
         match self {
             Self::None => formatter.write_str("None"),
             Self::PostgreSql(_) => formatter.write_str("PostgreSql([redacted])"),
-            Self::Neo4jBasic { username, .. } => formatter
-                .debug_struct("Neo4jBasic")
-                .field("username", username)
-                .field("password", &"[redacted]")
-                .finish(),
             Self::RemoteSignedToken(_) => formatter.write_str("RemoteSignedToken([redacted])"),
         }
     }
@@ -67,6 +60,7 @@ impl std::error::Error for DataConfigError {}
 pub struct DataProcessConfig {
     rpc_addr: SocketAddr,
     fjall_root: PathBuf,
+    kuzu_root: PathBuf,
     consensus_root: PathBuf,
     endpoint_profiles: BTreeMap<String, EndpointProfile>,
     credential_profiles: BTreeMap<String, CredentialProfile>,
@@ -79,6 +73,7 @@ impl DataProcessConfig {
         Self {
             rpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
             fjall_root: fjall_root.as_ref().to_path_buf(),
+            kuzu_root: PathBuf::from("./dtg-data/kuzu"),
             consensus_root: consensus_root.as_ref().to_path_buf(),
             endpoint_profiles: BTreeMap::new(),
             credential_profiles: BTreeMap::new(),
@@ -98,6 +93,9 @@ impl DataProcessConfig {
         let fjall_root = get("DTG_DATA_FJALL_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./dtg-data/business"));
+        let kuzu_root = get("DTG_DATA_KUZU_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("./dtg-data/kuzu"));
         let consensus_root = get("DTG_DATA_CONSENSUS_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./dtg-data/raft"));
@@ -106,7 +104,9 @@ impl DataProcessConfig {
         let rpc_addr = rpc_addr_value
             .parse()
             .map_err(|_| DataConfigError::InvalidRpcAddress(rpc_addr_value))?;
-        let mut config = Self::new(fjall_root, consensus_root).with_rpc_addr(rpc_addr);
+        let mut config = Self::new(fjall_root, consensus_root)
+            .with_kuzu_root(kuzu_root)
+            .with_rpc_addr(rpc_addr);
         if let Some(assignments) = environment_string(&get, "DTG_DATA_ASSIGNMENTS")? {
             let capability_names =
                 environment_string(&get, "DTG_DATA_CAPABILITIES")?.ok_or_else(|| {
@@ -178,6 +178,16 @@ impl DataProcessConfig {
         &self.fjall_root
     }
 
+    pub fn kuzu_root(&self) -> &Path {
+        &self.kuzu_root
+    }
+
+    #[must_use]
+    pub fn with_kuzu_root(mut self, root: impl AsRef<Path>) -> Self {
+        self.kuzu_root = root.as_ref().to_path_buf();
+        self
+    }
+
     pub fn consensus_root(&self) -> &Path {
         &self.consensus_root
     }
@@ -228,10 +238,6 @@ fn configure_environment_bootstrap(
         .assignments
         .iter()
         .any(|binding| binding.provider_kind() == &ProviderKind::PostgreSql);
-    let has_neo4j = config
-        .assignments
-        .iter()
-        .any(|binding| binding.provider_kind() == &ProviderKind::Neo4j);
     if has_postgresql {
         let endpoint = required_environment_string(get, "DTG_DATA_POSTGRES_ENDPOINT")?;
         let credential = required_environment_string(get, "DTG_DATA_POSTGRES_CREDENTIAL")?;
@@ -243,31 +249,6 @@ fn configure_environment_bootstrap(
             .with_credential_profile(
                 "environment-bootstrap",
                 CredentialProfile::PostgreSql(credential),
-            );
-    }
-    if has_neo4j {
-        if config
-            .endpoint_profiles
-            .contains_key("environment-bootstrap")
-        {
-            return Err(DataConfigError::InvalidEnvironment(
-                "environment bootstrap cannot mix PostgreSQL and Neo4j assignments".into(),
-            ));
-        }
-        config = config
-            .with_endpoint_profile(
-                "environment-bootstrap",
-                EndpointProfile::Neo4j {
-                    endpoint: required_environment_string(get, "DTG_DATA_NEO4J_ENDPOINT")?,
-                    database: required_environment_string(get, "DTG_DATA_NEO4J_DATABASE")?,
-                },
-            )
-            .with_credential_profile(
-                "environment-bootstrap",
-                CredentialProfile::Neo4jBasic {
-                    username: required_environment_string(get, "DTG_DATA_NEO4J_USERNAME")?,
-                    password: required_environment_string(get, "DTG_DATA_NEO4J_PASSWORD")?,
-                },
             );
     }
     Ok(config)
@@ -292,7 +273,7 @@ fn parse_assignment(
     let provider_kind = match fields[6] {
         "fjall" => ProviderKind::Fjall,
         "postgresql" => ProviderKind::PostgreSql,
-        "neo4j" => ProviderKind::Neo4j,
+        "kuzu" => ProviderKind::Kuzu,
         provider if provider.starts_with("remote/") => {
             ProviderKind::Remote(provider["remote/".len()..].to_owned())
         }
@@ -369,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_bootstrap_loads_neo4j_profile_and_redacts_password() {
+    fn environment_bootstrap_loads_local_kuzu_root_without_credentials() {
         let values = BTreeMap::from([
             (
                 "DTG_DATA_CAPABILITIES",
@@ -377,20 +358,14 @@ mod tests {
             ),
             (
                 "DTG_DATA_ASSIGNMENTS",
-                OsString::from("7:11:13:17:19:23:neo4j:1:1:neo4j-bench"),
+                OsString::from("7:11:13:17:19:23:kuzu:1:1:kuzu-bench"),
             ),
-            (
-                "DTG_DATA_NEO4J_ENDPOINT",
-                OsString::from("http://127.0.0.1:57474"),
-            ),
-            ("DTG_DATA_NEO4J_DATABASE", OsString::from("neo4j")),
-            ("DTG_DATA_NEO4J_USERNAME", OsString::from("neo4j")),
-            ("DTG_DATA_NEO4J_PASSWORD", OsString::from("secret")),
+            ("DTG_DATA_KUZU_ROOT", OsString::from("/tmp/dtgproxy-kuzu")),
         ]);
         let config = DataProcessConfig::from_environment(|name| values.get(name).cloned()).unwrap();
-        let debug = format!("{:?}", config.credential_profiles());
-        assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains("secret"));
+        assert_eq!(config.kuzu_root(), Path::new("/tmp/dtgproxy-kuzu"));
+        assert!(config.endpoint_profiles().is_empty());
+        assert!(config.credential_profiles().is_empty());
     }
 
     #[test]

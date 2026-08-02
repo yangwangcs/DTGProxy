@@ -104,9 +104,9 @@ fn different_generations_accept_different_backend_classes() {
 #[test]
 fn one_node_accepts_independent_heterogeneous_shards() {
     let fjall = class(ProviderKind::Fjall);
-    let neo4j = class(ProviderKind::Neo4j);
+    let kuzu = class(ProviderKind::Kuzu);
     let first = replica(1, 1, 1, 1, &fjall, BindingRole::Active);
-    let second = replica(2, 1, 1, 2, &neo4j, BindingRole::Active);
+    let second = replica(2, 1, 1, 2, &kuzu, BindingRole::Active);
     let node = ObservedNodeState::new(
         "node-a".to_owned(),
         Version::new(1),
@@ -122,9 +122,9 @@ fn one_node_accepts_independent_heterogeneous_shards() {
 #[test]
 fn one_node_rejects_mixed_classes_inside_one_shard_generation() {
     let fjall = class(ProviderKind::Fjall);
-    let neo4j = class(ProviderKind::Neo4j);
+    let kuzu = class(ProviderKind::Kuzu);
     let first = replica(1, 1, 1, 1, &fjall, BindingRole::Active);
-    let second = replica(1, 1, 1, 2, &neo4j, BindingRole::Active);
+    let second = replica(1, 1, 1, 2, &kuzu, BindingRole::Active);
     let node = ObservedNodeState::new(
         "node-a".to_owned(),
         Version::new(1),

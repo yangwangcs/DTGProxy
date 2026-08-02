@@ -16,7 +16,7 @@ path = "src/main.rs"
 dtg-execution = { path = "../../execution/dtg-execution" }
 futures-util = "=0.3.33"
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
-dtg-storage-neo4j = { path = "../../storage/dtg-storage-neo4j" }
+dtg-storage-kuzu = { path = "../../storage/dtg-storage-kuzu" }
 dtg-storage-postgres = { path = "../../storage/dtg-storage-postgres" }
 dtg-storage-remote = { path = "../../storage/dtg-storage-remote" }
 prost-011 = { package = "prost", version = "=0.11.9" }

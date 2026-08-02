@@ -911,6 +911,86 @@ impl GatewayProtocolV2Transport {
     }
 }
 
+pub struct ShardRoutedGatewayTransport {
+    default: Arc<dyn GatewayExecutionTransport>,
+    routes: BTreeMap<u64, Arc<dyn GatewayExecutionTransport>>,
+}
+
+impl ShardRoutedGatewayTransport {
+    pub fn new(
+        default: Arc<dyn GatewayExecutionTransport>,
+        routes: BTreeMap<u64, Arc<dyn GatewayExecutionTransport>>,
+    ) -> Self {
+        Self { default, routes }
+    }
+}
+
+impl GatewayExecutionTransport for ShardRoutedGatewayTransport {
+    fn execute(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
+        self.default.execute(request)
+    }
+
+    fn execute_query(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        let Some(plan) = request.physical_plan.as_ref() else {
+            return self.default.execute_query(request);
+        };
+        let mut grouped = BTreeMap::<u64, Vec<dtg_plan::PlanFragment>>::new();
+        for fragment in plan.fragments() {
+            grouped
+                .entry(fragment.fence().shard_id().get())
+                .or_default()
+                .push(fragment.clone());
+        }
+        let mut requests = Vec::with_capacity(grouped.len());
+        for (shard_id, fragments) in grouped {
+            let transport = self.routes.get(&shard_id).unwrap_or(&self.default).clone();
+            let mut routed = request.clone();
+            let mut routed_plan = plan.clone();
+            routed_plan.fragments = fragments;
+            routed.physical_plan = Some(routed_plan);
+            requests.push((transport, routed));
+        }
+        Box::pin(async move {
+            let mut batches = BTreeMap::new();
+            for (transport, request) in requests {
+                let GatewayQueryResponse::Materialized(response) =
+                    transport.execute_query(request).await?
+                else {
+                    return Err(GatewayExecutionError::new(
+                        "DTG-CLUSTER-ROUTING",
+                        "shard-routed query transport returned a non-materialized response",
+                        GatewayRetry::Safe,
+                    ));
+                };
+                for (fragment_id, fragment_batches) in response {
+                    if batches.insert(fragment_id, fragment_batches).is_some() {
+                        return Err(GatewayExecutionError::new(
+                            "DTG-CLUSTER-ROUTING",
+                            "two shard routes returned the same fragment",
+                            GatewayRetry::Never,
+                        ));
+                    }
+                }
+            }
+            Ok(GatewayQueryResponse::Materialized(batches))
+        })
+    }
+
+    fn execute_query_with_metrics(
+        &self,
+        request: GatewayClusterRequest,
+        _metrics: Arc<RequestStageMetrics>,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        self.execute_query(request)
+    }
+}
+
 pub struct TonicGatewayProtocolV2TransportFactory;
 
 impl GatewayExecutionTransportFactory for TonicGatewayProtocolV2TransportFactory {
@@ -1653,7 +1733,7 @@ impl GatewayExecution {
                                 GatewayRetry::Safe,
                             )
                         })?;
-                        let bound_program = bind_vertex_lookup_parameters(&program, &parameters)?;
+                        let bound_program = bind_process_query_parameters(&program, &parameters)?;
                         let physical_plan = planner
                             .plan(&bound_program, &planning_context)
                             .map_err(|error| {
@@ -3722,7 +3802,7 @@ pub fn bind_logical_expr(
     }
 }
 
-fn bind_vertex_lookup_parameters(
+fn bind_process_query_parameters(
     program: &LogicalProgram,
     parameters: &BTreeMap<String, GatewayValue>,
 ) -> Result<LogicalProgram, GatewayExecutionError> {
@@ -3730,12 +3810,80 @@ fn bind_vertex_lookup_parameters(
     let LogicalStatement::Query(plan) = &mut program.statement else {
         return Ok(program);
     };
+    bind_process_query_plan_parameters(plan, parameters)?;
+    Ok(program)
+}
+
+fn bind_process_query_plan_parameters(
+    plan: &mut LogicalPlan,
+    parameters: &BTreeMap<String, GatewayValue>,
+) -> Result<(), GatewayExecutionError> {
     for node in &mut plan.nodes {
-        if let LogicalNodeKind::VertexLookup(lookup) = &mut node.kind {
-            lookup.id = bind_logical_expr(&lookup.id, parameters)?;
+        match &mut node.kind {
+            LogicalNodeKind::NodeScan(scan) => {
+                bind_read_scope_parameters(&mut scan.read_scope, parameters)?;
+            }
+            LogicalNodeKind::RelationshipScan(scan) => {
+                bind_read_scope_parameters(&mut scan.read_scope, parameters)?;
+            }
+            LogicalNodeKind::VertexLookup(lookup) => {
+                lookup.id = bind_logical_expr(&lookup.id, parameters)?;
+                bind_read_scope_parameters(&mut lookup.read_scope, parameters)?;
+            }
+            LogicalNodeKind::RelationshipLookup(lookup) => {
+                lookup.id = bind_logical_expr(&lookup.id, parameters)?;
+                bind_read_scope_parameters(&mut lookup.read_scope, parameters)?;
+            }
+            LogicalNodeKind::Expand(expand) => {
+                bind_read_scope_parameters(&mut expand.read_scope, parameters)?;
+            }
+            LogicalNodeKind::Subquery(subquery) => {
+                bind_process_query_plan_parameters(&mut subquery.plan, parameters)?;
+            }
+            LogicalNodeKind::Filter { .. }
+            | LogicalNodeKind::Project { .. }
+            | LogicalNodeKind::Join(_)
+            | LogicalNodeKind::Aggregate(_)
+            | LogicalNodeKind::Sort(_)
+            | LogicalNodeKind::Limit(_)
+            | LogicalNodeKind::Unwind(_) => {}
         }
     }
-    Ok(program)
+    Ok(())
+}
+
+fn bind_read_scope_parameters(
+    scope: &mut dtg_language_ir::ReadScope,
+    parameters: &BTreeMap<String, GatewayValue>,
+) -> Result<(), GatewayExecutionError> {
+    let TemporalScope::AsOf(time) = &mut scope.transaction_time else {
+        return Ok(());
+    };
+    let TimeExpr::Parameter(name) = time else {
+        return Ok(());
+    };
+    let value = parameters.get(name).ok_or_else(|| {
+        GatewayExecutionError::new(
+            "DTG-EXECUTION-MISSING-PARAMETER",
+            format!("missing required parameter: {name}"),
+            GatewayRetry::Never,
+        )
+    })?;
+    let GatewayValue::Integer(value) = value else {
+        return Err(GatewayExecutionError::new(
+            "DTG-EXECUTION-TEMPORAL-PARAMETER",
+            format!("temporal parameter {name} must be an integer"),
+            GatewayRetry::Never,
+        ));
+    };
+    *time = TimeExpr::Literal(dtg_storage::TransactionTime::new(*value).map_err(|error| {
+        GatewayExecutionError::new(
+            "DTG-EXECUTION-TEMPORAL-PARAMETER",
+            error.to_string(),
+            GatewayRetry::Never,
+        )
+    })?);
+    Ok(())
 }
 
 async fn execute_process_create(

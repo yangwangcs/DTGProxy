@@ -477,7 +477,7 @@ fn encode_binding(out: &mut Vec<u8>, binding: &ReplicaBinding) -> Result<(), Con
     match binding.provider_kind() {
         ProviderKind::Fjall => out.push(1),
         ProviderKind::PostgreSql => out.push(2),
-        ProviderKind::Neo4j => out.push(3),
+        ProviderKind::Kuzu => out.push(3),
         ProviderKind::Remote(name) => {
             out.push(4);
             put_string(out, name)?;
@@ -508,7 +508,7 @@ fn decode_binding(input: &mut Input<'_>) -> Result<ReplicaBinding, ControlError>
     let provider = match input.byte()? {
         1 => ProviderKind::Fjall,
         2 => ProviderKind::PostgreSql,
-        3 => ProviderKind::Neo4j,
+        3 => ProviderKind::Kuzu,
         4 => ProviderKind::Remote(input.string()?),
         _ => return Err(ControlError::InvalidAction("invalid provider")),
     };

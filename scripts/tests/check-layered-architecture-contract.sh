@@ -7,7 +7,7 @@ cd "$repo_root"
 test -x scripts/check-layered-architecture.sh
 scripts/check-layered-architecture.sh
 
-for package in dtg-kernel dtg-language-ir dtg-language dtg-storage dtg-storage-fjall dtg-storage-postgres dtg-storage-neo4j dtg-storage-remote-protocol dtg-storage-remote dtg-plan dtg-query dtg-transaction dtg-shard dtg-analytics dtg-control dtg-cluster-protocol dtg-execution dtg-gateway dtg-data dtg-meta dtg-controller
+for package in dtg-kernel dtg-language-ir dtg-language dtg-storage dtg-storage-fjall dtg-storage-postgres dtg-storage-kuzu dtg-storage-remote-protocol dtg-storage-remote dtg-plan dtg-query dtg-transaction dtg-shard dtg-analytics dtg-control dtg-cluster-protocol dtg-snapshot-csr dtg-execution dtg-gateway dtg-data dtg-meta dtg-controller
 do
   cargo metadata --no-deps --format-version 1 |
     jq -e --arg package "$package" '.packages[] | select(.name == $package)' >/dev/null
@@ -41,9 +41,10 @@ reset_fixture() {
   members=''
   for name in \
     dtg-kernel dtg-language-ir dtg-language dtg-storage \
-    dtg-storage-fjall dtg-storage-postgres dtg-storage-neo4j \
+    dtg-storage-fjall dtg-storage-postgres dtg-storage-kuzu \
     dtg-storage-remote-protocol dtg-storage-remote dtg-plan dtg-query \
     dtg-transaction dtg-shard dtg-analytics dtg-control dtg-cluster-protocol \
+    dtg-snapshot-csr \
     dtg-execution dtg-gateway dtg-data dtg-meta dtg-controller storage-api tokio
   do
     if [ -n "$members" ]; then
@@ -67,7 +68,7 @@ dtg-language-ir = { path = "../dtg-language-ir" }'
 dtg-storage = { path = "../dtg-storage" }'
   write_crate dtg-storage-postgres 'dtg-kernel = { path = "../dtg-kernel" }
 dtg-storage = { path = "../dtg-storage" }'
-  write_crate dtg-storage-neo4j 'dtg-kernel = { path = "../dtg-kernel" }
+  write_crate dtg-storage-kuzu 'dtg-kernel = { path = "../dtg-kernel" }
 dtg-storage = { path = "../dtg-storage" }'
   write_crate dtg-storage-remote-protocol 'dtg-kernel = { path = "../dtg-kernel" }'
   write_crate dtg-storage-remote 'dtg-kernel = { path = "../dtg-kernel" }
@@ -92,6 +93,7 @@ dtg-storage = { path = "../dtg-storage" }'
 dtg-language-ir = { path = "../dtg-language-ir" }
 dtg-storage = { path = "../dtg-storage" }'
   write_crate dtg-cluster-protocol 'dtg-kernel = { path = "../dtg-kernel" }'
+  write_crate dtg-snapshot-csr 'dtg-storage = { path = "../dtg-storage" }'
   write_crate dtg-execution 'dtg-kernel = { path = "../dtg-kernel" }
 dtg-language = { path = "../dtg-language" }
 dtg-language-ir = { path = "../dtg-language-ir" }
@@ -102,12 +104,13 @@ dtg-transaction = { path = "../dtg-transaction" }
 dtg-shard = { path = "../dtg-shard" }
 dtg-analytics = { path = "../dtg-analytics" }
 dtg-control = { path = "../dtg-control" }
-dtg-cluster-protocol = { path = "../dtg-cluster-protocol" }'
+dtg-cluster-protocol = { path = "../dtg-cluster-protocol" }
+dtg-snapshot-csr = { path = "../dtg-snapshot-csr" }'
   write_crate dtg-gateway 'dtg-execution = { path = "../dtg-execution" }'
   write_crate dtg-data 'dtg-execution = { path = "../dtg-execution" }
 dtg-storage-fjall = { path = "../dtg-storage-fjall" }
 dtg-storage-postgres = { path = "../dtg-storage-postgres" }
-dtg-storage-neo4j = { path = "../dtg-storage-neo4j" }
+dtg-storage-kuzu = { path = "../dtg-storage-kuzu" }
 dtg-storage-remote = { path = "../dtg-storage-remote" }'
   write_crate dtg-meta 'dtg-execution = { path = "../dtg-execution" }'
   write_crate dtg-controller 'dtg-execution = { path = "../dtg-execution" }'

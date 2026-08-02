@@ -35,7 +35,7 @@ validate_contract() {
   done
   jq -e '.security.mode == "loopback_plaintext" and (.listen_addr | startswith("127.0.0.1:"))' \
     "$fixture_root/meta-1.json" "$fixture_root/controller-1.json" >/dev/null
-  jq -e '.provider_classes == ["fjall", "postgresql", "neo4j", "remote"]' \
+  jq -e '.provider_classes == ["fjall", "postgresql", "kuzu", "remote"]' \
     "$fixture_root/data-1.json" "$fixture_root/data-2.json" "$fixture_root/data-3.json" >/dev/null
   jq -e '.cluster_endpoint | startswith("http://127.0.0.1:")' \
     "$fixture_root/gateway-1.json" >/dev/null
@@ -128,7 +128,7 @@ run_behavioral_certification() {
     'six directed provider migration control-state paths' \
     "$runtime_evidence"
   record_success heterogeneous_data_node \
-    'one Data node hosting independent Fjall, PostgreSQL, and Neo4j bindings' \
+    'one Data node hosting independent Fjall, PostgreSQL, and Kuzu bindings' \
     "$runtime_evidence"
 
   if [[ $mode == live ]]; then
@@ -138,7 +138,7 @@ run_behavioral_certification() {
       "jq -e '.six_provider_migrations.count == 6 and all(.six_provider_migrations.directions[]; .source_content_digest == .target_canonical_digest)' '$provider_migration_evidence'"
   else
     jq -n \
-      '{schema_version:1,status:"not_run",reason:"local mode excludes external PostgreSQL and Neo4j services"}' \
+      '{schema_version:1,status:"not_run",reason:"local mode excludes the external PostgreSQL service"}' \
       >"$provider_migration_evidence"
   fi
 }
@@ -190,6 +190,7 @@ run_certification() {
   require_tool git
   validate_contract
   mkdir -p "$evidence_root"
+  evidence_root="$(cd "$evidence_root" && pwd -P)"
   evidence_dir="$evidence_root/$(date -u '+%Y%m%dT%H%M%SZ')-$(git -C "$repo_root" rev-parse --short HEAD)-$mode"
   mkdir -p "$evidence_dir"
   gates_file="$evidence_dir/gates.ndjson"
@@ -210,13 +211,12 @@ run_certification() {
   run_gate snapshots_and_builtin_analytics 'cargo test --locked -p dtg-analytics'
   run_gate control_and_six_migrations 'cargo test --locked -p dtg-control'
   run_gate storage_and_remote_protocol 'cargo test --locked -p dtg-storage -p dtg-storage-fjall -p dtg-storage-remote'
-  run_gate official_provider_contracts 'cargo test --locked -p dtg-storage-fjall -p dtg-storage-postgres -p dtg-storage-neo4j'
+  run_gate official_provider_contracts 'cargo test --locked -p dtg-storage-fjall -p dtg-storage-postgres -p dtg-storage-kuzu'
   run_gate strict_clippy 'cargo clippy --locked -p dtg-language -p dtg-execution -p dtg-meta -p dtg-controller -p dtg-data -p dtg-gateway --all-targets -- -D warnings'
   run_gate process_binaries 'cargo build --locked -p dtg-meta -p dtg-controller -p dtg-data -p dtg-gateway --bins'
 
   if [[ $mode == live ]]; then
     run_gate postgresql_live 'bash scripts/test-postgres-live.sh'
-    run_gate neo4j_live 'bash scripts/test-neo4j-live.sh'
   fi
   run_behavioral_certification
   write_manifest

@@ -143,7 +143,7 @@ async fn four_process_functional_probes_and_real_bolt_query() {
     wait_for_port(gateway_addr).await;
     let bolt = bolt_query(gateway_addr).await;
 
-    assert_eq!(bolt.fields, vec!["value"]);
+    assert_eq!(bolt.fields, vec!["n"]);
     assert_eq!(bolt.vertex_id, 37);
     assert!(!bolt.summary_has_more);
     assert_eq!(processes.len(), 4);

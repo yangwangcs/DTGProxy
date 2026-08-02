@@ -7,7 +7,7 @@ use dtg_execution::{
     StorageError, StoreFuture,
 };
 use dtg_storage_fjall::FjallReplicaStore;
-use dtg_storage_neo4j::{Neo4jConfig, Neo4jReplicaStore};
+use dtg_storage_kuzu::KuzuReplicaStore;
 use dtg_storage_postgres::PostgresReplicaStore;
 use dtg_storage_remote::{RemoteAuthToken, RemoteError, StorageRemoteClient};
 
@@ -157,40 +157,35 @@ impl ProviderResolver for PostgresResolver {
     }
 }
 
-pub struct Neo4jResolver {
-    profiles: Profiles,
+pub struct KuzuResolver {
+    root: PathBuf,
 }
 
-impl Neo4jResolver {
-    pub fn from_config(config: &DataProcessConfig) -> Self {
+impl KuzuResolver {
+    pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
-            profiles: Profiles::from_config(config),
+            root: root.as_ref().to_path_buf(),
         }
     }
 }
 
-impl ProviderResolver for Neo4jResolver {
+impl ProviderResolver for KuzuResolver {
     fn provider_kind(&self) -> ProviderKind {
-        ProviderKind::Neo4j
+        ProviderKind::Kuzu
     }
 
     fn open<'a>(&'a self, binding: ReplicaBinding) -> StoreFuture<'a, Arc<dyn ReplicaStateStore>> {
         Box::pin(async move {
-            let EndpointProfile::Neo4j { endpoint, database } = self.profiles.endpoint(&binding)?
-            else {
+            if binding.provider_kind() != &ProviderKind::Kuzu {
                 return Err(StorageError::InvalidBinding(
-                    "Neo4j binding resolved a non-Neo4j endpoint profile".into(),
+                    "Kuzu resolver received a non-Kuzu binding".into(),
                 ));
-            };
-            let CredentialProfile::Neo4jBasic { username, password } =
-                self.profiles.credential(&binding)?
-            else {
-                return Err(StorageError::InvalidBinding(
-                    "Neo4j binding resolved incompatible credentials".into(),
-                ));
-            };
-            let config = Neo4jConfig::new(endpoint, username, password)?.with_database(database);
-            let store = Neo4jReplicaStore::open(config, binding).await?;
+            }
+            std::fs::create_dir_all(&self.root).map_err(|error| {
+                StorageError::Internal(format!("cannot create Kuzu data root: {error}"))
+            })?;
+            let store =
+                KuzuReplicaStore::open(self.root.join(binding.namespace_id().as_str()), binding)?;
             Ok(Arc::new(store) as Arc<dyn ReplicaStateStore>)
         })
     }
@@ -200,21 +195,18 @@ impl ProviderResolver for Neo4jResolver {
         binding: ReplicaBinding,
     ) -> StoreFuture<'a, ResolvedReplicaStore> {
         Box::pin(async move {
-            let EndpointProfile::Neo4j { endpoint, database } = self.profiles.endpoint(&binding)?
-            else {
+            if binding.provider_kind() != &ProviderKind::Kuzu {
                 return Err(StorageError::InvalidBinding(
-                    "Neo4j binding resolved a non-Neo4j endpoint profile".into(),
+                    "Kuzu resolver received a non-Kuzu binding".into(),
                 ));
-            };
-            let CredentialProfile::Neo4jBasic { username, password } =
-                self.profiles.credential(&binding)?
-            else {
-                return Err(StorageError::InvalidBinding(
-                    "Neo4j binding resolved incompatible credentials".into(),
-                ));
-            };
-            let config = Neo4jConfig::new(endpoint, username, password)?.with_database(database);
-            let store = Arc::new(Neo4jReplicaStore::open(config, binding).await?);
+            }
+            std::fs::create_dir_all(&self.root).map_err(|error| {
+                StorageError::Internal(format!("cannot create Kuzu data root: {error}"))
+            })?;
+            let store = Arc::new(KuzuReplicaStore::open(
+                self.root.join(binding.namespace_id().as_str()),
+                binding,
+            )?);
             Ok(ResolvedReplicaStore::state_only(store.clone())
                 .with_snapshot_runtime(store.clone(), store.clone())
                 .with_pushdown(store))

@@ -79,7 +79,7 @@ fn providers(document: &Value) -> BTreeSet<String> {
 }
 
 fn approved_providers() -> BTreeSet<String> {
-    ["fjall", "postgresql", "neo4j", "remote"]
+    ["fjall", "postgresql", "kuzu", "remote"]
         .into_iter()
         .map(str::to_owned)
         .collect()
@@ -171,7 +171,7 @@ async fn four_role_composition_uses_only_clean_break_process_contracts() {
     let rows = gateway
         .bolt()
         .query("MATCH (n) FOR SYSTEM_TIME AS OF $t RETURN n.id ORDER BY n.id")
-        .param("t", 1_i64)
+        .param("t", 41_i64)
         .run()
         .await
         .unwrap();

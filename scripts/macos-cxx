@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+set -eu
+
+sdk_root="$(xcrun --sdk macosx --show-sdk-path)"
+if [ -x /opt/homebrew/opt/llvm/bin/clang++ ]; then
+    exec /opt/homebrew/opt/llvm/bin/clang++ -isysroot "$sdk_root" -isystem /opt/homebrew/opt/llvm/include/c++/v1 "$@"
+fi
+exec "$(xcrun --sdk macosx --find clang++)" -isysroot "$sdk_root" "$@"

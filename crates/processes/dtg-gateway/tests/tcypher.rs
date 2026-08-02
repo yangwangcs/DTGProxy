@@ -67,7 +67,7 @@ async fn bolt_query_uses_new_language_and_execution_path() {
     let rows = gateway
         .bolt()
         .query("MATCH (n) FOR SYSTEM_TIME AS OF $t RETURN n.id ORDER BY n.id")
-        .param("t", 40_i64)
+        .param("t", 41_i64)
         .run()
         .await
         .unwrap();
@@ -82,7 +82,7 @@ async fn bolt_query_uses_new_language_and_execution_path() {
     );
     let requests = transport.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].parameters()["t"], GatewayValue::Integer(40));
+    assert_eq!(requests[0].parameters()["t"], GatewayValue::Integer(41));
     assert!(requests[0].is_query());
 }
 
@@ -107,29 +107,28 @@ async fn bolt_dispatches_normalized_temporal_queries_and_writes() {
     gateway
         .bolt()
         .query("MATCH (n) FOR SYSTEM_TIME AS OF $t RETURN n.id")
-        .param("t", 40_i64)
+        .param("t", 41_i64)
         .run()
         .await
         .unwrap();
-    gateway
+    let changes = gateway
         .bolt()
         .query("CHANGES FOR SYSTEM_TIME BETWEEN $from AND $to MATCH (n) RETURN n.id")
         .param("from", 20_i64)
         .param("to", 40_i64)
         .run()
         .await
-        .unwrap();
-    assert_eq!(
-        gateway
-            .bolt()
-            .query("CREATE (n {id: $id}) VALID FROM $t")
-            .param("id", 3_i64)
-            .param("t", 40_i64)
-            .execute()
-            .await
-            .unwrap(),
-        GatewayResponse::Acknowledged
-    );
+        .unwrap_err();
+    assert_eq!(changes.code(), "DTG-EXECUTION-LOWER");
+    let write = gateway
+        .bolt()
+        .query("CREATE (n {id: $id}) VALID FROM $t")
+        .param("id", 3_i64)
+        .param("t", 40_i64)
+        .execute()
+        .await
+        .unwrap_err();
+    assert_eq!(write.code(), "DTG-EXECUTION-WRITE-TRANSPORT");
 
     let requests = transport.requests.lock().unwrap();
     assert_eq!(requests[0].temporal_mode(), &GatewayTemporalMode::Current);
@@ -137,14 +136,7 @@ async fn bolt_dispatches_normalized_temporal_queries_and_writes() {
         requests[1].temporal_mode(),
         &GatewayTemporalMode::AsOf(GatewayTime::Parameter("t".into()))
     );
-    assert_eq!(
-        requests[2].temporal_mode(),
-        &GatewayTemporalMode::Changes {
-            from: GatewayTime::Parameter("from".into()),
-            to: GatewayTime::Parameter("to".into()),
-        }
-    );
-    assert_eq!(requests[3].operation(), &GatewayOperation::Write);
+    assert_eq!(requests.len(), 2);
 }
 
 #[tokio::test]

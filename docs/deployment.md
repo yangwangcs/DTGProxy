@@ -18,9 +18,30 @@ Meta and Controller accept `--config PATH`. Data and Gateway read their document
 into isolated runtime directories and verifies that all four roles can run concurrently.
 
 Data placement is per replica binding. There is no node-global backend switch: a Data process may
-host independent Fjall, PostgreSQL, Neo4j, and Remote Shards at the same time. Consensus and logical
+host independent Fjall, PostgreSQL, Kuzu, and Remote Shards at the same time. Consensus and logical
 state use separate namespaces, and every replica identity is fenced by cluster, graph, Shard,
 placement epoch, replica, and backend generation.
 
 Use mutual TLS on non-loopback networks. Plaintext listeners are accepted only on loopback by the
 process configuration validators.
+
+## Local cluster
+
+For development and integration verification, run:
+
+```bash
+scripts/local-cluster.sh start --managed-postgres
+scripts/local-cluster.sh status
+scripts/local-cluster.sh stop
+```
+
+The launcher creates a private directory below `target/`, uses a random PostgreSQL password, and
+binds PostgreSQL to `127.0.0.1` only. It starts one Data process per official provider and routes
+read fragments to those three Data endpoints by their fenced Shard assignment. It owns only the
+processes whose PIDs it records, and the `stop` command refuses to signal a process whose executable
+does not match its record. Fjall and Kuzu remain embedded in each Data process; only PostgreSQL is
+launched as an external service. Process writes currently require one active catalog Shard, so this
+three-Shard launcher is a distributed read and provider-isolation environment rather than a
+multi-Shard write certification.
+Production deployments must manage PostgreSQL and the DTG processes with the platform supervisor
+(for example systemd, launchd, or Kubernetes), rather than this development launcher.

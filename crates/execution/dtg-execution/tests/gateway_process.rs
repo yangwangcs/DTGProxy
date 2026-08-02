@@ -11,8 +11,9 @@ use dtg_cluster_v2::{checksum_bytes, proto};
 use dtg_execution::{
     GatewayCancellationToken, GatewayClusterRequest, GatewayExecution, GatewayExecutionError,
     GatewayExecutionTransport, GatewayFuture, GatewayProtocolV2Client, GatewayProtocolV2Transport,
-    GatewayRequestContext, GatewayResponse, GatewayRows, GatewayValue, GatewayWriteReceipt,
-    GatewayWriteRequest, GatewayWriteTransport, RequestDetail, RequestStage,
+    GatewayQueryResponse, GatewayRequestContext, GatewayResponse, GatewayRows, GatewayValue,
+    GatewayWriteReceipt, GatewayWriteRequest, GatewayWriteTransport, RequestDetail, RequestStage,
+    ShardRoutedGatewayTransport,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -457,6 +458,29 @@ impl Future for ConcurrentTimestampFuture {
 #[derive(Default)]
 struct CapturingClusterTransport {
     requests: Mutex<Vec<GatewayClusterRequest>>,
+}
+
+#[derive(Default)]
+struct MaterializingClusterTransport {
+    requests: Mutex<Vec<GatewayClusterRequest>>,
+}
+
+impl GatewayExecutionTransport for MaterializingClusterTransport {
+    fn execute(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
+        self.requests.lock().unwrap().push(request);
+        Box::pin(async { Ok(GatewayResponse::Acknowledged) })
+    }
+
+    fn execute_query(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        self.requests.lock().unwrap().push(request);
+        Box::pin(async { Ok(GatewayQueryResponse::Materialized(BTreeMap::new())) })
+    }
 }
 
 impl GatewayExecutionTransport for CapturingClusterTransport {
@@ -1314,6 +1338,52 @@ fn process_merges_scalar_vertex_counts_from_data_fragments() {
             .stage(RequestStage::GatewayLocalExecution)
             .success,
         0
+    );
+}
+
+#[test]
+fn process_routes_each_fenced_fragment_to_its_data_transport() {
+    let default = Arc::new(MaterializingClusterTransport::default());
+    let secondary = Arc::new(MaterializingClusterTransport::default());
+    let execution = GatewayExecution::for_process(
+        Arc::new(ShardRoutedGatewayTransport::new(
+            default.clone(),
+            BTreeMap::from([(14, secondary.clone() as Arc<dyn GatewayExecutionTransport>)]),
+        )),
+        two_shard_planning_context(),
+    );
+
+    let error = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 106, u64::MAX, Vec::new()).unwrap(),
+        "MATCH (n) RETURN COUNT(*)".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code(), "DTG-EXECUTION-PARTIAL-COUNT");
+    assert_eq!(default.requests.lock().unwrap().len(), 1);
+    assert_eq!(secondary.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        default.requests.lock().unwrap()[0]
+            .physical_plan()
+            .unwrap()
+            .fragments()[0]
+            .fence()
+            .shard_id()
+            .get(),
+        13
+    );
+    assert_eq!(
+        secondary.requests.lock().unwrap()[0]
+            .physical_plan()
+            .unwrap()
+            .fragments()[0]
+            .fence()
+            .shard_id()
+            .get(),
+        14
     );
 }
 

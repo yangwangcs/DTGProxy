@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -16,6 +17,7 @@ pub struct GatewayConfig {
     cluster_id: u64,
     request_timeout: Duration,
     cluster_endpoint: String,
+    shard_endpoints: BTreeMap<u64, String>,
     meta_endpoint: String,
 }
 
@@ -36,6 +38,7 @@ impl GatewayConfig {
             cluster_id,
             request_timeout,
             cluster_endpoint: "http://127.0.0.1:7690".into(),
+            shard_endpoints: BTreeMap::new(),
             meta_endpoint: "http://127.0.0.1:7689".into(),
         })
     }
@@ -61,10 +64,18 @@ impl GatewayConfig {
             })?;
         let endpoint = std::env::var("DTG_GATEWAY_CLUSTER_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:7690".into());
+        let shard_endpoints = match std::env::var("DTG_GATEWAY_SHARD_ENDPOINTS") {
+            Ok(value) => parse_shard_endpoints(&value)?,
+            Err(std::env::VarError::NotPresent) => BTreeMap::new(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(GatewayConfigError::InvalidShardEndpoints);
+            }
+        };
         let meta_endpoint = std::env::var("DTG_GATEWAY_META_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:7689".into());
         Self::new(bind_addr, cluster_id, Duration::from_millis(timeout_ms))?
             .with_cluster_endpoint(endpoint)?
+            .with_shard_endpoints(shard_endpoints)?
             .with_meta_endpoint(meta_endpoint)
     }
 
@@ -94,6 +105,24 @@ impl GatewayConfig {
 
     pub fn cluster_endpoint(&self) -> &str {
         &self.cluster_endpoint
+    }
+
+    pub fn with_shard_endpoints(
+        mut self,
+        shard_endpoints: BTreeMap<u64, String>,
+    ) -> Result<Self, GatewayConfigError> {
+        if shard_endpoints
+            .values()
+            .any(|endpoint| endpoint.trim().is_empty())
+        {
+            return Err(GatewayConfigError::InvalidShardEndpoints);
+        }
+        self.shard_endpoints = shard_endpoints;
+        Ok(self)
+    }
+
+    pub const fn shard_endpoints(&self) -> &BTreeMap<u64, String> {
+        &self.shard_endpoints
     }
 
     pub fn with_meta_endpoint(
@@ -156,7 +185,7 @@ impl GatewayConfig {
             let provider_kind = match fields[5] {
                 "fjall" => ProviderKind::Fjall,
                 "postgresql" => ProviderKind::PostgreSql,
-                "neo4j" => ProviderKind::Neo4j,
+                "kuzu" => ProviderKind::Kuzu,
                 provider if provider.starts_with("remote/") => {
                     ProviderKind::Remote(provider["remote/".len()..].to_owned())
                 }
@@ -207,6 +236,15 @@ impl GatewayConfig {
             shards,
         )
         .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))?;
+        if !self.shard_endpoints.is_empty()
+            && catalog.shards().iter().any(|shard| {
+                !self
+                    .shard_endpoints
+                    .contains_key(&shard.binding().shard_id().get())
+            })
+        {
+            return Err(GatewayConfigError::InvalidShardEndpoints);
+        }
         PlanningContext::new(
             catalog,
             capabilities,
@@ -225,6 +263,7 @@ pub enum GatewayConfigError {
     InvalidCluster(String),
     InvalidRequestTimeout(String),
     EmptyClusterEndpoint,
+    InvalidShardEndpoints,
     EmptyMetaEndpoint,
     MissingPlanning(String),
     InvalidPlanning(String),
@@ -239,11 +278,37 @@ impl GatewayConfigError {
             Self::InvalidCluster(_) => "DTG-GATEWAY-CONFIG-CLUSTER",
             Self::InvalidRequestTimeout(_) => "DTG-GATEWAY-CONFIG-TIMEOUT",
             Self::EmptyClusterEndpoint => "DTG-GATEWAY-CONFIG-ENDPOINT",
+            Self::InvalidShardEndpoints => "DTG-GATEWAY-CONFIG-SHARD-ENDPOINTS",
             Self::EmptyMetaEndpoint => "DTG-GATEWAY-CONFIG-META-ENDPOINT",
             Self::MissingPlanning(_) => "DTG-GATEWAY-CONFIG-PLANNING-MISSING",
             Self::InvalidPlanning(_) => "DTG-GATEWAY-CONFIG-PLANNING",
         }
     }
+}
+
+fn parse_shard_endpoints(value: &str) -> Result<BTreeMap<u64, String>, GatewayConfigError> {
+    let mut endpoints = BTreeMap::new();
+    for spec in value
+        .split(',')
+        .map(str::trim)
+        .filter(|spec| !spec.is_empty())
+    {
+        let (shard, endpoint) = spec
+            .split_once('=')
+            .ok_or(GatewayConfigError::InvalidShardEndpoints)?;
+        let shard = shard
+            .trim()
+            .parse()
+            .map_err(|_| GatewayConfigError::InvalidShardEndpoints)?;
+        let endpoint = endpoint.trim();
+        if endpoint.is_empty() || endpoints.insert(shard, endpoint.to_owned()).is_some() {
+            return Err(GatewayConfigError::InvalidShardEndpoints);
+        }
+    }
+    if endpoints.is_empty() {
+        return Err(GatewayConfigError::InvalidShardEndpoints);
+    }
+    Ok(endpoints)
 }
 
 impl fmt::Display for GatewayConfigError {
@@ -300,5 +365,18 @@ mod tests {
                 .unwrap();
         assert_eq!(config.cluster_endpoint(), "http://data:7690");
         assert_eq!(config.meta_endpoint(), "http://meta:7689");
+    }
+
+    #[test]
+    fn shard_endpoint_specs_require_unique_nonempty_assignments() {
+        assert_eq!(
+            parse_shard_endpoints("1=http://data-1,2=http://data-2").unwrap(),
+            BTreeMap::from([
+                (1, "http://data-1".to_owned()),
+                (2, "http://data-2".to_owned()),
+            ])
+        );
+        assert!(parse_shard_endpoints("1=http://data-1,1=http://data-2").is_err());
+        assert!(parse_shard_endpoints("1=").is_err());
     }
 }

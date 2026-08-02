@@ -123,11 +123,11 @@ fn exercise_direction(source: ProviderKind, target: ProviderKind, migration_id: 
 fn every_directed_builtin_provider_pair_uses_the_same_neutral_contract() {
     let directions = [
         (ProviderKind::Fjall, ProviderKind::PostgreSql),
-        (ProviderKind::Fjall, ProviderKind::Neo4j),
+        (ProviderKind::Fjall, ProviderKind::Kuzu),
         (ProviderKind::PostgreSql, ProviderKind::Fjall),
-        (ProviderKind::PostgreSql, ProviderKind::Neo4j),
-        (ProviderKind::Neo4j, ProviderKind::Fjall),
-        (ProviderKind::Neo4j, ProviderKind::PostgreSql),
+        (ProviderKind::PostgreSql, ProviderKind::Kuzu),
+        (ProviderKind::Kuzu, ProviderKind::Fjall),
+        (ProviderKind::Kuzu, ProviderKind::PostgreSql),
     ];
 
     for (offset, (source, target)) in directions.into_iter().enumerate() {

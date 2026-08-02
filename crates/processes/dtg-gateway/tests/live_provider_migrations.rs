@@ -11,22 +11,22 @@ use dtg_execution::storage::{
     ValidInterval, Value, Version, VertexId, VertexVersion,
 };
 use dtg_storage_fjall::{FjallReplicaStore, FjallStorageTckFactory};
-use dtg_storage_neo4j::{Neo4jConfig, Neo4jReplicaStore, Neo4jStorageTckFactory};
+use dtg_storage_kuzu::{KuzuReplicaStore, KuzuStorageTckFactory};
 use dtg_storage_postgres::{PostgresReplicaStore, PostgresStorageTckFactory};
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires simultaneous disposable PostgreSQL 17 and Neo4j 5.26 services"]
+#[ignore = "requires a disposable PostgreSQL 17 service"]
 async fn every_physical_provider_direction_preserves_the_logical_snapshot_digest() {
     let root = tempfile::tempdir().unwrap();
     let environment = LiveProviderEnvironment::from_environment(root.path());
     let directions = [
         (ProviderKind::Fjall, ProviderKind::PostgreSql),
-        (ProviderKind::Fjall, ProviderKind::Neo4j),
+        (ProviderKind::Fjall, ProviderKind::Kuzu),
         (ProviderKind::PostgreSql, ProviderKind::Fjall),
-        (ProviderKind::PostgreSql, ProviderKind::Neo4j),
-        (ProviderKind::Neo4j, ProviderKind::Fjall),
-        (ProviderKind::Neo4j, ProviderKind::PostgreSql),
+        (ProviderKind::PostgreSql, ProviderKind::Kuzu),
+        (ProviderKind::Kuzu, ProviderKind::Fjall),
+        (ProviderKind::Kuzu, ProviderKind::PostgreSql),
     ];
     let mut evidence = Vec::new();
 
@@ -245,24 +245,17 @@ fn canonical_digest(
 
 struct LiveProviderEnvironment {
     fjall_root: PathBuf,
+    kuzu_root: PathBuf,
     postgres_url: String,
-    neo4j: Neo4jConfig,
 }
 
 impl LiveProviderEnvironment {
     fn from_environment(root: &Path) -> Self {
         Self {
             fjall_root: root.join("fjall"),
+            kuzu_root: root.join("kuzu"),
             postgres_url: std::env::var("DTG_POSTGRES_URL")
                 .expect("DTG_POSTGRES_URL must name a disposable PostgreSQL 17 database"),
-            neo4j: Neo4jConfig::new(
-                std::env::var("DTG_NEO4J_URL")
-                    .expect("DTG_NEO4J_URL must name a disposable Neo4j 5.26 service"),
-                std::env::var("DTG_NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
-                std::env::var("DTG_NEO4J_PASSWORD")
-                    .expect("DTG_NEO4J_PASSWORD must authenticate the disposable Neo4j service"),
-            )
-            .unwrap(),
         }
     }
 
@@ -280,8 +273,8 @@ impl LiveProviderEnvironment {
             ProviderKind::PostgreSql => {
                 PostgresStorageTckFactory::new(&self.postgres_url).binding(namespace, generation)
             }
-            ProviderKind::Neo4j => {
-                Neo4jStorageTckFactory::new(self.neo4j.clone()).binding(namespace, generation)
+            ProviderKind::Kuzu => {
+                KuzuStorageTckFactory::new(&self.kuzu_root).binding(namespace, generation)
             }
             ProviderKind::Remote(_) => {
                 panic!("remote storage is not an official provider migration endpoint")
@@ -308,10 +301,12 @@ impl LiveProviderEnvironment {
                     .await
                     .unwrap(),
             ),
-            ProviderKind::Neo4j => LiveStore::Neo4j(
-                Neo4jReplicaStore::open(self.neo4j.clone(), binding)
-                    .await
-                    .unwrap(),
+            ProviderKind::Kuzu => LiveStore::Kuzu(
+                KuzuReplicaStore::open(
+                    self.kuzu_root.join(binding.namespace_id().as_str()),
+                    binding,
+                )
+                .unwrap(),
             ),
             ProviderKind::Remote(_) => {
                 panic!("remote storage is not an official provider migration endpoint")
@@ -323,7 +318,7 @@ impl LiveProviderEnvironment {
 enum LiveStore {
     Fjall(FjallReplicaStore),
     PostgreSql(PostgresReplicaStore),
-    Neo4j(Neo4jReplicaStore),
+    Kuzu(KuzuReplicaStore),
 }
 
 impl LiveStore {
@@ -334,7 +329,7 @@ impl LiveStore {
         match self {
             Self::Fjall(store) => store.apply(batch).await?,
             Self::PostgreSql(store) => store.apply(batch).await?,
-            Self::Neo4j(store) => store.apply(batch).await?,
+            Self::Kuzu(store) => store.apply(batch).await?,
         };
         Ok(())
     }
@@ -343,7 +338,7 @@ impl LiveStore {
         match self {
             Self::Fjall(store) => store.applied_index().await,
             Self::PostgreSql(store) => store.applied_index().await,
-            Self::Neo4j(store) => store.applied_index().await,
+            Self::Kuzu(store) => store.applied_index().await,
         }
     }
 
@@ -354,7 +349,7 @@ impl LiveStore {
         match self {
             Self::Fjall(store) => store.replica_metadata(name).await,
             Self::PostgreSql(store) => store.replica_metadata(name).await,
-            Self::Neo4j(store) => store.replica_metadata(name).await,
+            Self::Kuzu(store) => store.replica_metadata(name).await,
         }
     }
 
@@ -366,7 +361,7 @@ impl LiveStore {
         match self {
             Self::Fjall(store) => store.begin_snapshot(fence, request).await,
             Self::PostgreSql(store) => store.begin_snapshot(fence, request).await,
-            Self::Neo4j(store) => store.begin_snapshot(fence, request).await,
+            Self::Kuzu(store) => store.begin_snapshot(fence, request).await,
         }
     }
 
@@ -378,7 +373,7 @@ impl LiveStore {
         match self {
             Self::Fjall(store) => store.begin_restore(binding, header).await,
             Self::PostgreSql(store) => store.begin_restore(binding, header).await,
-            Self::Neo4j(store) => store.begin_restore(binding, header).await,
+            Self::Kuzu(store) => store.begin_restore(binding, header).await,
         }
     }
 
@@ -390,7 +385,7 @@ impl LiveStore {
         match self {
             Self::Fjall(store) => store.activate_candidate(candidate, active_binding).await,
             Self::PostgreSql(store) => store.activate_candidate(candidate, active_binding).await,
-            Self::Neo4j(store) => store.activate_candidate(candidate, active_binding).await,
+            Self::Kuzu(store) => store.activate_candidate(candidate, active_binding).await,
         }
     }
 }
@@ -399,7 +394,7 @@ fn provider_name(provider: &ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Fjall => "fjall",
         ProviderKind::PostgreSql => "postgresql",
-        ProviderKind::Neo4j => "neo4j",
+        ProviderKind::Kuzu => "kuzu",
         ProviderKind::Remote(_) => "remote",
     }
 }

@@ -3,57 +3,69 @@ set -euo pipefail
 
 workspace_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
+test_process_id=""
+postgres_root=""
+postgres_data=""
+postgres_started=false
+
+terminate_process_tree() {
+  local process_id="$1"
+  local child_id
+  [[ $process_id =~ ^[0-9]+$ ]] || return 0
+  while IFS= read -r child_id; do
+    [[ -n $child_id ]] || continue
+    terminate_process_tree "$child_id"
+  done < <(pgrep -P "$process_id" 2>/dev/null || true)
+  kill -TERM "$process_id" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    kill -0 "$process_id" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -KILL "$process_id" 2>/dev/null || true
+}
+
 run_test() {
   (
     cd "$workspace_root"
-    cargo test --locked -p dtg-gateway --test live_provider_migrations -- \
+    cargo test --locked --jobs 1 -p dtg-gateway --test live_provider_migrations -- \
       --ignored --test-threads=1 --nocapture
-  )
+  ) &
+  test_process_id=$!
+  wait "$test_process_id"
+  test_process_id=""
 }
 
-if [[ -n "${DTG_POSTGRES_URL:-}" || -n "${DTG_NEO4J_URL:-}" || -n "${DTG_NEO4J_PASSWORD:-}" ]]; then
-  if [[ -z "${DTG_POSTGRES_URL:-}" || -z "${DTG_NEO4J_URL:-}" || -z "${DTG_NEO4J_PASSWORD:-}" ]]; then
-    printf 'DTG_POSTGRES_URL, DTG_NEO4J_URL, and DTG_NEO4J_PASSWORD must be set together\n' >&2
-    exit 78
+cleanup() {
+  if [[ -n $test_process_id ]]; then
+    terminate_process_tree "$test_process_id"
   fi
-  export DTG_NEO4J_USER="${DTG_NEO4J_USER:-neo4j}"
+  if [[ $postgres_started == true ]]; then
+    pg_ctl -D "$postgres_data" -m fast stop >/dev/null 2>&1 || true
+  fi
+  if [[ -n $postgres_root ]]; then
+    find "$postgres_root" -depth -delete 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ -n "${DTG_POSTGRES_URL:-}" ]]; then
   run_test
   exit 0
 fi
 
-for tool in initdb pg_ctl createdb pg_isready docker curl cargo openssl; do
+for tool in initdb pg_ctl createdb pg_isready cargo openssl; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     printf '%s is required for simultaneous live provider migration certification\n' "$tool" >&2
     exit 78
   fi
 done
-if ! docker info >/dev/null 2>&1; then
-  printf 'the Docker daemon is required for simultaneous Neo4j migration certification\n' >&2
-  exit 78
-fi
-
 postgres_root=$(mktemp -d "${TMPDIR:-/tmp}/dtgproxy-provider-migrations.XXXXXX")
 postgres_data="$postgres_root/postgres"
 postgres_log="$postgres_root/postgres.log"
 password_file="$postgres_root/password"
 postgres_password=$(openssl rand -hex 24)
-neo4j_password=$(openssl rand -hex 24)
-neo4j_container="dtgproxy-provider-migrations-$$"
-postgres_started=false
-neo4j_started=false
-
-cleanup() {
-  if [[ $neo4j_started == true ]]; then
-    docker rm -f "$neo4j_container" >/dev/null 2>&1 || true
-  fi
-  if [[ $postgres_started == true ]]; then
-    pg_ctl -D "$postgres_data" -m fast stop >/dev/null 2>&1 || true
-  fi
-  find "$postgres_root" -depth -delete 2>/dev/null || true
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 printf '%s\n' "$postgres_password" >"$password_file"
 postgres_port=55540
@@ -84,36 +96,5 @@ PGPASSWORD="$postgres_password" createdb \
   -U dtgproxy \
   dtgproxy
 
-docker run --detach --rm --name "$neo4j_container" \
-  --publish 127.0.0.1::7474 \
-  --env "NEO4J_AUTH=neo4j/$neo4j_password" \
-  neo4j:5.26-community >/dev/null
-neo4j_started=true
-neo4j_port_mapping=$(docker port "$neo4j_container" 7474/tcp)
-neo4j_port=${neo4j_port_mapping##*:}
-if ! [[ "$neo4j_port" =~ ^[0-9]+$ ]]; then
-  printf 'Docker did not report a numeric Neo4j HTTP host port\n' >&2
-  exit 1
-fi
-readiness_attempts=${DTGPROXY_NEO4J_READINESS_ATTEMPTS:-45}
-if ! [[ "$readiness_attempts" =~ ^[1-9][0-9]*$ ]]; then
-  printf 'DTGPROXY_NEO4J_READINESS_ATTEMPTS must be a positive integer\n' >&2
-  exit 64
-fi
-for ((attempt = 1; attempt <= readiness_attempts; attempt++)); do
-  if curl --fail --silent --show-error --connect-timeout 1 --max-time 1 \
-    "http://127.0.0.1:$neo4j_port" >/dev/null; then
-    break
-  fi
-  if ((attempt == readiness_attempts)); then
-    printf 'Neo4j did not become ready after %s bounded attempts\n' "$readiness_attempts" >&2
-    exit 1
-  fi
-  sleep 1
-done
-
 export DTG_POSTGRES_URL="host=127.0.0.1 port=$postgres_port user=dtgproxy password=$postgres_password dbname=dtgproxy sslmode=disable"
-export DTG_NEO4J_URL="http://127.0.0.1:$neo4j_port"
-export DTG_NEO4J_USER=neo4j
-export DTG_NEO4J_PASSWORD="$neo4j_password"
 run_test

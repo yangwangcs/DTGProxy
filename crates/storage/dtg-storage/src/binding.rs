@@ -8,7 +8,7 @@ use crate::{CapabilityManifest, StorageError, capability::encode_manifest};
 pub enum ProviderKind {
     Fjall,
     PostgreSql,
-    Neo4j,
+    Kuzu,
     Remote(String),
 }
 
@@ -21,8 +21,8 @@ impl ProviderKind {
             Self::PostgreSql => {
                 hasher.update(b"postgresql");
             }
-            Self::Neo4j => {
-                hasher.update(b"neo4j");
+            Self::Kuzu => {
+                hasher.update(b"kuzu");
             }
             Self::Remote(name) => {
                 if name.is_empty()

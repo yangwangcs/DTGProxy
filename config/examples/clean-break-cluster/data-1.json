@@ -4,7 +4,8 @@
   "node_id": 11,
   "rpc_addr": "127.0.0.1:55103",
   "fjall_root": "target/clean-break-cluster/data-1/business",
+  "kuzu_root": "target/clean-break-cluster/data-1/kuzu",
   "consensus_root": "target/clean-break-cluster/data-1/raft",
-  "provider_classes": ["fjall", "postgresql", "neo4j", "remote"],
+  "provider_classes": ["fjall", "postgresql", "kuzu", "remote"],
   "shards": [1, 3]
 }

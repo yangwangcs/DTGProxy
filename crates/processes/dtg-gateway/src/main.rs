@@ -2,8 +2,8 @@
 
 use dtg_execution::{
     GatewayExecution, GatewayExecutionTransportFactory, RequestMetricsSink,
-    TonicGatewayProtocolV2TransportFactory, TonicGatewayWriteTransport,
-    encode_request_metrics_snapshot,
+    ShardRoutedGatewayTransport, TonicGatewayProtocolV2TransportFactory,
+    TonicGatewayWriteTransport, encode_request_metrics_snapshot,
 };
 use dtg_gateway::{GatewayConfig, GatewayService, build_gateway_runtime};
 use std::sync::Arc;
@@ -20,7 +20,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::from_env()?;
     let factory = TonicGatewayProtocolV2TransportFactory;
-    let transport = factory.connect(config.cluster_endpoint()).await?;
+    let default_transport = factory.connect(config.cluster_endpoint()).await?;
+    let mut shard_transports = std::collections::BTreeMap::new();
+    for (shard_id, endpoint) in config.shard_endpoints() {
+        shard_transports.insert(*shard_id, factory.connect(endpoint).await?);
+    }
+    let transport = Arc::new(ShardRoutedGatewayTransport::new(
+        default_transport,
+        shard_transports,
+    ));
     let write_transport =
         TonicGatewayWriteTransport::connect(config.meta_endpoint(), config.cluster_endpoint())
             .await?;

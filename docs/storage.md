@@ -8,7 +8,7 @@ Official providers are linked and opened in process:
 - `dtg-storage-fjall` uses isolated keyspaces and native ordered logical records.
 - `dtg-storage-postgres` uses native relational tables, serializable activation, and indexed temporal
   access paths.
-- `dtg-storage-neo4j` uses native graph labels, relationships, constraints, and snapshot markers.
+- `dtg-storage-kuzu` is the embedded native graph provider for DTGProxy namespaces.
 
 Third-party providers implement `dtg-storage-remote-protocol`. The protocol is versioned, bounded,
 authenticated, checksum protected, idempotent under lost-response retry, and fail-closed on unknown

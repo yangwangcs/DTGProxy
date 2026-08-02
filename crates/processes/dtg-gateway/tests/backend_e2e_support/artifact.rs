@@ -155,11 +155,11 @@ pub enum Backend {
     Fjall,
     #[serde(rename = "postgresql")]
     PostgreSql,
-    Neo4j,
+    Kuzu,
 }
 
 impl Backend {
-    const ALL: [Self; 3] = [Self::Fjall, Self::PostgreSql, Self::Neo4j];
+    const ALL: [Self; 3] = [Self::Fjall, Self::PostgreSql, Self::Kuzu];
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]

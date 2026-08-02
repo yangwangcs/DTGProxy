@@ -3,3 +3,4 @@
 # Keep the macOS SDK lookup in the wrapper so no machine-local SDK path is committed.
 CXX_aarch64_apple_darwin = { value = "scripts/macos-cxx", relative = true }
 CXX_x86_64_apple_darwin = { value = "scripts/macos-cxx", relative = true }
+MACOSX_DEPLOYMENT_TARGET = "11.0"

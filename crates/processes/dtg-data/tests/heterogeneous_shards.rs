@@ -78,8 +78,8 @@ fn fixture_data_node() -> DataNodeBuilder {
             Arc::new(FixtureResolver::new(ProviderKind::PostgreSql)),
         )
         .with_provider(
-            ProviderKind::Neo4j,
-            Arc::new(FixtureResolver::new(ProviderKind::Neo4j)),
+            ProviderKind::Kuzu,
+            Arc::new(FixtureResolver::new(ProviderKind::Kuzu)),
         )
 }
 
@@ -91,8 +91,8 @@ fn postgres_shard(shard_id: u64) -> ReplicaBinding {
     binding(ProviderKind::PostgreSql, shard_id)
 }
 
-fn neo4j_shard(shard_id: u64) -> ReplicaBinding {
-    binding(ProviderKind::Neo4j, shard_id)
+fn kuzu_shard(shard_id: u64) -> ReplicaBinding {
+    binding(ProviderKind::Kuzu, shard_id)
 }
 
 fn binding(provider_kind: ProviderKind, shard_id: u64) -> ReplicaBinding {
@@ -129,7 +129,7 @@ async fn one_data_node_hosts_three_independent_backend_classes() {
     let node = fixture_data_node()
         .assign(fjall_shard(1))
         .assign(postgres_shard(2))
-        .assign(neo4j_shard(3))
+        .assign(kuzu_shard(3))
         .start()
         .await
         .unwrap();

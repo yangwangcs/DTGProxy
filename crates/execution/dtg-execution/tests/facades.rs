@@ -1827,19 +1827,19 @@ fn read_view_cache_does_not_retain_an_open_view_after_replica_replacement() {
 fn data_builder_accepts_multiple_provider_resolvers() {
     let runtime = DataExecution::builder()
         .with_provider(ProviderKind::Fjall, resolver(ProviderKind::Fjall))
-        .with_provider(ProviderKind::Neo4j, resolver(ProviderKind::Neo4j))
+        .with_provider(ProviderKind::Kuzu, resolver(ProviderKind::Kuzu))
         .build()
         .unwrap();
 
     assert_eq!(runtime.provider_kinds().len(), 2);
     assert!(runtime.provider_kinds().contains(&ProviderKind::Fjall));
-    assert!(runtime.provider_kinds().contains(&ProviderKind::Neo4j));
+    assert!(runtime.provider_kinds().contains(&ProviderKind::Kuzu));
 }
 
 #[test]
 fn data_builder_rejects_provider_kind_drift() {
     let result = DataExecution::builder()
-        .with_provider(ProviderKind::Fjall, resolver(ProviderKind::Neo4j))
+        .with_provider(ProviderKind::Fjall, resolver(ProviderKind::Kuzu))
         .build();
 
     assert!(result.is_err());
@@ -1855,20 +1855,20 @@ fn data_execution_rejects_namespace_reuse_by_a_different_binding() {
             }),
         )
         .with_provider(
-            ProviderKind::Neo4j,
+            ProviderKind::Kuzu,
             Arc::new(EchoResolver {
-                kind: ProviderKind::Neo4j,
+                kind: ProviderKind::Kuzu,
             }),
         )
         .build()
         .unwrap();
     let fjall = binding(ProviderKind::Fjall, 5, 6, "exclusive-namespace");
-    let neo4j = binding(ProviderKind::Neo4j, 7, 8, "exclusive-namespace");
+    let kuzu = binding(ProviderKind::Kuzu, 7, 8, "exclusive-namespace");
 
     assert!(block_on(runtime.open_store(fjall.clone())).is_ok());
     assert!(block_on(runtime.open_store(fjall)).is_ok());
     assert!(matches!(
-        block_on(runtime.open_store(neo4j)),
+        block_on(runtime.open_store(kuzu)),
         Err(StorageError::NamespaceOwnerMismatch { .. })
     ));
 }
@@ -1883,23 +1883,23 @@ fn data_execution_keeps_each_shard_generation_backend_homogeneous() {
             }),
         )
         .with_provider(
-            ProviderKind::Neo4j,
+            ProviderKind::Kuzu,
             Arc::new(EchoResolver {
-                kind: ProviderKind::Neo4j,
+                kind: ProviderKind::Kuzu,
             }),
         )
         .build()
         .unwrap();
     let fjall = binding(ProviderKind::Fjall, 5, 6, "fjall-shard-5");
-    let neo4j = binding(ProviderKind::Neo4j, 5, 7, "neo4j-shard-5");
+    let kuzu = binding(ProviderKind::Kuzu, 5, 7, "kuzu-shard-5");
     let fjall_store = block_on(runtime.open_store(fjall.clone())).unwrap();
-    let neo4j_store = block_on(runtime.open_store(neo4j.clone())).unwrap();
+    let kuzu_store = block_on(runtime.open_store(kuzu.clone())).unwrap();
 
     runtime
         .add_replica(Arc::new(BindingConsensus { binding: fjall }), fjall_store)
         .unwrap();
     assert!(matches!(
-        runtime.add_replica(Arc::new(BindingConsensus { binding: neo4j }), neo4j_store,),
+        runtime.add_replica(Arc::new(BindingConsensus { binding: kuzu }), kuzu_store,),
         Err(ShardError::HeterogeneousGeneration)
     ));
 }

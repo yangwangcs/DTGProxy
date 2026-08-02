@@ -43,7 +43,7 @@ fn require_version(version: u32, name: &str) -> Result<(), StorageError> {
 enum WireProviderKind {
     Fjall,
     PostgreSql,
-    Neo4j,
+    Kuzu,
     Remote(String),
 }
 
@@ -71,7 +71,7 @@ pub(crate) fn encode_binding(binding: &ReplicaBinding) -> Result<Vec<u8>, Storag
     let provider_kind = match binding.provider_kind() {
         ProviderKind::Fjall => WireProviderKind::Fjall,
         ProviderKind::PostgreSql => WireProviderKind::PostgreSql,
-        ProviderKind::Neo4j => WireProviderKind::Neo4j,
+        ProviderKind::Kuzu => WireProviderKind::Kuzu,
         ProviderKind::Remote(name) => WireProviderKind::Remote(name.clone()),
     };
     encode(&WireBinding {
@@ -104,7 +104,7 @@ pub(crate) fn decode_binding(bytes: &[u8]) -> Result<ReplicaBinding, StorageErro
     let provider_kind = match wire.provider_kind {
         WireProviderKind::Fjall => ProviderKind::Fjall,
         WireProviderKind::PostgreSql => ProviderKind::PostgreSql,
-        WireProviderKind::Neo4j => ProviderKind::Neo4j,
+        WireProviderKind::Kuzu => ProviderKind::Kuzu,
         WireProviderKind::Remote(name) => ProviderKind::Remote(name),
     };
     let role = match wire.role {

@@ -21,7 +21,7 @@ dtg-controller = { path = "../dtg-controller" }
 dtg-data = { path = "../dtg-data" }
 dtg-meta = { path = "../dtg-meta" }
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall", features = ["tck"] }
-dtg-storage-neo4j = { path = "../../storage/dtg-storage-neo4j" }
+dtg-storage-kuzu = { path = "../../storage/dtg-storage-kuzu" }
 dtg-storage-postgres = { path = "../../storage/dtg-storage-postgres" }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"

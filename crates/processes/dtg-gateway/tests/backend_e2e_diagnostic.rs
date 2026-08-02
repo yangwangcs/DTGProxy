@@ -71,8 +71,8 @@ async fn quick_selected_backend_e2e_comparison() {
     let backend = match env::var("DTG_BACKEND_E2E_SELECTED_BACKEND").as_deref() {
         Ok("fjall") => Backend::Fjall,
         Ok("postgresql") => Backend::PostgreSql,
-        Ok("neo4j") => Backend::Neo4j,
-        _ => panic!("DTG_BACKEND_E2E_SELECTED_BACKEND must be fjall, postgresql, or neo4j"),
+        Ok("kuzu") => Backend::Kuzu,
+        _ => panic!("DTG_BACKEND_E2E_SELECTED_BACKEND must be fjall, postgresql, or kuzu"),
     };
     let output = env::var_os("DTG_BACKEND_E2E_QUICK_OUTPUT").map(PathBuf::from);
     let repetitions = if output.is_some() {

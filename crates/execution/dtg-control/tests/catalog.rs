@@ -126,7 +126,7 @@ fn catalog_commands_use_version_cas_and_preserve_prior_state() {
 fn lineage_is_append_only_and_generation_class_cannot_be_reused() {
     let fjall = backend_class(ProviderKind::Fjall);
     let postgres = backend_class(ProviderKind::PostgreSql);
-    let neo4j = backend_class(ProviderKind::Neo4j);
+    let kuzu = backend_class(ProviderKind::Kuzu);
     let first = placement(
         1,
         1,
@@ -158,8 +158,8 @@ fn lineage_is_append_only_and_generation_class_cannot_be_reused() {
     let reused = placement(
         3,
         2,
-        neo4j.clone(),
-        vec![replica(1, 3, 2, 3, &neo4j, BindingRole::Active)],
+        kuzu.clone(),
+        vec![replica(1, 3, 2, 3, &kuzu, BindingRole::Active)],
     );
     assert_eq!(
         state

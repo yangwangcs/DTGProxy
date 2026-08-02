@@ -43,9 +43,6 @@ pub struct DiagnosticRuntime {
     bin_dir: PathBuf,
     pub postgres_endpoint: String,
     pub postgres_credential: String,
-    pub neo4j_endpoint: String,
-    pub neo4j_username: String,
-    pub neo4j_password: String,
 }
 
 impl DiagnosticRuntime {
@@ -74,9 +71,6 @@ impl DiagnosticRuntime {
             bin_dir,
             postgres_endpoint: environment_string("DTG_BACKEND_E2E_POSTGRES_ENDPOINT"),
             postgres_credential: environment_string("DTG_BACKEND_E2E_POSTGRES_CREDENTIAL"),
-            neo4j_endpoint: environment_string("DTG_BACKEND_E2E_NEO4J_ENDPOINT"),
-            neo4j_username: environment_string("DTG_BACKEND_E2E_NEO4J_USERNAME"),
-            neo4j_password: environment_string("DTG_BACKEND_E2E_NEO4J_PASSWORD"),
         })
     }
 
@@ -208,12 +202,7 @@ impl DiagnosticCluster {
                     runtime.postgres_credential.clone(),
                 ));
             }
-            Backend::Neo4j => {
-                data_environment.push(("DTG_DATA_NEO4J_ENDPOINT", runtime.neo4j_endpoint.clone()));
-                data_environment.push(("DTG_DATA_NEO4J_DATABASE", "neo4j".into()));
-                data_environment.push(("DTG_DATA_NEO4J_USERNAME", runtime.neo4j_username.clone()));
-                data_environment.push(("DTG_DATA_NEO4J_PASSWORD", runtime.neo4j_password.clone()));
-            }
+            Backend::Kuzu => {}
         }
         cluster.spawn(
             "data",
@@ -844,7 +833,7 @@ fn provider_kind(backend: Backend) -> ProviderKind {
     match backend {
         Backend::Fjall => ProviderKind::Fjall,
         Backend::PostgreSql => ProviderKind::PostgreSql,
-        Backend::Neo4j => ProviderKind::Neo4j,
+        Backend::Kuzu => ProviderKind::Kuzu,
     }
 }
 
@@ -852,7 +841,7 @@ const fn backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::Fjall => "fjall",
         Backend::PostgreSql => "postgresql",
-        Backend::Neo4j => "neo4j",
+        Backend::Kuzu => "kuzu",
     }
 }
 
@@ -860,7 +849,7 @@ fn backend_name_from_provider(provider: &ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Fjall => "fjall",
         ProviderKind::PostgreSql => "postgresql",
-        ProviderKind::Neo4j => "neo4j",
+        ProviderKind::Kuzu => "kuzu",
         ProviderKind::Remote(_) => "remote",
     }
 }

@@ -1,5 +1,14 @@
 /target/
 /artifacts/
+/output/
+/docs/papers/**/tmp/
+/docs/papers/**/*.aux
+/docs/papers/**/*.bbl
+/docs/papers/**/*.blg
+/docs/papers/**/*.fdb_latexmk
+/docs/papers/**/*.fls
+/docs/papers/**/*.log
+/docs/papers/**/*.out
 .worktrees/
 .DS_Store
 .idea/

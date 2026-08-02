@@ -1,18 +1,17 @@
-name: Neo4j native provider
+name: Kuzu native provider
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "crates/storage/dtg-storage-neo4j/**"
+      - "crates/storage/dtg-storage-kuzu/**"
       - "crates/storage/dtg-storage/**"
-      - "scripts/test-neo4j-live.sh"
 
 jobs:
-  live-tck:
+  storage-tck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: bash scripts/test-neo4j-live.sh
+      - run: cargo test --locked -p dtg-storage-kuzu --test storage_tck

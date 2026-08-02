@@ -806,11 +806,11 @@ fn crate_planning_context() -> dtg_execution::planning::PlanningContext {
 fn certify_six_provider_directions() -> serde_json::Value {
     let directions = [
         (ProviderKind::Fjall, ProviderKind::PostgreSql),
-        (ProviderKind::Fjall, ProviderKind::Neo4j),
+        (ProviderKind::Fjall, ProviderKind::Kuzu),
         (ProviderKind::PostgreSql, ProviderKind::Fjall),
-        (ProviderKind::PostgreSql, ProviderKind::Neo4j),
-        (ProviderKind::Neo4j, ProviderKind::Fjall),
-        (ProviderKind::Neo4j, ProviderKind::PostgreSql),
+        (ProviderKind::PostgreSql, ProviderKind::Kuzu),
+        (ProviderKind::Kuzu, ProviderKind::Fjall),
+        (ProviderKind::Kuzu, ProviderKind::PostgreSql),
     ];
     let mut certified = Vec::new();
     for (offset, (source, target)) in directions.into_iter().enumerate() {
@@ -919,8 +919,8 @@ async fn certify_heterogeneous_data_node(root: &std::path::Path) -> serde_json::
             Arc::new(FixtureResolver(ProviderKind::PostgreSql)),
         )
         .with_provider(
-            ProviderKind::Neo4j,
-            Arc::new(FixtureResolver(ProviderKind::Neo4j)),
+            ProviderKind::Kuzu,
+            Arc::new(FixtureResolver(ProviderKind::Kuzu)),
         )
         .assign(binding(
             ProviderKind::Fjall,
@@ -941,12 +941,12 @@ async fn certify_heterogeneous_data_node(root: &std::path::Path) -> serde_json::
             BindingRole::Active,
         ))
         .assign(binding(
-            ProviderKind::Neo4j,
+            ProviderKind::Kuzu,
             33,
             33,
             1,
             1,
-            "hetero-neo4j",
+            "hetero-kuzu",
             BindingRole::Active,
         ))
         .start()
@@ -1075,7 +1075,7 @@ fn provider_name(provider: &ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Fjall => "fjall",
         ProviderKind::PostgreSql => "postgresql",
-        ProviderKind::Neo4j => "neo4j",
+        ProviderKind::Kuzu => "kuzu",
         ProviderKind::Remote(_) => "remote",
     }
 }

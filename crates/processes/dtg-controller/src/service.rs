@@ -350,7 +350,7 @@ struct BackendClassWire {
 enum ProviderWire {
     Fjall,
     PostgreSql,
-    Neo4j,
+    Kuzu,
     Remote(String),
 }
 
@@ -610,7 +610,7 @@ impl From<ProviderWire> for ProviderKind {
         match value {
             ProviderWire::Fjall => Self::Fjall,
             ProviderWire::PostgreSql => Self::PostgreSql,
-            ProviderWire::Neo4j => Self::Neo4j,
+            ProviderWire::Kuzu => Self::Kuzu,
             ProviderWire::Remote(name) => Self::Remote(name),
         }
     }

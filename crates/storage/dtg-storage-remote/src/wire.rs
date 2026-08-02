@@ -13,7 +13,7 @@ pub(crate) fn encode_binding(binding: &ReplicaBinding) -> proto::Binding {
         provider_kind: match binding.provider_kind() {
             ProviderKind::Fjall => "fjall".into(),
             ProviderKind::PostgreSql => "postgresql".into(),
-            ProviderKind::Neo4j => "neo4j".into(),
+            ProviderKind::Kuzu => "kuzu".into(),
             ProviderKind::Remote(name) => format!("remote:{name}"),
         },
         contract_version: binding.contract_version(),
@@ -36,7 +36,7 @@ pub(crate) fn decode_binding(binding: &proto::Binding) -> Result<ReplicaBinding,
     let provider = match binding.provider_kind.as_str() {
         "fjall" => ProviderKind::Fjall,
         "postgresql" => ProviderKind::PostgreSql,
-        "neo4j" => ProviderKind::Neo4j,
+        "kuzu" => ProviderKind::Kuzu,
         value if value.starts_with("remote:") => ProviderKind::Remote(value[7..].into()),
         _ => {
             return Err(StorageError::InvalidBinding(

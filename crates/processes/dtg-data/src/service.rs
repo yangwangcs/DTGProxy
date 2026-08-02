@@ -39,7 +39,7 @@ use tokio::time::{Instant, timeout_at};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{DataProcessConfig, FjallResolver, Neo4jResolver, PostgresResolver, RemoteResolver};
+use crate::{DataProcessConfig, FjallResolver, KuzuResolver, PostgresResolver, RemoteResolver};
 
 const APPLY_BATCH_WINDOW: Duration = Duration::from_micros(250);
 const APPLY_BATCH_MAX_COMMANDS: usize = 64;
@@ -263,8 +263,8 @@ impl DataNodeBuilder {
                 Arc::new(PostgresResolver::from_config(&config)),
             )
             .with_provider(
-                ProviderKind::Neo4j,
-                Arc::new(Neo4jResolver::from_config(&config)),
+                ProviderKind::Kuzu,
+                Arc::new(KuzuResolver::new(config.kuzu_root())),
             );
         for name in config.remote_providers() {
             builder = builder.with_provider(

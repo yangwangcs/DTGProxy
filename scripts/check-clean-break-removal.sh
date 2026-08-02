@@ -27,6 +27,7 @@ legacy_paths=(
   crates/meta-node
   crates/controller
   crates/dtgproxy
+  crates/storage/dtg-storage-neo4j
 )
 
 failed=0

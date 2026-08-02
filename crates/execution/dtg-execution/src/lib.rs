@@ -28,10 +28,10 @@ pub use gateway::{
     GatewayAnalyticsState, GatewayCancellationToken, GatewayClusterRequest, GatewayExecution,
     GatewayExecutionBuilder, GatewayExecutionError, GatewayExecutionTransport,
     GatewayExecutionTransportFactory, GatewayFuture, GatewayOperation, GatewayProtocolV2Client,
-    GatewayProtocolV2Transport, GatewayRequestContext, GatewayResponse, GatewayRetry, GatewayRows,
-    GatewayTemporalMode, GatewayTime, GatewayValue, GatewayWriteReceipt, GatewayWriteRequest,
-    GatewayWriteRoute, GatewayWriteTransport, TonicGatewayProtocolV2TransportFactory,
-    TonicGatewayWriteTransport,
+    GatewayProtocolV2Transport, GatewayQueryResponse, GatewayRequestContext, GatewayResponse,
+    GatewayRetry, GatewayRows, GatewayTemporalMode, GatewayTime, GatewayValue, GatewayWriteReceipt,
+    GatewayWriteRequest, GatewayWriteRoute, GatewayWriteTransport, ShardRoutedGatewayTransport,
+    TonicGatewayProtocolV2TransportFactory, TonicGatewayWriteTransport,
 };
 pub use meta::{MetaExecution, MetaExecutionBuilder};
 pub use meta_raft::{
