@@ -7,7 +7,9 @@ use dtg_execution::{
     GatewayExecutionTransport, GatewayFuture, GatewayOperation, GatewayResponse, GatewayRetry,
     GatewayRows, GatewayTemporalMode, GatewayTime, GatewayValue,
 };
-use dtg_gateway::{GatewayConfig, GatewayService, serve_bolt};
+use dtg_gateway::{
+    BoltStatementClass, GatewayConfig, GatewayService, bolt_read_pipeline_enabled_from, serve_bolt,
+};
 use support::planning_context;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -201,6 +203,44 @@ async fn language_and_cluster_errors_keep_stable_codes() {
         .await
         .unwrap_err();
     assert_eq!(unavailable.code(), "DTG-CLUSTER-UNAVAILABLE");
+}
+
+#[test]
+fn bolt_read_pipeline_gate_defaults_off_and_only_accepts_one() {
+    assert!(!bolt_read_pipeline_enabled_from(None));
+    assert!(bolt_read_pipeline_enabled_from(Some("1")));
+    assert!(!bolt_read_pipeline_enabled_from(Some("0")));
+    assert!(!bolt_read_pipeline_enabled_from(Some("invalid")));
+}
+
+#[test]
+fn compiled_bolt_query_is_eligible_but_writes_and_transactions_are_barriers() {
+    let transport = Arc::new(CleanBreakTransport::default());
+    let execution = GatewayExecution::for_process(transport, planning_context());
+    let config = GatewayConfig::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7687),
+        7,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let gateway = GatewayService::new(config, execution);
+
+    assert_eq!(
+        gateway
+            .classify_bolt_statement("MATCH (n) RETURN n.id")
+            .unwrap(),
+        BoltStatementClass::Read
+    );
+    assert_eq!(
+        gateway
+            .classify_bolt_statement("CREATE (n) VALID FROM 1")
+            .unwrap(),
+        BoltStatementClass::Barrier
+    );
+    assert_eq!(
+        gateway.classify_bolt_statement("BEGIN").unwrap(),
+        BoltStatementClass::Barrier
+    );
 }
 
 #[test]

@@ -2350,6 +2350,11 @@ impl GatewayExecution {
         timer.finish_result(self.language.compile(source))
     }
 
+    pub fn classify_statement(&self, source: &str) -> Result<GatewayOperation, LanguageError> {
+        let program = self.compile(source)?;
+        Ok(gateway_operation_for_statement(&program.statement))
+    }
+
     pub fn request_metrics(&self) -> Arc<RequestStageMetrics> {
         Arc::clone(&self.request_metrics)
     }
@@ -2552,18 +2557,7 @@ impl GatewayExecution {
                     ));
                 }
             }
-            let operation = match &program.statement {
-                LogicalStatement::Query(_) => GatewayOperation::Query,
-                LogicalStatement::Write(_) => GatewayOperation::Write,
-                LogicalStatement::BeginTransaction => GatewayOperation::BeginTransaction,
-                LogicalStatement::CommitTransaction => GatewayOperation::CommitTransaction,
-                LogicalStatement::RollbackTransaction => GatewayOperation::RollbackTransaction,
-                LogicalStatement::SubmitAnalytics(submission) => {
-                    GatewayOperation::SubmitAnalytics {
-                        algorithm: submission.algorithm.as_str().to_owned(),
-                    }
-                }
-            };
+            let operation = gateway_operation_for_statement(&program.statement);
             let temporal_mode = normalized_temporal_mode(&program.statement)?;
             if let LogicalStatement::Write(write) = &program.statement {
                 if transaction_id.is_some() {
@@ -3839,6 +3833,19 @@ fn encode_logical_type(data_type: &dtg_language_ir::LogicalType, output: &mut Ve
         LogicalType::Vertex => output.push(8),
         LogicalType::Relationship => output.push(9),
         LogicalType::Any => output.push(10),
+    }
+}
+
+fn gateway_operation_for_statement(statement: &LogicalStatement) -> GatewayOperation {
+    match statement {
+        LogicalStatement::Query(_) => GatewayOperation::Query,
+        LogicalStatement::Write(_) => GatewayOperation::Write,
+        LogicalStatement::BeginTransaction => GatewayOperation::BeginTransaction,
+        LogicalStatement::CommitTransaction => GatewayOperation::CommitTransaction,
+        LogicalStatement::RollbackTransaction => GatewayOperation::RollbackTransaction,
+        LogicalStatement::SubmitAnalytics(submission) => GatewayOperation::SubmitAnalytics {
+            algorithm: submission.algorithm.as_str().to_owned(),
+        },
     }
 }
 

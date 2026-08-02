@@ -36,6 +36,22 @@ impl GatewayService {
         self.execution.request_metrics()
     }
 
+    pub fn classify_bolt_statement(
+        &self,
+        statement: &str,
+    ) -> Result<crate::BoltStatementClass, BoltError> {
+        self.execution
+            .classify_statement(statement)
+            .map(|operation| {
+                if matches!(operation, GatewayOperation::Query) {
+                    crate::BoltStatementClass::Read
+                } else {
+                    crate::BoltStatementClass::Barrier
+                }
+            })
+            .map_err(|error| BoltError::from_code(error.code(), error.to_string()))
+    }
+
     pub const fn bolt(&self) -> BoltSession<'_> {
         BoltSession::new(self)
     }

@@ -33,6 +33,12 @@ pub async fn serve_bolt(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoltStatementClass {
+    Read,
+    Barrier,
+}
+
 fn configure_bolt_socket(socket: &TcpStream) -> Result<(), io::Error> {
     socket.set_nodelay(true)
 }
@@ -857,11 +863,15 @@ pub struct BoltError {
 }
 
 impl BoltError {
-    pub(crate) fn protocol(message: impl Into<String>) -> Self {
+    pub(crate) fn from_code(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            code: "DTG-GATEWAY-BOLT-PROTOCOL".into(),
+            code: code.into(),
             message: message.into(),
         }
+    }
+
+    pub(crate) fn protocol(message: impl Into<String>) -> Self {
+        Self::from_code("DTG-GATEWAY-BOLT-PROTOCOL", message)
     }
 
     pub fn code(&self) -> &str {

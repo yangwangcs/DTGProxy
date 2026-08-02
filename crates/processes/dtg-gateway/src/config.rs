@@ -16,6 +16,7 @@ pub struct GatewayConfig {
     bind_addr: SocketAddr,
     cluster_id: u64,
     request_timeout: Duration,
+    bolt_read_pipeline_enabled: bool,
     cluster_endpoint: String,
     shard_endpoints: BTreeMap<u64, String>,
     meta_endpoint: String,
@@ -37,6 +38,7 @@ impl GatewayConfig {
             bind_addr,
             cluster_id,
             request_timeout,
+            bolt_read_pipeline_enabled: false,
             cluster_endpoint: "http://127.0.0.1:7690".into(),
             shard_endpoints: BTreeMap::new(),
             meta_endpoint: "http://127.0.0.1:7689".into(),
@@ -74,6 +76,11 @@ impl GatewayConfig {
         let meta_endpoint = std::env::var("DTG_GATEWAY_META_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:7689".into());
         Self::new(bind_addr, cluster_id, Duration::from_millis(timeout_ms))?
+            .with_bolt_read_pipeline_enabled(bolt_read_pipeline_enabled_from(
+                std::env::var("DTG_GATEWAY_BOLT_READ_PIPELINE")
+                    .ok()
+                    .as_deref(),
+            ))
             .with_cluster_endpoint(endpoint)?
             .with_shard_endpoints(shard_endpoints)?
             .with_meta_endpoint(meta_endpoint)
@@ -101,6 +108,15 @@ impl GatewayConfig {
 
     pub const fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    pub const fn bolt_read_pipeline_enabled(&self) -> bool {
+        self.bolt_read_pipeline_enabled
+    }
+
+    pub const fn with_bolt_read_pipeline_enabled(mut self, enabled: bool) -> Self {
+        self.bolt_read_pipeline_enabled = enabled;
+        self
     }
 
     pub fn cluster_endpoint(&self) -> &str {
@@ -253,6 +269,10 @@ impl GatewayConfig {
         )
         .map_err(|error| GatewayConfigError::InvalidPlanning(error.to_string()))
     }
+}
+
+pub fn bolt_read_pipeline_enabled_from(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
