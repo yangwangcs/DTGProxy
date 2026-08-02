@@ -1,7 +1,7 @@
 # Gateway–Data 批量 / Pipelined API 设计
 
 日期：2026-08-03  
-状态：设计已获确认，待实现
+状态：已实现（2026-08-03，`7e944ce`）
 
 ## 1. 目标与非目标
 
@@ -90,12 +90,12 @@ Data 必须验证：每个 request 有非零、16 字节 request ID；一个 bat
 每个 Data endpoint 保持一个长期双向 pipeline stream。Gateway pipeline client 包含：
 
 1. 有界 pending map，最多 256 个 request；
-2. batch builder，限制 32 requests、64 KiB、25 µs 聚合窗口，达到任一条件即 flush；
+2. batch builder，限制 32 requests、64 KiB；只合并 writer 中已经就绪的请求，达到任一限制即 flush，绝不为凑批等待；
 3. bounded outbound channel，不允许无界排队；
 4. response reader，根据 request ID 从 pending map 取回 waiter；
 5. credit counter，未获得 Data credit 时不再向网络提交新 request。
 
-Data 初始发送 32 个 request credits；每条 request 进入终态（成功、typed error 或取消）后归还一个 credit。Gateway 的 256 条上限包括已排队和已提交请求，超过上限立即返回 `DTG-CLUSTER-PIPELINE-BACKPRESSURE`（`GatewayRetry::Safe`），而不是无限等待。批 builder 等待窗口只在队列未满且仍有 credit 时发生，并受调用方 deadline 限制。
+Data 初始发送 32 个 request credits；每条 request 进入终态（成功、typed error 或取消）后归还一个 credit。Gateway 的 256 条上限包括已排队和已提交请求，超过上限立即返回 `DTG-CLUSTER-PIPELINE-BACKPRESSURE`（`GatewayRetry::Safe`），而不是无限等待。批 builder 不设置填充等待窗口：低并发请求立即发送；只有本地 pending 容量或 Data credit 耗尽时，才在调用方 deadline 以内等待可用容量。
 
 Data 端使用独立的 semaphore 限制执行并发（初始 32），输出 channel 有界。正常客户端遵守 credit；若客户端违反 credit 或 batch 限制，超限 request 获得 `ResourceExhausted` typed error，其他 request 继续执行。Data 读取输入时在无 permit/无输出容量时自然停止读取，从而把背压传回 Gateway，而不创建无界 task。
 
@@ -112,13 +112,12 @@ Data 端使用独立的 semaphore 限制执行并发（初始 32），输出 cha
 
 ## 7. 可观测性
 
-保留既有 `gateway_query_session_submit` 与 `gateway_query_session_response_wait`，并新增 pipeline detail：
+保留既有 `gateway_query_session_submit` 与 `gateway_query_session_response_wait`，并已新增：
 
-- `gateway_pipeline_enqueue_wait`：等待本地有界队列/credit 的时间；
-- `gateway_pipeline_batch_build`：聚合窗口与 batch 构建时间；
-- `gateway_pipeline_flush`：一次 batch ingress 的发送时间；
-- `gateway_pipeline_response_dispatch`：按 request ID 分发时间；
-- `gateway_pipeline_cancel`：取消发送到终态的时间。
+- `gateway_query_pipeline_submit`：从 Gateway 提交至 pipeline writer 的边界；
+- `gateway_query_pipeline_response_wait`：等待及按 request ID 分发对应终态的边界。
+
+batch bytes/count、credit、backpressure、cancelled 和 protocol error 由 Data 端计数。更细粒度的 enqueue、batch-build、flush、dispatch 和 cancel 子阶段留给下一轮剖析；在没有先证明其测量价值前，不以额外计时点干扰热路径。
 
 Data 继续记录 `data_gateway_session_execution`，并为 pipeline 记录 batch request 数、bytes、credit、backpressure、cancelled、protocol error 计数。artifact 必须能区分 TCP/UDS、unary/session/pipeline 和每个 concurrency。
 
