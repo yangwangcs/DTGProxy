@@ -149,6 +149,78 @@ const REQUEST_METRIC_DETAILS_V6: [&str; 29] = [
     "data_snapshot_csr_build",
 ];
 
+const REQUEST_METRIC_DETAILS_V7: [&str; 32] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "gateway_meta_prepare_write",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+    "data_adjacency_cache_hit",
+    "data_adjacency_cache_miss",
+    "data_adjacency_backend_expand",
+    "data_snapshot_csr_cache_hit",
+    "data_snapshot_csr_cache_miss",
+    "data_snapshot_csr_build",
+    "gateway_query_session_submit",
+    "gateway_query_session_response_wait",
+    "data_gateway_session_execution",
+];
+
+const REQUEST_METRIC_DETAILS_V8: [&str; 34] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "gateway_meta_prepare_write",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+    "data_adjacency_cache_hit",
+    "data_adjacency_cache_miss",
+    "data_adjacency_backend_expand",
+    "data_snapshot_csr_cache_hit",
+    "data_snapshot_csr_cache_miss",
+    "data_snapshot_csr_build",
+    "gateway_query_session_submit",
+    "gateway_query_session_response_wait",
+    "data_gateway_session_execution",
+    "gateway_query_pipeline_submit",
+    "gateway_query_pipeline_response_wait",
+];
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
@@ -196,10 +268,10 @@ pub struct CellSpec {
 
 impl CellSpec {
     pub fn matrix(seed: u64) -> Vec<Self> {
-        let mut cells = Vec::with_capacity(90);
+        let mut cells = Vec::with_capacity(135);
         for backend in Backend::ALL {
             for workload in Workload::ALL {
-                for concurrency in [1, 8] {
+                for concurrency in [1, 8, 64] {
                     for repetition in 0..3 {
                         cells.push(Self {
                             backend,
@@ -365,9 +437,9 @@ fn validate_metrics_snapshot(
     snapshot: &ProcessMetricsSnapshot,
     expected_role: &str,
 ) -> io::Result<()> {
-    if !matches!(snapshot.schema_version, 1..=6) {
+    if !matches!(snapshot.schema_version, 1..=8) {
         return Err(invalid_data(
-            "request metrics schema version must be between 1 and 6",
+            "request metrics schema version must be between 1 and 8",
         ));
     }
     if snapshot.process_role != expected_role {
@@ -399,6 +471,8 @@ fn validate_metrics_snapshot(
             4 => &REQUEST_METRIC_DETAILS_V4,
             5 => &REQUEST_METRIC_DETAILS_V5,
             6 => &REQUEST_METRIC_DETAILS_V6,
+            7 => &REQUEST_METRIC_DETAILS_V7,
+            8 => &REQUEST_METRIC_DETAILS_V8,
             _ => unreachable!("schema v1 is handled above"),
         };
         if snapshot.details.len() != expected_details.len()
@@ -582,8 +656,10 @@ impl QuickDiagnosticArtifact {
             if observation.backend != backend {
                 return Err(invalid_data("quick diagnostic mixes backend families"));
             }
-            if !matches!(observation.concurrency, 1 | 8) {
-                return Err(invalid_data("quick diagnostic concurrency must be 1 or 8"));
+            if !matches!(observation.concurrency, 1 | 8 | 64) {
+                return Err(invalid_data(
+                    "quick diagnostic concurrency must be 1, 8, or 64",
+                ));
             }
             if observation.errors != 0
                 || observation.operations == 0
@@ -670,7 +746,7 @@ impl QuickDiagnosticArtifact {
             .iter()
             .map(|(repetition, _, _)| *repetition)
             .collect::<BTreeSet<_>>();
-        let expected_observations = Workload::ALL.len() * 2 * 3;
+        let expected_observations = Workload::ALL.len() * 3 * 3;
         if repetitions != BTreeSet::from([0, 1, 2]) || observations.len() != expected_observations {
             return Err(invalid_data(
                 "quick diagnostic requires exactly three complete repetitions",
@@ -678,7 +754,7 @@ impl QuickDiagnosticArtifact {
         }
         for repetition in 0..3 {
             for workload in Workload::ALL {
-                for concurrency in [1, 8] {
+                for concurrency in [1, 8, 64] {
                     if !cells.contains(&(repetition, workload, concurrency)) {
                         return Err(invalid_data("quick diagnostic matrix is incomplete"));
                     }

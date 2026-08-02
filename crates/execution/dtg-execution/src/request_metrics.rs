@@ -6,7 +6,7 @@ use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
 const REQUEST_STAGES: usize = 10;
-const REQUEST_DETAILS: usize = 29;
+const REQUEST_DETAILS: usize = 34;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -89,6 +89,11 @@ pub enum RequestDetail {
     DataSnapshotCsrCacheHit,
     DataSnapshotCsrCacheMiss,
     DataSnapshotCsrBuild,
+    GatewayQuerySessionSubmit,
+    GatewayQuerySessionResponseWait,
+    DataGatewaySessionExecution,
+    GatewayQueryPipelineSubmit,
+    GatewayQueryPipelineResponseWait,
 }
 
 impl RequestDetail {
@@ -122,6 +127,11 @@ impl RequestDetail {
         Self::DataSnapshotCsrCacheHit,
         Self::DataSnapshotCsrCacheMiss,
         Self::DataSnapshotCsrBuild,
+        Self::GatewayQuerySessionSubmit,
+        Self::GatewayQuerySessionResponseWait,
+        Self::DataGatewaySessionExecution,
+        Self::GatewayQueryPipelineSubmit,
+        Self::GatewayQueryPipelineResponseWait,
     ];
 
     const fn index(self) -> usize {
@@ -159,6 +169,11 @@ impl RequestDetail {
             Self::DataSnapshotCsrCacheHit => "data_snapshot_csr_cache_hit",
             Self::DataSnapshotCsrCacheMiss => "data_snapshot_csr_cache_miss",
             Self::DataSnapshotCsrBuild => "data_snapshot_csr_build",
+            Self::GatewayQuerySessionSubmit => "gateway_query_session_submit",
+            Self::GatewayQuerySessionResponseWait => "gateway_query_session_response_wait",
+            Self::DataGatewaySessionExecution => "data_gateway_session_execution",
+            Self::GatewayQueryPipelineSubmit => "gateway_query_pipeline_submit",
+            Self::GatewayQueryPipelineResponseWait => "gateway_query_pipeline_response_wait",
         }
     }
 }
@@ -432,7 +447,7 @@ pub fn encode_request_metrics_snapshot(
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&serde_json::json!({
-        "schema_version": 6,
+        "schema_version": 8,
         "process_role": process_role,
         "unix_timestamp_ns": unix_timestamp_ns,
         "sequence": sequence,
@@ -537,7 +552,7 @@ mod tests {
             encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 6);
+        assert_eq!(value["schema_version"], 8);
         assert_eq!(value["process_role"], "gateway");
         assert_eq!(value["unix_timestamp_ns"], 7);
         assert_eq!(value["sequence"], 11);
@@ -545,7 +560,7 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "gateway_compile");
         assert_eq!(value["stages"][1]["success"], 1);
         assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
-        assert_eq!(value["details"].as_array().unwrap().len(), 29);
+        assert_eq!(value["details"].as_array().unwrap().len(), 34);
         assert_eq!(value["details"][12]["detail"], "data_read_view_cache_hit");
         assert_eq!(value["details"][12]["success"], 1);
         assert_eq!(value["details"][19]["detail"], "gateway_meta_prepare_write");
@@ -570,6 +585,26 @@ mod tests {
             "data_snapshot_csr_cache_miss"
         );
         assert_eq!(value["details"][28]["detail"], "data_snapshot_csr_build");
+        assert_eq!(
+            value["details"][29]["detail"],
+            "gateway_query_session_submit"
+        );
+        assert_eq!(
+            value["details"][30]["detail"],
+            "gateway_query_session_response_wait"
+        );
+        assert_eq!(
+            value["details"][31]["detail"],
+            "data_gateway_session_execution"
+        );
+        assert_eq!(
+            value["details"][32]["detail"],
+            "gateway_query_pipeline_submit"
+        );
+        assert_eq!(
+            value["details"][33]["detail"],
+            "gateway_query_pipeline_response_wait"
+        );
         assert!(!encoded.contains("statement"));
         assert!(!encoded.contains("parameter"));
     }

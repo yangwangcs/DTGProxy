@@ -12,7 +12,8 @@ use std::time::Duration;
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
 use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayService;
 use dtg_execution::cluster_protocol::proto::{
-    ColumnBatch, ExecutionFragment, GatewayRequest, GatewayResponse as GatewayWireResponse,
+    ColumnBatch, ExecutionFragment, GatewayPipelineClientFrame, GatewayPipelineCredit,
+    GatewayPipelineServerFrame, GatewayRequest, GatewayResponse as GatewayWireResponse,
     GatewaySessionResponse, LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind, RequestContext,
     RetryDisposition, StatusCode, TransactionRequest, TypedStatus,
 };
@@ -35,6 +36,7 @@ use futures_util::TryStreamExt as _;
 use futures_util::{StreamExt as _, stream};
 use prost_011::Message as _;
 use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
@@ -45,6 +47,9 @@ const APPLY_BATCH_WINDOW: Duration = Duration::from_micros(250);
 const APPLY_BATCH_MAX_COMMANDS: usize = 64;
 const MAX_GATEWAY_FRAGMENT_CONCURRENCY: usize = 32;
 const MAX_GATEWAY_SESSION_IN_FLIGHT: usize = 32;
+const MAX_GATEWAY_PIPELINE_IN_FLIGHT: usize = 32;
+const MAX_GATEWAY_PIPELINE_BATCH_REQUESTS: usize = 32;
+const MAX_GATEWAY_PIPELINE_BATCH_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaFailure {
@@ -1033,6 +1038,22 @@ where
     ReceiverStream::new(receiver)
 }
 
+#[cfg(test)]
+fn stream_gateway_pipeline_results_bounded<T, R, E, F, Fut>(
+    requests: Vec<T>,
+    concurrency: usize,
+    execute: F,
+) -> ReceiverStream<Result<(usize, R), E>>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    E: Send + 'static,
+    F: Fn(T) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<R, E>> + Send + 'static,
+{
+    stream_fragment_results_bounded(requests, concurrency, execute)
+}
+
 fn gateway_query_responses(
     response_context: Option<RequestContext>,
     batches: Vec<ColumnBatch>,
@@ -1379,6 +1400,8 @@ impl GatewayService for DataRpcService {
         Pin<Box<dyn Stream<Item = Result<GatewayWireResponse, Status>> + Send + 'static>>;
     type ExecuteSessionStream =
         Pin<Box<dyn Stream<Item = Result<GatewaySessionResponse, Status>> + Send + 'static>>;
+    type ExecutePipelinedStream =
+        Pin<Box<dyn Stream<Item = Result<GatewayPipelineServerFrame, Status>> + Send + 'static>>;
 
     async fn execute(
         &self,
@@ -1532,6 +1555,366 @@ impl GatewayService for DataRpcService {
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
+
+    async fn execute_pipelined(
+        &self,
+        request: Request<Streaming<GatewayPipelineClientFrame>>,
+    ) -> Result<Response<Self::ExecutePipelinedStream>, Status> {
+        let mut requests = request.into_inner();
+        let service = self.clone();
+        let (sender, receiver) = mpsc::channel(MAX_GATEWAY_PIPELINE_IN_FLIGHT);
+        tokio::spawn(async move {
+            if sender
+                .send(Ok(GatewayPipelineServerFrame {
+                    payload: Some(
+                        dtg_execution::cluster_protocol::proto::gateway_pipeline_server_frame::Payload::Credit(
+                            GatewayPipelineCredit {
+                                available_requests: MAX_GATEWAY_PIPELINE_IN_FLIGHT as u32,
+                            },
+                        ),
+                    ),
+                    returned_credits: 0,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let permits = Arc::new(Semaphore::new(MAX_GATEWAY_PIPELINE_IN_FLIGHT));
+            let mut tasks: JoinSet<(u128, GatewaySessionResponse)> = JoinSet::new();
+            let mut abort_handles = BTreeMap::<u128, AbortHandle>::new();
+            let mut cancelled_before_start = BTreeMap::<u128, RequestContext>::new();
+            let mut input_open = true;
+            loop {
+                if input_open {
+                    tokio::select! {
+                        frame = requests.message() => match frame {
+                            Ok(Some(frame)) => {
+                                if process_gateway_pipeline_frame(
+                                    &service,
+                                    frame,
+                                    &permits,
+                                    &mut tasks,
+                                    &mut abort_handles,
+                                    &mut cancelled_before_start,
+                                    &sender,
+                                ).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => input_open = false,
+                            Err(error) => {
+                                let _ = sender.send(Err(Status::invalid_argument(error.to_string()))).await;
+                                return;
+                            }
+                        },
+                        completed = tasks.join_next(), if !tasks.is_empty() => {
+                            if !emit_gateway_pipeline_completion(&sender, &mut abort_handles, completed).await {
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    let Some(completed) = tasks.join_next().await else {
+                        return;
+                    };
+                    if !emit_gateway_pipeline_completion(
+                        &sender,
+                        &mut abort_handles,
+                        Some(completed),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+    }
+}
+
+async fn process_gateway_pipeline_frame(
+    service: &DataRpcService,
+    frame: GatewayPipelineClientFrame,
+    permits: &Arc<Semaphore>,
+    tasks: &mut JoinSet<(u128, GatewaySessionResponse)>,
+    abort_handles: &mut BTreeMap<u128, AbortHandle>,
+    cancelled_before_start: &mut BTreeMap<u128, RequestContext>,
+    sender: &mpsc::Sender<Result<GatewayPipelineServerFrame, Status>>,
+) -> Result<(), ()> {
+    match frame.payload {
+        Some(
+            dtg_execution::cluster_protocol::proto::gateway_pipeline_client_frame::Payload::Batch(
+                batch,
+            ),
+        ) => {
+            let batch_too_large = batch.requests.len() > MAX_GATEWAY_PIPELINE_BATCH_REQUESTS
+                || batch
+                    .requests
+                    .iter()
+                    .map(gateway_pipeline_wire_size)
+                    .sum::<usize>()
+                    > MAX_GATEWAY_PIPELINE_BATCH_BYTES;
+            for wire in batch.requests {
+                let Some(request) = wire.request.clone() else {
+                    return Err(());
+                };
+                let request_id = match pipeline_request_id(Some(&request)) {
+                    Ok(request_id) => request_id,
+                    Err(error) => {
+                        if !send_gateway_pipeline_terminal(
+                            sender,
+                            gateway_pipeline_error_frame(
+                                request,
+                                StatusCode::InvalidRequest,
+                                RetryDisposition::Never,
+                                error,
+                            ),
+                        )
+                        .await
+                        {
+                            return Err(());
+                        }
+                        continue;
+                    }
+                };
+                if cancelled_before_start.remove(&request_id).is_some() {
+                    if !send_gateway_pipeline_terminal(
+                        sender,
+                        gateway_pipeline_error_frame(
+                            request,
+                            StatusCode::Cancelled,
+                            RetryDisposition::Never,
+                            "Gateway pipeline request was cancelled",
+                        ),
+                    )
+                    .await
+                    {
+                        return Err(());
+                    }
+                    continue;
+                }
+                if batch_too_large {
+                    if !send_gateway_pipeline_terminal(
+                        sender,
+                        gateway_pipeline_error_frame(
+                            request,
+                            StatusCode::ResourceExhausted,
+                            RetryDisposition::Safe,
+                            "Gateway pipeline batch exceeds its request or byte limit",
+                        ),
+                    )
+                    .await
+                    {
+                        return Err(());
+                    }
+                    continue;
+                }
+                if abort_handles.contains_key(&request_id) {
+                    if !send_gateway_pipeline_terminal(
+                        sender,
+                        gateway_pipeline_error_frame(
+                            request,
+                            StatusCode::InvalidRequest,
+                            RetryDisposition::Never,
+                            "Gateway pipeline request ID is already in flight",
+                        ),
+                    )
+                    .await
+                    {
+                        return Err(());
+                    }
+                    continue;
+                }
+                let permit = match Arc::clone(permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        if !send_gateway_pipeline_terminal(
+                            sender,
+                            gateway_pipeline_error_frame(
+                                request,
+                                StatusCode::ResourceExhausted,
+                                RetryDisposition::Safe,
+                                "Data pipeline execution credits are exhausted",
+                            ),
+                        )
+                        .await
+                        {
+                            return Err(());
+                        }
+                        continue;
+                    }
+                };
+                let service = service.clone();
+                let handle = tasks.spawn(async move {
+                    let _permit = permit;
+                    (
+                        request_id,
+                        execute_gateway_session_request(service, wire).await,
+                    )
+                });
+                abort_handles.insert(request_id, handle);
+            }
+        }
+        Some(
+            dtg_execution::cluster_protocol::proto::gateway_pipeline_client_frame::Payload::Cancel(
+                cancel,
+            ),
+        ) => {
+            let Some(request) = cancel.request else {
+                return Err(());
+            };
+            let request_id = pipeline_request_id(Some(&request)).map_err(|_| ())?;
+            if let Some(handle) = abort_handles.remove(&request_id) {
+                handle.abort();
+                if !send_gateway_pipeline_terminal(
+                    sender,
+                    gateway_pipeline_error_frame(
+                        request,
+                        StatusCode::Cancelled,
+                        RetryDisposition::Never,
+                        "Gateway pipeline request was cancelled",
+                    ),
+                )
+                .await
+                {
+                    return Err(());
+                }
+            } else if cancelled_before_start.len() < MAX_GATEWAY_PIPELINE_IN_FLIGHT {
+                cancelled_before_start.insert(request_id, request);
+            } else {
+                return Err(());
+            }
+        }
+        None => return Err(()),
+    }
+    Ok(())
+}
+
+async fn emit_gateway_pipeline_completion(
+    sender: &mpsc::Sender<Result<GatewayPipelineServerFrame, Status>>,
+    abort_handles: &mut BTreeMap<u128, AbortHandle>,
+    completed: Option<Result<(u128, GatewaySessionResponse), tokio::task::JoinError>>,
+) -> bool {
+    let Some(completed) = completed else {
+        return true;
+    };
+    match completed {
+        Ok((request_id, response)) => {
+            // Cancellation emits the only terminal response and removes the
+            // abort handle. A task that won the completion race must therefore
+            // be discarded rather than returning a second response/credit.
+            if abort_handles.remove(&request_id).is_none() {
+                return true;
+            }
+            send_gateway_pipeline_terminal(sender, GatewayPipelineServerFrame {
+                payload: Some(
+                    dtg_execution::cluster_protocol::proto::gateway_pipeline_server_frame::Payload::Response(
+                        response,
+                    ),
+                ),
+                returned_credits: 1,
+            })
+            .await
+        }
+        Err(error) if error.is_cancelled() => true,
+        Err(error) => {
+            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+            false
+        }
+    }
+}
+
+async fn send_gateway_pipeline_terminal(
+    sender: &mpsc::Sender<Result<GatewayPipelineServerFrame, Status>>,
+    response: GatewayPipelineServerFrame,
+) -> bool {
+    sender.send(Ok(response)).await.is_ok()
+}
+
+fn gateway_pipeline_error_frame(
+    request: RequestContext,
+    code: StatusCode,
+    retry: RetryDisposition,
+    message: impl Into<String>,
+) -> GatewayPipelineServerFrame {
+    GatewayPipelineServerFrame {
+        payload: Some(
+            dtg_execution::cluster_protocol::proto::gateway_pipeline_server_frame::Payload::Response(
+                GatewaySessionResponse {
+                    request: Some(request.clone()),
+                    responses: vec![GatewayWireResponse {
+                        status: Some(TypedStatus {
+                            request: Some(request),
+                            code: code.into(),
+                            retry: retry.into(),
+                            message: message.into(),
+                            idempotency_key: Vec::new(),
+                            details: None,
+                        }),
+                        batch: None,
+                    }],
+                },
+            ),
+        ),
+        returned_credits: 1,
+    }
+}
+
+fn pipeline_request_id(request: Option<&RequestContext>) -> Result<u128, &'static str> {
+    let request = request.ok_or("Gateway pipeline request omitted request identity")?;
+    let bytes: [u8; 16] = request
+        .request_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| "Gateway pipeline request identity must contain 16 bytes")?;
+    let request_id = u128::from_be_bytes(bytes);
+    if request_id == 0 {
+        return Err("Gateway pipeline request identity must be non-zero");
+    }
+    Ok(request_id)
+}
+
+fn gateway_pipeline_wire_size(request: &GatewayRequest) -> usize {
+    let mut bytes = 32_usize;
+    if let Some(context) = request.request.as_ref() {
+        bytes = bytes
+            .saturating_add(context.cluster_id.len())
+            .saturating_add(context.request_id.len())
+            .saturating_add(context.trace_context.len())
+            .saturating_add(32);
+    }
+    if let Some(payload) = request.execution_request.as_ref() {
+        bytes = bytes
+            .saturating_add(payload.body.len())
+            .saturating_add(payload.checksum.len())
+            .saturating_add(32);
+    }
+    for fragment in &request.fragments {
+        bytes = bytes
+            .saturating_add(fragment.fragment_id.len())
+            .saturating_add(fragment.capability_digest.len())
+            .saturating_add(64);
+        if let Some(payload) = fragment.payload.as_ref() {
+            bytes = bytes
+                .saturating_add(payload.body.len())
+                .saturating_add(payload.checksum.len())
+                .saturating_add(32);
+        }
+        if let Some(context) = fragment
+            .context
+            .as_ref()
+            .and_then(|context| context.request.as_ref())
+        {
+            bytes = bytes
+                .saturating_add(context.cluster_id.len())
+                .saturating_add(context.request_id.len())
+                .saturating_add(context.trace_context.len())
+                .saturating_add(32);
+        }
+    }
+    bytes
 }
 
 async fn execute_gateway_session_request(
@@ -1547,6 +1930,9 @@ async fn execute_gateway_session_request(
     if let Err(error) = service.begin_request() {
         return gateway_session_error(request, error);
     }
+    let timer = service
+        .request_metrics
+        .start_detail(dtg_execution::RequestDetail::DataGatewaySessionExecution);
     let result = async {
         let validated =
             validate_gateway_request(wire.clone()).map_err(|error| service.invalid(error))?;
@@ -1568,22 +1954,32 @@ async fn execute_gateway_session_request(
     }
     .await;
     match result {
-        Ok(frame) => frame,
-        Err(error) => gateway_session_error(request, error),
+        Ok(frame) => {
+            timer.finish(dtg_execution::StageOutcome::Success);
+            frame
+        }
+        Err(error) => {
+            timer.finish(dtg_execution::StageOutcome::Error);
+            gateway_session_error(request, error)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
     use futures_util::StreamExt as _;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, mpsc};
+    use tokio::task::JoinSet;
 
     use super::{
-        ColumnBatch, PROTOCOL_MAJOR, RequestContext, StatusCode, collect_fragment_results_bounded,
+        ColumnBatch, GatewaySessionResponse, PROTOCOL_MAJOR, RequestContext, StatusCode,
+        collect_fragment_results_bounded, emit_gateway_pipeline_completion,
         gateway_query_responses, gateway_session_frame, stream_fragment_results_bounded,
+        stream_gateway_pipeline_results_bounded,
     };
 
     #[test]
@@ -1679,5 +2075,34 @@ mod tests {
             .expect("stream ended before emitting the ready fragment")
             .unwrap();
         assert_eq!(first, (1, 2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_stream_emits_a_fast_request_before_a_slow_batch_peer() {
+        let mut results =
+            stream_gateway_pipeline_results_bounded(vec![1_u8, 2], 2, |request_id| async move {
+                if request_id == 1 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Ok::<_, ()>(request_id)
+            });
+
+        let first = tokio::time::timeout(Duration::from_millis(50), results.next())
+            .await
+            .expect("fast pipeline request was delayed behind slow peer")
+            .expect("pipeline stream ended before emitting the fast request")
+            .unwrap();
+        assert_eq!(first, (1, 2));
+    }
+
+    #[tokio::test]
+    async fn cancelled_pipeline_request_does_not_emit_a_second_terminal_response() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { (7_u128, GatewaySessionResponse::default()) });
+        let completed = tasks.join_next().await;
+
+        assert!(emit_gateway_pipeline_completion(&sender, &mut BTreeMap::new(), completed,).await);
+        assert!(receiver.try_recv().is_err());
     }
 }

@@ -19,7 +19,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::from_env()?;
-    let factory = TonicGatewayProtocolV2TransportFactory;
+    let query_sessions_enabled =
+        std::env::var("DTG_GATEWAY_QUERY_SESSIONS").map_or(true, |value| value != "0");
+    let query_pipelines_enabled =
+        std::env::var("DTG_GATEWAY_QUERY_PIPELINE").map_or(true, |value| value != "0");
+    let factory = TonicGatewayProtocolV2TransportFactory::new(query_sessions_enabled)
+        .with_query_pipelines(query_pipelines_enabled);
     let default_transport = factory.connect(config.cluster_endpoint()).await?;
     let mut shard_transports = std::collections::BTreeMap::new();
     for (shard_id, endpoint) in config.shard_endpoints() {

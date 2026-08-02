@@ -183,6 +183,7 @@ message GatewayPipelineServerFrame {
     GatewaySessionResponse response = 1;
     GatewayPipelineCredit credit = 2;
   }
+  uint32 returned_credits = 3;
 }
 
 service GatewayService {

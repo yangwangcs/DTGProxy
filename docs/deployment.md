@@ -25,6 +25,15 @@ placement epoch, replica, and backend generation.
 Use mutual TLS on non-loopback networks. Plaintext listeners are accepted only on loopback by the
 process configuration validators.
 
+## Same-host Gateway/Data transport
+
+TCP remains the default and is required between hosts. When Gateway and its assigned Data process
+run under the same operating-system user on one Unix host, set `DTG_DATA_GATEWAY_UNIX_SOCKET` to an
+absolute socket path and set the matching `DTG_GATEWAY_CLUSTER_ENDPOINT` (or shard endpoint) to
+`unix:///absolute/socket/path`. Data continues to serve TCP for Raft, probes, and remote Gateway
+routes. The socket is owner-only (`0600`); Data removes only a stale socket at that exact path and
+refuses to overwrite any ordinary file.
+
 ## Local cluster
 
 For development and integration verification, run:

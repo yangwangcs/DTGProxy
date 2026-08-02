@@ -94,7 +94,7 @@ async fn quick_selected_backend_e2e_comparison() {
             Workload::TwoHopExpand,
             Workload::CountVertices,
         ] {
-            for concurrency in [1, 8] {
+            for concurrency in [1, 8, 64] {
                 let spec = CellSpec {
                     backend,
                     workload,
@@ -273,6 +273,56 @@ async fn fjall_one_hop_uses_the_real_four_process_bolt_path() {
     cluster.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires release DTGProxy binaries"]
+async fn fjall_pipeline_c64_one_hop_completes_without_stalling() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let spec = CellSpec::one(Backend::Fjall, Workload::OneHopExpand, 64, 1);
+    let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+    cluster.seed_read_dataset(4_096).await.unwrap();
+    let observation = tokio::time::timeout(Duration::from_secs(20), cluster.measure_cell(spec))
+        .await
+        .expect("pipeline c64 one-hop measurement must not stall")
+        .unwrap();
+    assert_eq!(observation.errors, 0);
+    assert!(!observation.latency_samples_ns.is_empty());
+    let gateway_metrics = observation
+        .gateway_stage_metrics
+        .as_ref()
+        .expect("Gateway stage metrics must be available");
+    for detail in [
+        "gateway_query_pipeline_submit",
+        "gateway_query_pipeline_response_wait",
+    ] {
+        assert!(
+            gateway_metrics
+                .delta
+                .details
+                .iter()
+                .any(|candidate| candidate.detail == detail && candidate.success != 0),
+            "pipeline c64 traffic must record {detail}",
+        );
+    }
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires release DTGProxy binaries"]
+async fn fjall_pipeline_point_lookup_c64_completes_after_lower_concurrency_cells() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    for concurrency in [1, 8, 64] {
+        let spec = CellSpec::one(Backend::Fjall, Workload::PointLookup, concurrency, 1);
+        let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+        cluster.seed_read_dataset(4_096).await.unwrap();
+        let observation = tokio::time::timeout(Duration::from_secs(20), cluster.measure_cell(spec))
+            .await
+            .expect("pipeline point lookup c64 measurement must not stall")
+            .unwrap();
+        assert_eq!(observation.errors, 0);
+        cluster.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires release DTGProxy binaries"]
 async fn fjall_two_hop_uses_the_real_four_process_bolt_path() {
@@ -388,9 +438,13 @@ fn detail_success(snapshot: &backend_e2e_support::ProcessMetricsSnapshot, detail
 #[test]
 fn matrix_has_exact_diagnostic_cells() {
     let cells = backend_e2e_support::CellSpec::matrix(4_923_929_926_749_575_257);
-    assert_eq!(cells.len(), 90);
+    assert_eq!(cells.len(), 135);
     assert_eq!(
         cells.iter().filter(|cell| cell.concurrency == 8).count(),
+        45
+    );
+    assert_eq!(
+        cells.iter().filter(|cell| cell.concurrency == 64).count(),
         45
     );
     assert!(
@@ -681,6 +735,23 @@ fn stage_metrics_window_accepts_schema_v6_snapshot_csr_details() {
 }
 
 #[test]
+fn stage_metrics_window_accepts_schema_v8_pipeline_details() {
+    let first = stage_metrics_line_with_pipeline_details("gateway", 10, 1, 1);
+    let second = stage_metrics_line_with_pipeline_details("gateway", 20, 2, 2);
+    let log = format!("{first}\n{second}\n");
+    let window = stage_metrics_window_from_log(&log, "gateway", 15, 20).unwrap();
+    assert_eq!(window.delta.details.len(), 34);
+    assert_eq!(
+        window.delta.details[32].detail,
+        "gateway_query_pipeline_submit"
+    );
+    assert_eq!(
+        window.delta.details[33].detail,
+        "gateway_query_pipeline_response_wait"
+    );
+}
+
+#[test]
 fn stage_metrics_window_rejects_invalid_or_unbracketed_snapshots() {
     let mut incomplete_snapshot = serde_json::from_str::<serde_json::Value>(
         stage_metrics_line("gateway", 10, 1, 1)
@@ -751,15 +822,15 @@ fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
     let artifact =
         backend_e2e_support::QuickDiagnosticArtifact::new("test-revision", observations).unwrap();
     assert_eq!(artifact.repetitions, 3);
-    assert_eq!(artifact.observations.len(), 30);
-    assert_eq!(artifact.summaries.len(), 10);
+    assert_eq!(artifact.observations.len(), 45);
+    assert_eq!(artifact.summaries.len(), 15);
     let serialized = serde_json::to_value(&artifact).unwrap();
     assert_eq!(serialized["format_version"], 1);
     assert_eq!(serialized["backend"], "fjall");
     assert_eq!(serialized["revision"], "test-revision");
     assert_eq!(serialized["repetitions"], 3);
-    assert_eq!(serialized["observations"].as_array().unwrap().len(), 30);
-    assert_eq!(serialized["summaries"].as_array().unwrap().len(), 10);
+    assert_eq!(serialized["observations"].as_array().unwrap().len(), 45);
+    assert_eq!(serialized["summaries"].as_array().unwrap().len(), 15);
     let summary = serialized["summaries"]
         .as_array()
         .unwrap()
@@ -848,7 +919,7 @@ fn complete_quick_observations(
             backend_e2e_support::Workload::TwoHopExpand,
             backend_e2e_support::Workload::CountVertices,
         ] {
-            for concurrency in [1, 8] {
+            for concurrency in [1, 8, 64] {
                 let mut data_stage_metrics = synthetic_stage_metrics_window_v6("data");
                 if matches!(
                     workload,
@@ -1125,6 +1196,42 @@ fn stage_metrics_line_with_snapshot_csr_details(
         "data_snapshot_csr_cache_hit",
         "data_snapshot_csr_cache_miss",
         "data_snapshot_csr_build",
+    ] {
+        value["details"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "detail": detail,
+                "buckets": vec![success; 64],
+                "success": success,
+                "error": success,
+                "cancelled": success,
+                "total_nanoseconds": success,
+                "max_nanoseconds": success,
+            }));
+    }
+    format!("DTG_REQUEST_STAGE_METRICS={value}")
+}
+
+fn stage_metrics_line_with_pipeline_details(
+    role: &str,
+    timestamp: u64,
+    sequence: u64,
+    success: u64,
+) -> String {
+    let mut value = serde_json::from_str::<serde_json::Value>(
+        stage_metrics_line_with_snapshot_csr_details(role, timestamp, sequence, success)
+            .strip_prefix("DTG_REQUEST_STAGE_METRICS=")
+            .unwrap(),
+    )
+    .unwrap();
+    value["schema_version"] = serde_json::Value::from(8);
+    for detail in [
+        "gateway_query_session_submit",
+        "gateway_query_session_response_wait",
+        "data_gateway_session_execution",
+        "gateway_query_pipeline_submit",
+        "gateway_query_pipeline_response_wait",
     ] {
         value["details"]
             .as_array_mut()

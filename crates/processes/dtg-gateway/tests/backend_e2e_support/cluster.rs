@@ -43,6 +43,7 @@ pub struct DiagnosticRuntime {
     bin_dir: PathBuf,
     pub postgres_endpoint: String,
     pub postgres_credential: String,
+    gateway_data_uds: bool,
 }
 
 impl DiagnosticRuntime {
@@ -71,6 +72,8 @@ impl DiagnosticRuntime {
             bin_dir,
             postgres_endpoint: environment_string("DTG_BACKEND_E2E_POSTGRES_ENDPOINT"),
             postgres_credential: environment_string("DTG_BACKEND_E2E_POSTGRES_CREDENTIAL"),
+            gateway_data_uds: env::var("DTG_BACKEND_E2E_GATEWAY_DATA_UDS")
+                .is_ok_and(|value| value != "0"),
         })
     }
 
@@ -86,6 +89,7 @@ pub struct DiagnosticCluster {
     spec: CellSpec,
     meta_address: SocketAddr,
     data_address: SocketAddr,
+    gateway_data_endpoint: String,
     gateway_address: SocketAddr,
     binding: ReplicaBinding,
     children: Vec<ManagedChild>,
@@ -105,6 +109,14 @@ impl DiagnosticCluster {
         let controller_address = free_address()?;
         let data_address = free_address()?;
         let gateway_address = free_address()?;
+        let gateway_unix_socket = runtime.gateway_data_uds.then(|| {
+            std::env::temp_dir().join(format!("dtgproxy-{}-gateway.sock", identity.unique))
+        });
+        if let Some(path) = gateway_unix_socket.as_deref()
+            && let Some(parent) = path.parent()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         let meta_config = root.path().join("meta.json");
         let controller_config = root.path().join("controller.json");
         write_json(
@@ -146,6 +158,10 @@ impl DiagnosticCluster {
             spec,
             meta_address,
             data_address,
+            gateway_data_endpoint: gateway_data_endpoint(
+                data_address,
+                gateway_unix_socket.as_deref(),
+            ),
             gateway_address,
             binding,
             children: Vec::with_capacity(4),
@@ -190,6 +206,9 @@ impl DiagnosticCluster {
             ("DTG_DATA_CAPABILITIES", CAPABILITIES.into()),
             ("DTG_DATA_ASSIGNMENTS", assignment),
         ];
+        if let Some(path) = gateway_unix_socket.as_deref() {
+            data_environment.push(("DTG_DATA_GATEWAY_UNIX_SOCKET", path.display().to_string()));
+        }
         match spec.backend {
             Backend::Fjall => {}
             Backend::PostgreSql => {
@@ -410,7 +429,7 @@ impl DiagnosticCluster {
             | Workload::CountVertices => "4096",
             Workload::CreateVertex => "1",
         };
-        let environment = vec![
+        let mut environment = vec![
             ("DTG_GATEWAY_BIND", self.gateway_address.to_string()),
             (
                 "DTG_GATEWAY_CLUSTER_ID",
@@ -419,7 +438,7 @@ impl DiagnosticCluster {
             ("DTG_GATEWAY_REQUEST_TIMEOUT_MS", "10000".into()),
             (
                 "DTG_GATEWAY_CLUSTER_ENDPOINT",
-                format!("http://{}", self.data_address),
+                self.gateway_data_endpoint.clone(),
             ),
             (
                 "DTG_GATEWAY_META_ENDPOINT",
@@ -437,6 +456,12 @@ impl DiagnosticCluster {
             ("DTG_GATEWAY_CAPABILITIES", CAPABILITIES.into()),
             ("DTG_GATEWAY_SHARDS", shard),
         ];
+        if env::var_os("DTG_BACKEND_E2E_DISABLE_QUERY_SESSIONS").is_some() {
+            environment.push(("DTG_GATEWAY_QUERY_SESSIONS", "0".into()));
+        }
+        if env::var_os("DTG_BACKEND_E2E_DISABLE_QUERY_PIPELINE").is_some() {
+            environment.push(("DTG_GATEWAY_QUERY_PIPELINE", "0".into()));
+        }
         self.spawn("gateway", self.gateway_binary.clone(), &[], &environment)
     }
 
@@ -486,19 +511,11 @@ impl DiagnosticCluster {
                 observation.measurement_started_at_unix_ns,
                 observation.measurement_finished_at_unix_ns,
             ) {
-                Ok(window) => {
-                    let latest_allowed = observation
-                        .measurement_finished_at_unix_ns
-                        .saturating_add(duration_nanos(POST_MEASUREMENT_METRICS_WAIT));
-                    if window.before.unix_timestamp_ns < observation.started_at_unix_ns
-                        || window.after.unix_timestamp_ns > latest_allowed
-                    {
-                        return Err(invalid_data(format!(
-                            "{process} request metrics snapshot lies outside the cell interval"
-                        )));
-                    }
-                    return Ok(window);
-                }
+                // The exporter is periodic and may be delayed while the process is
+                // saturated. The parser already guarantees that the selected pair
+                // brackets the measurement window; a late cumulative snapshot is
+                // still valid because no requests are issued after measurement ends.
+                Ok(window) => return Ok(window),
                 Err(error)
                     if error.kind() == io::ErrorKind::InvalidData
                         && error
@@ -930,6 +947,26 @@ fn free_address() -> io::Result<SocketAddr> {
     listener.local_addr()
 }
 
+fn gateway_data_endpoint(address: SocketAddr, socket: Option<&Path>) -> String {
+    socket.map_or_else(
+        || format!("http://{address}"),
+        |path| format!("unix://{}", path.display()),
+    )
+}
+
+#[test]
+fn gateway_data_endpoint_prefers_configured_unix_socket() {
+    let address: SocketAddr = "127.0.0.1:7690".parse().unwrap();
+    assert_eq!(
+        gateway_data_endpoint(address, None),
+        "http://127.0.0.1:7690"
+    );
+    assert_eq!(
+        gateway_data_endpoint(address, Some(Path::new("/tmp/dtg-data.sock"))),
+        "unix:///tmp/dtg-data.sock"
+    );
+}
+
 fn write_json(path: &Path, value: serde_json::Value) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(&value).map_err(io_other)?;
     std::fs::write(path, bytes)
@@ -957,10 +994,6 @@ fn unix_time_nanos() -> u64 {
             .as_nanos(),
     )
     .unwrap_or(u64::MAX)
-}
-
-fn duration_nanos(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

@@ -59,6 +59,7 @@ impl std::error::Error for DataConfigError {}
 #[derive(Clone, Debug)]
 pub struct DataProcessConfig {
     rpc_addr: SocketAddr,
+    gateway_unix_socket: Option<PathBuf>,
     fjall_root: PathBuf,
     kuzu_root: PathBuf,
     consensus_root: PathBuf,
@@ -72,6 +73,7 @@ impl DataProcessConfig {
     pub fn new(fjall_root: impl AsRef<Path>, consensus_root: impl AsRef<Path>) -> Self {
         Self {
             rpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
+            gateway_unix_socket: None,
             fjall_root: fjall_root.as_ref().to_path_buf(),
             kuzu_root: PathBuf::from("./dtg-data/kuzu"),
             consensus_root: consensus_root.as_ref().to_path_buf(),
@@ -104,9 +106,20 @@ impl DataProcessConfig {
         let rpc_addr = rpc_addr_value
             .parse()
             .map_err(|_| DataConfigError::InvalidRpcAddress(rpc_addr_value))?;
+        let gateway_unix_socket =
+            environment_string(&get, "DTG_DATA_GATEWAY_UNIX_SOCKET")?.map(PathBuf::from);
+        if gateway_unix_socket
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(DataConfigError::InvalidEnvironment(
+                "DTG_DATA_GATEWAY_UNIX_SOCKET must be an absolute path".into(),
+            ));
+        }
         let mut config = Self::new(fjall_root, consensus_root)
             .with_kuzu_root(kuzu_root)
             .with_rpc_addr(rpc_addr);
+        config.gateway_unix_socket = gateway_unix_socket;
         if let Some(assignments) = environment_string(&get, "DTG_DATA_ASSIGNMENTS")? {
             let capability_names =
                 environment_string(&get, "DTG_DATA_CAPABILITIES")?.ok_or_else(|| {
@@ -172,6 +185,10 @@ impl DataProcessConfig {
 
     pub const fn rpc_addr(&self) -> SocketAddr {
         self.rpc_addr
+    }
+
+    pub fn gateway_unix_socket(&self) -> Option<&Path> {
+        self.gateway_unix_socket.as_deref()
     }
 
     pub fn fjall_root(&self) -> &Path {
@@ -317,6 +334,26 @@ fn parse_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_accepts_only_absolute_gateway_unix_socket_paths() {
+        let absolute = DataProcessConfig::from_environment(|name| match name {
+            "DTG_DATA_GATEWAY_UNIX_SOCKET" => Some(OsString::from("/tmp/dtg-data.sock")),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            absolute.gateway_unix_socket(),
+            Some(Path::new("/tmp/dtg-data.sock"))
+        );
+
+        let error = DataProcessConfig::from_environment(|name| match name {
+            "DTG_DATA_GATEWAY_UNIX_SOCKET" => Some(OsString::from("relative.sock")),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(matches!(error, DataConfigError::InvalidEnvironment(_)));
+    }
 
     #[test]
     fn environment_bootstrap_loads_postgresql_profile() {

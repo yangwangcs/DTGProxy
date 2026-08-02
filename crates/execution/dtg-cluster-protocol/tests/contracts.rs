@@ -24,6 +24,15 @@ fn pipeline_frames_are_additive_and_statuses_are_stable() {
     );
     assert_eq!(proto::StatusCode::ResourceExhausted as i32, 7);
     assert_eq!(proto::StatusCode::Cancelled as i32, 8);
+
+    let response = proto::GatewayPipelineServerFrame {
+        payload: None,
+        returned_credits: 1,
+    };
+    assert_eq!(
+        proto::GatewayPipelineServerFrame::decode(response.encode_to_vec().as_slice()).unwrap(),
+        response
+    );
 }
 
 #[test]

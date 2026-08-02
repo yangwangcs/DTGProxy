@@ -36,4 +36,4 @@ tokio-stream = "=0.1.18"
 [dev-dependencies]
 dtg-storage-fjall = { path = "../../storage/dtg-storage-fjall" }
 tempfile = "3"
-tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "=1.53.0", features = ["macros", "net", "rt-multi-thread"] }

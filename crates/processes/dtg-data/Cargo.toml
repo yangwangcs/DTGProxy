@@ -22,7 +22,7 @@ dtg-storage-remote = { path = "../../storage/dtg-storage-remote" }
 prost-011 = { package = "prost", version = "=0.11.9" }
 raft = { version = "=0.7.0", default-features = false, features = ["prost-codec"] }
 tokio = { version = "=1.53.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-stream = "=0.1.18"
+tokio-stream = { version = "=0.1.18", features = ["net"] }
 tonic = { version = "=0.14.6", features = ["transport"] }
 
 [dev-dependencies]

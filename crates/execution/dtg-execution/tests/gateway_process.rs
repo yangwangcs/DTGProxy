@@ -5,7 +5,7 @@ use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dtg_cluster_v2::{checksum_bytes, proto};
 use dtg_execution::{
@@ -13,7 +13,7 @@ use dtg_execution::{
     GatewayExecutionTransport, GatewayFuture, GatewayProtocolV2Client, GatewayProtocolV2Transport,
     GatewayQueryResponse, GatewayRequestContext, GatewayResponse, GatewayRows, GatewayValue,
     GatewayWriteReceipt, GatewayWriteRequest, GatewayWriteTransport, RequestDetail, RequestStage,
-    ShardRoutedGatewayTransport,
+    ShardRoutedGatewayTransport, StageOutcome,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -28,6 +28,22 @@ use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, LogicalMutation, ProviderKind, ReplicaBinding,
     TransactionId, TransactionTime, Version,
 };
+
+#[tokio::test]
+async fn cancellation_token_notifies_waiters_without_polling() {
+    let token = GatewayCancellationToken::new();
+    let waiter_token = token.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_token.cancelled().await;
+    });
+
+    tokio::task::yield_now().await;
+    token.cancel();
+    tokio::time::timeout(Duration::from_millis(100), waiter)
+        .await
+        .expect("cancellation waiter should be notified")
+        .expect("cancellation waiter should not panic");
+}
 
 #[derive(Clone, Copy, Default)]
 enum ProtocolFixture {
@@ -159,8 +175,10 @@ impl GatewayProtocolV2Client for RecordingProtocolClient {
 #[derive(Default)]
 struct SessionRecordingProtocolClient {
     session_requests: Mutex<Vec<proto::GatewayRequest>>,
+    pipeline_requests: Mutex<Vec<proto::GatewayRequest>>,
     direct_requests: Mutex<Vec<proto::GatewayRequest>>,
     session_available: bool,
+    pipeline_available: bool,
 }
 
 impl SessionRecordingProtocolClient {
@@ -174,6 +192,14 @@ impl SessionRecordingProtocolClient {
     fn available() -> Self {
         Self {
             session_available: true,
+            ..Self::default()
+        }
+    }
+
+    fn pipeline_available() -> Self {
+        Self {
+            session_available: true,
+            pipeline_available: true,
             ..Self::default()
         }
     }
@@ -201,6 +227,34 @@ impl GatewayProtocolV2Client for SessionRecordingProtocolClient {
         let session_available = self.session_available;
         Box::pin(async move {
             Ok(session_available.then(|| {
+                vec![session_gateway_response(
+                    &request,
+                    encoded_batch(1, encoded_vertex_rows(1..=1), 1),
+                )]
+            }))
+        })
+    }
+
+    fn execute_pipeline_with_metrics_and_cancellation(
+        &self,
+        request: proto::GatewayRequest,
+        metrics: Arc<dtg_execution::RequestStageMetrics>,
+        _cancellation: &GatewayCancellationToken,
+    ) -> GatewayFuture<'_, Result<Option<Vec<proto::GatewayResponse>>, GatewayExecutionError>> {
+        self.pipeline_requests.lock().unwrap().push(request.clone());
+        metrics.record_detail(
+            RequestDetail::GatewayQueryPipelineSubmit,
+            StageOutcome::Success,
+            1,
+        );
+        metrics.record_detail(
+            RequestDetail::GatewayQueryPipelineResponseWait,
+            StageOutcome::Success,
+            1,
+        );
+        let pipeline_available = self.pipeline_available;
+        Box::pin(async move {
+            Ok(pipeline_available.then(|| {
                 vec![session_gateway_response(
                     &request,
                     encoded_batch(1, encoded_vertex_rows(1..=1), 1),
@@ -1031,6 +1085,47 @@ fn single_fragment_query_prefers_the_session_and_falls_back_when_unavailable() {
                 "{detail:?} must remain separately observable for session and fallback queries"
             );
         }
+    }
+}
+
+#[test]
+fn routed_single_fragment_query_preserves_transport_metrics() {
+    let client = Arc::new(SessionRecordingProtocolClient::pipeline_available());
+    let transport = Arc::new(ShardRoutedGatewayTransport::new(
+        Arc::new(GatewayProtocolV2Transport::new(client.clone())),
+        BTreeMap::new(),
+    ));
+    let execution = GatewayExecution::for_process(transport, planning_context());
+
+    let response = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 0x7655, u64::MAX, Vec::new()).unwrap(),
+        "MATCH (n) WHERE n.id = $id RETURN n.id".into(),
+        BTreeMap::from([("id".into(), GatewayValue::Integer(2048))]),
+        None,
+        &GatewayCancellationToken::new(),
+    ));
+
+    assert!(matches!(response, Ok(GatewayResponse::Rows(_))));
+    assert_eq!(client.pipeline_requests.lock().unwrap().len(), 1);
+    assert_eq!(client.session_requests.lock().unwrap().len(), 0);
+    for detail in [
+        RequestDetail::GatewayQueryRequestEncode,
+        RequestDetail::GatewayQueryResponseCollect,
+        RequestDetail::GatewayQueryResponseDecode,
+        RequestDetail::GatewayQueryPipelineSubmit,
+        RequestDetail::GatewayQueryPipelineResponseWait,
+    ] {
+        assert_eq!(
+            execution
+                .request_metrics()
+                .snapshot()
+                .details()
+                .find_map(|(observed, snapshot)| (observed == detail).then_some(snapshot))
+                .unwrap()
+                .success,
+            1,
+            "{detail:?} must remain observable through shard routing"
+        );
     }
 }
 
