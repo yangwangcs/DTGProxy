@@ -323,6 +323,51 @@ async fn fjall_pipeline_point_lookup_c64_completes_after_lower_concurrency_cells
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires release DTGProxy binaries and DTG_GATEWAY_BOLT_READ_PIPELINE=1"]
+async fn fjall_bolt_read_pipeline_depth_matrix() {
+    assert_eq!(
+        env::var("DTG_GATEWAY_BOLT_READ_PIPELINE").as_deref(),
+        Ok("1"),
+        "the real Bolt pipeline benchmark requires DTG_GATEWAY_BOLT_READ_PIPELINE=1",
+    );
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    for depth in [1, 8, 64] {
+        let spec = CellSpec::one(Backend::Fjall, Workload::PointLookup, 64, 1);
+        let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+        cluster.seed_read_dataset(4_096).await.unwrap();
+        let observation = tokio::time::timeout(
+            Duration::from_secs(30),
+            backend_e2e_support::measure_pipeline_cell_with_durations(
+                cluster.bolt_address(),
+                spec,
+                depth,
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("Bolt pipeline depth cell must not stall")
+        .unwrap();
+        assert_eq!(observation.errors, 0);
+        assert!(!observation.latency_samples_ns.is_empty());
+        println!(
+            "DTG_BOLT_PIPELINE_RESULT={}",
+            serde_json::json!({
+                "depth": depth,
+                "concurrency": spec.concurrency,
+                "operations": observation.operations,
+                "throughput_ops_per_second": observation.operations as f64 * 1_000_000_000.0 / observation.measured_duration_ns as f64,
+                "p50_ms": percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
+                "p95_ms": percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
+                "p99_ms": percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
+                "result_digest": observation.result_digest,
+            })
+        );
+        cluster.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires release DTGProxy binaries"]
 async fn fjall_two_hop_uses_the_real_four_process_bolt_path() {
@@ -577,6 +622,37 @@ async fn measure_cell_records_each_measured_read_on_one_worker_connection() {
         "the measurement boundary must be sampled when warmup actually finishes"
     );
     assert!(measurement_finished_at_unix_ns >= measurement_started_at_unix_ns);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn measure_pipeline_cell_counts_every_depth_two_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        serve_fake_bolt_pipeline_until_closed(&mut socket, 2).await;
+    });
+    let cell = backend_e2e_support::CellSpec {
+        backend: backend_e2e_support::Backend::Fjall,
+        workload: backend_e2e_support::Workload::PointLookup,
+        concurrency: 1,
+        repetition: 0,
+    };
+
+    let observation = backend_e2e_support::measure_pipeline_cell_with_durations(
+        address,
+        cell,
+        2,
+        Duration::ZERO,
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap();
+
+    assert!(observation.operations >= 2);
+    assert_eq!(observation.operations % 2, 0);
+    assert_eq!(observation.errors, 0);
     server.await.unwrap();
 }
 
@@ -1400,6 +1476,46 @@ async fn serve_fake_bolt_until_closed(socket: &mut TcpStream) {
             ],
         )
         .await;
+    }
+}
+
+async fn serve_fake_bolt_pipeline_until_closed(socket: &mut TcpStream, depth: usize) {
+    let mut handshake = [0_u8; 20];
+    socket.read_exact(&mut handshake).await.unwrap();
+    socket.write_all(&[0, 0, 4, 5]).await.unwrap();
+    if try_read_bolt_message(socket).await.is_err() {
+        return;
+    }
+    write_bolt_message(socket, &[0xb1, 0x70, 0xa0]).await;
+    loop {
+        for _ in 0..depth {
+            let Ok(run) = try_read_bolt_message(socket).await else {
+                return;
+            };
+            assert_eq!(run[1], 0x10);
+            let Ok(pull) = try_read_bolt_message(socket).await else {
+                return;
+            };
+            assert_eq!(pull, vec![0xb1, 0x3f, 0xa0]);
+        }
+        for _ in 0..depth {
+            write_bolt_message(
+                socket,
+                &[
+                    0xb1, 0x70, 0xa1, 0x86, b'f', b'i', b'e', b'l', b'd', b's', 0x91, 0x84, b'n',
+                    b'.', b'i', b'd',
+                ],
+            )
+            .await;
+            write_bolt_message(socket, &[0xb1, 0x71, 0x91, 0xc9, 0x08, 0x00]).await;
+            write_bolt_message(
+                socket,
+                &[
+                    0xb1, 0x70, 0xa1, 0x88, b'h', b'a', b's', b'_', b'm', b'o', b'r', b'e', 0xc2,
+                ],
+            )
+            .await;
+        }
     }
 }
 

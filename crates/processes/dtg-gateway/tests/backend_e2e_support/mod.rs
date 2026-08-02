@@ -11,7 +11,10 @@ pub use artifact::{
     StageMetricsWindow, Summary, Workload, percentile_ns, stage_metrics_window_from_log, summarize,
     write_quick_artifact,
 };
-pub use bolt::{BoltResult, BoltSession, BoltValue, measure_cell as measure_cell_with_durations};
+pub use bolt::{
+    BoltResult, BoltSession, BoltValue, measure_cell as measure_cell_with_durations,
+    measure_pipeline_cell as measure_pipeline_cell_with_durations,
+};
 pub use cluster::{DiagnosticCluster, DiagnosticRuntime};
 
 pub async fn measure_cell(address: SocketAddr, spec: CellSpec) -> io::Result<RawObservation> {

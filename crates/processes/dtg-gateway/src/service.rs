@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dtg_execution::{
-    GatewayCancellationToken, GatewayExecution, GatewayOperation, GatewayRequestContext,
-    GatewayResponse, GatewayRows, GatewayValue, RequestStageMetrics,
+    GATEWAY_PIPELINE_MAX_PENDING, GatewayCancellationToken, GatewayExecution, GatewayOperation,
+    GatewayRequestContext, GatewayResponse, GatewayRows, GatewayValue, RequestStageMetrics,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{BoltError, BoltSession, GatewayConfig};
 
@@ -15,6 +16,7 @@ pub struct GatewayService {
     execution: GatewayExecution,
     request_nonce: u64,
     request_sequence: AtomicU64,
+    bolt_read_pipeline_permits: Arc<Semaphore>,
 }
 
 impl GatewayService {
@@ -25,6 +27,7 @@ impl GatewayService {
             execution,
             request_nonce,
             request_sequence: AtomicU64::new(1),
+            bolt_read_pipeline_permits: Arc::new(Semaphore::new(GATEWAY_PIPELINE_MAX_PENDING)),
         }
     }
 
@@ -34,6 +37,13 @@ impl GatewayService {
 
     pub fn request_metrics(&self) -> Arc<RequestStageMetrics> {
         self.execution.request_metrics()
+    }
+
+    pub(crate) async fn acquire_bolt_read_pipeline_permit(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.bolt_read_pipeline_permits)
+            .acquire_owned()
+            .await
+            .expect("GatewayService retains its Bolt pipeline semaphore")
     }
 
     pub fn classify_bolt_statement(

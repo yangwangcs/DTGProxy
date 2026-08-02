@@ -403,6 +403,7 @@ async fn serve_pipelined_events(
                             .start_detail(RequestDetail::BoltReadPipelineEnqueueWait);
                         let request_metrics = Arc::clone(request_metrics);
                         tokio::spawn(async move {
+                            let _permit = service.acquire_bolt_read_pipeline_permit().await;
                             enqueue_timer.finish(StageOutcome::Success);
                             let execution_timer = request_metrics
                                 .start_detail(RequestDetail::BoltReadPipelineExecutionWait);

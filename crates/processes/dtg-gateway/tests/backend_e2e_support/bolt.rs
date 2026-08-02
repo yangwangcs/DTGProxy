@@ -228,6 +228,24 @@ pub async fn measure_cell(
     warmup: Duration,
     measurement: Duration,
 ) -> io::Result<RawObservation> {
+    measure_pipeline_cell(address, cell, 1, warmup, measurement).await
+}
+
+pub async fn measure_pipeline_cell(
+    address: SocketAddr,
+    cell: CellSpec,
+    depth: usize,
+    warmup: Duration,
+    measurement: Duration,
+) -> io::Result<RawObservation> {
+    if depth == 0 {
+        return Err(invalid_data("Bolt pipeline depth must be positive"));
+    }
+    if cell.workload.is_write() {
+        return Err(invalid_data(
+            "Bolt pipeline measurement only supports read workloads",
+        ));
+    }
     let phase_started = Instant::now();
     let started_at_unix_ns = unix_time_nanos();
     let warmup_deadline = phase_started + warmup;
@@ -244,6 +262,7 @@ pub async fn measure_cell(
                 cell.workload,
                 statement,
                 parameters,
+                depth,
                 warmup_deadline,
                 measurement_deadline,
             )
@@ -318,26 +337,42 @@ async fn measure_worker(
     workload: Workload,
     statement: String,
     parameters: BTreeMap<String, BoltValue>,
+    depth: usize,
     warmup_deadline: Instant,
     measurement_deadline: Instant,
 ) -> io::Result<WorkerMeasurement> {
     let mut session = BoltSession::connect(address).await?;
     let mut identity = None;
+    let requests = vec![(statement, parameters); depth];
     while Instant::now() < warmup_deadline {
-        let result = session.run(&statement, parameters.clone()).await?;
-        validate_result(workload, &result)?;
-        check_identity(workload, &mut identity, result)?;
+        let results = if depth == 1 {
+            vec![session.run(&requests[0].0, requests[0].1.clone()).await?]
+        } else {
+            session.run_pipeline(&requests).await?
+        };
+        for result in results {
+            validate_result(workload, &result)?;
+            check_identity(workload, &mut identity, result)?;
+        }
     }
 
     let mut latency_samples_ns = Vec::new();
     let mut operations = 0_u64;
     while Instant::now() < measurement_deadline {
         let operation_started = Instant::now();
-        let result = session.run(&statement, parameters.clone()).await?;
-        validate_result(workload, &result)?;
-        check_identity(workload, &mut identity, result)?;
-        latency_samples_ns.push(nanos_u64(operation_started.elapsed()));
-        operations += 1;
+        let results = if depth == 1 {
+            vec![session.run(&requests[0].0, requests[0].1.clone()).await?]
+        } else {
+            session.run_pipeline(&requests).await?
+        };
+        let per_request_latency = nanos_u64(operation_started.elapsed())
+            / u64::try_from(results.len()).unwrap_or(1).max(1);
+        for result in results {
+            validate_result(workload, &result)?;
+            check_identity(workload, &mut identity, result)?;
+            latency_samples_ns.push(per_request_latency);
+            operations += 1;
+        }
     }
     Ok(WorkerMeasurement {
         latency_samples_ns,

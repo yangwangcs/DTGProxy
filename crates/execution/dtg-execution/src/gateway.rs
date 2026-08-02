@@ -907,7 +907,7 @@ pub enum GatewayQueryResponse {
 type GatewaySessionResponses = Result<Vec<proto::GatewayResponse>, GatewayExecutionError>;
 type GatewaySessionPending = Arc<Mutex<BTreeMap<u128, oneshot::Sender<GatewaySessionResponses>>>>;
 
-const PIPELINE_MAX_PENDING: usize = 256;
+pub const GATEWAY_PIPELINE_MAX_PENDING: usize = 256;
 const PIPELINE_MAX_BATCH_REQUESTS: usize = 32;
 const PIPELINE_MAX_BATCH_BYTES: usize = 65_536;
 
@@ -1352,7 +1352,7 @@ impl TonicGatewayPipelineClient {
             .await
             .map_err(cluster_rpc_error)?
             .into_inner();
-        let (submissions, submission_receiver) = mpsc::channel(PIPELINE_MAX_PENDING);
+        let (submissions, submission_receiver) = mpsc::channel(GATEWAY_PIPELINE_MAX_PENDING);
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         let active = Arc::new(AtomicBool::new(true));
         let credits = Arc::new(AtomicUsize::new(0));
@@ -1408,7 +1408,7 @@ impl TonicGatewayPipelineClient {
                 );
                 return Err(gateway_pipeline_unavailable("Gateway pipeline is closed"));
             }
-            if pending.len() >= PIPELINE_MAX_PENDING {
+            if pending.len() >= GATEWAY_PIPELINE_MAX_PENDING {
                 return Err(GatewayExecutionError::new(
                     "DTG-CLUSTER-PIPELINE-BACKPRESSURE",
                     "Gateway pipeline pending-request limit is exhausted",
@@ -5439,7 +5439,7 @@ mod write_receipt_tests {
 
     #[tokio::test]
     async fn pipeline_writer_flushes_a_second_batch_after_returned_credits() {
-        let (submission_sender, submission_receiver) = mpsc::channel(PIPELINE_MAX_PENDING);
+        let (submission_sender, submission_receiver) = mpsc::channel(GATEWAY_PIPELINE_MAX_PENDING);
         let (frame_sender, mut frame_receiver) = mpsc::channel(4);
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         for request_id in 1..=64_u128 {
@@ -5492,7 +5492,7 @@ mod write_receipt_tests {
 
     #[tokio::test]
     async fn pipeline_writer_splits_a_ready_batch_to_the_available_credits() {
-        let (submission_sender, submission_receiver) = mpsc::channel(PIPELINE_MAX_PENDING);
+        let (submission_sender, submission_receiver) = mpsc::channel(GATEWAY_PIPELINE_MAX_PENDING);
         let (frame_sender, mut frame_receiver) = mpsc::channel(4);
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         for request_id in 1..=PIPELINE_MAX_BATCH_REQUESTS as u128 {
