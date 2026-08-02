@@ -123,6 +123,8 @@ enum StatusCode {
   STATUS_CODE_CONFLICT = 4;
   STATUS_CODE_UNAVAILABLE = 5;
   STATUS_CODE_INTERNAL = 6;
+  STATUS_CODE_RESOURCE_EXHAUSTED = 7;
+  STATUS_CODE_CANCELLED = 8;
 }
 
 enum RetryDisposition {
@@ -157,9 +159,36 @@ message GatewaySessionResponse {
   repeated GatewayResponse responses = 2;
 }
 
+message GatewayPipelineRequestBatch {
+  repeated GatewayRequest requests = 1;
+}
+
+message GatewayPipelineCancel {
+  RequestContext request = 1;
+}
+
+message GatewayPipelineClientFrame {
+  oneof payload {
+    GatewayPipelineRequestBatch batch = 1;
+    GatewayPipelineCancel cancel = 2;
+  }
+}
+
+message GatewayPipelineCredit {
+  uint32 available_requests = 1;
+}
+
+message GatewayPipelineServerFrame {
+  oneof payload {
+    GatewaySessionResponse response = 1;
+    GatewayPipelineCredit credit = 2;
+  }
+}
+
 service GatewayService {
   rpc Execute(GatewayRequest) returns (stream GatewayResponse);
   rpc ExecuteSession(stream GatewayRequest) returns (stream GatewaySessionResponse);
+  rpc ExecutePipelined(stream GatewayPipelineClientFrame) returns (stream GatewayPipelineServerFrame);
 }
 
 service DataService {

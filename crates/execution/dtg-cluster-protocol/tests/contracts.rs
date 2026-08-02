@@ -8,6 +8,25 @@ use dtg_cluster_v2::{
 use prost::Message;
 
 #[test]
+fn pipeline_frames_are_additive_and_statuses_are_stable() {
+    let frame = proto::GatewayPipelineClientFrame {
+        payload: Some(proto::gateway_pipeline_client_frame::Payload::Batch(
+            proto::GatewayPipelineRequestBatch {
+                requests: Vec::new(),
+            },
+        )),
+    };
+
+    let encoded = frame.encode_to_vec();
+    assert_eq!(
+        proto::GatewayPipelineClientFrame::decode(encoded.as_slice()).unwrap(),
+        frame
+    );
+    assert_eq!(proto::StatusCode::ResourceExhausted as i32, 7);
+    assert_eq!(proto::StatusCode::Cancelled as i32, 8);
+}
+
+#[test]
 fn shard_context_requires_backend_generation() {
     let wire = proto::ShardContext {
         backend_generation: 0,
