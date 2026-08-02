@@ -363,6 +363,10 @@ async fn fjall_bolt_read_pipeline_depth_matrix() {
                 "pipeline benchmark must record {detail}",
             );
         }
+        let data_metrics = observation
+            .data_stage_metrics
+            .as_ref()
+            .expect("pipeline benchmark must capture Data metrics");
         println!(
             "DTG_BOLT_PIPELINE_RESULT={}",
             serde_json::json!({
@@ -375,6 +379,8 @@ async fn fjall_bolt_read_pipeline_depth_matrix() {
                 "p99_ms": percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
                 "result_digest": observation.result_digest,
                 "gateway_details": gateway_metrics.delta.details.iter().filter(|detail| detail.detail.starts_with("bolt_read_pipeline_") && detail.success != 0).map(|detail| serde_json::json!({"detail": detail.detail, "calls": detail.success, "mean_nanoseconds": detail.total_nanoseconds / detail.success})).collect::<Vec<_>>(),
+                "gateway_stages": gateway_metrics.delta.stages.iter().filter(|stage| stage.success != 0).map(|stage| serde_json::json!({"stage": stage.stage, "calls": stage.success, "mean_nanoseconds": stage.total_nanoseconds / stage.success})).collect::<Vec<_>>(),
+                "data_stages": data_metrics.delta.stages.iter().filter(|stage| stage.success != 0).map(|stage| serde_json::json!({"stage": stage.stage, "calls": stage.success, "mean_nanoseconds": stage.total_nanoseconds / stage.success})).collect::<Vec<_>>(),
             })
         );
         cluster.shutdown().await.unwrap();
