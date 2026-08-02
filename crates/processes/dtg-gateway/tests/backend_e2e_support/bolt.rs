@@ -87,10 +87,7 @@ impl BoltSession {
         statement: &str,
         parameters: BTreeMap<String, BoltValue>,
     ) -> io::Result<BoltResult> {
-        let mut message = vec![0xb3, 0x10];
-        encode_string(statement, &mut message)?;
-        encode_map(&parameters, &mut message)?;
-        message.push(0xa0);
+        let message = run_message(statement, &parameters)?;
         write_message(&mut self.socket, &message).await?;
         let metadata = decode_success(&read_message(&mut self.socket).await?)?;
         let fields = match metadata.get("fields") {
@@ -145,6 +142,83 @@ impl BoltSession {
             rows,
             summary,
         })
+    }
+
+    pub async fn run_pipeline(
+        &mut self,
+        requests: &[(String, BTreeMap<String, BoltValue>)],
+    ) -> io::Result<Vec<BoltResult>> {
+        for (statement, parameters) in requests {
+            write_message(&mut self.socket, &run_message(statement, parameters)?).await?;
+            write_message(&mut self.socket, &[0xb1, 0x3f, 0xa0]).await?;
+        }
+
+        let mut results = Vec::with_capacity(requests.len());
+        for _ in requests {
+            let metadata = decode_success(&read_message(&mut self.socket).await?)?;
+            let fields = fields_from_run_metadata(metadata)?;
+            let mut rows = Vec::new();
+            let summary = loop {
+                let message = read_message(&mut self.socket).await?;
+                let value = decode_message(&message)?;
+                match value {
+                    BoltValue::Structure {
+                        signature: 0x71,
+                        mut fields,
+                    } if fields.len() == 1 => match fields.remove(0) {
+                        BoltValue::List(row) => rows.push(row),
+                        _ => return Err(invalid_data("Bolt RECORD must contain a list")),
+                    },
+                    BoltValue::Structure {
+                        signature: 0x70,
+                        mut fields,
+                    } if fields.len() == 1 => match fields.remove(0) {
+                        BoltValue::Map(summary) => break summary,
+                        _ => return Err(invalid_data("Bolt SUCCESS must contain a map")),
+                    },
+                    BoltValue::Structure {
+                        signature: 0x7f,
+                        mut fields,
+                    } if fields.len() == 1 => {
+                        let detail = match fields.remove(0) {
+                            BoltValue::Map(metadata) => format_failure(&metadata),
+                            _ => "Bolt FAILURE did not contain a map".into(),
+                        };
+                        return Err(invalid_data(detail));
+                    }
+                    _ => return Err(invalid_data("unexpected Bolt response while pulling rows")),
+                }
+            };
+            results.push(BoltResult {
+                result_digest: result_digest(&fields, &rows),
+                fields,
+                rows,
+                summary,
+            });
+        }
+        Ok(results)
+    }
+}
+
+fn run_message(statement: &str, parameters: &BTreeMap<String, BoltValue>) -> io::Result<Vec<u8>> {
+    let mut message = vec![0xb3, 0x10];
+    encode_string(statement, &mut message)?;
+    encode_map(parameters, &mut message)?;
+    message.push(0xa0);
+    Ok(message)
+}
+
+fn fields_from_run_metadata(metadata: BTreeMap<String, BoltValue>) -> io::Result<Vec<String>> {
+    match metadata.get("fields") {
+        None => Ok(Vec::new()),
+        Some(BoltValue::List(values)) => values
+            .iter()
+            .map(|value| match value {
+                BoltValue::String(value) => Ok(value.clone()),
+                _ => Err(invalid_data("Bolt RUN fields must be strings")),
+            })
+            .collect::<io::Result<Vec<_>>>(),
+        Some(_) => Err(invalid_data("Bolt RUN fields must be a list")),
     }
 }
 

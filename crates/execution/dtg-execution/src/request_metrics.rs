@@ -6,7 +6,7 @@ use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
 const REQUEST_STAGES: usize = 10;
-const REQUEST_DETAILS: usize = 34;
+const REQUEST_DETAILS: usize = 37;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -94,6 +94,9 @@ pub enum RequestDetail {
     DataGatewaySessionExecution,
     GatewayQueryPipelineSubmit,
     GatewayQueryPipelineResponseWait,
+    BoltReadPipelineEnqueueWait,
+    BoltReadPipelineExecutionWait,
+    BoltReadPipelineOrderedWriteWait,
 }
 
 impl RequestDetail {
@@ -132,6 +135,9 @@ impl RequestDetail {
         Self::DataGatewaySessionExecution,
         Self::GatewayQueryPipelineSubmit,
         Self::GatewayQueryPipelineResponseWait,
+        Self::BoltReadPipelineEnqueueWait,
+        Self::BoltReadPipelineExecutionWait,
+        Self::BoltReadPipelineOrderedWriteWait,
     ];
 
     const fn index(self) -> usize {
@@ -174,6 +180,9 @@ impl RequestDetail {
             Self::DataGatewaySessionExecution => "data_gateway_session_execution",
             Self::GatewayQueryPipelineSubmit => "gateway_query_pipeline_submit",
             Self::GatewayQueryPipelineResponseWait => "gateway_query_pipeline_response_wait",
+            Self::BoltReadPipelineEnqueueWait => "bolt_read_pipeline_enqueue_wait",
+            Self::BoltReadPipelineExecutionWait => "bolt_read_pipeline_execution_wait",
+            Self::BoltReadPipelineOrderedWriteWait => "bolt_read_pipeline_ordered_write_wait",
         }
     }
 }
@@ -447,7 +456,7 @@ pub fn encode_request_metrics_snapshot(
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&serde_json::json!({
-        "schema_version": 8,
+        "schema_version": 9,
         "process_role": process_role,
         "unix_timestamp_ns": unix_timestamp_ns,
         "sequence": sequence,
@@ -552,7 +561,7 @@ mod tests {
             encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 8);
+        assert_eq!(value["schema_version"], 9);
         assert_eq!(value["process_role"], "gateway");
         assert_eq!(value["unix_timestamp_ns"], 7);
         assert_eq!(value["sequence"], 11);
@@ -560,7 +569,7 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "gateway_compile");
         assert_eq!(value["stages"][1]["success"], 1);
         assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
-        assert_eq!(value["details"].as_array().unwrap().len(), 34);
+        assert_eq!(value["details"].as_array().unwrap().len(), 37);
         assert_eq!(value["details"][12]["detail"], "data_read_view_cache_hit");
         assert_eq!(value["details"][12]["success"], 1);
         assert_eq!(value["details"][19]["detail"], "gateway_meta_prepare_write");
@@ -604,6 +613,18 @@ mod tests {
         assert_eq!(
             value["details"][33]["detail"],
             "gateway_query_pipeline_response_wait"
+        );
+        assert_eq!(
+            value["details"][34]["detail"],
+            "bolt_read_pipeline_enqueue_wait"
+        );
+        assert_eq!(
+            value["details"][35]["detail"],
+            "bolt_read_pipeline_execution_wait"
+        );
+        assert_eq!(
+            value["details"][36]["detail"],
+            "bolt_read_pipeline_ordered_write_wait"
         );
         assert!(!encoded.contains("statement"));
         assert!(!encoded.contains("parameter"));

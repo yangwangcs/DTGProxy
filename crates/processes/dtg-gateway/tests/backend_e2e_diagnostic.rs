@@ -499,6 +499,39 @@ async fn bolt_session_reuses_a_single_socket_and_keeps_read_identity_stable() {
 }
 
 #[tokio::test]
+async fn bolt_pipeline_session_submits_a_batch_before_reading_ordered_results() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        serve_fake_pipelined_bolt_session(&mut socket, 2).await;
+    });
+
+    let mut session = backend_e2e_support::BoltSession::connect(address)
+        .await
+        .unwrap();
+    let results = session
+        .run_pipeline(&[
+            (
+                "MATCH (n) WHERE n.id = $id RETURN n.id".to_owned(),
+                BTreeMap::new(),
+            ),
+            (
+                "MATCH (n) WHERE n.id = $id RETURN n.id".to_owned(),
+                BTreeMap::new(),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].fields, vec!["n.id"]);
+    assert_eq!(results[0].result_digest, results[1].result_digest);
+    drop(session);
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn measure_cell_records_each_measured_read_on_one_worker_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -735,12 +768,12 @@ fn stage_metrics_window_accepts_schema_v6_snapshot_csr_details() {
 }
 
 #[test]
-fn stage_metrics_window_accepts_schema_v8_pipeline_details() {
+fn stage_metrics_window_accepts_schema_v9_bolt_pipeline_details() {
     let first = stage_metrics_line_with_pipeline_details("gateway", 10, 1, 1);
     let second = stage_metrics_line_with_pipeline_details("gateway", 20, 2, 2);
     let log = format!("{first}\n{second}\n");
     let window = stage_metrics_window_from_log(&log, "gateway", 15, 20).unwrap();
-    assert_eq!(window.delta.details.len(), 34);
+    assert_eq!(window.delta.details.len(), 37);
     assert_eq!(
         window.delta.details[32].detail,
         "gateway_query_pipeline_submit"
@@ -748,6 +781,18 @@ fn stage_metrics_window_accepts_schema_v8_pipeline_details() {
     assert_eq!(
         window.delta.details[33].detail,
         "gateway_query_pipeline_response_wait"
+    );
+    assert_eq!(
+        window.delta.details[34].detail,
+        "bolt_read_pipeline_enqueue_wait"
+    );
+    assert_eq!(
+        window.delta.details[35].detail,
+        "bolt_read_pipeline_execution_wait"
+    );
+    assert_eq!(
+        window.delta.details[36].detail,
+        "bolt_read_pipeline_ordered_write_wait"
     );
 }
 
@@ -1225,13 +1270,16 @@ fn stage_metrics_line_with_pipeline_details(
             .unwrap(),
     )
     .unwrap();
-    value["schema_version"] = serde_json::Value::from(8);
+    value["schema_version"] = serde_json::Value::from(9);
     for detail in [
         "gateway_query_session_submit",
         "gateway_query_session_response_wait",
         "data_gateway_session_execution",
         "gateway_query_pipeline_submit",
         "gateway_query_pipeline_response_wait",
+        "bolt_read_pipeline_enqueue_wait",
+        "bolt_read_pipeline_execution_wait",
+        "bolt_read_pipeline_ordered_write_wait",
     ] {
         value["details"]
             .as_array_mut()
@@ -1273,6 +1321,41 @@ async fn serve_fake_bolt_session(socket: &mut TcpStream, exchanges: usize) {
 
         let pull = read_bolt_message(socket).await;
         assert_eq!(pull, vec![0xb1, 0x3f, 0xa0]);
+        write_bolt_message(socket, &[0xb1, 0x71, 0x91, 0xc9, 0x08, 0x00]).await;
+        write_bolt_message(
+            socket,
+            &[
+                0xb1, 0x70, 0xa1, 0x88, b'h', b'a', b's', b'_', b'm', b'o', b'r', b'e', 0xc2,
+            ],
+        )
+        .await;
+    }
+}
+
+async fn serve_fake_pipelined_bolt_session(socket: &mut TcpStream, exchanges: usize) {
+    let mut handshake = [0_u8; 20];
+    socket.read_exact(&mut handshake).await.unwrap();
+    assert_eq!(&handshake[..4], &[0x60, 0x60, 0xb0, 0x17]);
+    socket.write_all(&[0, 0, 4, 5]).await.unwrap();
+
+    let hello = read_bolt_message(socket).await;
+    assert_eq!(hello[1], 0x01);
+    write_bolt_message(socket, &[0xb1, 0x70, 0xa0]).await;
+
+    for _ in 0..exchanges {
+        let run = read_bolt_message(socket).await;
+        assert_eq!(run[1], 0x10);
+        assert_eq!(read_bolt_message(socket).await, vec![0xb1, 0x3f, 0xa0]);
+    }
+    for _ in 0..exchanges {
+        write_bolt_message(
+            socket,
+            &[
+                0xb1, 0x70, 0xa1, 0x86, b'f', b'i', b'e', b'l', b'd', b's', 0x91, 0x84, b'n', b'.',
+                b'i', b'd',
+            ],
+        )
+        .await;
         write_bolt_message(socket, &[0xb1, 0x71, 0x91, 0xc9, 0x08, 0x00]).await;
         write_bolt_message(
             socket,

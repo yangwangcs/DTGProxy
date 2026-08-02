@@ -221,6 +221,46 @@ const REQUEST_METRIC_DETAILS_V8: [&str; 34] = [
     "gateway_query_pipeline_response_wait",
 ];
 
+const REQUEST_METRIC_DETAILS_V9: [&str; 37] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_meta_allocate_start",
+    "gateway_meta_reserve_commit",
+    "gateway_data_apply_rpc",
+    "gateway_meta_resolve_commit",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "gateway_meta_prepare_write",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+    "data_adjacency_cache_hit",
+    "data_adjacency_cache_miss",
+    "data_adjacency_backend_expand",
+    "data_snapshot_csr_cache_hit",
+    "data_snapshot_csr_cache_miss",
+    "data_snapshot_csr_build",
+    "gateway_query_session_submit",
+    "gateway_query_session_response_wait",
+    "data_gateway_session_execution",
+    "gateway_query_pipeline_submit",
+    "gateway_query_pipeline_response_wait",
+    "bolt_read_pipeline_enqueue_wait",
+    "bolt_read_pipeline_execution_wait",
+    "bolt_read_pipeline_ordered_write_wait",
+];
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
@@ -437,9 +477,9 @@ fn validate_metrics_snapshot(
     snapshot: &ProcessMetricsSnapshot,
     expected_role: &str,
 ) -> io::Result<()> {
-    if !matches!(snapshot.schema_version, 1..=8) {
+    if !matches!(snapshot.schema_version, 1..=9) {
         return Err(invalid_data(
-            "request metrics schema version must be between 1 and 8",
+            "request metrics schema version must be between 1 and 9",
         ));
     }
     if snapshot.process_role != expected_role {
@@ -473,6 +513,7 @@ fn validate_metrics_snapshot(
             6 => &REQUEST_METRIC_DETAILS_V6,
             7 => &REQUEST_METRIC_DETAILS_V7,
             8 => &REQUEST_METRIC_DETAILS_V8,
+            9 => &REQUEST_METRIC_DETAILS_V9,
             _ => unreachable!("schema v1 is handled above"),
         };
         if snapshot.details.len() != expected_details.len()
