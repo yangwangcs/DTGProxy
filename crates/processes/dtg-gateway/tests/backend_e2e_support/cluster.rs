@@ -348,6 +348,29 @@ impl DiagnosticCluster {
         Ok(observation)
     }
 
+    pub async fn measure_pipeline_cell(
+        &self,
+        spec: CellSpec,
+        depth: usize,
+    ) -> io::Result<RawObservation> {
+        let mut observation = super::measure_pipeline_cell_with_durations(
+            self.bolt_address(),
+            spec,
+            depth,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .await?;
+        let (gateway_stage_metrics, data_stage_metrics) = tokio::try_join!(
+            self.stage_metrics_window("gateway", &observation),
+            self.stage_metrics_window("data", &observation),
+        )?;
+        observation.gateway_stage_metrics = Some(gateway_stage_metrics);
+        observation.data_stage_metrics = Some(data_stage_metrics);
+        observation.finished_at_unix_ns = unix_time_nanos();
+        Ok(observation)
+    }
+
     pub fn last_request_metrics_line(&self, process: &str) -> io::Result<String> {
         const PREFIX: &str = "DTG_REQUEST_STAGE_METRICS=";
         std::fs::read_to_string(self.process_log_path(process)?)?

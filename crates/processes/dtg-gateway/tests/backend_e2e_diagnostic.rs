@@ -338,19 +338,31 @@ async fn fjall_bolt_read_pipeline_depth_matrix() {
         cluster.seed_read_dataset(4_096).await.unwrap();
         let observation = tokio::time::timeout(
             Duration::from_secs(30),
-            backend_e2e_support::measure_pipeline_cell_with_durations(
-                cluster.bolt_address(),
-                spec,
-                depth,
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-            ),
+            cluster.measure_pipeline_cell(spec, depth),
         )
         .await
         .expect("Bolt pipeline depth cell must not stall")
         .unwrap();
         assert_eq!(observation.errors, 0);
         assert!(!observation.latency_samples_ns.is_empty());
+        let gateway_metrics = observation
+            .gateway_stage_metrics
+            .as_ref()
+            .expect("pipeline benchmark must capture Gateway metrics");
+        for detail in [
+            "bolt_read_pipeline_enqueue_wait",
+            "bolt_read_pipeline_execution_wait",
+            "bolt_read_pipeline_ordered_write_wait",
+        ] {
+            assert!(
+                gateway_metrics
+                    .delta
+                    .details
+                    .iter()
+                    .any(|candidate| candidate.detail == detail && candidate.success != 0),
+                "pipeline benchmark must record {detail}",
+            );
+        }
         println!(
             "DTG_BOLT_PIPELINE_RESULT={}",
             serde_json::json!({
@@ -362,6 +374,7 @@ async fn fjall_bolt_read_pipeline_depth_matrix() {
                 "p95_ms": percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
                 "p99_ms": percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
                 "result_digest": observation.result_digest,
+                "gateway_details": gateway_metrics.delta.details.iter().filter(|detail| detail.detail.starts_with("bolt_read_pipeline_") && detail.success != 0).map(|detail| serde_json::json!({"detail": detail.detail, "calls": detail.success, "mean_nanoseconds": detail.total_nanoseconds / detail.success})).collect::<Vec<_>>(),
             })
         );
         cluster.shutdown().await.unwrap();
