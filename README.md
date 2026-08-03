@@ -63,6 +63,77 @@ cargo test --locked -p dtg-data diagnostic_snapshot_ingest_admission_latency -- 
 
 这不是 `COMMITTED` 写入延迟，也不是完整网络路径或生产 SLO。
 
+## 三后端端到端性能
+
+下表是 2026-08-03 在开发机得到的真实四进程诊断结果，对应代码 revision
+`5ec51fb`。每个 cell 启动独立的 Meta、Controller、Data 和 Gateway；Data 只绑定表中
+的一种官方后端。Fjall 与 Kuzu 使用临时嵌入式目录，PostgreSQL 使用临时 loopback
+PostgreSQL 实例，运行结束后已停止并清理。每个 cell 预热 1 秒、计量 5 秒，重复 3 次。
+
+写入工作负载是单条 T-Cypher：
+
+```cypher
+CREATE (n:Bench {value: 1}) VALID FROM 1
+```
+
+每条请求经 Bolt → Gateway → Data → Shard/Raft → 官方后端原子 apply，只有收到
+`COMMITTED` 才计入。计量后执行 `MATCH (n) RETURN COUNT(*)`；每个写 cell 都验证
+`落盘顶点数 = 预热 CREATE 数 + 计量 CREATE 数`，所以表中的写 QPS 不包含 admission
+回执或幂等重放。读数据集为 4,096 个落盘顶点；点查为 `n.id = 2048`，一跳和两跳分别
+返回固定关系，计数为 `MATCH (n) RETURN COUNT(*)`。
+
+**单顶点 `COMMITTED` 写入**（QPS；p50/p95/p99，ms）
+
+| 后端 | 并发 | QPS | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fjall | 1 | 64 | 15.35 | 18.78 | 22.03 |
+| Fjall | 8 | 262 | 30.05 | 42.26 | 44.60 |
+| Fjall | 64 | 309 | 201.37 | 316.24 | 351.75 |
+| Kuzu | 1 | 59 | 16.35 | 21.26 | 28.31 |
+| Kuzu | 8 | 257 | 29.60 | 43.21 | 81.49 |
+| Kuzu | 64 | 415 | 153.91 | 228.91 | 283.03 |
+| PostgreSQL | 1 | 41 | 22.07 | 32.51 | 39.45 |
+| PostgreSQL | 8 | 81 | 87.70 | 139.35 | 172.41 |
+| PostgreSQL | 64 | 115 | 491.54 | 842.45 | 859.49 |
+
+**完整 Bolt 读取**（QPS；p50/p95/p99，ms）
+
+| 工作负载 / 并发 | Fjall | Kuzu | PostgreSQL |
+| --- | --- | --- | --- |
+| 点查 / 1 | 8,231; 0.122/0.150/0.221 | 9,121; 0.106/0.130/0.172 | 260; 3.606/4.962/5.871 |
+| 点查 / 8 | 17,413; 0.441/0.664/0.900 | 21,501; 0.362/0.527/0.645 | 916; 7.060/19.518/24.344 |
+| 点查 / 64 | 22,752; 2.748/4.040/4.756 | 26,334; 2.265/3.902/5.444 | 937; 56.784/145.070/173.563 |
+| 一跳 / 1 | 7,755; 0.123/0.151/0.235 | 8,293; 0.113/0.159/0.226 | 285; 3.318/4.424/4.849 |
+| 一跳 / 8 | 15,908; 0.480/0.728/0.969 | 14,445; 0.481/1.047/1.526 | 942; 7.283/16.144/20.733 |
+| 一跳 / 64 | 20,778; 2.965/4.493/5.430 | 18,394; 2.777/7.827/12.146 | 917; 59.858/121.254/158.428 |
+| 两跳 / 1 | 7,088; 0.134/0.170/0.276 | 6,467; 0.125/0.291/0.446 | 270; 3.746/4.395/4.769 |
+| 两跳 / 8 | 14,528; 0.522/0.807/1.141 | 14,724; 0.450/1.093/1.980 | 712; 7.576/25.778/36.571 |
+| 两跳 / 64 | 19,613; 3.196/4.670/5.438 | 19,115; 2.874/6.696/10.015 | 693; 52.915/212.578/255.165 |
+| 计数 / 1 | 8,030; 0.119/0.146/0.235 | 8,155; 0.111/0.186/0.215 | 239; 3.826/6.927/8.279 |
+| 计数 / 8 | 16,557; 0.456/0.692/1.019 | 19,812; 0.388/0.571/0.789 | 693; 7.452/31.475/48.192 |
+| 计数 / 64 | 23,524; 2.631/4.015/4.907 | 29,295; 2.137/3.115/3.669 | 751; 52.646/200.257/234.655 |
+
+读取单元格格式为 `QPS; p50/p95/p99`。这些是开发机端到端诊断，不是裸后端吞吐、生产
+SLO 或跨机器横向扩展承诺。高并发单条强提交会显著增加排队和尾延迟；高吞吐写入应使用
+批量摄入并轮询至 `COMMITTED`，而不是把单条提交写当作导入基准。
+
+原始、版本化 artifact 位于（被 Git 忽略以避免提交大型延迟样本）：
+`target/backend-e2e-committed-20260803-r2/fjall.json`、
+`target/backend-e2e-committed-20260803-r2/kuzu.json`、
+`target/backend-e2e-committed-20260803-r2/postgresql.json`。每份均包含 45 个原始 cell、
+阶段指标、延迟样本、查询/结果摘要和逐写落盘审计。复现时需先构建 release 进程，并为
+PostgreSQL 提供临时实例与凭据：
+
+```bash
+cargo build --locked --release -p dtg-meta -p dtg-controller -p dtg-data -p dtg-gateway
+DTG_BACKEND_E2E_BIN_DIR="$PWD/target/release" \
+DTG_BACKEND_E2E_SELECTED_BACKEND=fjall \
+DTG_BACKEND_E2E_QUICK_REPETITIONS=3 \
+DTG_BACKEND_E2E_QUICK_OUTPUT="$PWD/target/backend-e2e/fjall.json" \
+cargo test --locked --release -p dtg-gateway --test backend_e2e_diagnostic \
+  quick_selected_backend_e2e_comparison -- --ignored --exact --nocapture
+```
+
 ## 构建与验证
 
 ```bash

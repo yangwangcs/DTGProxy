@@ -188,32 +188,12 @@ impl DiagnosticCluster {
         probe_controller(controller_address, identity.request_id(2)).await?;
 
         let assignment = assignment_spec(&cluster.binding);
-        let mut data_environment = vec![
-            ("DTG_DATA_RPC_ADDR", data_address.to_string()),
-            (
-                "DTG_DATA_BACKEND_KIND",
-                match spec.backend {
-                    Backend::Fjall => "fjall".into(),
-                    Backend::PostgreSql => "postgresql".into(),
-                    Backend::Kuzu => "kuzu".into(),
-                },
-            ),
-            (
-                "DTG_DATA_FJALL_ROOT",
-                cluster
-                    .root
-                    .path()
-                    .join("data/business")
-                    .display()
-                    .to_string(),
-            ),
-            (
-                "DTG_DATA_CONSENSUS_ROOT",
-                cluster.root.path().join("data/raft").display().to_string(),
-            ),
-            ("DTG_DATA_CAPABILITIES", CAPABILITIES.into()),
-            ("DTG_DATA_ASSIGNMENTS", assignment),
-        ];
+        let mut data_environment = diagnostic_data_environment(
+            cluster.root.path(),
+            &data_address.to_string(),
+            backend_name(spec.backend),
+            assignment,
+        );
         if let Some(path) = gateway_unix_socket.as_deref() {
             data_environment.push(("DTG_DATA_GATEWAY_UNIX_SOCKET", path.display().to_string()));
         }
@@ -1022,6 +1002,32 @@ fn gateway_data_endpoint(address: SocketAddr, socket: Option<&Path>) -> String {
     )
 }
 
+fn diagnostic_data_environment(
+    root: &Path,
+    rpc_address: &str,
+    backend_kind: &str,
+    assignment: String,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("DTG_DATA_RPC_ADDR", rpc_address.into()),
+        ("DTG_DATA_BACKEND_KIND", backend_kind.into()),
+        (
+            "DTG_DATA_FJALL_ROOT",
+            root.join("data/business").display().to_string(),
+        ),
+        (
+            "DTG_DATA_KUZU_ROOT",
+            root.join("data/kuzu").display().to_string(),
+        ),
+        (
+            "DTG_DATA_CONSENSUS_ROOT",
+            root.join("data/raft").display().to_string(),
+        ),
+        ("DTG_DATA_CAPABILITIES", CAPABILITIES.into()),
+        ("DTG_DATA_ASSIGNMENTS", assignment),
+    ]
+}
+
 #[test]
 fn gateway_data_endpoint_prefers_configured_unix_socket() {
     let address: SocketAddr = "127.0.0.1:7690".parse().unwrap();
@@ -1094,5 +1100,22 @@ mod tests {
         };
 
         assert_eq!(seed_applied_index(status).unwrap(), 37);
+    }
+
+    #[test]
+    fn diagnostic_data_environment_keeps_kuzu_state_inside_the_cell_root() {
+        let root = Path::new("/tmp/dtg-backend-e2e-cell");
+        let environment =
+            diagnostic_data_environment(root, "127.0.0.1:50052", "kuzu", "seed".into());
+
+        assert!(environment.contains(&(
+            "DTG_DATA_KUZU_ROOT",
+            "/tmp/dtg-backend-e2e-cell/data/kuzu".into(),
+        )));
+        assert!(
+            !environment
+                .iter()
+                .any(|(_, value)| value == "./dtg-data/kuzu")
+        );
     }
 }
