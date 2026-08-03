@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -26,7 +24,7 @@ use dtg_plan::{
 };
 use dtg_storage::{
     BackendClass, BindingRole, CapabilityManifest, LogicalMutation, ProviderKind, ReplicaBinding,
-    TransactionId, TransactionTime, Version,
+    TransactionTime, Version,
 };
 
 #[tokio::test]
@@ -287,69 +285,9 @@ struct RecordingWriteTransport {
     events: Mutex<Vec<&'static str>>,
     requests: Mutex<Vec<GatewayWriteRequest>>,
     apply_calls: AtomicUsize,
-    apply_barrier: Option<Arc<Barrier>>,
-    reverse_apply_replay: bool,
-    resolve_calls: AtomicUsize,
-    resolve_failures: AtomicUsize,
-    resolve_barrier: Option<Arc<Barrier>>,
-    synchronize_after_resolve: Option<usize>,
-}
-
-impl RecordingWriteTransport {
-    fn fail_resolve_once() -> Self {
-        Self {
-            resolve_failures: AtomicUsize::new(1),
-            ..Self::default()
-        }
-    }
-
-    fn synchronize_two_resolutions() -> Self {
-        Self {
-            resolve_barrier: Some(Arc::new(Barrier::new(2))),
-            synchronize_after_resolve: Some(0),
-            ..Self::default()
-        }
-    }
-
-    fn synchronize_with_reversed_apply_receipts() -> Self {
-        Self {
-            apply_barrier: Some(Arc::new(Barrier::new(2))),
-            reverse_apply_replay: true,
-            resolve_barrier: Some(Arc::new(Barrier::new(2))),
-            synchronize_after_resolve: Some(0),
-            ..Self::default()
-        }
-    }
-
-    fn fail_once_then_synchronize_two_resolutions() -> Self {
-        Self {
-            resolve_failures: AtomicUsize::new(1),
-            resolve_barrier: Some(Arc::new(Barrier::new(2))),
-            synchronize_after_resolve: Some(1),
-            ..Self::default()
-        }
-    }
 }
 
 impl GatewayWriteTransport for RecordingWriteTransport {
-    fn allocate_start_time(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
-        self.events.lock().unwrap().push("prewrite");
-        Box::pin(async { Ok(TransactionTime::new(41).unwrap()) })
-    }
-
-    fn reserve_commit_time(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
-        self.events.lock().unwrap().push("commit");
-        Box::pin(async { Ok(TransactionTime::new(43).unwrap()) })
-    }
-
     fn apply_single_shard(
         &self,
         request: GatewayWriteRequest,
@@ -357,155 +295,13 @@ impl GatewayWriteTransport for RecordingWriteTransport {
         self.events.lock().unwrap().push("apply");
         self.requests.lock().unwrap().push(request);
         let call = self.apply_calls.fetch_add(1, Ordering::SeqCst);
-        let barrier = self.apply_barrier.clone();
-        let replayed = if self.reverse_apply_replay {
-            call == 0
-        } else {
-            call > 0
-        };
         Box::pin(async move {
-            if let Some(barrier) = barrier {
-                barrier.wait();
-            }
-            Ok(GatewayWriteReceipt::new(38 + call as u64, replayed))
+            Ok(GatewayWriteReceipt::with_commit_time(
+                38 + call as u64,
+                call > 0,
+                TransactionTime::new(43).unwrap(),
+            ))
         })
-    }
-
-    fn resolve_committed(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
-        self.events.lock().unwrap().push("resolve");
-        let call = self.resolve_calls.fetch_add(1, Ordering::SeqCst);
-        let fail = self
-            .resolve_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok();
-        let barrier = self
-            .synchronize_after_resolve
-            .is_some_and(|first| call >= first)
-            .then(|| self.resolve_barrier.clone())
-            .flatten();
-        Box::pin(async move {
-            if let Some(barrier) = barrier {
-                barrier.wait();
-            }
-            if fail {
-                Err(GatewayExecutionError::new(
-                    "DTG-TEST-RESOLVE",
-                    "injected resolve failure",
-                    dtg_execution::GatewayRetry::Safe,
-                ))
-            } else {
-                Ok(())
-            }
-        })
-    }
-
-    fn abort(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
-        self.events.lock().unwrap().push("abort");
-        Box::pin(async { Ok(()) })
-    }
-}
-
-#[derive(Clone, Default)]
-struct ConcurrentTimestampTransport {
-    arrivals: Arc<AtomicUsize>,
-}
-
-impl GatewayWriteTransport for ConcurrentTimestampTransport {
-    fn allocate_start_time(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
-        Box::pin(ConcurrentTimestampFuture::new(
-            Arc::clone(&self.arrivals),
-            TransactionTime::new(41).unwrap(),
-        ))
-    }
-
-    fn reserve_commit_time(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<TransactionTime, GatewayExecutionError>> {
-        Box::pin(ConcurrentTimestampFuture::new(
-            Arc::clone(&self.arrivals),
-            TransactionTime::new(43).unwrap(),
-        ))
-    }
-
-    fn apply_single_shard(
-        &self,
-        _request: GatewayWriteRequest,
-    ) -> GatewayFuture<'_, Result<GatewayWriteReceipt, GatewayExecutionError>> {
-        Box::pin(async { Ok(GatewayWriteReceipt::new(38, false)) })
-    }
-
-    fn resolve_committed(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn abort(
-        &self,
-        _route: &dtg_execution::GatewayWriteRoute,
-        _transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-struct ConcurrentTimestampFuture {
-    arrivals: Arc<AtomicUsize>,
-    timestamp: TransactionTime,
-    registered: bool,
-    yielded: bool,
-}
-
-impl ConcurrentTimestampFuture {
-    fn new(arrivals: Arc<AtomicUsize>, timestamp: TransactionTime) -> Self {
-        Self {
-            arrivals,
-            timestamp,
-            registered: false,
-            yielded: false,
-        }
-    }
-}
-
-impl Future for ConcurrentTimestampFuture {
-    type Output = Result<TransactionTime, GatewayExecutionError>;
-
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.registered {
-            self.arrivals.fetch_add(1, Ordering::SeqCst);
-            self.registered = true;
-        }
-        if self.arrivals.load(Ordering::SeqCst) == 2 {
-            return Poll::Ready(Ok(self.timestamp));
-        }
-        if self.yielded {
-            return Poll::Ready(Err(GatewayExecutionError::new(
-                "DTG-TEST-SERIAL-TIMESTAMPS",
-                "Gateway awaited a timestamp before dispatching its peer request",
-                dtg_execution::GatewayRetry::Never,
-            )));
-        }
-        self.yielded = true;
-        context.waker().wake_by_ref();
-        Poll::Pending
     }
 }
 
@@ -558,247 +354,8 @@ impl GatewayExecutionTransport for PendingClusterTransport {
     }
 }
 
-fn logical_scan_bound(transport: &CapturingClusterTransport) -> u32 {
-    let requests = transport.requests.lock().unwrap();
-    let plan = requests.last().unwrap().physical_plan().unwrap();
-    match plan.fragments()[0].storage_accesses() {
-        [StorageAccess::Logical(read)] => read.row_bound(),
-        [StorageAccess::Pushdown { request, .. }] => match request.operation() {
-            dtg_storage::PushdownOperation::VertexScan(scan) => scan.limit(),
-            operation => panic!("expected a vertex scan, got {operation:?}"),
-        },
-        accesses => panic!("expected one logical scan, got {accesses:?}"),
-    }
-}
-
-fn create_statement() -> String {
-    "CREATE (n:Bench {value: 1}) VALID FROM 1".into()
-}
-
-fn count_statement() -> String {
-    "MATCH (n) RETURN COUNT(*)".into()
-}
-
 #[test]
-fn overlapping_initial_creates_advance_the_scan_bound_once() {
-    let writes = Arc::new(RecordingWriteTransport::synchronize_two_resolutions());
-    let queries = Arc::new(CapturingClusterTransport::default());
-    let execution = Arc::new(GatewayExecution::for_process_with_writes(
-        queries.clone(),
-        writes,
-        planning_context(),
-    ));
-    let first = {
-        let execution = execution.clone();
-        std::thread::spawn(move || {
-            block_on(execution.execute_statement(
-                GatewayRequestContext::new(7, 93, u64::MAX, Vec::new()).unwrap(),
-                create_statement(),
-                BTreeMap::new(),
-                None,
-                &GatewayCancellationToken::new(),
-            ))
-        })
-    };
-    let second = {
-        let execution = execution.clone();
-        std::thread::spawn(move || {
-            block_on(execution.execute_statement(
-                GatewayRequestContext::new(7, 93, u64::MAX, Vec::new()).unwrap(),
-                create_statement(),
-                BTreeMap::new(),
-                None,
-                &GatewayCancellationToken::new(),
-            ))
-        })
-    };
-    assert_eq!(
-        first.join().unwrap().unwrap(),
-        GatewayResponse::Acknowledged
-    );
-    assert_eq!(
-        second.join().unwrap().unwrap(),
-        GatewayResponse::Acknowledged
-    );
-
-    block_on(execution.execute_statement(
-        GatewayRequestContext::new(7, 94, u64::MAX, Vec::new()).unwrap(),
-        count_statement(),
-        BTreeMap::new(),
-        None,
-        &GatewayCancellationToken::new(),
-    ))
-    .unwrap();
-    assert_eq!(logical_scan_bound(&queries), 129);
-}
-
-#[test]
-fn overlapping_initial_creates_account_the_non_replayed_receipt_regardless_of_owner() {
-    let writes = Arc::new(RecordingWriteTransport::synchronize_with_reversed_apply_receipts());
-    let queries = Arc::new(CapturingClusterTransport::default());
-    let execution = Arc::new(GatewayExecution::for_process_with_writes(
-        queries.clone(),
-        writes,
-        planning_context(),
-    ));
-    let calls: Vec<_> = (0..2)
-        .map(|_| {
-            let execution = execution.clone();
-            std::thread::spawn(move || {
-                block_on(execution.execute_statement(
-                    GatewayRequestContext::new(7, 97, u64::MAX, Vec::new()).unwrap(),
-                    create_statement(),
-                    BTreeMap::new(),
-                    None,
-                    &GatewayCancellationToken::new(),
-                ))
-            })
-        })
-        .collect();
-    for call in calls {
-        assert_eq!(call.join().unwrap().unwrap(), GatewayResponse::Acknowledged);
-    }
-
-    block_on(execution.execute_statement(
-        GatewayRequestContext::new(7, 98, u64::MAX, Vec::new()).unwrap(),
-        count_statement(),
-        BTreeMap::new(),
-        None,
-        &GatewayCancellationToken::new(),
-    ))
-    .unwrap();
-    assert_eq!(logical_scan_bound(&queries), 129);
-}
-
-#[test]
-fn process_create_retry_after_resolve_failure_accounts_for_the_write_once() {
-    let writes = Arc::new(RecordingWriteTransport::fail_resolve_once());
-    let queries = Arc::new(CapturingClusterTransport::default());
-    let execution =
-        GatewayExecution::for_process_with_writes(queries.clone(), writes, planning_context());
-    let context = GatewayRequestContext::new(7, 91, u64::MAX, Vec::new()).unwrap();
-    let cancellation = GatewayCancellationToken::new();
-
-    let first = block_on(execution.execute_statement(
-        context.clone(),
-        "CREATE (n:Bench {value: 1}) VALID FROM 1".into(),
-        BTreeMap::new(),
-        None,
-        &cancellation,
-    ));
-    assert_eq!(first.unwrap_err().code(), "DTG-TEST-RESOLVE");
-    assert_eq!(
-        block_on(execution.execute_statement(
-            context,
-            "CREATE (n:Bench {value: 1}) VALID FROM 1".into(),
-            BTreeMap::new(),
-            None,
-            &cancellation,
-        ))
-        .unwrap(),
-        GatewayResponse::Acknowledged
-    );
-
-    block_on(execution.execute_statement(
-        GatewayRequestContext::new(7, 92, u64::MAX, Vec::new()).unwrap(),
-        count_statement(),
-        BTreeMap::new(),
-        None,
-        &cancellation,
-    ))
-    .unwrap();
-    assert_eq!(logical_scan_bound(&queries), 129);
-
-    assert_eq!(
-        block_on(execution.execute_statement(
-            GatewayRequestContext::new(7, 91, u64::MAX, Vec::new()).unwrap(),
-            create_statement(),
-            BTreeMap::new(),
-            None,
-            &GatewayCancellationToken::new(),
-        ))
-        .unwrap(),
-        GatewayResponse::Acknowledged
-    );
-    block_on(execution.execute_statement(
-        GatewayRequestContext::new(7, 93, u64::MAX, Vec::new()).unwrap(),
-        count_statement(),
-        BTreeMap::new(),
-        None,
-        &GatewayCancellationToken::new(),
-    ))
-    .unwrap();
-    assert_eq!(logical_scan_bound(&queries), 129);
-}
-
-#[test]
-fn overlapping_replays_after_failed_resolution_advance_the_scan_bound_once() {
-    let writes = Arc::new(RecordingWriteTransport::fail_once_then_synchronize_two_resolutions());
-    let queries = Arc::new(CapturingClusterTransport::default());
-    let execution = Arc::new(GatewayExecution::for_process_with_writes(
-        queries.clone(),
-        writes,
-        planning_context(),
-    ));
-    assert_eq!(
-        block_on(execution.execute_statement(
-            GatewayRequestContext::new(7, 95, u64::MAX, Vec::new()).unwrap(),
-            create_statement(),
-            BTreeMap::new(),
-            None,
-            &GatewayCancellationToken::new(),
-        ))
-        .unwrap_err()
-        .code(),
-        "DTG-TEST-RESOLVE"
-    );
-
-    let first = {
-        let execution = execution.clone();
-        std::thread::spawn(move || {
-            block_on(execution.execute_statement(
-                GatewayRequestContext::new(7, 95, u64::MAX, Vec::new()).unwrap(),
-                create_statement(),
-                BTreeMap::new(),
-                None,
-                &GatewayCancellationToken::new(),
-            ))
-        })
-    };
-    let second = {
-        let execution = execution.clone();
-        std::thread::spawn(move || {
-            block_on(execution.execute_statement(
-                GatewayRequestContext::new(7, 95, u64::MAX, Vec::new()).unwrap(),
-                create_statement(),
-                BTreeMap::new(),
-                None,
-                &GatewayCancellationToken::new(),
-            ))
-        })
-    };
-    assert_eq!(
-        first.join().unwrap().unwrap(),
-        GatewayResponse::Acknowledged
-    );
-    assert_eq!(
-        second.join().unwrap().unwrap(),
-        GatewayResponse::Acknowledged
-    );
-
-    block_on(execution.execute_statement(
-        GatewayRequestContext::new(7, 96, u64::MAX, Vec::new()).unwrap(),
-        count_statement(),
-        BTreeMap::new(),
-        None,
-        &GatewayCancellationToken::new(),
-    ))
-    .unwrap();
-    assert_eq!(logical_scan_bound(&queries), 129);
-}
-
-#[test]
-fn process_create_requires_transaction_dispatch() {
+fn process_create_commits_through_data_without_meta_round_trips() {
     let writes = Arc::new(RecordingWriteTransport::default());
     let client = Arc::new(RecordingProtocolClient::default());
     let execution = GatewayExecution::for_process_with_writes(
@@ -817,29 +374,24 @@ fn process_create_requires_transaction_dispatch() {
     .unwrap();
 
     assert_eq!(response, GatewayResponse::Acknowledged);
-    let prepare = execution
+    let apply = execution
         .request_metrics()
         .snapshot()
         .details()
         .find_map(|(detail, snapshot)| {
-            (detail == RequestDetail::GatewayMetaPrepareWrite).then_some(snapshot)
+            (detail == RequestDetail::GatewayDataApplyRpc).then_some(snapshot)
         })
         .unwrap();
-    assert_eq!(prepare.success, 1);
-    assert_eq!(prepare.error, 0);
-    assert_eq!(prepare.cancelled, 0);
-    assert_eq!(
-        writes.events.lock().unwrap().as_slice(),
-        ["prewrite", "commit", "apply", "resolve"]
-    );
+    assert_eq!(apply.success, 1);
+    assert_eq!(apply.error, 0);
+    assert_eq!(apply.cancelled, 0);
+    assert_eq!(writes.events.lock().unwrap().as_slice(), ["apply"]);
     let requests = writes.requests.lock().unwrap();
     let request = requests.first().unwrap();
     assert_eq!(
         request.transaction_id().get(),
         0x68097dfc0e984bbabae54d2b1af0a090
     );
-    assert_eq!(request.start_time().get(), 41);
-    assert_eq!(request.commit_time().get(), 43);
     assert_eq!(request.snapshot_applied_index(), 37);
     let dtg_execution::shard::ShardCommand::CommitSingleShardTransaction(command) =
         request.command()
@@ -882,29 +434,6 @@ fn process_create_requires_transaction_dispatch() {
     let queries = client.requests.lock().unwrap();
     assert_eq!(queries[0].fragments[0].applied_index, 38);
     assert_eq!(queries[0].fragments[0].transaction_time, 43);
-}
-
-#[test]
-fn process_create_dispatches_start_and_commit_timestamps_before_waiting() {
-    let writes = Arc::new(ConcurrentTimestampTransport::default());
-    let execution = GatewayExecution::for_process_with_writes(
-        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
-            RecordingProtocolClient::default(),
-        ))),
-        Arc::clone(&writes) as Arc<dyn GatewayWriteTransport>,
-        planning_context(),
-    );
-
-    let response = block_on(execution.execute_statement(
-        GatewayRequestContext::new(7, 181, u64::MAX, Vec::new()).unwrap(),
-        create_statement(),
-        BTreeMap::new(),
-        None,
-        &GatewayCancellationToken::new(),
-    ));
-
-    assert_eq!(response.unwrap(), GatewayResponse::Acknowledged);
-    assert_eq!(writes.arrivals.load(Ordering::SeqCst), 2);
 }
 
 struct ThreadWake;

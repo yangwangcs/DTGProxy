@@ -596,6 +596,52 @@ impl RaftReplica {
         &mut self,
         entries: Vec<Entry>,
     ) -> Result<(Vec<ProposalReceipt>, Vec<ApplyOutcome>), ShardError> {
+        if entries.len() > 1
+            && entries.iter().all(|entry| {
+                entry.get_entry_type() == EntryType::EntryNormal && !entry.data.is_empty()
+            })
+        {
+            let commands = entries
+                .iter()
+                .map(|entry| {
+                    let command = ShardCommand::decode(&entry.data)?;
+                    let command_id = command.header().command_id().get();
+                    if entry.context.as_slice() != command_id.to_be_bytes() {
+                        return Err(ShardError::InvalidRaftState(
+                            "committed entry context does not match command identifier".into(),
+                        ));
+                    }
+                    Ok((entry.term, entry.index, command))
+                })
+                .collect::<Result<Vec<_>, ShardError>>()?;
+            let command_ids = commands
+                .iter()
+                .map(|(_, _, command)| command.header().command_id().get())
+                .collect::<Vec<_>>();
+            let outcomes = self.machine.apply_committed_batch(commands)?;
+            if outcomes.len() != entries.len() {
+                return Err(ShardError::InvalidRaftState(
+                    "state-machine batch outcome count differs from committed entries".into(),
+                ));
+            }
+            let receipts = entries
+                .into_iter()
+                .zip(outcomes.iter().zip(command_ids))
+                .map(|(entry, (outcome, command_id))| {
+                    self.binding = outcome.active_binding().clone();
+                    ProposalReceipt {
+                        term: entry.term,
+                        index: entry.index,
+                        command_id,
+                        digest: outcome.digest(),
+                        replayed: outcome.replayed(),
+                        rejection: outcome.rejection(),
+                        active_binding: outcome.active_binding().clone(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            return Ok((receipts, outcomes));
+        }
         let mut receipts = Vec::new();
         let mut outcomes = Vec::with_capacity(entries.len());
         for entry in entries {

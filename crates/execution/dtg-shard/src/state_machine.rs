@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 
 use dtg_kernel::{Digest32, KernelError, TransactionId, TransactionTime, ValidInterval};
 use dtg_storage::{
-    BindingRole, ChangeCursor, ChangeRecord, ChangesRead, CommandId, CommittedShardBatch, EdgeId,
-    LogicalMutation, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError,
-    TransactionRecord, TransactionState, Value, VertexId,
+    ApplyReceipt, BindingRole, ChangeCursor, ChangeRecord, ChangesRead, CommandId,
+    CommittedShardBatch, EdgeId, LogicalMutation, ReadFence, ReplicaBinding, ReplicaMetadata,
+    ReplicaStateStore, StorageError, TransactionRecord, TransactionState, Value, VertexId,
 };
 
 use crate::command::MAX_TRANSACTION_INTENT_ITEMS;
@@ -516,6 +516,92 @@ impl ShardStateMachine {
             rejection: None,
             active_binding: self.binding.clone(),
         })
+    }
+
+    pub fn apply_committed_batch(
+        &mut self,
+        entries: Vec<(u64, u64, ShardCommand)>,
+    ) -> Result<Vec<ApplyOutcome>, ShardError> {
+        if entries.len() < 2 || !self.state_store.supports_atomic_batch_apply() {
+            return entries
+                .into_iter()
+                .map(|(term, index, command)| self.apply_committed(term, index, command))
+                .collect();
+        }
+        let Some(outcomes) = self.try_apply_single_shard_transaction_batch(&entries)? else {
+            return entries
+                .into_iter()
+                .map(|(term, index, command)| self.apply_committed(term, index, command))
+                .collect();
+        };
+        Ok(outcomes)
+    }
+
+    fn try_apply_single_shard_transaction_batch(
+        &mut self,
+        entries: &[(u64, u64, ShardCommand)],
+    ) -> Result<Option<Vec<ApplyOutcome>>, ShardError> {
+        let mut expected_index = self.applied_index.saturating_add(1);
+        let mut prior_mutations = Vec::new();
+        let mut transaction_ids = BTreeSet::new();
+        let mut batches = Vec::with_capacity(entries.len());
+        for (term, index, command) in entries {
+            let ShardCommand::CommitSingleShardTransaction(transaction) = command else {
+                return Ok(None);
+            };
+            if *index != expected_index || *term == 0 {
+                return Ok(None);
+            }
+            expected_index = expected_index.saturating_add(1);
+            if !transaction_ids.insert(transaction.transaction_id()) {
+                return Ok(None);
+            }
+            if self.validate_command(command).is_err()
+                || !matches!(
+                    self.validate_transaction_acceptance(command),
+                    Ok(IntentTransition::None)
+                )
+            {
+                return Ok(None);
+            }
+            let mutations = transaction.mutations();
+            if mutations_conflict(&prior_mutations, mutations) {
+                return Ok(None);
+            }
+            prior_mutations.extend_from_slice(mutations);
+            let mut persisted = mutations.to_vec();
+            persisted.push(LogicalMutation::PutReplicaMetadata(
+                single_shard_transaction_metadata(transaction)?,
+            ));
+            batches.push(CommittedShardBatch::new(
+                self.binding.clone(),
+                *term,
+                *index,
+                transaction.header().command_id(),
+                persisted,
+            )?);
+        }
+        let receipts = block_on(self.state_store.apply_batches(batches))?;
+        if receipts.len() != entries.len() || receipts.iter().any(ApplyReceipt::replayed) {
+            return Err(ShardError::InvalidRaftState(
+                "atomic state-store batch returned inconsistent receipts".into(),
+            ));
+        }
+        self.applied_index = receipts
+            .last()
+            .map_or(self.applied_index, ApplyReceipt::raft_index);
+        Ok(Some(
+            receipts
+                .into_iter()
+                .map(|receipt| ApplyOutcome {
+                    digest: receipt.mutation_digest(),
+                    applied_index: receipt.raft_index(),
+                    replayed: false,
+                    rejection: None,
+                    active_binding: self.binding.clone(),
+                })
+                .collect(),
+        ))
     }
 
     fn replay_old_transaction_command(

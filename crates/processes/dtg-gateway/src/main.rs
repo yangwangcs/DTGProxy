@@ -39,9 +39,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         default_transport,
         shard_transports,
     ));
-    let write_transport =
-        TonicGatewayWriteTransport::connect(config.meta_endpoint(), config.cluster_endpoint())
-            .await?;
+    let write_transport = TonicGatewayWriteTransport::connect(config.cluster_endpoint()).await?;
     let planning_context = config.planning_context_from_env()?;
     let execution =
         GatewayExecution::for_process_with_writes(transport, write_transport, planning_context);

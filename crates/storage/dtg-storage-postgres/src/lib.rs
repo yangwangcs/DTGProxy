@@ -172,6 +172,17 @@ impl ReplicaStateStore for PostgresReplicaStore {
         Box::pin(async move { apply::apply_batch(self, batch, None).await })
     }
 
+    fn supports_atomic_batch_apply(&self) -> bool {
+        true
+    }
+
+    fn apply_batches(
+        &self,
+        batches: Vec<CommittedShardBatch>,
+    ) -> StoreFuture<'_, Vec<ApplyReceipt>> {
+        Box::pin(async move { apply::apply_batches(self, batches, None).await })
+    }
+
     fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
         Box::pin(async move {
             Ok(Box::new(self.open_read_view(fence).await?) as Box<dyn TemporalReadView>)

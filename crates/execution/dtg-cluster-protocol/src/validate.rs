@@ -11,6 +11,8 @@ pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_BATCH_ROWS: u32 = 65_536;
 pub const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TRANSACTION_ITEMS: u32 = 4_096;
+pub const MAX_SNAPSHOT_INGEST_ITEMS: usize = 64;
+pub const MAX_SNAPSHOT_INGEST_BYTES: usize = 64 * 1024;
 pub const MAX_GATEWAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_GATEWAY_FRAGMENTS: usize = 4_096;
 pub const MAX_RAFT_BYTES: usize = 16 * 1024 * 1024;
@@ -256,10 +258,48 @@ pub fn validate_transaction_request(
         .try_into()?;
     require_nonzero_id(&wire.transaction_id)?;
     require_nonzero_id(&wire.idempotency_key)?;
-    if !(1..=6).contains(&wire.operation) {
+    if !(1..=7).contains(&wire.operation) {
         return Err(ProtocolError::UnknownEnum);
     }
     validate_payload(wire.payload, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_ITEMS)
+}
+
+pub fn validate_snapshot_ingest_batch(
+    wire: &proto::SnapshotIngestBatch,
+) -> Result<(), ProtocolError> {
+    let request = wire.request.clone().ok_or(ProtocolError::MissingContext)?;
+    let _: RequestContext = request.try_into()?;
+    if wire.items.is_empty() || wire.items.len() > MAX_SNAPSHOT_INGEST_ITEMS {
+        return Err(ProtocolError::ItemLimit);
+    }
+    let mut bytes = 0_usize;
+    for item in &wire.items {
+        require_nonzero_id(&item.receipt_id)?;
+        let transaction = item
+            .transaction
+            .clone()
+            .ok_or(ProtocolError::MissingPayload)?;
+        if transaction.operation != proto::TransactionOperation::CommitSnapshot as i32 {
+            return Err(ProtocolError::UnknownEnum);
+        }
+        bytes = bytes
+            .checked_add(prost::Message::encoded_len(&transaction))
+            .ok_or(ProtocolError::PayloadLimit)?;
+        validate_transaction_request(transaction)?;
+    }
+    if bytes > MAX_SNAPSHOT_INGEST_BYTES {
+        return Err(ProtocolError::PayloadLimit);
+    }
+    Ok(())
+}
+
+pub fn validate_snapshot_ingest_receipt_request(
+    wire: &proto::SnapshotIngestReceiptRequest,
+) -> Result<(), ProtocolError> {
+    let request = wire.request.clone().ok_or(ProtocolError::MissingContext)?;
+    let _: RequestContext = request.try_into()?;
+    require_nonzero_id(&wire.receipt_id)?;
+    Ok(())
 }
 
 pub fn validate_raft_envelope(

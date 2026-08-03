@@ -35,8 +35,9 @@ validate_contract() {
   done
   jq -e '.security.mode == "loopback_plaintext" and (.listen_addr | startswith("127.0.0.1:"))' \
     "$fixture_root/meta-1.json" "$fixture_root/controller-1.json" >/dev/null
-  jq -e '.provider_classes == ["fjall", "postgresql", "kuzu", "remote"]' \
-    "$fixture_root/data-1.json" "$fixture_root/data-2.json" "$fixture_root/data-3.json" >/dev/null
+  jq -e '.provider_class == "fjall"' "$fixture_root/data-1.json" >/dev/null
+  jq -e '.provider_class == "postgresql"' "$fixture_root/data-2.json" >/dev/null
+  jq -e '.provider_class == "kuzu"' "$fixture_root/data-3.json" >/dev/null
   jq -e '.cluster_endpoint | startswith("http://127.0.0.1:")' \
     "$fixture_root/gateway-1.json" >/dev/null
   test -f "$repo_root/crates/processes/dtg-gateway/tests/four_process_cluster.rs"

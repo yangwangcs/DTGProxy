@@ -5,7 +5,8 @@ use dtg_data::{RaftTransport, TonicRaftTransport};
 use dtg_execution::cluster_protocol::proto::data_service_server::{DataService, DataServiceServer};
 use dtg_execution::cluster_protocol::proto::{
     ColumnBatch, ExecutionFragment, LogicalReplicaSnapshot, RaftEnvelope, RetryDisposition,
-    StatusCode, TransactionRequest, TypedStatus,
+    SnapshotIngestBatch, SnapshotIngestReceipt, SnapshotIngestReceiptRequest,
+    SnapshotIngestReceiptResponse, StatusCode, TransactionRequest, TypedStatus,
 };
 use dtg_execution::storage::{
     BackendClass, BindingRole, CapabilityManifest, ProviderKind, ReplicaBinding, ReplicaId, Version,
@@ -36,6 +37,23 @@ impl DataService for RecordingDataService {
         &self,
         _request: Request<TransactionRequest>,
     ) -> Result<Response<TypedStatus>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
+    type AcceptSnapshotIngestStream =
+        Pin<Box<dyn Stream<Item = Result<SnapshotIngestReceipt, Status>> + Send + 'static>>;
+
+    async fn accept_snapshot_ingest(
+        &self,
+        _request: Request<SnapshotIngestBatch>,
+    ) -> Result<Response<Self::AcceptSnapshotIngestStream>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
+    async fn get_snapshot_ingest_receipt(
+        &self,
+        _request: Request<SnapshotIngestReceiptRequest>,
+    ) -> Result<Response<SnapshotIngestReceiptResponse>, Status> {
         Err(Status::unimplemented("not used"))
     }
 

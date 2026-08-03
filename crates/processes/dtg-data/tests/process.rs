@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 use std::{collections::BTreeMap, ffi::OsString};
 
 use dtg_data::{
@@ -11,7 +12,8 @@ use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
 use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayService as ClusterGatewayService;
 use dtg_execution::cluster_protocol::proto::{
     BoundedPayload, ExecutionFragment, GatewayRequest, LogicalReplicaSnapshot, RaftEnvelope,
-    RaftMessageKind, RequestContext, ShardContext, StatusCode, TransactionOperation,
+    RaftMessageKind, RequestContext, ShardContext, SnapshotIngestBatch, SnapshotIngestItem,
+    SnapshotIngestReceiptRequest, SnapshotIngestState, StatusCode, TransactionOperation,
     TransactionRequest,
 };
 use dtg_execution::planning::{
@@ -555,6 +557,272 @@ fn transaction_request(
             body,
         }),
     }
+}
+
+fn snapshot_transaction_request(
+    binding: &ReplicaBinding,
+    command_id: u128,
+    vertex_id: u128,
+) -> TransactionRequest {
+    let vertex = VertexVersion::new(
+        VertexId::new(vertex_id).unwrap(),
+        Version::new(1),
+        ValidInterval::new(1, 100).unwrap(),
+        TransactionTime::new(42).unwrap(),
+        Properties::new(),
+    )
+    .unwrap();
+    let command = ShardCommand::CommitSingleShardTransaction(
+        CommitSingleShardTransaction::new(
+            CommandId::new(command_id).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            dtg_execution::storage::TransactionId::new(command_id).unwrap(),
+            TransactionTime::new(41).unwrap(),
+            1,
+            dtg_execution::storage::Digest32::new([7; 32]),
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .unwrap(),
+    );
+    let body = command.encode_current().unwrap();
+    TransactionRequest {
+        context: Some(shard_context(binding)),
+        transaction_id: command_id.to_be_bytes().to_vec(),
+        operation: TransactionOperation::CommitSnapshot.into(),
+        idempotency_key: command_id.to_be_bytes().to_vec(),
+        payload: Some(BoundedPayload {
+            format_version: 1,
+            declared_len: body.len() as u64,
+            item_count: 1,
+            checksum: checksum_bytes(&body).to_vec(),
+            body,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn snapshot_ingest_acknowledges_once_and_exposes_its_committed_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("snapshot-ingest-receipt");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let service = node.rpc_service();
+    let receipt_id = 911_u128;
+    let batch = || SnapshotIngestBatch {
+        request: Some(shard_context(&binding).request.unwrap()),
+        items: vec![SnapshotIngestItem {
+            receipt_id: receipt_id.to_be_bytes().to_vec(),
+            transaction: Some(snapshot_transaction_request(&binding, 912, 913)),
+        }],
+    };
+
+    let mut first = service
+        .accept_snapshot_ingest(Request::new(batch()))
+        .await
+        .unwrap()
+        .into_inner();
+    let accepted = first.next().await.unwrap().unwrap();
+    assert_eq!(accepted.state, SnapshotIngestState::Pending as i32);
+    assert_eq!(accepted.receipt_id, receipt_id.to_be_bytes());
+
+    let mut duplicate = service
+        .accept_snapshot_ingest(Request::new(batch()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        duplicate.next().await.unwrap().unwrap().state,
+        SnapshotIngestState::Pending as i32
+    );
+
+    let committed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let receipt = service
+                .get_snapshot_ingest_receipt(Request::new(SnapshotIngestReceiptRequest {
+                    request: Some(shard_context(&binding).request.unwrap()),
+                    receipt_id: receipt_id.to_be_bytes().to_vec(),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .receipt
+                .unwrap();
+            if receipt.state != SnapshotIngestState::Pending as i32 {
+                break receipt;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ingest receipt should reach a terminal state");
+    assert_eq!(committed.state, SnapshotIngestState::Committed as i32);
+    assert!(committed.applied_index > 1);
+    assert!(committed.commit_time > 0);
+}
+
+#[tokio::test]
+async fn snapshot_ingest_rejects_a_reused_receipt_with_different_content() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("snapshot-ingest-digest");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let service = node.rpc_service();
+    let batch = |vertex_id| SnapshotIngestBatch {
+        request: Some(shard_context(&binding).request.unwrap()),
+        items: vec![SnapshotIngestItem {
+            receipt_id: 914_u128.to_be_bytes().to_vec(),
+            transaction: Some(snapshot_transaction_request(&binding, 915, vertex_id)),
+        }],
+    };
+
+    let _ = service
+        .accept_snapshot_ingest(Request::new(batch(916)))
+        .await
+        .unwrap();
+    let result = service
+        .accept_snapshot_ingest(Request::new(batch(917)))
+        .await;
+    let Err(error) = result else {
+        panic!("reused receipt must reject different content");
+    };
+    assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn snapshot_ingest_rejects_a_non_snapshot_transaction_before_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("snapshot-ingest-operation");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let result = node
+        .rpc_service()
+        .accept_snapshot_ingest(Request::new(SnapshotIngestBatch {
+            request: Some(shard_context(&binding).request.unwrap()),
+            items: vec![SnapshotIngestItem {
+                receipt_id: 918_u128.to_be_bytes().to_vec(),
+                transaction: Some(transaction_request(&binding, 919, 920)),
+            }],
+        }))
+        .await;
+    let Err(error) = result else {
+        panic!("ingest must reject non-snapshot transactions");
+    };
+    assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn snapshot_commit_replay_returns_the_original_commit_time() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("snapshot-commit-replay");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let request = snapshot_transaction_request(&binding, 921, 922);
+
+    let first = node
+        .rpc_service()
+        .apply_transaction(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let second = node
+        .rpc_service()
+        .apply_transaction(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    let first_receipt = first.details.unwrap().body;
+    let second_receipt = second.details.unwrap().body;
+
+    assert_eq!(first_receipt.len(), 17);
+    assert_eq!(second_receipt.len(), 17);
+    assert_eq!(&first_receipt[9..], &second_receipt[9..]);
+    assert_eq!(second_receipt[8], 1);
+}
+
+#[tokio::test]
+#[ignore = "development-host diagnostic; run explicitly to measure Data ingress only"]
+async fn diagnostic_snapshot_ingest_admission_latency() {
+    const WARMUP_SAMPLES: u128 = 128;
+    const MEASURED_SAMPLES: u128 = 1_024;
+
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_binding("snapshot-ingest-admission-diagnostic");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let service = node.rpc_service();
+    let submit = |ordinal: u128| {
+        let service = service.clone();
+        let binding = binding.clone();
+        async move {
+            let request = Request::new(SnapshotIngestBatch {
+                request: Some(shard_context(&binding).request.unwrap()),
+                items: vec![SnapshotIngestItem {
+                    receipt_id: ordinal.to_be_bytes().to_vec(),
+                    transaction: Some(snapshot_transaction_request(
+                        &binding,
+                        ordinal + 10_000,
+                        ordinal + 20_000,
+                    )),
+                }],
+            });
+            let started = Instant::now();
+            let mut response = service
+                .accept_snapshot_ingest(request)
+                .await
+                .unwrap()
+                .into_inner();
+            let receipt = response.next().await.unwrap().unwrap();
+            assert!(matches!(
+                receipt.state,
+                state if state == SnapshotIngestState::Pending as i32
+                    || state == SnapshotIngestState::Committed as i32
+            ));
+            started.elapsed().as_nanos() as u64
+        }
+    };
+
+    for ordinal in 1..=WARMUP_SAMPLES {
+        let _ = submit(ordinal).await;
+    }
+    let mut samples = Vec::with_capacity(MEASURED_SAMPLES as usize);
+    for ordinal in WARMUP_SAMPLES + 1..=WARMUP_SAMPLES + MEASURED_SAMPLES {
+        samples.push(submit(ordinal).await);
+    }
+    samples.sort_unstable();
+    let percentile = |percentile: usize| samples[(samples.len() * percentile).div_ceil(100) - 1];
+    println!(
+        "snapshot_ingest_admission samples={} p50_ns={} p95_ns={} p99_ns={}",
+        samples.len(),
+        percentile(50),
+        percentile(95),
+        percentile(99),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

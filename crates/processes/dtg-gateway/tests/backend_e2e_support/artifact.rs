@@ -489,6 +489,52 @@ const REQUEST_METRIC_DETAILS_V14: [&str; 45] = [
     "gateway_query_pipeline_writer_wait",
 ];
 
+const REQUEST_METRIC_DETAILS_V15: [&str; 43] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_data_apply_rpc",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+    "data_adjacency_cache_hit",
+    "data_adjacency_cache_miss",
+    "data_adjacency_backend_expand",
+    "data_snapshot_csr_cache_hit",
+    "data_snapshot_csr_cache_miss",
+    "data_snapshot_csr_build",
+    "gateway_query_session_submit",
+    "gateway_query_session_response_wait",
+    "data_gateway_session_execution",
+    "gateway_query_pipeline_submit",
+    "gateway_query_pipeline_response_wait",
+    "bolt_read_pipeline_enqueue_wait",
+    "bolt_read_pipeline_execution_wait",
+    "bolt_read_pipeline_ordered_write_wait",
+    "gateway_query_pipeline_credit_wait",
+    "data_gateway_pipeline_dispatch_wait",
+    "data_gateway_pipeline_completion_send_wait",
+    "data_gateway_pipeline_completion_frame",
+    "gateway_query_pipeline_response_transport_wait",
+    "gateway_query_pipeline_response_dispatch_wait",
+    "data_gateway_pipeline_request_transport_wait",
+    "gateway_query_pipeline_writer_wait",
+    "data_snapshot_ingest_admission",
+    "data_snapshot_ingest_receipt_lookup",
+];
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
@@ -705,9 +751,9 @@ fn validate_metrics_snapshot(
     snapshot: &ProcessMetricsSnapshot,
     expected_role: &str,
 ) -> io::Result<()> {
-    if !matches!(snapshot.schema_version, 1..=14) {
+    if !matches!(snapshot.schema_version, 1..=15) {
         return Err(invalid_data(
-            "request metrics schema version must be between 1 and 14",
+            "request metrics schema version must be between 1 and 15",
         ));
     }
     if snapshot.process_role != expected_role {
@@ -747,6 +793,7 @@ fn validate_metrics_snapshot(
             12 => &REQUEST_METRIC_DETAILS_V12,
             13 => &REQUEST_METRIC_DETAILS_V13,
             14 => &REQUEST_METRIC_DETAILS_V14,
+            15 => &REQUEST_METRIC_DETAILS_V15,
             _ => unreachable!("schema v1 is handled above"),
         };
         if snapshot.details.len() != expected_details.len()

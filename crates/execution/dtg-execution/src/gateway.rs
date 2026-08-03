@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -470,8 +470,6 @@ impl GatewayWriteRoute {
 pub struct GatewayWriteRequest {
     route: GatewayWriteRoute,
     transaction_id: TransactionId,
-    start_time: dtg_storage::TransactionTime,
-    commit_time: dtg_storage::TransactionTime,
     command: ShardCommand,
 }
 
@@ -479,6 +477,7 @@ pub struct GatewayWriteRequest {
 pub struct GatewayWriteReceipt {
     applied_index: u64,
     replayed: bool,
+    commit_time: Option<dtg_storage::TransactionTime>,
 }
 
 impl GatewayWriteReceipt {
@@ -486,6 +485,19 @@ impl GatewayWriteReceipt {
         Self {
             applied_index,
             replayed,
+            commit_time: None,
+        }
+    }
+
+    pub const fn with_commit_time(
+        applied_index: u64,
+        replayed: bool,
+        commit_time: dtg_storage::TransactionTime,
+    ) -> Self {
+        Self {
+            applied_index,
+            replayed,
+            commit_time: Some(commit_time),
         }
     }
 
@@ -496,35 +508,23 @@ impl GatewayWriteReceipt {
     pub const fn replayed(self) -> bool {
         self.replayed
     }
+
+    pub const fn commit_time(self) -> Option<dtg_storage::TransactionTime> {
+        self.commit_time
+    }
 }
 
 impl GatewayWriteRequest {
-    fn new(
-        route: GatewayWriteRoute,
-        transaction_id: TransactionId,
-        start_time: dtg_storage::TransactionTime,
-        commit_time: dtg_storage::TransactionTime,
-        command: ShardCommand,
-    ) -> Self {
+    fn new(route: GatewayWriteRoute, transaction_id: TransactionId, command: ShardCommand) -> Self {
         Self {
             route,
             transaction_id,
-            start_time,
-            commit_time,
             command,
         }
     }
 
     pub const fn transaction_id(&self) -> TransactionId {
         self.transaction_id
-    }
-
-    pub const fn start_time(&self) -> dtg_storage::TransactionTime {
-        self.start_time
-    }
-
-    pub const fn commit_time(&self) -> dtg_storage::TransactionTime {
-        self.commit_time
     }
 
     pub const fn snapshot_applied_index(&self) -> u64 {
@@ -544,196 +544,29 @@ impl GatewayWriteRequest {
 }
 
 pub trait GatewayWriteTransport: Send + Sync {
-    fn allocate_start_time(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>>;
-
-    fn reserve_commit_time(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>>;
-
-    fn prepare_write_times(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<
-        '_,
-        Result<(dtg_storage::TransactionTime, dtg_storage::TransactionTime), GatewayExecutionError>,
-    > {
-        let route = route.clone();
-        Box::pin(async move {
-            tokio::try_join!(
-                self.allocate_start_time(&route, transaction_id),
-                self.reserve_commit_time(&route, transaction_id),
-            )
-        })
-    }
-
     fn apply_single_shard(
         &self,
         request: GatewayWriteRequest,
     ) -> GatewayFuture<'_, Result<GatewayWriteReceipt, GatewayExecutionError>>;
-
-    fn resolve_committed(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>>;
-
-    fn abort(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>>;
 }
 
 #[derive(Clone)]
 pub struct TonicGatewayWriteTransport {
-    meta: proto::meta_service_client::MetaServiceClient<Channel>,
     data: proto::data_service_client::DataServiceClient<Channel>,
 }
 
 impl TonicGatewayWriteTransport {
     pub async fn connect(
-        meta_endpoint: impl Into<String>,
         data_endpoint: impl Into<String>,
     ) -> Result<Arc<dyn GatewayWriteTransport>, GatewayExecutionError> {
-        let meta = proto::meta_service_client::MetaServiceClient::connect(meta_endpoint.into())
-            .await
-            .map_err(cluster_connect_error)?;
         let data = proto::data_service_client::DataServiceClient::connect(data_endpoint.into())
             .await
             .map_err(cluster_connect_error)?;
-        Ok(Arc::new(Self { meta, data }))
-    }
-
-    async fn timestamp(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-        operation: i32,
-    ) -> Result<dtg_storage::TransactionTime, GatewayExecutionError> {
-        let request = transaction_rpc_request(route, transaction_id, operation, None)?;
-        let mut client = self.meta.clone();
-        let status = client
-            .submit_transaction(request)
-            .await
-            .map_err(cluster_rpc_error)?
-            .into_inner();
-        let details = status_details(status)?.ok_or_else(|| {
-            GatewayExecutionError::new(
-                "DTG-EXECUTION-TIMESTAMP",
-                "Meta timestamp response is missing details",
-                GatewayRetry::Safe,
-            )
-        })?;
-        let bytes: [u8; 8] = details.body().try_into().map_err(|_| {
-            GatewayExecutionError::new(
-                "DTG-EXECUTION-TIMESTAMP",
-                "Meta timestamp response is not an i64",
-                GatewayRetry::Safe,
-            )
-        })?;
-        dtg_storage::TransactionTime::new(i64::from_be_bytes(bytes)).map_err(|error| {
-            GatewayExecutionError::new(
-                "DTG-EXECUTION-TIMESTAMP",
-                error.to_string(),
-                GatewayRetry::Safe,
-            )
-        })
-    }
-
-    async fn prepare_write_times_rpc(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> Result<(dtg_storage::TransactionTime, dtg_storage::TransactionTime), GatewayExecutionError>
-    {
-        let request = transaction_rpc_request(route, transaction_id, 6, None)?;
-        let mut client = self.meta.clone();
-        let status = client
-            .submit_transaction(request)
-            .await
-            .map_err(cluster_rpc_error)?
-            .into_inner();
-        let details = status_details(status)?.ok_or_else(|| {
-            GatewayExecutionError::new(
-                "DTG-EXECUTION-TIMESTAMP",
-                "Meta write preparation response is missing details",
-                GatewayRetry::Safe,
-            )
-        })?;
-        let bytes: [u8; 16] = details.body().try_into().map_err(|_| {
-            GatewayExecutionError::new(
-                "DTG-EXECUTION-TIMESTAMP",
-                "Meta write preparation response is not two i64 values",
-                GatewayRetry::Safe,
-            )
-        })?;
-        let start =
-            dtg_storage::TransactionTime::new(i64::from_be_bytes(bytes[..8].try_into().unwrap()))
-                .map_err(|error| {
-                GatewayExecutionError::new(
-                    "DTG-EXECUTION-TIMESTAMP",
-                    error.to_string(),
-                    GatewayRetry::Safe,
-                )
-            })?;
-        let commit =
-            dtg_storage::TransactionTime::new(i64::from_be_bytes(bytes[8..].try_into().unwrap()))
-                .map_err(|error| {
-                GatewayExecutionError::new(
-                    "DTG-EXECUTION-TIMESTAMP",
-                    error.to_string(),
-                    GatewayRetry::Safe,
-                )
-            })?;
-        if commit <= start {
-            return Err(GatewayExecutionError::new(
-                "DTG-EXECUTION-TIMESTAMP",
-                "Meta write preparation returned a non-increasing timestamp pair",
-                GatewayRetry::Safe,
-            ));
-        }
-        Ok((start, commit))
+        Ok(Arc::new(Self { data }))
     }
 }
 
 impl GatewayWriteTransport for TonicGatewayWriteTransport {
-    fn allocate_start_time(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>> {
-        let route = route.clone();
-        Box::pin(async move { self.timestamp(&route, transaction_id, 1).await })
-    }
-
-    fn reserve_commit_time(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<dtg_storage::TransactionTime, GatewayExecutionError>> {
-        let route = route.clone();
-        Box::pin(async move { self.timestamp(&route, transaction_id, 2).await })
-    }
-
-    fn prepare_write_times(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<
-        '_,
-        Result<(dtg_storage::TransactionTime, dtg_storage::TransactionTime), GatewayExecutionError>,
-    > {
-        let route = route.clone();
-        Box::pin(async move { self.prepare_write_times_rpc(&route, transaction_id).await })
-    }
-
     fn apply_single_shard(
         &self,
         request: GatewayWriteRequest,
@@ -749,7 +582,7 @@ impl GatewayWriteTransport for TonicGatewayWriteTransport {
             let wire = transaction_rpc_request(
                 &request.route,
                 request.transaction_id(),
-                2,
+                7,
                 Some((request.command().header().command_id().get(), command)),
             )?;
             let mut client = self.data.clone();
@@ -760,24 +593,6 @@ impl GatewayWriteTransport for TonicGatewayWriteTransport {
                 .into_inner();
             decode_write_receipt(status_details(status)?)
         })
-    }
-
-    fn resolve_committed(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
-        let route = route.clone();
-        Box::pin(async move { self.timestamp(&route, transaction_id, 5).await.map(|_| ()) })
-    }
-
-    fn abort(
-        &self,
-        route: &GatewayWriteRoute,
-        transaction_id: TransactionId,
-    ) -> GatewayFuture<'_, Result<(), GatewayExecutionError>> {
-        let route = route.clone();
-        Box::pin(async move { self.timestamp(&route, transaction_id, 3).await.map(|_| ()) })
     }
 }
 
@@ -855,20 +670,17 @@ fn decode_write_receipt(
             GatewayRetry::Safe,
         )
     })?;
-    if details.format_version() != 1 || details.item_count() != 1 || details.len() != 9 {
+    if details.format_version() != 1
+        || details.item_count() != 1
+        || !matches!(details.len(), 9 | 17)
+    {
         return Err(GatewayExecutionError::new(
             "DTG-EXECUTION-WRITE-RECEIPT",
             "Data write response is not a single applied receipt",
             GatewayRetry::Safe,
         ));
     }
-    let bytes: [u8; 9] = details.body().try_into().map_err(|_| {
-        GatewayExecutionError::new(
-            "DTG-EXECUTION-WRITE-RECEIPT",
-            "Data write response is not an applied receipt",
-            GatewayRetry::Safe,
-        )
-    })?;
+    let bytes = details.body();
     let applied_index = u64::from_be_bytes(bytes[..8].try_into().expect("length checked"));
     if applied_index == 0 {
         return Err(GatewayExecutionError::new(
@@ -888,7 +700,25 @@ fn decode_write_receipt(
             ));
         }
     };
-    Ok(GatewayWriteReceipt::new(applied_index, replayed))
+    if bytes.len() == 17 {
+        let commit_time = dtg_storage::TransactionTime::new(i64::from_be_bytes(
+            bytes[9..].try_into().expect("length checked"),
+        ))
+        .map_err(|error| {
+            GatewayExecutionError::new(
+                "DTG-EXECUTION-WRITE-RECEIPT",
+                error.to_string(),
+                GatewayRetry::Safe,
+            )
+        })?;
+        Ok(GatewayWriteReceipt::with_commit_time(
+            applied_index,
+            replayed,
+            commit_time,
+        ))
+    } else {
+        Ok(GatewayWriteReceipt::new(applied_index, replayed))
+    }
 }
 
 fn cluster_connect_error(error: tonic::transport::Error) -> GatewayExecutionError {
@@ -2504,7 +2334,6 @@ enum GatewayExecutionMode {
         planning_context: Arc<RwLock<PlanningContext>>,
         transport: Arc<dyn GatewayExecutionTransport>,
         write_transport: Option<Arc<dyn GatewayWriteTransport>>,
-        write_accounting: Arc<ProcessWriteAccounting>,
     },
 }
 
@@ -2531,7 +2360,6 @@ impl GatewayExecution {
                 planning_context: Arc::new(RwLock::new(planning_context)),
                 transport,
                 write_transport: None,
-                write_accounting: Arc::new(ProcessWriteAccounting::default()),
             },
             request_metrics: Arc::new(RequestStageMetrics::default()),
         }
@@ -2808,7 +2636,6 @@ impl GatewayExecution {
                 let GatewayExecutionMode::Process {
                     planning_context,
                     write_transport,
-                    write_accounting,
                     ..
                 } = &self.mode
                 else {
@@ -2825,7 +2652,7 @@ impl GatewayExecution {
                         GatewayRetry::Never,
                     )
                 })?;
-                let planning_context = planning_context
+                let current_planning_context = planning_context
                     .read()
                     .map_err(|_| {
                         GatewayExecutionError::new(
@@ -2840,21 +2667,11 @@ impl GatewayExecution {
                     context,
                     write,
                     &parameters,
-                    &planning_context,
-                    write_accounting,
+                    &current_planning_context,
                     &self.request_metrics,
                 )
                 .await?;
-                account_process_write(
-                    write_accounting,
-                    match &self.mode {
-                        GatewayExecutionMode::Process {
-                            planning_context, ..
-                        } => planning_context,
-                        GatewayExecutionMode::Composed { .. } => unreachable!(),
-                    },
-                    &outcome,
-                )?;
+                advance_process_snapshot(planning_context, &outcome, !outcome.replayed)?;
                 validate_process_request_end(cancellation)?;
                 return Ok(GatewayResponse::Acknowledged);
             }
@@ -5063,7 +4880,6 @@ async fn execute_process_create(
     write: &dtg_language_ir::LogicalWrite,
     parameters: &BTreeMap<String, GatewayValue>,
     planning_context: &PlanningContext,
-    write_accounting: &ProcessWriteAccounting,
     request_metrics: &Arc<RequestStageMetrics>,
 ) -> Result<ProcessWriteOutcome, GatewayExecutionError> {
     let [catalog_shard] = planning_context.catalog().shards() else {
@@ -5112,9 +4928,14 @@ async fn execute_process_create(
         0,
     ))
     .map_err(|error| process_write_error(error.to_string()))?;
-    let (start_time, commit_time) = request_metrics
-        .start_detail(RequestDetail::GatewayMetaPrepareWrite)
-        .finish_result(transport.prepare_write_times(&route, transaction_id).await)?;
+    let start_time = planning_context.snapshot_requirements().transaction_time();
+    let command_placeholder_time = dtg_storage::TransactionTime::new(
+        start_time
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| process_write_error("snapshot timestamp overflow"))?,
+    )
+    .map_err(|error| process_write_error(error.to_string()))?;
     let command_id = CommandId::new(process_write_identity(
         b"dtg-gateway-create-command-v1",
         context.request_id(),
@@ -5133,7 +4954,7 @@ async fn execute_process_create(
         properties,
         valid_from,
         parameters,
-        commit_time,
+        command_placeholder_time,
     )?;
     let request_digest = dtg_storage::Digest32::new(process_write_digest(
         b"dtg-gateway-create-command-digest-v1",
@@ -5153,216 +4974,29 @@ async fn execute_process_create(
         )
         .map_err(|error| process_write_error(error.to_string()))?,
     );
-    let request = GatewayWriteRequest::new(
-        route.clone(),
-        transaction_id,
-        start_time,
-        commit_time,
-        command,
-    );
-    reserve_process_write_capacity(write_accounting, transaction_id)?;
+    let request = GatewayWriteRequest::new(route.clone(), transaction_id, command);
     let receipt = match request_metrics
         .start_detail(RequestDetail::GatewayDataApplyRpc)
         .finish_result(transport.apply_single_shard(request).await)
     {
         Ok(receipt) => receipt,
-        Err(error) => {
-            complete_process_write_attempt(
-                write_accounting,
-                transaction_id,
-                error.retry() == GatewayRetry::Safe,
-            )?;
-            if error.retry() == GatewayRetry::Never {
-                transport.abort(&route, transaction_id).await?;
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
-    complete_process_write_attempt(write_accounting, transaction_id, !receipt.replayed())?;
-    request_metrics
-        .start_detail(RequestDetail::GatewayMetaResolveCommit)
-        .finish_result(transport.resolve_committed(&route, transaction_id).await)?;
     Ok(ProcessWriteOutcome {
-        transaction_id,
         binding: route.binding,
         applied_index: receipt.applied_index(),
-        commit_time,
+        commit_time: receipt.commit_time().ok_or_else(|| {
+            process_write_error("Data snapshot commit receipt is missing a commit time")
+        })?,
+        replayed: receipt.replayed(),
     })
 }
 
 struct ProcessWriteOutcome {
-    transaction_id: TransactionId,
     binding: dtg_storage::ReplicaBinding,
     applied_index: u64,
     commit_time: dtg_storage::TransactionTime,
-}
-
-// This is bounded process-local diagnostic retention, not restart recovery. Completed receipts
-// are evicted fail-closed for bound growth; pending receipts are admitted before Data I/O and
-// never evicted while ambiguous.
-const PROCESS_WRITE_ACCOUNTING_LIMIT: usize = 4_096;
-
-#[derive(Clone, Copy)]
-enum ProcessWriteAccountingState {
-    Reserved { in_flight: usize },
-    Pending,
-    Accounting,
-    Accounted,
-}
-
-#[derive(Default)]
-struct ProcessWriteAccounting {
-    state: Mutex<ProcessWriteAccountingStateMachine>,
-}
-
-#[derive(Default)]
-struct ProcessWriteAccountingStateMachine {
-    states: BTreeMap<TransactionId, ProcessWriteAccountingState>,
-    accounted_order: VecDeque<TransactionId>,
-    pending_count: usize,
-    capacity_reservations: usize,
-}
-
-impl ProcessWriteAccountingStateMachine {
-    fn reserve_capacity(
-        &mut self,
-        transaction_id: TransactionId,
-    ) -> Result<bool, GatewayExecutionError> {
-        if let Some(state) = self.states.get_mut(&transaction_id) {
-            if let ProcessWriteAccountingState::Reserved { in_flight } = state {
-                *in_flight = in_flight.saturating_add(1);
-            }
-            return Ok(false);
-        }
-        if self.pending_count + self.capacity_reservations >= PROCESS_WRITE_ACCOUNTING_LIMIT {
-            return Err(process_write_error(
-                "process write-accounting capacity is exhausted",
-            ));
-        }
-        self.capacity_reservations += 1;
-        self.states.insert(
-            transaction_id,
-            ProcessWriteAccountingState::Reserved { in_flight: 1 },
-        );
-        Ok(true)
-    }
-
-    fn complete_attempt(&mut self, transaction_id: TransactionId, retain_pending: bool) {
-        let Some(ProcessWriteAccountingState::Reserved { in_flight }) =
-            self.states.get(&transaction_id).copied()
-        else {
-            return;
-        };
-        if retain_pending {
-            self.states
-                .insert(transaction_id, ProcessWriteAccountingState::Pending);
-            self.capacity_reservations = self
-                .capacity_reservations
-                .checked_sub(1)
-                .expect("capacity reservation exists");
-            self.pending_count += 1;
-        } else if in_flight == 1 {
-            self.states.remove(&transaction_id);
-            self.capacity_reservations = self
-                .capacity_reservations
-                .checked_sub(1)
-                .expect("capacity reservation exists");
-        } else {
-            self.states.insert(
-                transaction_id,
-                ProcessWriteAccountingState::Reserved {
-                    in_flight: in_flight - 1,
-                },
-            );
-        }
-    }
-
-    fn mark_accounted(&mut self, transaction_id: TransactionId) {
-        self.states
-            .insert(transaction_id, ProcessWriteAccountingState::Accounted);
-        self.pending_count = self
-            .pending_count
-            .checked_sub(1)
-            .expect("accounted write was pending");
-        self.accounted_order.push_back(transaction_id);
-        while self.accounted_order.len() > PROCESS_WRITE_ACCOUNTING_LIMIT {
-            let expired = self.accounted_order.pop_front().expect("length checked");
-            self.states.remove(&expired);
-        }
-    }
-}
-
-fn reserve_process_write_capacity(
-    write_accounting: &ProcessWriteAccounting,
-    transaction_id: TransactionId,
-) -> Result<bool, GatewayExecutionError> {
-    write_accounting
-        .state
-        .lock()
-        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?
-        .reserve_capacity(transaction_id)
-}
-
-fn complete_process_write_attempt(
-    write_accounting: &ProcessWriteAccounting,
-    transaction_id: TransactionId,
-    retain_pending: bool,
-) -> Result<(), GatewayExecutionError> {
-    write_accounting
-        .state
-        .lock()
-        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?
-        .complete_attempt(transaction_id, retain_pending);
-    Ok(())
-}
-
-// Lock ordering is write accounting, then planning context. Neither lock spans Meta/Data I/O;
-// install_planning_context acquires only the planning-context lock, so it has no inverse ordering.
-fn account_process_write(
-    write_accounting: &ProcessWriteAccounting,
-    planning_context: &RwLock<PlanningContext>,
-    outcome: &ProcessWriteOutcome,
-) -> Result<(), GatewayExecutionError> {
-    let mut accounting = write_accounting
-        .state
-        .lock()
-        .map_err(|_| process_write_error("process write-accounting lock is poisoned"))?;
-    let increment_bound = match accounting.states.get(&outcome.transaction_id).copied() {
-        Some(ProcessWriteAccountingState::Pending) => {
-            accounting.states.insert(
-                outcome.transaction_id,
-                ProcessWriteAccountingState::Accounting,
-            );
-            true
-        }
-        Some(ProcessWriteAccountingState::Accounted) | None => false,
-        Some(ProcessWriteAccountingState::Reserved { .. }) => {
-            return Err(process_write_error(
-                "process write accounting receipt was not classified",
-            ));
-        }
-        Some(ProcessWriteAccountingState::Accounting) => {
-            return Err(process_write_error(
-                "process write accounting state was observed while owned",
-            ));
-        }
-    };
-    match advance_process_snapshot(planning_context, outcome, increment_bound) {
-        Ok(()) => {
-            if increment_bound {
-                accounting.mark_accounted(outcome.transaction_id);
-            }
-            Ok(())
-        }
-        Err(error) => {
-            if increment_bound {
-                accounting
-                    .states
-                    .insert(outcome.transaction_id, ProcessWriteAccountingState::Pending);
-            }
-            Err(error)
-        }
-    }
+    replayed: bool,
 }
 
 fn advance_process_snapshot(

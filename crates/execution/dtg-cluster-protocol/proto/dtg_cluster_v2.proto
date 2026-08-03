@@ -56,6 +56,7 @@ enum TransactionOperation {
   TRANSACTION_OPERATION_RECOVER = 4;
   TRANSACTION_OPERATION_RESOLVE_COMMITTED = 5;
   TRANSACTION_OPERATION_PREPARE_WRITE = 6;
+  TRANSACTION_OPERATION_COMMIT_SNAPSHOT = 7;
 }
 
 message TransactionRequest {
@@ -64,6 +65,41 @@ message TransactionRequest {
   TransactionOperation operation = 3;
   bytes idempotency_key = 4;
   BoundedPayload payload = 5;
+}
+
+enum SnapshotIngestState {
+  SNAPSHOT_INGEST_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_INGEST_STATE_PENDING = 1;
+  SNAPSHOT_INGEST_STATE_COMMITTED = 2;
+  SNAPSHOT_INGEST_STATE_REJECTED = 3;
+}
+
+message SnapshotIngestItem {
+  bytes receipt_id = 1;
+  TransactionRequest transaction = 2;
+}
+
+message SnapshotIngestBatch {
+  RequestContext request = 1;
+  repeated SnapshotIngestItem items = 2;
+}
+
+message SnapshotIngestReceipt {
+  bytes receipt_id = 1;
+  SnapshotIngestState state = 2;
+  uint64 applied_index = 3;
+  string message = 4;
+  int64 commit_time = 5;
+}
+
+message SnapshotIngestReceiptRequest {
+  RequestContext request = 1;
+  bytes receipt_id = 2;
+}
+
+message SnapshotIngestReceiptResponse {
+  TypedStatus status = 1;
+  SnapshotIngestReceipt receipt = 2;
 }
 
 enum RaftMessageKind {
@@ -203,6 +239,8 @@ service GatewayService {
 service DataService {
   rpc ExecuteFragment(ExecutionFragment) returns (stream ColumnBatch);
   rpc ApplyTransaction(TransactionRequest) returns (TypedStatus);
+  rpc AcceptSnapshotIngest(SnapshotIngestBatch) returns (stream SnapshotIngestReceipt);
+  rpc GetSnapshotIngestReceipt(SnapshotIngestReceiptRequest) returns (SnapshotIngestReceiptResponse);
   rpc SendRaft(RaftEnvelope) returns (TypedStatus);
   rpc InstallReplicaSnapshot(LogicalReplicaSnapshot) returns (TypedStatus);
 }

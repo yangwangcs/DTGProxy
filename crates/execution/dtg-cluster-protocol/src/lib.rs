@@ -16,7 +16,8 @@ pub use validate::{
     ValidatedGatewayRequest, ValidatedPayload, ValidatedStatus, checksum_bytes,
     decode_request_context, validate_column_batch, validate_control_observation,
     validate_execution_fragment, validate_gateway_request, validate_raft_envelope,
-    validate_replica_snapshot, validate_transaction_request, validate_typed_status,
+    validate_replica_snapshot, validate_snapshot_ingest_batch,
+    validate_snapshot_ingest_receipt_request, validate_transaction_request, validate_typed_status,
 };
 
 pub const PROTOCOL_MAJOR: u32 = 2;

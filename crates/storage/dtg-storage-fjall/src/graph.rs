@@ -374,40 +374,61 @@ impl FjallReplicaStore {
         }
     }
 
-    fn apply_sync(&self, batch: CommittedShardBatch) -> Result<ApplyReceipt, StorageError> {
-        batch.validate()?;
-        self.verify_binding(batch.binding())?;
+    fn apply_batches_sync(
+        &self,
+        batches: Vec<CommittedShardBatch>,
+    ) -> Result<Vec<ApplyReceipt>, StorageError> {
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+        for batch in &batches {
+            batch.validate()?;
+            self.verify_binding(batch.binding())?;
+        }
         let _guard = self.lock_graph()?;
         self.ensure_no_restore_in_progress()?;
-        let applied = self.applied_index_sync()?;
-        if batch.raft_index() <= applied {
-            let replay = self
-                .inner
-                .namespace
-                .identity
-                .get(batch.raft_index().to_be_bytes())
-                .map_err(fjall_error)?
-                .ok_or(StorageError::ReplayMismatch {
+        let mut applied = self.applied_index_sync()?;
+        let mut receipt_slots = Vec::with_capacity(batches.len());
+        let mut pending = Vec::new();
+        for batch in batches {
+            if batch.raft_index() <= applied {
+                let replay = self
+                    .inner
+                    .namespace
+                    .identity
+                    .get(batch.raft_index().to_be_bytes())
+                    .map_err(fjall_error)?
+                    .ok_or(StorageError::ReplayMismatch {
+                        raft_index: batch.raft_index(),
+                    })?;
+                let replay = decode_replay_identity(&replay)?;
+                if replay.term == batch.raft_term()
+                    && replay.command_id == batch.command_id()
+                    && replay.mutation_digest == batch.mutation_digest()
+                {
+                    receipt_slots.push(Some(ApplyReceipt::new(&batch, true)));
+                    continue;
+                }
+                return Err(StorageError::ReplayMismatch {
                     raft_index: batch.raft_index(),
-                })?;
-            let replay = decode_replay_identity(&replay)?;
-            if replay.term == batch.raft_term()
-                && replay.command_id == batch.command_id()
-                && replay.mutation_digest == batch.mutation_digest()
-            {
-                return Ok(ApplyReceipt::new(&batch, true));
+                });
             }
-            return Err(StorageError::ReplayMismatch {
-                raft_index: batch.raft_index(),
-            });
+            if batch.raft_index() != applied.saturating_add(1) {
+                return Err(StorageError::NonMonotonicIndex {
+                    applied,
+                    proposed: batch.raft_index(),
+                });
+            }
+            applied = batch.raft_index();
+            receipt_slots.push(None);
+            pending.push(batch);
         }
-        if batch.raft_index() != applied.saturating_add(1) {
-            return Err(StorageError::NonMonotonicIndex {
-                applied,
-                proposed: batch.raft_index(),
-            });
+        if pending.is_empty() {
+            return Ok(receipt_slots
+                .into_iter()
+                .map(|receipt| receipt.expect("replay receipt slot must be populated"))
+                .collect());
         }
-
         #[cfg(feature = "tck")]
         let failure_after = lock(&self.inner.injected_failure_after)?.take();
         let mut write = self
@@ -417,40 +438,63 @@ impl FjallReplicaStore {
             .batch()
             .durability(Some(PersistMode::SyncAll));
         let mut adjacency = EdgeAdjacencyState::default();
-        for (ordinal, mutation) in batch.mutations().iter().enumerate() {
-            stage_mutation(
-                &self.inner.namespace,
-                &mut write,
-                batch.raft_index(),
-                ordinal as u64,
-                mutation,
-                &mut adjacency,
-            )?;
-            #[cfg(feature = "tck")]
-            if failure_after == Some(ordinal + 1) {
-                return Err(StorageError::InjectedApplyFailure {
-                    staged_mutations: ordinal + 1,
-                });
+        let mut staged = 0_usize;
+        for batch in &pending {
+            for (ordinal, mutation) in batch.mutations().iter().enumerate() {
+                stage_mutation(
+                    &self.inner.namespace,
+                    &mut write,
+                    batch.raft_index(),
+                    ordinal as u64,
+                    mutation,
+                    &mut adjacency,
+                )?;
+                staged = staged.saturating_add(1);
+                #[cfg(feature = "tck")]
+                if failure_after == Some(staged) {
+                    return Err(StorageError::InjectedApplyFailure {
+                        staged_mutations: staged,
+                    });
+                }
             }
+            write.insert(
+                &self.inner.namespace.identity,
+                batch.raft_index().to_be_bytes(),
+                encode_replay_identity(
+                    batch.raft_term(),
+                    batch.command_id(),
+                    batch.mutation_digest(),
+                )?,
+            );
         }
-        write.insert(
-            &self.inner.namespace.identity,
-            batch.raft_index().to_be_bytes(),
-            encode_replay_identity(
-                batch.raft_term(),
-                batch.command_id(),
-                batch.mutation_digest(),
-            )?,
-        );
         write.insert(
             &self.inner.namespace.replica_meta,
             APPLIED_INDEX_KEY,
-            batch.raft_index().to_be_bytes(),
+            applied.to_be_bytes(),
         );
         #[cfg(feature = "tck")]
         self.pause_graph_at(GraphPausePoint::ApplyBeforeCommit)?;
         write.commit().map_err(fjall_error)?;
-        Ok(ApplyReceipt::new(&batch, false))
+        let mut pending_receipts = pending.iter().map(|batch| ApplyReceipt::new(batch, false));
+        Ok(receipt_slots
+            .into_iter()
+            .map(|receipt| {
+                receipt.unwrap_or_else(|| {
+                    pending_receipts
+                        .next()
+                        .expect("pending receipt slot must be populated")
+                })
+            })
+            .collect())
+    }
+
+    fn apply_sync(&self, batch: CommittedShardBatch) -> Result<ApplyReceipt, StorageError> {
+        self.apply_batches_sync(vec![batch])
+            .and_then(|mut receipts| {
+                receipts.pop().ok_or_else(|| {
+                    StorageError::Internal("single apply did not return a receipt".into())
+                })
+            })
     }
 }
 
@@ -491,6 +535,17 @@ impl ReplicaStateStore for FjallReplicaStore {
 
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
         Box::pin(async move { self.apply_sync(batch) })
+    }
+
+    fn supports_atomic_batch_apply(&self) -> bool {
+        true
+    }
+
+    fn apply_batches(
+        &self,
+        batches: Vec<CommittedShardBatch>,
+    ) -> StoreFuture<'_, Vec<ApplyReceipt>> {
+        Box::pin(async move { self.apply_batches_sync(batches) })
     }
 
     fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {

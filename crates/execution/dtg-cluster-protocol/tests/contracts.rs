@@ -45,6 +45,47 @@ fn pipeline_frames_are_additive_and_statuses_are_stable() {
 }
 
 #[test]
+fn snapshot_ingest_receipts_are_additive_and_preserve_retry_identity() {
+    let receipt_id = 71_u128.to_be_bytes().to_vec();
+    let batch = proto::SnapshotIngestBatch {
+        request: Some(valid_request_context()),
+        items: vec![proto::SnapshotIngestItem {
+            receipt_id: receipt_id.clone(),
+            transaction: Some(valid_transaction()),
+        }],
+    };
+
+    assert_eq!(
+        proto::SnapshotIngestBatch::decode(batch.encode_to_vec().as_slice()).unwrap(),
+        batch
+    );
+    assert_eq!(proto::SnapshotIngestState::Pending as i32, 1);
+    assert_eq!(proto::SnapshotIngestState::Committed as i32, 2);
+    assert_eq!(proto::SnapshotIngestState::Rejected as i32, 3);
+}
+
+#[test]
+fn snapshot_ingest_rejects_non_snapshot_transactions() {
+    let batch = proto::SnapshotIngestBatch {
+        request: Some(valid_request_context()),
+        items: vec![proto::SnapshotIngestItem {
+            receipt_id: 71_u128.to_be_bytes().to_vec(),
+            transaction: Some(proto::TransactionRequest {
+                operation: proto::TransactionOperation::Commit as i32,
+                ..valid_transaction()
+            }),
+        }],
+    };
+
+    assert_eq!(
+        dtg_cluster_v2::validate_snapshot_ingest_batch(&batch)
+            .unwrap_err()
+            .code(),
+        "DTG-PROTOCOL-ENUM"
+    );
+}
+
+#[test]
 fn shard_context_requires_backend_generation() {
     let wire = proto::ShardContext {
         backend_generation: 0,

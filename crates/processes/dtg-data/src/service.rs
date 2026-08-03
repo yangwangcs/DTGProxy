@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
@@ -15,16 +15,23 @@ use dtg_execution::cluster_protocol::proto::{
     ColumnBatch, ExecutionFragment, GatewayPipelineClientFrame, GatewayPipelineCredit,
     GatewayPipelineServerFrame, GatewayRequest, GatewayResponse as GatewayWireResponse,
     GatewaySessionResponse, LogicalReplicaSnapshot, RaftEnvelope, RaftMessageKind, RequestContext,
-    RetryDisposition, StatusCode, TransactionRequest, TypedStatus,
+    RetryDisposition, SnapshotIngestBatch, SnapshotIngestReceipt, SnapshotIngestReceiptRequest,
+    SnapshotIngestReceiptResponse, SnapshotIngestState, StatusCode, TransactionRequest,
+    TypedStatus,
 };
 use dtg_execution::cluster_protocol::{
     PROTOCOL_MAJOR, ProtocolError, ShardRequestContext, checksum_bytes,
     validate_execution_fragment, validate_gateway_request, validate_raft_envelope,
-    validate_replica_snapshot, validate_transaction_request,
+    validate_replica_snapshot, validate_snapshot_ingest_batch,
+    validate_snapshot_ingest_receipt_request, validate_transaction_request,
 };
-use dtg_execution::shard::{ProposalReceipt, ReplicaKey, ShardCommand};
+use dtg_execution::shard::{
+    CommitSingleShardTransaction, ProposalReceipt, ReplicaKey,
+    SINGLE_SHARD_TRANSACTION_METADATA_NAME, ShardCommand, decode_single_shard_transaction_metadata,
+};
 use dtg_execution::storage::{
-    BackendClass, BindingRole, CapabilityManifest, ConsensusStore, StorageError,
+    BackendClass, BindingRole, CapabilityManifest, ConsensusStore, LogicalMutation, StorageError,
+    TransactionTime, VertexVersion,
 };
 use dtg_execution::{
     DataExecution, DataExecutionBuilder, GatewayRows, GatewayValue, ProviderKind, ProviderResolver,
@@ -45,6 +52,8 @@ use crate::{DataProcessConfig, FjallResolver, KuzuResolver, PostgresResolver};
 
 const APPLY_BATCH_WINDOW: Duration = Duration::from_micros(250);
 const APPLY_BATCH_MAX_COMMANDS: usize = 64;
+const SNAPSHOT_INGEST_RECEIPT_LIMIT: usize = 4_096;
+const SNAPSHOT_INGEST_CHANNEL_CAPACITY: usize = 4_096;
 const MAX_GATEWAY_FRAGMENT_CONCURRENCY: usize = 32;
 const MAX_GATEWAY_SESSION_IN_FLIGHT: usize = 32;
 const MAX_GATEWAY_PIPELINE_IN_FLIGHT: usize = 32;
@@ -324,6 +333,10 @@ impl DataNodeBuilder {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(Vec::new()));
         let apply_batchers = Arc::new(Mutex::new(BTreeMap::new()));
+        let snapshot_ingest_receipts = Arc::new(Mutex::new(SnapshotIngestReceipts::default()));
+        let last_snapshot_commit_time = Arc::new(AtomicI64::new(0));
+        let (snapshot_ingest_sender, mut snapshot_ingest_receiver) =
+            mpsc::channel(SNAPSHOT_INGEST_CHANNEL_CAPACITY);
         for binding in self.assignments {
             match add_assignment(&execution, &self.consensus_root, binding.clone()).await {
                 Ok(()) => {
@@ -351,6 +364,35 @@ impl DataNodeBuilder {
             Arc::clone(&driver_stop),
             self.raft_transport,
         );
+        let ingest_service = DataRpcService {
+            state: Arc::clone(&state),
+            execution: Arc::clone(&execution),
+            request_metrics: Arc::clone(&request_metrics),
+            apply_batchers: Arc::clone(&apply_batchers),
+            snapshot_ingest_sender: snapshot_ingest_sender.clone(),
+            snapshot_ingest_receipts: Arc::clone(&snapshot_ingest_receipts),
+            last_snapshot_commit_time: Arc::clone(&last_snapshot_commit_time),
+            pipeline_execution_permits: Arc::clone(&pipeline_execution_permits),
+        };
+        tokio::spawn(async move {
+            while let Some(pending) = snapshot_ingest_receiver.recv().await {
+                let state = match ingest_service
+                    .apply_snapshot_ingest(pending.transaction)
+                    .await
+                {
+                    Ok((applied_index, commit_time)) => SnapshotIngestReceiptState::Committed {
+                        applied_index,
+                        commit_time,
+                    },
+                    Err(error) => SnapshotIngestReceiptState::Rejected {
+                        message: error.message().to_owned(),
+                    },
+                };
+                if let Ok(mut receipts) = ingest_service.snapshot_ingest_receipts.lock() {
+                    receipts.complete(pending.receipt_id, state);
+                }
+            }
+        });
 
         Ok(DataNode {
             execution,
@@ -360,6 +402,9 @@ impl DataNodeBuilder {
             state,
             request_metrics,
             apply_batchers,
+            snapshot_ingest_sender,
+            snapshot_ingest_receipts,
+            last_snapshot_commit_time,
             pipeline_execution_permits,
             driver_stop,
         })
@@ -548,6 +593,163 @@ struct BatchedApplyReceipt {
     receipt: ProposalReceipt,
 }
 
+#[derive(Clone)]
+struct PendingSnapshotIngest {
+    receipt_id: u128,
+    transaction: TransactionRequest,
+}
+
+#[derive(Clone)]
+enum SnapshotIngestReceiptState {
+    Pending,
+    Committed {
+        applied_index: u64,
+        commit_time: TransactionTime,
+    },
+    Rejected {
+        message: String,
+    },
+}
+
+#[derive(Clone)]
+struct SnapshotIngestReceiptEntry {
+    payload_digest: [u8; 32],
+    state: SnapshotIngestReceiptState,
+}
+
+#[derive(Default)]
+struct SnapshotIngestReceipts {
+    entries: BTreeMap<u128, SnapshotIngestReceiptEntry>,
+    completed_order: std::collections::VecDeque<u128>,
+}
+
+enum SnapshotIngestAdmissionError {
+    Capacity,
+    ReceiptPayloadMismatch,
+}
+
+impl SnapshotIngestReceipts {
+    fn admit(
+        &mut self,
+        receipt_id: u128,
+        payload_digest: [u8; 32],
+    ) -> Result<bool, SnapshotIngestAdmissionError> {
+        if let Some(existing) = self.entries.get(&receipt_id) {
+            if existing.payload_digest != payload_digest {
+                return Err(SnapshotIngestAdmissionError::ReceiptPayloadMismatch);
+            }
+            return Ok(false);
+        }
+        if self.entries.len() >= SNAPSHOT_INGEST_RECEIPT_LIMIT {
+            self.evict_completed();
+        }
+        if self.entries.len() >= SNAPSHOT_INGEST_RECEIPT_LIMIT {
+            return Err(SnapshotIngestAdmissionError::Capacity);
+        }
+        self.entries.insert(
+            receipt_id,
+            SnapshotIngestReceiptEntry {
+                payload_digest,
+                state: SnapshotIngestReceiptState::Pending,
+            },
+        );
+        Ok(true)
+    }
+
+    fn complete(&mut self, receipt_id: u128, state: SnapshotIngestReceiptState) {
+        if matches!(
+            self.entries.get(&receipt_id).map(|entry| &entry.state),
+            Some(SnapshotIngestReceiptState::Pending)
+        ) {
+            self.entries
+                .get_mut(&receipt_id)
+                .expect("receipt exists")
+                .state = state;
+            self.completed_order.push_back(receipt_id);
+        }
+        self.evict_completed();
+    }
+
+    fn get(&self, receipt_id: u128) -> Option<SnapshotIngestReceiptState> {
+        self.entries
+            .get(&receipt_id)
+            .map(|entry| entry.state.clone())
+    }
+
+    fn remove(&mut self, receipt_id: u128) {
+        self.entries.remove(&receipt_id);
+    }
+
+    fn evict_completed(&mut self) {
+        while self.entries.len() >= SNAPSHOT_INGEST_RECEIPT_LIMIT {
+            let Some(receipt_id) = self.completed_order.pop_front() else {
+                return;
+            };
+            if !matches!(
+                self.entries.get(&receipt_id).map(|entry| &entry.state),
+                Some(SnapshotIngestReceiptState::Pending)
+            ) {
+                self.entries.remove(&receipt_id);
+            }
+        }
+    }
+}
+
+fn snapshot_ingest_receipt(
+    receipt_id: u128,
+    state: SnapshotIngestReceiptState,
+) -> SnapshotIngestReceipt {
+    let (state, applied_index, message, commit_time) = match state {
+        SnapshotIngestReceiptState::Pending => (
+            SnapshotIngestState::Pending,
+            0,
+            "accepted by Data ingress".into(),
+            0,
+        ),
+        SnapshotIngestReceiptState::Committed {
+            applied_index,
+            commit_time,
+        } => (
+            SnapshotIngestState::Committed,
+            applied_index,
+            "committed into the stable snapshot".into(),
+            commit_time.get(),
+        ),
+        SnapshotIngestReceiptState::Rejected { message } => {
+            (SnapshotIngestState::Rejected, 0, message, 0)
+        }
+    };
+    SnapshotIngestReceipt {
+        receipt_id: receipt_id.to_be_bytes().to_vec(),
+        state: state.into(),
+        applied_index,
+        message,
+        commit_time,
+    }
+}
+
+fn snapshot_ingest_payload_digest(transaction: &TransactionRequest) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&transaction.transaction_id);
+    bytes.extend_from_slice(&transaction.operation.to_be_bytes());
+    bytes.extend_from_slice(&transaction.idempotency_key);
+    if let Some(context) = &transaction.context {
+        bytes.extend_from_slice(&context.graph_id.to_be_bytes());
+        bytes.extend_from_slice(&context.shard_id.to_be_bytes());
+        bytes.extend_from_slice(&context.placement_epoch.to_be_bytes());
+        bytes.extend_from_slice(&context.backend_generation.to_be_bytes());
+        bytes.extend_from_slice(&context.catalog_version.to_be_bytes());
+    }
+    if let Some(payload) = &transaction.payload {
+        bytes.extend_from_slice(&payload.format_version.to_be_bytes());
+        bytes.extend_from_slice(&payload.declared_len.to_be_bytes());
+        bytes.extend_from_slice(&payload.item_count.to_be_bytes());
+        bytes.extend_from_slice(&payload.checksum);
+        bytes.extend_from_slice(&payload.body);
+    }
+    checksum_bytes(&bytes)
+}
+
 async fn run_apply_batcher(
     execution: Arc<DataExecution>,
     request_metrics: Arc<RequestStageMetrics>,
@@ -647,6 +849,9 @@ pub struct DataNode {
     state: Arc<ProcessState>,
     request_metrics: Arc<RequestStageMetrics>,
     apply_batchers: Arc<Mutex<BTreeMap<ReplicaKey, mpsc::Sender<PendingApply>>>>,
+    snapshot_ingest_sender: mpsc::Sender<PendingSnapshotIngest>,
+    snapshot_ingest_receipts: Arc<Mutex<SnapshotIngestReceipts>>,
+    last_snapshot_commit_time: Arc<AtomicI64>,
     pipeline_execution_permits: Arc<Semaphore>,
     driver_stop: Arc<AtomicBool>,
 }
@@ -766,6 +971,9 @@ impl DataNode {
             execution: self.execution.clone(),
             request_metrics: Arc::clone(&self.request_metrics),
             apply_batchers: Arc::clone(&self.apply_batchers),
+            snapshot_ingest_sender: self.snapshot_ingest_sender.clone(),
+            snapshot_ingest_receipts: Arc::clone(&self.snapshot_ingest_receipts),
+            last_snapshot_commit_time: Arc::clone(&self.last_snapshot_commit_time),
             pipeline_execution_permits: Arc::clone(&self.pipeline_execution_permits),
         }
     }
@@ -792,6 +1000,9 @@ pub struct DataRpcService {
     execution: Arc<DataExecution>,
     request_metrics: Arc<RequestStageMetrics>,
     apply_batchers: Arc<Mutex<BTreeMap<ReplicaKey, mpsc::Sender<PendingApply>>>>,
+    snapshot_ingest_sender: mpsc::Sender<PendingSnapshotIngest>,
+    snapshot_ingest_receipts: Arc<Mutex<SnapshotIngestReceipts>>,
+    last_snapshot_commit_time: Arc<AtomicI64>,
     pipeline_execution_permits: Arc<Semaphore>,
 }
 
@@ -863,6 +1074,200 @@ impl DataRpcService {
             .await
             .map_err(|_| self.execution_failure("Raft apply batch worker dropped its response"))?
             .map_err(|error| self.execution_failure(error))
+    }
+
+    async fn apply_snapshot_ingest(
+        &self,
+        transaction: TransactionRequest,
+    ) -> Result<(u64, TransactionTime), Status> {
+        let shard_context: ShardRequestContext = transaction
+            .context
+            .clone()
+            .ok_or_else(|| self.invalid(ProtocolError::MissingContext))?
+            .try_into()
+            .map_err(|error| self.invalid(error))?;
+        let payload = validate_transaction_request(transaction.clone())
+            .map_err(|error| self.invalid(error))?;
+        if transaction.operation
+            != dtg_execution::cluster_protocol::proto::TransactionOperation::CommitSnapshot as i32
+        {
+            return Err(self.invalid(ProtocolError::UnknownEnum));
+        }
+        let command =
+            ShardCommand::decode(payload.body()).map_err(|error| self.execution_failure(error))?;
+        if command.header().placement_epoch() != shard_context.placement_epoch()
+            || command.header().backend_generation() != shard_context.backend_generation()
+        {
+            return Err(self.execution_failure("transaction command and request fence differ"));
+        }
+        let lookup = self
+            .execution
+            .locate_replica_timed(
+                shard_context.request().cluster_id(),
+                shard_context.graph_id(),
+                shard_context.shard_id(),
+                shard_context.placement_epoch(),
+                shard_context.backend_generation(),
+                None,
+            )
+            .map_err(|error| self.execution_failure(error))?;
+        let (command, commit_time) = if let Some(commit_time) = self
+            .existing_snapshot_commit_time(lookup.key(), &command)
+            .await?
+        {
+            self.stamp_snapshot_commit_at(command, commit_time)?
+        } else {
+            self.stamp_snapshot_commit(command)?
+        };
+        let receipt = self
+            .apply_transaction_batched(lookup.key(), command)
+            .await?;
+        if receipt.receipt.rejection().is_some() {
+            return Err(self.execution_failure("snapshot ingest transaction was rejected"));
+        }
+        Ok((receipt.receipt.index(), commit_time))
+    }
+
+    fn snapshot_ingest_state(
+        &self,
+        receipt_id: u128,
+    ) -> Result<Option<SnapshotIngestReceiptState>, Status> {
+        self.snapshot_ingest_receipts
+            .lock()
+            .map_err(|_| self.execution_failure("snapshot ingest receipt registry is poisoned"))
+            .map(|receipts| receipts.get(receipt_id))
+    }
+
+    fn next_snapshot_commit_time(
+        &self,
+        start_time: TransactionTime,
+    ) -> Result<TransactionTime, Status> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| self.execution_failure("system clock precedes the Unix epoch"))?
+            .as_micros();
+        let now = i64::try_from(now).unwrap_or(i64::MAX);
+        let mut current = self.last_snapshot_commit_time.load(Ordering::Acquire);
+        loop {
+            let next = now
+                .max(start_time.get().saturating_add(1))
+                .max(current.saturating_add(1));
+            match self.last_snapshot_commit_time.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return TransactionTime::new(next)
+                        .map_err(|error| self.execution_failure(error));
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn stamp_snapshot_commit(
+        &self,
+        command: ShardCommand,
+    ) -> Result<(ShardCommand, TransactionTime), Status> {
+        let ShardCommand::CommitSingleShardTransaction(transaction) = command else {
+            return Err(
+                self.execution_failure("snapshot commit requires a single-Shard transaction")
+            );
+        };
+        let commit_time = self.next_snapshot_commit_time(transaction.start_time())?;
+        self.stamp_snapshot_transaction(transaction, commit_time)
+    }
+
+    fn stamp_snapshot_commit_at(
+        &self,
+        command: ShardCommand,
+        commit_time: TransactionTime,
+    ) -> Result<(ShardCommand, TransactionTime), Status> {
+        let ShardCommand::CommitSingleShardTransaction(transaction) = command else {
+            return Err(
+                self.execution_failure("snapshot commit requires a single-Shard transaction")
+            );
+        };
+        self.stamp_snapshot_transaction(transaction, commit_time)
+    }
+
+    fn stamp_snapshot_transaction(
+        &self,
+        transaction: CommitSingleShardTransaction,
+        commit_time: TransactionTime,
+    ) -> Result<(ShardCommand, TransactionTime), Status> {
+        let mutations = transaction
+            .mutations()
+            .iter()
+            .map(|mutation| match mutation {
+                LogicalMutation::PutVertex(vertex) => VertexVersion::new(
+                    vertex.id(),
+                    vertex.version(),
+                    vertex.valid_time(),
+                    commit_time,
+                    vertex.properties().clone(),
+                )
+                .map(LogicalMutation::PutVertex),
+                _ => Err(StorageError::InvalidMutation(
+                    "snapshot commit currently supports vertex mutations only".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| self.execution_failure(error))?;
+        let command = CommitSingleShardTransaction::new(
+            transaction.header().command_id(),
+            transaction.header().placement_epoch().get(),
+            transaction.header().backend_generation().get(),
+            transaction.transaction_id(),
+            transaction.start_time(),
+            transaction.snapshot_applied_index(),
+            transaction.request_digest(),
+            mutations,
+        )
+        .map(ShardCommand::CommitSingleShardTransaction)
+        .map_err(|error| self.execution_failure(error))?;
+        Ok((command, commit_time))
+    }
+
+    async fn existing_snapshot_commit_time(
+        &self,
+        key: ReplicaKey,
+        command: &ShardCommand,
+    ) -> Result<Option<TransactionTime>, Status> {
+        let ShardCommand::CommitSingleShardTransaction(transaction) = command else {
+            return Err(
+                self.execution_failure("snapshot commit requires a single-Shard transaction")
+            );
+        };
+        let name = format!(
+            "{SINGLE_SHARD_TRANSACTION_METADATA_NAME}{:032x}",
+            transaction.transaction_id().get()
+        );
+        let store = self
+            .execution
+            .replica_state_store(key)
+            .map_err(|error| self.execution_failure(error))?;
+        let Some(metadata) = store
+            .replica_metadata(&name)
+            .await
+            .map_err(|error| self.execution_failure(error))?
+        else {
+            return Ok(None);
+        };
+        let receipt = decode_single_shard_transaction_metadata(&metadata)
+            .map_err(|error| self.execution_failure(error))?;
+        if receipt.command_id() != transaction.header().command_id()
+            || receipt.start_time() != transaction.start_time()
+            || receipt.snapshot_applied_index() != transaction.snapshot_applied_index()
+            || receipt.request_digest() != transaction.request_digest()
+        {
+            return Err(self.execution_failure(
+                "snapshot transaction ID is already bound to a different command",
+            ));
+        }
+        Ok(Some(receipt.commit_time()))
     }
 
     fn begin_request(&self) -> Result<(), Status> {
@@ -1258,7 +1663,8 @@ impl DataService for DataRpcService {
             Ok((shard_context, command))
         })();
         let (shard_context, command) = timer.finish_result(validation)?;
-        let command_id = command.header().command_id().get();
+        let snapshot_commit = wire.operation
+            == dtg_execution::cluster_protocol::proto::TransactionOperation::CommitSnapshot as i32;
         let timer = self.request_metrics.start(RequestStage::DataRouting);
         let lookup = timer.finish_result(
             self.execution
@@ -1283,6 +1689,19 @@ impl DataService for DataRpcService {
             lookup.lookup_nanoseconds(),
         );
         let key = lookup.key();
+        let (command, commit_time) = if snapshot_commit {
+            if let Some(commit_time) = self.existing_snapshot_commit_time(key, &command).await? {
+                self.stamp_snapshot_commit_at(command, commit_time)?
+            } else {
+                self.stamp_snapshot_commit(command)?
+            }
+        } else {
+            (
+                command,
+                TransactionTime::new(0).expect("zero transaction time is valid"),
+            )
+        };
+        let command_id = command.header().command_id().get();
         let timer = self.request_metrics.start(RequestStage::DataRaftApply);
         let apply = timer.finish_result(self.apply_transaction_batched(key, command).await)?;
         let receipt = apply.receipt;
@@ -1294,11 +1713,18 @@ impl DataService for DataRpcService {
         }
         let mut body = receipt.index().to_be_bytes().to_vec();
         body.push(u8::from(receipt.replayed()));
+        if snapshot_commit {
+            body.extend_from_slice(&commit_time.get().to_be_bytes());
+        }
         Ok(Response::new(TypedStatus {
             request: response_context,
             code: StatusCode::Ok.into(),
             retry: RetryDisposition::Never.into(),
-            message: "transaction command accepted by Shard Raft".into(),
+            message: if snapshot_commit {
+                "snapshot-isolated transaction committed by Shard Raft".into()
+            } else {
+                "transaction command accepted by Shard Raft".into()
+            },
             idempotency_key: wire.idempotency_key,
             details: Some(dtg_execution::cluster_protocol::proto::BoundedPayload {
                 format_version: 1,
@@ -1307,6 +1733,135 @@ impl DataService for DataRpcService {
                 checksum: checksum_bytes(&body).to_vec(),
                 body,
             }),
+        }))
+    }
+
+    type AcceptSnapshotIngestStream =
+        Pin<Box<dyn Stream<Item = Result<SnapshotIngestReceipt, Status>> + Send + 'static>>;
+
+    async fn accept_snapshot_ingest(
+        &self,
+        request: Request<SnapshotIngestBatch>,
+    ) -> Result<Response<Self::AcceptSnapshotIngestStream>, Status> {
+        self.begin_request()?;
+        let batch = request.into_inner();
+        validate_snapshot_ingest_batch(&batch).map_err(|error| self.invalid(error))?;
+        let mut replies = Vec::with_capacity(batch.items.len());
+        for item in batch.items {
+            let admission_started = Instant::now();
+            let receipt_id = u128::from_be_bytes(
+                item.receipt_id
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| self.invalid(ProtocolError::IdentifierLength))?,
+            );
+            let transaction = item
+                .transaction
+                .ok_or_else(|| self.invalid(ProtocolError::MissingPayload))?;
+            let payload_digest = snapshot_ingest_payload_digest(&transaction);
+            let newly_admitted = self
+                .snapshot_ingest_receipts
+                .lock()
+                .map_err(|_| {
+                    self.execution_failure("snapshot ingest receipt registry is poisoned")
+                })?
+                .admit(receipt_id, payload_digest)
+                .map_err(|error| match error {
+                    SnapshotIngestAdmissionError::Capacity => {
+                        Status::resource_exhausted("snapshot ingest receipt capacity is exhausted")
+                    }
+                    SnapshotIngestAdmissionError::ReceiptPayloadMismatch => {
+                        Status::invalid_argument(
+                            "snapshot ingest receipt ID is already bound to a different payload",
+                        )
+                    }
+                })?;
+            if newly_admitted {
+                match self.snapshot_ingest_sender.try_send(PendingSnapshotIngest {
+                    receipt_id,
+                    transaction,
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.snapshot_ingest_receipts
+                            .lock()
+                            .map_err(|_| {
+                                self.execution_failure(
+                                    "snapshot ingest receipt registry is poisoned",
+                                )
+                            })?
+                            .remove(receipt_id);
+                        return Err(Status::resource_exhausted(
+                            "snapshot ingest queue is exhausted; retry safely",
+                        ));
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(self.execution_failure("snapshot ingest worker stopped"));
+                    }
+                }
+            }
+            let state = self
+                .snapshot_ingest_state(receipt_id)?
+                .expect("receipt is admitted before it is returned");
+            self.request_metrics.record_detail(
+                dtg_execution::RequestDetail::DataSnapshotIngestAdmission,
+                dtg_execution::StageOutcome::Success,
+                elapsed_nanoseconds(admission_started),
+            );
+            replies.push(Ok(snapshot_ingest_receipt(receipt_id, state)));
+        }
+        Ok(Response::new(Box::pin(tokio_stream::iter(replies))))
+    }
+
+    async fn get_snapshot_ingest_receipt(
+        &self,
+        request: Request<SnapshotIngestReceiptRequest>,
+    ) -> Result<Response<SnapshotIngestReceiptResponse>, Status> {
+        self.begin_request()?;
+        let lookup_started = Instant::now();
+        let request = request.into_inner();
+        validate_snapshot_ingest_receipt_request(&request).map_err(|error| self.invalid(error))?;
+        let receipt_id = u128::from_be_bytes(
+            request
+                .receipt_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| self.invalid(ProtocolError::IdentifierLength))?,
+        );
+        let Some(state) = self.snapshot_ingest_state(receipt_id)? else {
+            self.request_metrics.record_detail(
+                dtg_execution::RequestDetail::DataSnapshotIngestReceiptLookup,
+                dtg_execution::StageOutcome::Success,
+                elapsed_nanoseconds(lookup_started),
+            );
+            return Ok(Response::new(SnapshotIngestReceiptResponse {
+                status: Some(TypedStatus {
+                    request: request.request,
+                    code: StatusCode::Unavailable.into(),
+                    retry: RetryDisposition::Safe.into(),
+                    message: "snapshot ingest receipt is unknown; retry with the same receipt ID"
+                        .into(),
+                    idempotency_key: receipt_id.to_be_bytes().to_vec(),
+                    details: None,
+                }),
+                receipt: None,
+            }));
+        };
+        self.request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataSnapshotIngestReceiptLookup,
+            dtg_execution::StageOutcome::Success,
+            elapsed_nanoseconds(lookup_started),
+        );
+        Ok(Response::new(SnapshotIngestReceiptResponse {
+            status: Some(TypedStatus {
+                request: request.request,
+                code: StatusCode::Ok.into(),
+                retry: RetryDisposition::Never.into(),
+                message: "snapshot ingest receipt found".into(),
+                idempotency_key: receipt_id.to_be_bytes().to_vec(),
+                details: None,
+            }),
+            receipt: Some(snapshot_ingest_receipt(receipt_id, state)),
         }))
     }
 

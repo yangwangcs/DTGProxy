@@ -241,7 +241,7 @@ pub async fn measure_pipeline_cell(
     if depth == 0 {
         return Err(invalid_data("Bolt pipeline depth must be positive"));
     }
-    if cell.workload.is_write() {
+    if cell.workload.is_write() && depth > 1 {
         return Err(invalid_data(
             "Bolt pipeline measurement only supports read workloads",
         ));

@@ -15,7 +15,7 @@ use dtg_storage::{
     CommandId, CommittedShardBatch, Digest32, LogicalMutation, PlacementEpoch, Properties,
     ProviderKind, ReadFence, ReplicaBinding, ReplicaMetadata, ReplicaStateStore, StorageError,
     StoreFuture, TemporalReadView, TransactionId, TransactionRecord, TransactionState,
-    TransactionTime, ValidInterval, Value, Version, VertexId, VertexVersion,
+    TransactionTime, ValidInterval, Value, Version, VertexId, VertexRead, VertexVersion,
 };
 use dtg_storage_fjall::FjallReplicaStore;
 
@@ -27,6 +27,66 @@ fn replaying_one_command_is_idempotent() {
     let second = machine.apply_committed(11, 7, command).unwrap();
     assert_eq!(first.digest(), second.digest());
     assert_eq!(machine.applied_index(), 7);
+}
+
+#[test]
+fn applies_non_conflicting_single_shard_transactions_in_one_state_store_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let binding = fjall_fixture_binding();
+    let store = Arc::new(FjallReplicaStore::open(root.path(), binding.clone()).unwrap());
+    let mut machine = ShardStateMachine::new(binding.clone(), store.clone()).unwrap();
+    let commands = vec![
+        (
+            11,
+            1,
+            ShardCommand::CommitSingleShardTransaction(
+                CommitSingleShardTransaction::new(
+                    CommandId::new(601).unwrap(),
+                    7,
+                    10,
+                    TransactionId::new(701).unwrap(),
+                    TransactionTime::new(40).unwrap(),
+                    0,
+                    Digest32::new([6; 32]),
+                    vec![vertex_mutation_at(61, 1, 0, 100, 50)],
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            11,
+            2,
+            ShardCommand::CommitSingleShardTransaction(
+                CommitSingleShardTransaction::new(
+                    CommandId::new(602).unwrap(),
+                    7,
+                    10,
+                    TransactionId::new(702).unwrap(),
+                    TransactionTime::new(41).unwrap(),
+                    0,
+                    Digest32::new([7; 32]),
+                    vec![vertex_mutation_at(62, 1, 0, 100, 51)],
+                )
+                .unwrap(),
+            ),
+        ),
+    ];
+
+    let outcomes = machine.apply_committed_batch(commands).unwrap();
+
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|outcome| !outcome.replayed()));
+    assert_eq!(machine.applied_index(), 2);
+    let view = block_on(store.begin_read_view(ReadFence::new(binding, 2))).unwrap();
+    assert!(
+        block_on(view.get_vertex(VertexRead::new(
+            VertexId::new(61).unwrap(),
+            1,
+            TransactionTime::new(51).unwrap(),
+        )))
+        .unwrap()
+        .is_some()
+    );
 }
 
 #[test]

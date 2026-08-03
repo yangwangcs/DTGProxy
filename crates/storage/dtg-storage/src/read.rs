@@ -490,6 +490,21 @@ pub trait ReplicaStateStore: Send + Sync {
     fn applied_index(&self) -> StoreFuture<'_, u64>;
     fn replica_metadata<'a>(&'a self, name: &'a str) -> StoreFuture<'a, Option<ReplicaMetadata>>;
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt>;
+    fn supports_atomic_batch_apply(&self) -> bool {
+        false
+    }
+    fn apply_batches(
+        &self,
+        batches: Vec<CommittedShardBatch>,
+    ) -> StoreFuture<'_, Vec<ApplyReceipt>> {
+        Box::pin(async move {
+            let mut receipts = Vec::with_capacity(batches.len());
+            for batch in batches {
+                receipts.push(self.apply(batch).await?);
+            }
+            Ok(receipts)
+        })
+    }
     fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>>;
 }
 

@@ -569,6 +569,18 @@ impl DataExecution {
         self.lock_shards()?.observe(key)
     }
 
+    pub fn replica_state_store(
+        &self,
+        key: ReplicaKey,
+    ) -> Result<Arc<dyn ReplicaStateStore>, ShardError> {
+        self.stores
+            .lock()
+            .map_err(|_| ShardError::InvalidLifecycle("replica store mutex is poisoned".into()))?
+            .get(&key)
+            .map(|store| store.state().clone())
+            .ok_or(ShardError::ReplicaNotFound)
+    }
+
     pub fn locate_replica(
         &self,
         cluster_id: dtg_storage::ClusterId,

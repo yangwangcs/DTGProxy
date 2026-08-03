@@ -95,6 +95,53 @@ fn edge(id: u128, source: u128, target: u128, version: u64) -> EdgeVersion {
     .unwrap()
 }
 
+#[test]
+fn applies_contiguous_committed_batches_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let binding = binding("atomic-committed-batches", 1);
+    let store = FjallReplicaStore::open(directory.path(), binding.clone()).unwrap();
+    let first = CommittedShardBatch::new(
+        binding.clone(),
+        1,
+        1,
+        CommandId::new(1).unwrap(),
+        vec![LogicalMutation::PutVertex(vertex(1, 1))],
+    )
+    .unwrap();
+    let second = CommittedShardBatch::new(
+        binding.clone(),
+        1,
+        2,
+        CommandId::new(2).unwrap(),
+        vec![LogicalMutation::PutVertex(vertex(2, 1))],
+    )
+    .unwrap();
+
+    let receipts = block_on(store.apply_batches(vec![first, second])).unwrap();
+
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().all(|receipt| !receipt.replayed()));
+    let view = block_on(store.begin_read_view(ReadFence::new(binding, 2))).unwrap();
+    assert!(
+        block_on(view.get_vertex(VertexRead::new(
+            VertexId::new(1).unwrap(),
+            1,
+            TransactionTime::new(1).unwrap(),
+        )))
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        block_on(view.get_vertex(VertexRead::new(
+            VertexId::new(2).unwrap(),
+            1,
+            TransactionTime::new(1).unwrap(),
+        )))
+        .unwrap()
+        .is_some()
+    );
+}
+
 fn transaction(
     id: u128,
     state: TransactionState,

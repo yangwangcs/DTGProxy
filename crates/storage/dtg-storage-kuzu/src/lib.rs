@@ -157,6 +157,41 @@ impl ReplicaStateStore for KuzuReplicaStore {
 
     fn apply(&self, batch: CommittedShardBatch) -> StoreFuture<'_, ApplyReceipt> {
         Box::pin(async move {
+            let mut receipts = self.apply_batches_sync(vec![batch])?;
+            receipts.pop().ok_or_else(|| {
+                StorageError::Internal("single apply did not return a receipt".into())
+            })
+        })
+    }
+
+    fn supports_atomic_batch_apply(&self) -> bool {
+        true
+    }
+
+    fn apply_batches(
+        &self,
+        batches: Vec<CommittedShardBatch>,
+    ) -> StoreFuture<'_, Vec<ApplyReceipt>> {
+        Box::pin(async move { self.apply_batches_sync(batches) })
+    }
+
+    fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
+        Box::pin(async move {
+            let state = self.verify_fence(&fence)?;
+            Ok(Box::new(KuzuReadView { fence, state }) as Box<dyn TemporalReadView>)
+        })
+    }
+}
+
+impl KuzuReplicaStore {
+    fn apply_batches_sync(
+        &self,
+        batches: Vec<CommittedShardBatch>,
+    ) -> Result<Vec<ApplyReceipt>, StorageError> {
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+        for batch in &batches {
             batch.validate()?;
             if batch.binding() != &self.inner.binding {
                 return Err(StorageError::StaleBinding {
@@ -164,14 +199,20 @@ impl ReplicaStateStore for KuzuReplicaStore {
                     actual: Box::new(batch.binding().clone()),
                 });
             }
-            let _apply_guard = lock(&self.inner.apply_guard, "Kuzu apply")?;
-            let current = lock(&self.inner.state, "Kuzu state")?.clone();
-            if batch.raft_index() <= current.applied_index {
-                let replay = current.replay.get(&batch.raft_index()).ok_or(
-                    StorageError::ReplayMismatch {
-                        raft_index: batch.raft_index(),
-                    },
-                )?;
+        }
+        let _apply_guard = lock(&self.inner.apply_guard, "Kuzu apply")?;
+        let current = lock(&self.inner.state, "Kuzu state")?.clone();
+        let mut next = current.clone();
+        let mut receipts = Vec::with_capacity(batches.len());
+        let mut applied_new_batch = false;
+        for batch in batches {
+            if batch.raft_index() <= next.applied_index {
+                let replay =
+                    next.replay
+                        .get(&batch.raft_index())
+                        .ok_or(StorageError::ReplayMismatch {
+                            raft_index: batch.raft_index(),
+                        })?;
                 if replay.term != batch.raft_term()
                     || replay.command_id != batch.command_id()
                     || replay.digest != batch.mutation_digest()
@@ -180,15 +221,15 @@ impl ReplicaStateStore for KuzuReplicaStore {
                         raft_index: batch.raft_index(),
                     });
                 }
-                return Ok(ApplyReceipt::new(&batch, true));
+                receipts.push(ApplyReceipt::new(&batch, true));
+                continue;
             }
-            if batch.raft_index() != current.applied_index.saturating_add(1) {
+            if batch.raft_index() != next.applied_index.saturating_add(1) {
                 return Err(StorageError::NonMonotonicIndex {
-                    applied: current.applied_index,
+                    applied: next.applied_index,
                     proposed: batch.raft_index(),
                 });
             }
-            let mut next = current;
             for (ordinal, mutation) in batch.mutations().iter().enumerate() {
                 next.history.push(mutation.clone());
                 next.changes.push((
@@ -205,17 +246,14 @@ impl ReplicaStateStore for KuzuReplicaStore {
                     digest: batch.mutation_digest(),
                 },
             );
+            receipts.push(ApplyReceipt::new(&batch, false));
+            applied_new_batch = true;
+        }
+        if applied_new_batch {
             persist_state(&self.inner.database, &next)?;
             *lock(&self.inner.state, "Kuzu state")? = next;
-            Ok(ApplyReceipt::new(&batch, false))
-        })
-    }
-
-    fn begin_read_view(&self, fence: ReadFence) -> StoreFuture<'_, Box<dyn TemporalReadView>> {
-        Box::pin(async move {
-            let state = self.verify_fence(&fence)?;
-            Ok(Box::new(KuzuReadView { fence, state }) as Box<dyn TemporalReadView>)
-        })
+        }
+        Ok(receipts)
     }
 }
 

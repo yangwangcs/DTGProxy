@@ -6,7 +6,7 @@ use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
 const REQUEST_STAGES: usize = 10;
-const REQUEST_DETAILS: usize = 45;
+const REQUEST_DETAILS: usize = 43;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -64,10 +64,7 @@ pub enum RequestDetail {
     GatewayQueryResponseCollect,
     GatewayQueryResponseDecode,
     GatewayQueryLocalMaterialize,
-    GatewayMetaAllocateStart,
-    GatewayMetaReserveCommit,
     GatewayDataApplyRpc,
-    GatewayMetaResolveCommit,
     DataRouteLockWait,
     DataRouteLookup,
     DataRaftPropose,
@@ -79,7 +76,6 @@ pub enum RequestDetail {
     DataTemporalScanIdCollection,
     DataTemporalScanVisibility,
     DataRaftLockWait,
-    GatewayMetaPrepareWrite,
     DataRaftBatchAdmission,
     DataRaftBatchQueue,
     DataRaftBlockingDispatch,
@@ -105,6 +101,8 @@ pub enum RequestDetail {
     GatewayQueryPipelineResponseDispatchWait,
     DataGatewayPipelineRequestTransportWait,
     GatewayQueryPipelineWriterWait,
+    DataSnapshotIngestAdmission,
+    DataSnapshotIngestReceiptLookup,
 }
 
 impl RequestDetail {
@@ -113,10 +111,7 @@ impl RequestDetail {
         Self::GatewayQueryResponseCollect,
         Self::GatewayQueryResponseDecode,
         Self::GatewayQueryLocalMaterialize,
-        Self::GatewayMetaAllocateStart,
-        Self::GatewayMetaReserveCommit,
         Self::GatewayDataApplyRpc,
-        Self::GatewayMetaResolveCommit,
         Self::DataRouteLockWait,
         Self::DataRouteLookup,
         Self::DataRaftPropose,
@@ -128,7 +123,6 @@ impl RequestDetail {
         Self::DataTemporalScanIdCollection,
         Self::DataTemporalScanVisibility,
         Self::DataRaftLockWait,
-        Self::GatewayMetaPrepareWrite,
         Self::DataRaftBatchAdmission,
         Self::DataRaftBatchQueue,
         Self::DataRaftBlockingDispatch,
@@ -154,6 +148,8 @@ impl RequestDetail {
         Self::GatewayQueryPipelineResponseDispatchWait,
         Self::DataGatewayPipelineRequestTransportWait,
         Self::GatewayQueryPipelineWriterWait,
+        Self::DataSnapshotIngestAdmission,
+        Self::DataSnapshotIngestReceiptLookup,
     ];
 
     const fn index(self) -> usize {
@@ -166,10 +162,7 @@ impl RequestDetail {
             Self::GatewayQueryResponseCollect => "gateway_query_response_collect",
             Self::GatewayQueryResponseDecode => "gateway_query_response_decode",
             Self::GatewayQueryLocalMaterialize => "gateway_query_local_materialize",
-            Self::GatewayMetaAllocateStart => "gateway_meta_allocate_start",
-            Self::GatewayMetaReserveCommit => "gateway_meta_reserve_commit",
             Self::GatewayDataApplyRpc => "gateway_data_apply_rpc",
-            Self::GatewayMetaResolveCommit => "gateway_meta_resolve_commit",
             Self::DataRouteLockWait => "data_route_lock_wait",
             Self::DataRouteLookup => "data_route_lookup",
             Self::DataRaftPropose => "data_raft_propose",
@@ -181,7 +174,6 @@ impl RequestDetail {
             Self::DataTemporalScanIdCollection => "data_temporal_scan_id_collection",
             Self::DataTemporalScanVisibility => "data_temporal_scan_visibility",
             Self::DataRaftLockWait => "data_raft_lock_wait",
-            Self::GatewayMetaPrepareWrite => "gateway_meta_prepare_write",
             Self::DataRaftBatchAdmission => "data_raft_batch_admission",
             Self::DataRaftBatchQueue => "data_raft_batch_queue",
             Self::DataRaftBlockingDispatch => "data_raft_blocking_dispatch",
@@ -215,6 +207,8 @@ impl RequestDetail {
                 "data_gateway_pipeline_request_transport_wait"
             }
             Self::GatewayQueryPipelineWriterWait => "gateway_query_pipeline_writer_wait",
+            Self::DataSnapshotIngestAdmission => "data_snapshot_ingest_admission",
+            Self::DataSnapshotIngestReceiptLookup => "data_snapshot_ingest_receipt_lookup",
         }
     }
 }
@@ -488,7 +482,7 @@ pub fn encode_request_metrics_snapshot(
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&serde_json::json!({
-        "schema_version": 14,
+        "schema_version": 15,
         "process_role": process_role,
         "unix_timestamp_ns": unix_timestamp_ns,
         "sequence": sequence,
@@ -593,7 +587,7 @@ mod tests {
             encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 14);
+        assert_eq!(value["schema_version"], 15);
         assert_eq!(value["process_role"], "gateway");
         assert_eq!(value["unix_timestamp_ns"], 7);
         assert_eq!(value["sequence"], 11);
@@ -601,94 +595,101 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "gateway_compile");
         assert_eq!(value["stages"][1]["success"], 1);
         assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
-        assert_eq!(value["details"].as_array().unwrap().len(), 45);
-        assert_eq!(value["details"][12]["detail"], "data_read_view_cache_hit");
-        assert_eq!(value["details"][12]["success"], 1);
-        assert_eq!(value["details"][19]["detail"], "gateway_meta_prepare_write");
-        assert_eq!(value["details"][20]["detail"], "data_raft_batch_admission");
-        assert_eq!(value["details"][21]["detail"], "data_raft_batch_queue");
+        assert_eq!(value["details"].as_array().unwrap().len(), 43);
+        assert_eq!(value["details"][9]["detail"], "data_read_view_cache_hit");
+        assert_eq!(value["details"][9]["success"], 1);
+        assert_eq!(value["details"][16]["detail"], "data_raft_batch_admission");
+        assert_eq!(value["details"][17]["detail"], "data_raft_batch_queue");
         assert_eq!(
-            value["details"][22]["detail"],
+            value["details"][18]["detail"],
             "data_raft_blocking_dispatch"
         );
-        assert_eq!(value["details"][23]["detail"], "data_adjacency_cache_hit");
-        assert_eq!(value["details"][24]["detail"], "data_adjacency_cache_miss");
+        assert_eq!(value["details"][19]["detail"], "data_adjacency_cache_hit");
+        assert_eq!(value["details"][20]["detail"], "data_adjacency_cache_miss");
         assert_eq!(
-            value["details"][25]["detail"],
+            value["details"][21]["detail"],
             "data_adjacency_backend_expand"
         );
         assert_eq!(
-            value["details"][26]["detail"],
+            value["details"][22]["detail"],
             "data_snapshot_csr_cache_hit"
         );
         assert_eq!(
-            value["details"][27]["detail"],
+            value["details"][23]["detail"],
             "data_snapshot_csr_cache_miss"
         );
-        assert_eq!(value["details"][28]["detail"], "data_snapshot_csr_build");
+        assert_eq!(value["details"][24]["detail"], "data_snapshot_csr_build");
         assert_eq!(
-            value["details"][29]["detail"],
+            value["details"][25]["detail"],
             "gateway_query_session_submit"
         );
         assert_eq!(
-            value["details"][30]["detail"],
+            value["details"][26]["detail"],
             "gateway_query_session_response_wait"
         );
         assert_eq!(
-            value["details"][31]["detail"],
+            value["details"][27]["detail"],
             "data_gateway_session_execution"
         );
         assert_eq!(
-            value["details"][32]["detail"],
+            value["details"][28]["detail"],
             "gateway_query_pipeline_submit"
         );
         assert_eq!(
-            value["details"][33]["detail"],
+            value["details"][29]["detail"],
             "gateway_query_pipeline_response_wait"
         );
         assert_eq!(
-            value["details"][34]["detail"],
+            value["details"][30]["detail"],
             "bolt_read_pipeline_enqueue_wait"
         );
         assert_eq!(
-            value["details"][35]["detail"],
+            value["details"][31]["detail"],
             "bolt_read_pipeline_execution_wait"
         );
         assert_eq!(
-            value["details"][36]["detail"],
+            value["details"][32]["detail"],
             "bolt_read_pipeline_ordered_write_wait"
         );
         assert_eq!(
-            value["details"][37]["detail"],
+            value["details"][33]["detail"],
             "gateway_query_pipeline_credit_wait"
         );
         assert_eq!(
-            value["details"][38]["detail"],
+            value["details"][34]["detail"],
             "data_gateway_pipeline_dispatch_wait"
         );
         assert_eq!(
-            value["details"][39]["detail"],
+            value["details"][35]["detail"],
             "data_gateway_pipeline_completion_send_wait"
         );
         assert_eq!(
-            value["details"][40]["detail"],
+            value["details"][36]["detail"],
             "data_gateway_pipeline_completion_frame"
         );
         assert_eq!(
-            value["details"][41]["detail"],
+            value["details"][37]["detail"],
             "gateway_query_pipeline_response_transport_wait"
         );
         assert_eq!(
-            value["details"][42]["detail"],
+            value["details"][38]["detail"],
             "gateway_query_pipeline_response_dispatch_wait"
         );
         assert_eq!(
-            value["details"][43]["detail"],
+            value["details"][39]["detail"],
             "data_gateway_pipeline_request_transport_wait"
         );
         assert_eq!(
-            value["details"][44]["detail"],
+            value["details"][40]["detail"],
             "gateway_query_pipeline_writer_wait"
+        );
+        assert_eq!(
+            value["details"][41]["detail"],
+            "data_snapshot_ingest_admission"
+        );
+        assert_eq!(
+            value["details"][42]["detail"],
+            "data_snapshot_ingest_receipt_lookup"
         );
         assert!(!encoded.contains("statement"));
         assert!(!encoded.contains("parameter"));

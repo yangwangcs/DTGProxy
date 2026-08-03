@@ -18,12 +18,28 @@ pub(crate) async fn apply_batch(
     batch: CommittedShardBatch,
     failure_after: Option<usize>,
 ) -> Result<ApplyReceipt, StorageError> {
-    batch.validate()?;
-    if batch.binding() != store.binding_ref() {
-        return Err(StorageError::StaleBinding {
-            expected: Box::new(store.binding_ref().clone()),
-            actual: Box::new(batch.binding().clone()),
-        });
+    let mut receipts = apply_batches(store, vec![batch], failure_after).await?;
+    receipts
+        .pop()
+        .ok_or_else(|| StorageError::Internal("single apply did not return a receipt".into()))
+}
+
+pub(crate) async fn apply_batches(
+    store: &PostgresReplicaStore,
+    batches: Vec<CommittedShardBatch>,
+    failure_after: Option<usize>,
+) -> Result<Vec<ApplyReceipt>, StorageError> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    for batch in &batches {
+        batch.validate()?;
+        if batch.binding() != store.binding_ref() {
+            return Err(StorageError::StaleBinding {
+                expected: Box::new(store.binding_ref().clone()),
+                actual: Box::new(batch.binding().clone()),
+            });
+        }
     }
     let client = store.connect().await?;
     client
@@ -33,7 +49,14 @@ pub(crate) async fn apply_batch(
         )
         .await
         .map_err(postgres_error)?;
-    let result = apply_in_transaction(&client, store, &batch, failure_after).await;
+    let result = async {
+        let mut receipts = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            receipts.push(apply_in_transaction(&client, store, batch, failure_after).await?);
+        }
+        Ok(receipts)
+    }
+    .await;
     finish_transaction(&client, result).await
 }
 

@@ -18,6 +18,7 @@ rg -F 'postgres_credential="user=dtgproxy password=$password application_name=dt
   scripts/local-cluster.sh >/dev/null
 rg -F 'DTG_DATA_POSTGRES_ENDPOINT="$postgres_endpoint"' scripts/local-cluster.sh >/dev/null
 rg -F 'DTG_DATA_POSTGRES_CREDENTIAL="$postgres_credential"' scripts/local-cluster.sh >/dev/null
+rg -F 'DTG_DATA_BACKEND_KIND="$provider"' scripts/local-cluster.sh >/dev/null
 rg -F 'postgres_credential=""' scripts/local-cluster.sh >/dev/null
 rg -F 'DTG_GATEWAY_SHARD_ENDPOINTS=' scripts/local-cluster.sh >/dev/null
 rg -F '2:1:12:1:0:postgresql:1:1:local-postgres' scripts/local-cluster.sh >/dev/null

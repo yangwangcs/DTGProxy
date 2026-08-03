@@ -157,6 +157,7 @@ start_data() {
       DTG_DATA_FJALL_ROOT="$data_root/business" \
       DTG_DATA_KUZU_ROOT="$data_root/kuzu" \
       DTG_DATA_CONSENSUS_ROOT="$data_root/raft" \
+      DTG_DATA_BACKEND_KIND="$provider" \
       DTG_DATA_CAPABILITIES="$capabilities" \
       DTG_DATA_ASSIGNMENTS="$assignment" \
       DTG_DATA_POSTGRES_ENDPOINT="$postgres_endpoint" \
@@ -168,6 +169,7 @@ start_data() {
       DTG_DATA_FJALL_ROOT="$data_root/business" \
       DTG_DATA_KUZU_ROOT="$data_root/kuzu" \
       DTG_DATA_CONSENSUS_ROOT="$data_root/raft" \
+      DTG_DATA_BACKEND_KIND="$provider" \
       DTG_DATA_CAPABILITIES="$capabilities" \
       DTG_DATA_ASSIGNMENTS="$assignment" \
       "$binary" >>"$log" 2>&1 &

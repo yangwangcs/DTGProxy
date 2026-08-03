@@ -6,6 +6,6 @@
   "fjall_root": "target/clean-break-cluster/data-1/business",
   "kuzu_root": "target/clean-break-cluster/data-1/kuzu",
   "consensus_root": "target/clean-break-cluster/data-1/raft",
-  "provider_classes": ["fjall", "postgresql", "kuzu", "remote"],
+  "provider_class": "fjall",
   "shards": [1, 3]
 }
