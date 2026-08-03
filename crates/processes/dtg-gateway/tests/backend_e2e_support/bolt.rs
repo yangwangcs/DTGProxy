@@ -277,6 +277,7 @@ pub async fn measure_pipeline_cell(
 
     let mut latency_samples_ns = Vec::new();
     let mut operations = 0_u64;
+    let mut warmup_operations = 0_u64;
     let mut measured_duration_ns = 0_u64;
     let mut identity = None;
     while let Some(worker) = workers.join_next().await {
@@ -284,6 +285,7 @@ pub async fn measure_pipeline_cell(
             .map_err(|error| invalid_data(format!("measurement worker failed: {error}")))??;
         latency_samples_ns.extend(worker.latency_samples_ns);
         operations += worker.operations;
+        warmup_operations += worker.warmup_operations;
         measured_duration_ns = measured_duration_ns.max(worker.measured_duration_ns);
         if let Some(result) = worker.identity {
             let candidate = (
@@ -315,6 +317,8 @@ pub async fn measure_pipeline_cell(
         measurement_finished_at_unix_ns,
         measured_duration_ns,
         operations,
+        warmup_operations,
+        persisted_operations: 0,
         errors: 0,
         latency_samples_ns,
         row_count,
@@ -328,6 +332,7 @@ pub async fn measure_pipeline_cell(
 struct WorkerMeasurement {
     latency_samples_ns: Vec<u64>,
     operations: u64,
+    warmup_operations: u64,
     measured_duration_ns: u64,
     identity: Option<BoltResult>,
 }
@@ -344,6 +349,7 @@ async fn measure_worker(
     let mut session = BoltSession::connect(address).await?;
     let mut identity = None;
     let requests = vec![(statement, parameters); depth];
+    let mut warmup_operations = 0_u64;
     while Instant::now() < warmup_deadline {
         let results = if depth == 1 {
             vec![session.run(&requests[0].0, requests[0].1.clone()).await?]
@@ -353,6 +359,7 @@ async fn measure_worker(
         for result in results {
             validate_result(workload, &result)?;
             check_identity(workload, &mut identity, result)?;
+            warmup_operations += 1;
         }
     }
 
@@ -377,6 +384,7 @@ async fn measure_worker(
     Ok(WorkerMeasurement {
         latency_samples_ns,
         operations,
+        warmup_operations,
         measured_duration_ns: nanos_u64(
             measurement_deadline.saturating_duration_since(warmup_deadline),
         ),

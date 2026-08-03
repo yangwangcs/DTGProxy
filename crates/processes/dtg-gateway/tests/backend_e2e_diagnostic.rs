@@ -23,6 +23,8 @@ struct QuickResult {
     workload: Workload,
     concurrency: usize,
     operations: u64,
+    warmup_operations: u64,
+    persisted_operations: u64,
     throughput_ops_per_second: f64,
     p50_ms: f64,
     p95_ms: f64,
@@ -114,6 +116,8 @@ async fn quick_selected_backend_e2e_comparison() {
                     workload,
                     concurrency,
                     operations: observation.operations,
+                    warmup_operations: observation.warmup_operations,
+                    persisted_operations: observation.persisted_operations,
                     throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
                         / observation.measured_duration_ns as f64,
                     p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
@@ -257,6 +261,8 @@ async fn fjall_one_hop_uses_the_real_four_process_bolt_path() {
             workload: Workload::OneHopExpand,
             concurrency: 1,
             operations: observation.operations,
+            warmup_operations: observation.warmup_operations,
+            persisted_operations: observation.persisted_operations,
             throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
                 / observation.measured_duration_ns as f64,
             p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
@@ -426,6 +432,8 @@ async fn fjall_two_hop_uses_the_real_four_process_bolt_path() {
             workload: Workload::TwoHopExpand,
             concurrency: 1,
             operations: observation.operations,
+            warmup_operations: observation.warmup_operations,
+            persisted_operations: observation.persisted_operations,
             throughput_ops_per_second: observation.operations as f64 * 1_000_000_000.0
                 / observation.measured_duration_ns as f64,
             p50_ms: percentile_ns(&observation.latency_samples_ns, 50) as f64 / 1_000_000.0,
@@ -724,6 +732,8 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
         measurement_finished_at_unix_ns: 20,
         measured_duration_ns: 10,
         operations: 3,
+        warmup_operations: 0,
+        persisted_operations: 0,
         errors: 0,
         latency_samples_ns: vec![10, 20, 30],
         row_count: 1,
@@ -740,6 +750,8 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
     let artifact = serde_json::to_value(observation).unwrap();
     assert_eq!(artifact["backend"], "fjall");
     assert_eq!(artifact["workload"], "point_lookup");
+    assert_eq!(artifact["warmup_operations"], 0);
+    assert_eq!(artifact["persisted_operations"], 0);
 }
 
 #[test]
@@ -1080,6 +1092,29 @@ fn quick_artifact_rejects_incomplete_matrix_and_changed_read_identity() {
     assert!(error.to_string().contains("lacks snapshot CSR cache hits"));
 }
 
+#[test]
+fn quick_artifact_rejects_writes_without_one_persisted_vertex_per_create() {
+    let mut observations = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    let write = observations
+        .iter_mut()
+        .find(|observation| {
+            observation.workload == backend_e2e_support::Workload::CreateVertex
+                && observation.concurrency == 1
+                && observation.repetition == 0
+        })
+        .unwrap();
+    write.warmup_operations = 3;
+    write.persisted_operations = 4;
+
+    let error =
+        backend_e2e_support::QuickDiagnosticArtifact::new("revision", observations).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not prove every accepted CREATE")
+    );
+}
+
 fn complete_quick_observations(
     backend: backend_e2e_support::Backend,
     repetitions: u8,
@@ -1120,6 +1155,8 @@ fn complete_quick_observations(
                     measurement_finished_at_unix_ns: 20,
                     measured_duration_ns: 5,
                     operations: 2,
+                    warmup_operations: 0,
+                    persisted_operations: if workload.is_write() { 2 } else { 0 },
                     errors: 0,
                     latency_samples_ns: vec![10, 20],
                     row_count: u64::from(!workload.is_write()),

@@ -30,8 +30,8 @@ use tempfile::TempDir;
 use tokio::net::TcpStream;
 
 use super::{
-    Backend, CellSpec, ProcessMetricsSnapshot, RawObservation, StageMetricsWindow, Workload,
-    stage_metrics_window_from_log,
+    Backend, BoltSession, BoltValue, CellSpec, ProcessMetricsSnapshot, RawObservation,
+    StageMetricsWindow, Workload, stage_metrics_window_from_log,
 };
 
 const CAPABILITIES: &str = "adjacency,immutable-read-view,logical-snapshot,point";
@@ -358,8 +358,39 @@ impl DiagnosticCluster {
         )?;
         observation.gateway_stage_metrics = Some(gateway_stage_metrics);
         observation.data_stage_metrics = Some(data_stage_metrics);
+        if spec.workload.is_write() {
+            observation.persisted_operations = self.persisted_vertex_count().await?;
+            let accepted_operations = observation
+                .operations
+                .saturating_add(observation.warmup_operations);
+            if observation.persisted_operations != accepted_operations {
+                return Err(invalid_data(format!(
+                    "write persistence verification failed: accepted {accepted_operations} CREATE operations but COUNT(*) returned {}",
+                    observation.persisted_operations,
+                )));
+            }
+        }
         observation.finished_at_unix_ns = unix_time_nanos();
         Ok(observation)
+    }
+
+    async fn persisted_vertex_count(&self) -> io::Result<u64> {
+        let mut session = BoltSession::connect(self.bolt_address()).await?;
+        let result = session
+            .run("MATCH (n) RETURN COUNT(*)", BTreeMap::new())
+            .await?;
+        match result.rows.as_slice() {
+            [row] => match row.as_slice() {
+                [BoltValue::Integer(count)] if *count >= 0 => u64::try_from(*count)
+                    .map_err(|_| invalid_data("persisted vertex count exceeds u64")),
+                _ => Err(invalid_data(
+                    "write persistence verification did not return a single non-negative COUNT(*)",
+                )),
+            },
+            _ => Err(invalid_data(
+                "write persistence verification did not return a single non-negative COUNT(*)",
+            )),
+        }
     }
 
     pub async fn measure_pipeline_cell(

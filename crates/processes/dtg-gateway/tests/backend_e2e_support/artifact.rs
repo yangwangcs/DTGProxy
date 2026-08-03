@@ -615,6 +615,8 @@ pub struct RawObservation {
     pub measurement_finished_at_unix_ns: u64,
     pub measured_duration_ns: u64,
     pub operations: u64,
+    pub warmup_operations: u64,
+    pub persisted_operations: u64,
     pub errors: u64,
     pub latency_samples_ns: Vec<u64>,
     pub row_count: u64,
@@ -1043,6 +1045,15 @@ impl QuickDiagnosticArtifact {
             if observation.workload.is_write() {
                 if observation.row_count != 0 {
                     return Err(invalid_data("quick diagnostic write returned rows"));
+                }
+                if observation.persisted_operations
+                    != observation
+                        .operations
+                        .saturating_add(observation.warmup_operations)
+                {
+                    return Err(invalid_data(
+                        "quick diagnostic write does not prove every accepted CREATE was persisted",
+                    ));
                 }
             } else {
                 let identity = (
