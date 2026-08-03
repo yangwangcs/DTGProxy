@@ -13,8 +13,10 @@ fn pipeline_frames_are_additive_and_statuses_are_stable() {
         payload: Some(proto::gateway_pipeline_client_frame::Payload::Batch(
             proto::GatewayPipelineRequestBatch {
                 requests: Vec::new(),
+                accepts_response_batches: true,
             },
         )),
+        sent_unix_ns: 5,
     };
 
     let encoded = frame.encode_to_vec();
@@ -26,8 +28,15 @@ fn pipeline_frames_are_additive_and_statuses_are_stable() {
     assert_eq!(proto::StatusCode::Cancelled as i32, 8);
 
     let response = proto::GatewayPipelineServerFrame {
-        payload: None,
+        payload: Some(
+            proto::gateway_pipeline_server_frame::Payload::ResponseBatch(
+                proto::GatewayPipelineResponseBatch {
+                    responses: vec![proto::GatewaySessionResponse::default()],
+                },
+            ),
+        ),
         returned_credits: 1,
+        emitted_unix_ns: 7,
     };
     assert_eq!(
         proto::GatewayPipelineServerFrame::decode(response.encode_to_vec().as_slice()).unwrap(),

@@ -25,13 +25,14 @@ pub use dtg_storage::{ProviderKind, ReplicaBinding, ReplicaStateStore, StorageEr
 #[cfg(feature = "test-support")]
 pub use gateway::encode_physical_fragment_body;
 pub use gateway::{
-    GATEWAY_PIPELINE_MAX_PENDING, GatewayAnalyticsState, GatewayCancellationToken,
-    GatewayClusterRequest, GatewayExecution, GatewayExecutionBuilder, GatewayExecutionError,
-    GatewayExecutionTransport, GatewayExecutionTransportFactory, GatewayFuture, GatewayOperation,
-    GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayQueryResponse,
-    GatewayRequestContext, GatewayResponse, GatewayRetry, GatewayRows, GatewayTemporalMode,
-    GatewayTime, GatewayValue, GatewayWriteReceipt, GatewayWriteRequest, GatewayWriteRoute,
-    GatewayWriteTransport, ShardRoutedGatewayTransport, TonicGatewayProtocolV2TransportFactory,
+    DEFAULT_GATEWAY_PIPELINE_STREAMS, GATEWAY_PIPELINE_MAX_PENDING, GatewayAnalyticsState,
+    GatewayCancellationToken, GatewayClusterRequest, GatewayExecution, GatewayExecutionBuilder,
+    GatewayExecutionError, GatewayExecutionTransport, GatewayExecutionTransportFactory,
+    GatewayFuture, GatewayOperation, GatewayProtocolV2Client, GatewayProtocolV2Transport,
+    GatewayQueryResponse, GatewayRequestContext, GatewayResponse, GatewayRetry, GatewayRows,
+    GatewayTemporalMode, GatewayTime, GatewayValue, GatewayWriteReceipt, GatewayWriteRequest,
+    GatewayWriteRoute, GatewayWriteTransport, MAX_GATEWAY_PIPELINE_STREAMS,
+    ShardRoutedGatewayTransport, TonicGatewayProtocolV2TransportFactory,
     TonicGatewayWriteTransport,
 };
 pub use meta::{MetaExecution, MetaExecutionBuilder};

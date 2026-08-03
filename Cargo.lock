@@ -490,6 +490,7 @@ dependencies = [
  "dtg-storage-remote",
  "futures-util",
  "prost 0.11.9",
+ "prost 0.14.4",
  "raft",
  "tempfile",
  "tokio",

@@ -908,17 +908,26 @@ type GatewaySessionResponses = Result<Vec<proto::GatewayResponse>, GatewayExecut
 type GatewaySessionPending = Arc<Mutex<BTreeMap<u128, oneshot::Sender<GatewaySessionResponses>>>>;
 
 pub const GATEWAY_PIPELINE_MAX_PENDING: usize = 256;
+pub const DEFAULT_GATEWAY_PIPELINE_STREAMS: usize = 4;
+pub const MAX_GATEWAY_PIPELINE_STREAMS: usize = 4;
 const PIPELINE_MAX_BATCH_REQUESTS: usize = 32;
 const PIPELINE_MAX_BATCH_BYTES: usize = 65_536;
 
 #[derive(Default)]
 struct GatewayPipelineBatch {
     requests: Vec<proto::GatewayRequest>,
+    metrics: Vec<Arc<RequestStageMetrics>>,
+    submitted_at: Vec<Instant>,
     estimated_bytes: usize,
 }
 
 impl GatewayPipelineBatch {
-    fn push(&mut self, request: proto::GatewayRequest) -> Result<(), ()> {
+    fn push(
+        &mut self,
+        request: proto::GatewayRequest,
+        metrics: Arc<RequestStageMetrics>,
+        submitted_at: Instant,
+    ) -> Result<(), ()> {
         if self.requests.len() >= PIPELINE_MAX_BATCH_REQUESTS {
             return Err(());
         }
@@ -929,6 +938,8 @@ impl GatewayPipelineBatch {
         }
         self.estimated_bytes = total_bytes;
         self.requests.push(request);
+        self.metrics.push(metrics);
+        self.submitted_at.push(submitted_at);
         Ok(())
     }
 
@@ -936,8 +947,19 @@ impl GatewayPipelineBatch {
         self.requests.is_empty()
     }
 
-    fn take_prefix(&mut self, count: usize) -> Vec<proto::GatewayRequest> {
-        self.requests.drain(..count).collect()
+    fn take_prefix(
+        &mut self,
+        count: usize,
+    ) -> (
+        Vec<proto::GatewayRequest>,
+        Vec<Arc<RequestStageMetrics>>,
+        Vec<Instant>,
+    ) {
+        (
+            self.requests.drain(..count).collect(),
+            self.metrics.drain(..count).collect(),
+            self.submitted_at.drain(..count).collect(),
+        )
     }
 }
 
@@ -982,11 +1004,18 @@ fn gateway_pipeline_request_size(request: &proto::GatewayRequest) -> usize {
     bytes
 }
 
-type GatewayPipelinePending = Arc<Mutex<BTreeMap<u128, oneshot::Sender<GatewaySessionResponses>>>>;
+type GatewayPipelinePending = Arc<Mutex<BTreeMap<u128, PendingGatewayPipelineRequest>>>;
+
+struct PendingGatewayPipelineRequest {
+    completion: oneshot::Sender<GatewaySessionResponses>,
+    metrics: Arc<RequestStageMetrics>,
+}
 
 struct GatewayPipelineSubmission {
     request_id: u128,
     request: proto::GatewayRequest,
+    metrics: Arc<RequestStageMetrics>,
+    submitted_at: Instant,
 }
 
 struct TonicGatewayPipelineClient {
@@ -995,6 +1024,110 @@ struct TonicGatewayPipelineClient {
     pending: GatewayPipelinePending,
     active: Arc<AtomicBool>,
     credit_notify: Arc<Notify>,
+}
+
+struct TonicGatewayPipelinePool {
+    streams: Vec<Arc<TonicGatewayPipelineClient>>,
+    pending: AtomicUsize,
+    next: AtomicUsize,
+}
+
+impl TonicGatewayPipelinePool {
+    async fn connect(
+        client: proto::gateway_service_client::GatewayServiceClient<Channel>,
+        stream_count: usize,
+    ) -> Result<Self, GatewayExecutionError> {
+        let stream_count = stream_count.clamp(1, MAX_GATEWAY_PIPELINE_STREAMS);
+        let mut streams = Vec::with_capacity(stream_count);
+        for _ in 0..stream_count {
+            streams.push(Arc::new(
+                TonicGatewayPipelineClient::connect(client.clone()).await?,
+            ));
+        }
+        Ok(Self {
+            streams,
+            pending: AtomicUsize::new(0),
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    async fn execute_with_metrics_and_cancellation(
+        &self,
+        request: proto::GatewayRequest,
+        metrics: Arc<RequestStageMetrics>,
+        cancellation: &GatewayCancellationToken,
+    ) -> Result<Vec<proto::GatewayResponse>, GatewayExecutionError> {
+        if !reserve_gateway_pipeline_pool_pending(&self.pending) {
+            return Err(GatewayExecutionError::new(
+                "DTG-CLUSTER-PIPELINE-BACKPRESSURE",
+                "Gateway pipeline pool pending-request limit is exhausted",
+                GatewayRetry::Safe,
+            ));
+        }
+        let stream = self.select_stream();
+        let result = match stream {
+            Some(stream) => {
+                stream
+                    .execute_with_metrics_and_cancellation(request, metrics, cancellation)
+                    .await
+            }
+            None => Err(gateway_pipeline_unavailable(
+                "Gateway pipeline pool has no active stream",
+            )),
+        };
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
+    fn select_stream(&self) -> Option<Arc<TonicGatewayPipelineClient>> {
+        let loads = self
+            .streams
+            .iter()
+            .map(|stream| stream.pending_load())
+            .collect::<Vec<_>>();
+        select_gateway_pipeline_stream(&loads, &self.next)
+            .and_then(|index| self.streams.get(index).cloned())
+    }
+}
+
+fn reserve_gateway_pipeline_pool_pending(pending: &AtomicUsize) -> bool {
+    let mut observed = pending.load(Ordering::Acquire);
+    loop {
+        if observed >= GATEWAY_PIPELINE_MAX_PENDING {
+            return false;
+        }
+        match pending.compare_exchange_weak(
+            observed,
+            observed + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+fn select_gateway_pipeline_stream(loads: &[usize], next: &AtomicUsize) -> Option<usize> {
+    if loads.is_empty() {
+        return None;
+    }
+    let start = next.fetch_add(1, Ordering::Relaxed) % loads.len();
+    let mut selected = None;
+    for offset in 0..loads.len() {
+        let index = (start + offset) % loads.len();
+        let load = loads[index];
+        if load == usize::MAX {
+            continue;
+        }
+        if selected.is_none_or(|selected_index| load < loads[selected_index]) {
+            selected = Some(index);
+        }
+    }
+    if let Some(index) = selected {
+        next.store((index + 1) % loads.len(), Ordering::Relaxed);
+    }
+    selected
 }
 
 pub trait GatewayProtocolV2Client: Send + Sync {
@@ -1240,6 +1373,7 @@ impl GatewayExecutionTransport for ShardRoutedGatewayTransport {
 pub struct TonicGatewayProtocolV2TransportFactory {
     query_sessions_enabled: bool,
     query_pipelines_enabled: bool,
+    query_pipeline_streams: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1279,11 +1413,23 @@ impl TonicGatewayProtocolV2TransportFactory {
         Self {
             query_sessions_enabled,
             query_pipelines_enabled: false,
+            query_pipeline_streams: DEFAULT_GATEWAY_PIPELINE_STREAMS,
         }
     }
 
     pub const fn with_query_pipelines(mut self, query_pipelines_enabled: bool) -> Self {
         self.query_pipelines_enabled = query_pipelines_enabled;
+        self
+    }
+
+    pub const fn with_query_pipeline_streams(mut self, query_pipeline_streams: usize) -> Self {
+        self.query_pipeline_streams = if query_pipeline_streams == 0
+            || query_pipeline_streams > MAX_GATEWAY_PIPELINE_STREAMS
+        {
+            DEFAULT_GATEWAY_PIPELINE_STREAMS
+        } else {
+            query_pipeline_streams
+        };
         self
     }
 }
@@ -1311,7 +1457,9 @@ impl GatewayExecutionTransportFactory for TonicGatewayProtocolV2TransportFactory
                 None
             };
             let pipeline = if self.query_pipelines_enabled {
-                match TonicGatewayPipelineClient::connect(client.clone()).await {
+                match TonicGatewayPipelinePool::connect(client.clone(), self.query_pipeline_streams)
+                    .await
+                {
                     Ok(pipeline) => Some(Arc::new(pipeline)),
                     Err(_) => None,
                 }
@@ -1333,7 +1481,7 @@ impl GatewayExecutionTransportFactory for TonicGatewayProtocolV2TransportFactory
 struct TonicGatewayProtocolV2Client {
     client: proto::gateway_service_client::GatewayServiceClient<Channel>,
     session: Option<Arc<TonicGatewaySessionClient>>,
-    pipeline: Option<Arc<TonicGatewayPipelineClient>>,
+    pipeline: Option<Arc<TonicGatewayPipelinePool>>,
 }
 
 struct TonicGatewaySessionClient {
@@ -1415,7 +1563,16 @@ impl TonicGatewayPipelineClient {
                     GatewayRetry::Safe,
                 ));
             }
-            if pending.insert(request_id, sender).is_some() {
+            if pending
+                .insert(
+                    request_id,
+                    PendingGatewayPipelineRequest {
+                        completion: sender,
+                        metrics: Arc::clone(&metrics),
+                    },
+                )
+                .is_some()
+            {
                 return Err(GatewayExecutionError::new(
                     "DTG-CLUSTER-PIPELINE-ID",
                     "Gateway pipeline received a duplicate in-flight request ID",
@@ -1426,6 +1583,8 @@ impl TonicGatewayPipelineClient {
         match self.submissions.try_send(GatewayPipelineSubmission {
             request_id,
             request: request.clone(),
+            metrics: Arc::clone(&metrics),
+            submitted_at: Instant::now(),
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1472,6 +1631,16 @@ impl TonicGatewayPipelineClient {
         response
     }
 
+    fn pending_load(&self) -> usize {
+        if !self.active.load(Ordering::Acquire) {
+            return usize::MAX;
+        }
+        self.pending
+            .lock()
+            .map(|pending| pending.len())
+            .unwrap_or(usize::MAX)
+    }
+
     async fn cancel(&self, request_id: u128, request: Option<proto::RequestContext>) {
         let present = match self.pending.lock() {
             Ok(pending) => pending.contains_key(&request_id),
@@ -1484,6 +1653,7 @@ impl TonicGatewayPipelineClient {
             payload: Some(proto::gateway_pipeline_client_frame::Payload::Cancel(
                 proto::GatewayPipelineCancel { request },
             )),
+            sent_unix_ns: 0,
         };
         if self.frames.send(frame).await.is_err() {
             fail_gateway_pipeline(
@@ -1554,6 +1724,7 @@ async fn write_gateway_pipeline_requests(
             continue;
         }
         while !batch.is_empty() {
+            let credit_wait_started = Instant::now();
             let request_count = match reserve_gateway_pipeline_credits(
                 batch.requests.len(),
                 &active,
@@ -1575,14 +1746,38 @@ async fn write_gateway_pipeline_requests(
                     return;
                 }
             };
+            let (requests, metrics, submitted_at) = batch.take_prefix(request_count);
+            for metrics in &metrics {
+                record_session_metric(
+                    &Some(Arc::clone(metrics)),
+                    RequestDetail::GatewayQueryPipelineCreditWait,
+                    StageOutcome::Success,
+                    credit_wait_started.elapsed(),
+                );
+            }
             let frame = proto::GatewayPipelineClientFrame {
                 payload: Some(proto::gateway_pipeline_client_frame::Payload::Batch(
                     proto::GatewayPipelineRequestBatch {
-                        requests: batch.take_prefix(request_count),
+                        requests,
+                        accepts_response_batches: true,
                     },
                 )),
+                sent_unix_ns: unix_timestamp_nanoseconds(),
             };
-            if frames.send(frame).await.is_err() {
+            let sent = frames.send(frame).await.is_ok();
+            for (metrics, submitted_at) in metrics.into_iter().zip(submitted_at) {
+                record_session_metric(
+                    &Some(metrics),
+                    RequestDetail::GatewayQueryPipelineWriterWait,
+                    if sent {
+                        StageOutcome::Success
+                    } else {
+                        StageOutcome::Error
+                    },
+                    submitted_at.elapsed(),
+                );
+            }
+            if !sent {
                 fail_gateway_pipeline(
                     &pending,
                     &active,
@@ -1614,7 +1809,11 @@ fn push_active_pipeline_submission(
         return Err(Box::new(submission));
     }
     batch
-        .push(submission.request)
+        .push(
+            submission.request,
+            submission.metrics,
+            submission.submitted_at,
+        )
         .expect("pipeline batch capacity was checked before push");
     Ok(())
 }
@@ -1694,54 +1893,93 @@ async fn read_gateway_pipeline_responses(
             credits.fetch_add(frame.returned_credits as usize, Ordering::AcqRel);
             credit_notify.notify_waiters();
         }
-        match frame.payload {
+        let delivery = match frame.payload {
             Some(proto::gateway_pipeline_server_frame::Payload::Credit(credit)) => {
                 credits.fetch_add(credit.available_requests as usize, Ordering::AcqRel);
                 credit_notify.notify_waiters();
+                Ok(())
             }
             Some(proto::gateway_pipeline_server_frame::Payload::Response(response)) => {
-                let request_id = match gateway_session_request_id(response.request.as_ref()) {
-                    Ok(request_id) => request_id,
-                    Err(error) => {
-                        fail_gateway_pipeline(&pending, &active, &credit_notify, error);
-                        return;
-                    }
-                };
-                let sender = match pending.lock() {
-                    Ok(mut pending) => pending.remove(&request_id),
-                    Err(_) => {
-                        fail_gateway_pipeline(
-                            &pending,
-                            &active,
-                            &credit_notify,
-                            GatewayExecutionError::new(
-                                "DTG-CLUSTER-PIPELINE",
-                                "Gateway pipeline pending-request lock is poisoned",
-                                GatewayRetry::Safe,
-                            ),
-                        );
-                        return;
-                    }
-                };
-                if let Some(sender) = sender {
-                    let _ = sender.send(Ok(response.responses));
+                deliver_gateway_pipeline_response(&pending, response, frame.emitted_unix_ns)
+            }
+            Some(proto::gateway_pipeline_server_frame::Payload::ResponseBatch(batch)) => {
+                if batch.responses.is_empty() {
+                    Err(GatewayExecutionError::new(
+                        "DTG-CLUSTER-PIPELINE",
+                        "Gateway pipeline response batch omitted terminal responses",
+                        GatewayRetry::Safe,
+                    ))
+                } else {
+                    batch.responses.into_iter().try_for_each(|response| {
+                        deliver_gateway_pipeline_response(&pending, response, frame.emitted_unix_ns)
+                    })
                 }
             }
-            None => {
-                fail_gateway_pipeline(
-                    &pending,
-                    &active,
-                    &credit_notify,
-                    GatewayExecutionError::new(
-                        "DTG-CLUSTER-PIPELINE",
-                        "Gateway pipeline response frame omitted a payload",
-                        GatewayRetry::Safe,
-                    ),
-                );
-                return;
-            }
+            None => Err(GatewayExecutionError::new(
+                "DTG-CLUSTER-PIPELINE",
+                "Gateway pipeline response frame omitted a payload",
+                GatewayRetry::Safe,
+            )),
+        };
+        if let Err(error) = delivery {
+            fail_gateway_pipeline(&pending, &active, &credit_notify, error);
+            return;
         }
     }
+}
+
+fn deliver_gateway_pipeline_response(
+    pending: &GatewayPipelinePending,
+    response: proto::GatewaySessionResponse,
+    emitted_unix_ns: u64,
+) -> Result<(), GatewayExecutionError> {
+    let request_id = gateway_session_request_id(response.request.as_ref())?;
+    let pending_request = pending
+        .lock()
+        .map_err(|_| {
+            GatewayExecutionError::new(
+                "DTG-CLUSTER-PIPELINE",
+                "Gateway pipeline pending-request lock is poisoned",
+                GatewayRetry::Safe,
+            )
+        })?
+        .remove(&request_id);
+    if let Some(pending_request) = pending_request {
+        if let Some(transport_wait) = elapsed_since_unix_timestamp(emitted_unix_ns) {
+            pending_request.metrics.record_detail(
+                RequestDetail::GatewayQueryPipelineResponseTransportWait,
+                StageOutcome::Success,
+                transport_wait,
+            );
+        }
+        let dispatch_started = Instant::now();
+        let _ = pending_request.completion.send(Ok(response.responses));
+        pending_request.metrics.record_detail(
+            RequestDetail::GatewayQueryPipelineResponseDispatchWait,
+            StageOutcome::Success,
+            u64::try_from(dispatch_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+    Ok(())
+}
+
+fn elapsed_since_unix_timestamp(emitted_unix_ns: u64) -> Option<u64> {
+    if emitted_unix_ns == 0 {
+        return None;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())?;
+    now.checked_sub(emitted_unix_ns)
+}
+
+fn unix_timestamp_nanoseconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
 }
 
 fn remove_gateway_pipeline_pending(
@@ -1771,8 +2009,8 @@ fn fail_gateway_pipeline_request(
         .lock()
         .ok()
         .and_then(|mut pending| pending.remove(&request_id));
-    if let Some(sender) = sender {
-        let _ = sender.send(Err(error));
+    if let Some(pending_request) = sender {
+        let _ = pending_request.completion.send(Err(error));
     }
 }
 
@@ -1804,8 +2042,8 @@ fn fail_gateway_pipeline(
         Ok(mut pending) => std::mem::take(&mut *pending),
         Err(_) => return,
     };
-    for (_, sender) in entries {
-        let _ = sender.send(Err(error.clone()));
+    for (_, pending_request) in entries {
+        let _ = pending_request.completion.send(Err(error.clone()));
     }
 }
 
@@ -5416,16 +5654,28 @@ mod write_receipt_tests {
     fn pipeline_batch_keeps_request_identity_and_stops_at_its_request_limit() {
         let mut batch = GatewayPipelineBatch::default();
         for request_id in 1..=PIPELINE_MAX_BATCH_REQUESTS {
-            assert!(batch.push(pipeline_request(request_id as u128)).is_ok());
+            assert!(
+                batch
+                    .push(
+                        pipeline_request(request_id as u128),
+                        Arc::new(RequestStageMetrics::default()),
+                        Instant::now(),
+                    )
+                    .is_ok()
+            );
         }
         assert!(
             batch
-                .push(pipeline_request(PIPELINE_MAX_BATCH_REQUESTS as u128 + 1))
+                .push(
+                    pipeline_request(PIPELINE_MAX_BATCH_REQUESTS as u128 + 1),
+                    Arc::new(RequestStageMetrics::default()),
+                    Instant::now(),
+                )
                 .is_err()
         );
 
-        let request_ids = batch
-            .take_prefix(PIPELINE_MAX_BATCH_REQUESTS)
+        let (requests, _, _) = batch.take_prefix(PIPELINE_MAX_BATCH_REQUESTS);
+        let request_ids = requests
             .into_iter()
             .map(|request| gateway_session_request_id(request.request.as_ref()).unwrap())
             .collect::<Vec<_>>();
@@ -5437,14 +5687,58 @@ mod write_receipt_tests {
         );
     }
 
+    #[test]
+    fn pipeline_pool_prefers_the_least_loaded_stream_and_rotates_ties() {
+        let next = AtomicUsize::new(0);
+        assert_eq!(
+            select_gateway_pipeline_stream(&[8, 2, 2, 9], &next),
+            Some(1)
+        );
+        assert_eq!(
+            select_gateway_pipeline_stream(&[8, 2, 2, 9], &next),
+            Some(2)
+        );
+        assert_eq!(
+            select_gateway_pipeline_stream(&[usize::MAX; 4], &next),
+            None
+        );
+    }
+
+    #[test]
+    fn pipeline_pool_stream_count_defaults_to_four_and_rejects_larger_values() {
+        assert_eq!(
+            TonicGatewayProtocolV2TransportFactory::new(true).query_pipeline_streams,
+            4
+        );
+        assert_eq!(
+            TonicGatewayProtocolV2TransportFactory::new(true)
+                .with_query_pipeline_streams(5)
+                .query_pipeline_streams,
+            4
+        );
+        assert_eq!(
+            TonicGatewayProtocolV2TransportFactory::new(true)
+                .with_query_pipeline_streams(1)
+                .query_pipeline_streams,
+            1
+        );
+    }
+
     #[tokio::test]
     async fn pipeline_writer_flushes_a_second_batch_after_returned_credits() {
         let (submission_sender, submission_receiver) = mpsc::channel(GATEWAY_PIPELINE_MAX_PENDING);
         let (frame_sender, mut frame_receiver) = mpsc::channel(4);
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let metrics = Arc::new(RequestStageMetrics::default());
         for request_id in 1..=64_u128 {
             let (completion, _receiver) = oneshot::channel();
-            pending.lock().unwrap().insert(request_id, completion);
+            pending.lock().unwrap().insert(
+                request_id,
+                PendingGatewayPipelineRequest {
+                    completion,
+                    metrics: Arc::clone(&metrics),
+                },
+            );
         }
         let active = Arc::new(AtomicBool::new(true));
         let credits = Arc::new(AtomicUsize::new(PIPELINE_MAX_BATCH_REQUESTS));
@@ -5462,6 +5756,8 @@ mod write_receipt_tests {
                 .send(GatewayPipelineSubmission {
                     request_id,
                     request: pipeline_request(request_id),
+                    metrics: Arc::clone(&metrics),
+                    submitted_at: Instant::now(),
                 })
                 .await
                 .unwrap();
@@ -5488,6 +5784,11 @@ mod write_receipt_tests {
             _ => panic!("writer emitted a non-batch frame"),
         };
         assert_eq!(second_count, PIPELINE_MAX_BATCH_REQUESTS);
+        assert_eq!(
+            metrics.snapshot().details[RequestDetail::GatewayQueryPipelineCreditWait as usize]
+                .success,
+            64
+        );
     }
 
     #[tokio::test]
@@ -5495,9 +5796,16 @@ mod write_receipt_tests {
         let (submission_sender, submission_receiver) = mpsc::channel(GATEWAY_PIPELINE_MAX_PENDING);
         let (frame_sender, mut frame_receiver) = mpsc::channel(4);
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let metrics = Arc::new(RequestStageMetrics::default());
         for request_id in 1..=PIPELINE_MAX_BATCH_REQUESTS as u128 {
             let (completion, _receiver) = oneshot::channel();
-            pending.lock().unwrap().insert(request_id, completion);
+            pending.lock().unwrap().insert(
+                request_id,
+                PendingGatewayPipelineRequest {
+                    completion,
+                    metrics: Arc::clone(&metrics),
+                },
+            );
         }
         let active = Arc::new(AtomicBool::new(true));
         let credits = Arc::new(AtomicUsize::new(20));
@@ -5515,6 +5823,8 @@ mod write_receipt_tests {
                 .send(GatewayPipelineSubmission {
                     request_id,
                     request: pipeline_request(request_id),
+                    metrics: Arc::clone(&metrics),
+                    submitted_at: Instant::now(),
                 })
                 .await
                 .unwrap();

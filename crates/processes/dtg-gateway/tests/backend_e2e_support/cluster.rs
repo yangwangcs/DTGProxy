@@ -209,6 +209,12 @@ impl DiagnosticCluster {
         if let Some(path) = gateway_unix_socket.as_deref() {
             data_environment.push(("DTG_DATA_GATEWAY_UNIX_SOCKET", path.display().to_string()));
         }
+        if let Some(limit) = env::var_os("DTG_BACKEND_E2E_DATA_PIPELINE_EXECUTION_LIMIT") {
+            data_environment.push((
+                "DTG_DATA_GATEWAY_PIPELINE_EXECUTION_LIMIT",
+                limit.to_string_lossy().into_owned(),
+            ));
+        }
         match spec.backend {
             Backend::Fjall => {}
             Backend::PostgreSql => {

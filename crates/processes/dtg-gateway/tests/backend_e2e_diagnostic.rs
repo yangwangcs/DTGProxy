@@ -353,6 +353,7 @@ async fn fjall_bolt_read_pipeline_depth_matrix() {
             "bolt_read_pipeline_enqueue_wait",
             "bolt_read_pipeline_execution_wait",
             "bolt_read_pipeline_ordered_write_wait",
+            "gateway_query_pipeline_credit_wait",
         ] {
             assert!(
                 gateway_metrics
@@ -378,9 +379,10 @@ async fn fjall_bolt_read_pipeline_depth_matrix() {
                 "p95_ms": percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
                 "p99_ms": percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
                 "result_digest": observation.result_digest,
-                "gateway_details": gateway_metrics.delta.details.iter().filter(|detail| detail.detail.starts_with("bolt_read_pipeline_") && detail.success != 0).map(|detail| serde_json::json!({"detail": detail.detail, "calls": detail.success, "mean_nanoseconds": detail.total_nanoseconds / detail.success})).collect::<Vec<_>>(),
+                "gateway_details": gateway_metrics.delta.details.iter().filter(|detail| (detail.detail.starts_with("bolt_read_pipeline_") || detail.detail.starts_with("gateway_query_pipeline_")) && detail.success != 0).map(|detail| serde_json::json!({"detail": detail.detail, "calls": detail.success, "mean_nanoseconds": detail.total_nanoseconds / detail.success})).collect::<Vec<_>>(),
                 "gateway_stages": gateway_metrics.delta.stages.iter().filter(|stage| stage.success != 0).map(|stage| serde_json::json!({"stage": stage.stage, "calls": stage.success, "mean_nanoseconds": stage.total_nanoseconds / stage.success})).collect::<Vec<_>>(),
                 "data_stages": data_metrics.delta.stages.iter().filter(|stage| stage.success != 0).map(|stage| serde_json::json!({"stage": stage.stage, "calls": stage.success, "mean_nanoseconds": stage.total_nanoseconds / stage.success})).collect::<Vec<_>>(),
+                "data_details": data_metrics.delta.details.iter().filter(|detail| detail.detail.starts_with("data_gateway_pipeline_") && detail.success != 0).map(|detail| serde_json::json!({"detail": detail.detail, "calls": detail.success, "mean_nanoseconds": detail.total_nanoseconds / detail.success})).collect::<Vec<_>>(),
             })
         );
         cluster.shutdown().await.unwrap();
@@ -863,12 +865,12 @@ fn stage_metrics_window_accepts_schema_v6_snapshot_csr_details() {
 }
 
 #[test]
-fn stage_metrics_window_accepts_schema_v9_bolt_pipeline_details() {
+fn stage_metrics_window_accepts_schema_v14_pipeline_boundary_details() {
     let first = stage_metrics_line_with_pipeline_details("gateway", 10, 1, 1);
     let second = stage_metrics_line_with_pipeline_details("gateway", 20, 2, 2);
     let log = format!("{first}\n{second}\n");
     let window = stage_metrics_window_from_log(&log, "gateway", 15, 20).unwrap();
-    assert_eq!(window.delta.details.len(), 37);
+    assert_eq!(window.delta.details.len(), 45);
     assert_eq!(
         window.delta.details[32].detail,
         "gateway_query_pipeline_submit"
@@ -888,6 +890,38 @@ fn stage_metrics_window_accepts_schema_v9_bolt_pipeline_details() {
     assert_eq!(
         window.delta.details[36].detail,
         "bolt_read_pipeline_ordered_write_wait"
+    );
+    assert_eq!(
+        window.delta.details[37].detail,
+        "gateway_query_pipeline_credit_wait"
+    );
+    assert_eq!(
+        window.delta.details[38].detail,
+        "data_gateway_pipeline_dispatch_wait"
+    );
+    assert_eq!(
+        window.delta.details[39].detail,
+        "data_gateway_pipeline_completion_send_wait"
+    );
+    assert_eq!(
+        window.delta.details[40].detail,
+        "data_gateway_pipeline_completion_frame"
+    );
+    assert_eq!(
+        window.delta.details[41].detail,
+        "gateway_query_pipeline_response_transport_wait"
+    );
+    assert_eq!(
+        window.delta.details[42].detail,
+        "gateway_query_pipeline_response_dispatch_wait"
+    );
+    assert_eq!(
+        window.delta.details[43].detail,
+        "data_gateway_pipeline_request_transport_wait"
+    );
+    assert_eq!(
+        window.delta.details[44].detail,
+        "gateway_query_pipeline_writer_wait"
     );
 }
 
@@ -1365,7 +1399,7 @@ fn stage_metrics_line_with_pipeline_details(
             .unwrap(),
     )
     .unwrap();
-    value["schema_version"] = serde_json::Value::from(9);
+    value["schema_version"] = serde_json::Value::from(14);
     for detail in [
         "gateway_query_session_submit",
         "gateway_query_session_response_wait",
@@ -1375,6 +1409,14 @@ fn stage_metrics_line_with_pipeline_details(
         "bolt_read_pipeline_enqueue_wait",
         "bolt_read_pipeline_execution_wait",
         "bolt_read_pipeline_ordered_write_wait",
+        "gateway_query_pipeline_credit_wait",
+        "data_gateway_pipeline_dispatch_wait",
+        "data_gateway_pipeline_completion_send_wait",
+        "data_gateway_pipeline_completion_frame",
+        "gateway_query_pipeline_response_transport_wait",
+        "gateway_query_pipeline_response_dispatch_wait",
+        "data_gateway_pipeline_request_transport_wait",
+        "gateway_query_pipeline_writer_wait",
     ] {
         value["details"]
             .as_array_mut()

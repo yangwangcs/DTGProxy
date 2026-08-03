@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
 use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayService;
@@ -35,7 +35,7 @@ use dtg_storage_fjall::FjallConsensusStore;
 use futures_util::TryStreamExt as _;
 use futures_util::{StreamExt as _, stream};
 use prost_011::Message as _;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
@@ -48,8 +48,11 @@ const APPLY_BATCH_MAX_COMMANDS: usize = 64;
 const MAX_GATEWAY_FRAGMENT_CONCURRENCY: usize = 32;
 const MAX_GATEWAY_SESSION_IN_FLIGHT: usize = 32;
 const MAX_GATEWAY_PIPELINE_IN_FLIGHT: usize = 32;
+const MAX_CONFIGURED_GATEWAY_PIPELINE_EXECUTION: usize = 128;
 const MAX_GATEWAY_PIPELINE_BATCH_REQUESTS: usize = 32;
 const MAX_GATEWAY_PIPELINE_BATCH_BYTES: usize = 65_536;
+const MAX_GATEWAY_PIPELINE_RESPONSE_BATCH_RESPONSES: usize = 32;
+const MAX_GATEWAY_PIPELINE_RESPONSE_BATCH_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicaFailure {
@@ -310,6 +313,8 @@ impl DataNodeBuilder {
             DataNodeError::Build(format!("cannot create Fjall consensus root: {error}"))
         })?;
         let request_metrics = Arc::new(RequestStageMetrics::default());
+        let pipeline_execution_permits =
+            Arc::new(Semaphore::new(configured_gateway_pipeline_execution_limit()));
         let execution = self
             .execution
             .with_request_metrics(Arc::clone(&request_metrics))
@@ -356,6 +361,7 @@ impl DataNodeBuilder {
             state,
             request_metrics,
             apply_batchers,
+            pipeline_execution_permits,
             driver_stop,
         })
     }
@@ -457,6 +463,21 @@ fn consensus_binding(binding: &ReplicaBinding) -> Result<ReplicaBinding, Storage
         .credential_ref("local-fjall-consensus")
         .role(BindingRole::Active)
         .build()
+}
+
+fn configured_gateway_pipeline_execution_limit() -> usize {
+    gateway_pipeline_execution_limit(
+        std::env::var("DTG_DATA_GATEWAY_PIPELINE_EXECUTION_LIMIT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gateway_pipeline_execution_limit(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| (1..=MAX_CONFIGURED_GATEWAY_PIPELINE_EXECUTION).contains(limit))
+        .unwrap_or(MAX_GATEWAY_PIPELINE_IN_FLIGHT)
 }
 
 fn hex_digest(bytes: [u8; 32]) -> String {
@@ -627,6 +648,7 @@ pub struct DataNode {
     state: Arc<ProcessState>,
     request_metrics: Arc<RequestStageMetrics>,
     apply_batchers: Arc<Mutex<BTreeMap<ReplicaKey, mpsc::Sender<PendingApply>>>>,
+    pipeline_execution_permits: Arc<Semaphore>,
     driver_stop: Arc<AtomicBool>,
 }
 
@@ -745,6 +767,7 @@ impl DataNode {
             execution: self.execution.clone(),
             request_metrics: Arc::clone(&self.request_metrics),
             apply_batchers: Arc::clone(&self.apply_batchers),
+            pipeline_execution_permits: Arc::clone(&self.pipeline_execution_permits),
         }
     }
 
@@ -770,6 +793,7 @@ pub struct DataRpcService {
     execution: Arc<DataExecution>,
     request_metrics: Arc<RequestStageMetrics>,
     apply_batchers: Arc<Mutex<BTreeMap<ReplicaKey, mpsc::Sender<PendingApply>>>>,
+    pipeline_execution_permits: Arc<Semaphore>,
 }
 
 impl DataRpcService {
@@ -1574,6 +1598,7 @@ impl GatewayService for DataRpcService {
                         ),
                     ),
                     returned_credits: 0,
+                    emitted_unix_ns: 0,
                 }))
                 .await
                 .is_err()
@@ -1581,19 +1606,25 @@ impl GatewayService for DataRpcService {
                 return;
             }
             let permits = Arc::new(Semaphore::new(MAX_GATEWAY_PIPELINE_IN_FLIGHT));
+            let execution_permits = Arc::clone(&service.pipeline_execution_permits);
             let mut tasks: JoinSet<(u128, GatewaySessionResponse)> = JoinSet::new();
             let mut abort_handles = BTreeMap::<u128, AbortHandle>::new();
             let mut cancelled_before_start = BTreeMap::<u128, RequestContext>::new();
+            let mut response_batches_enabled = false;
             let mut input_open = true;
             loop {
                 if input_open {
                     tokio::select! {
                         frame = requests.message() => match frame {
                             Ok(Some(frame)) => {
+                                let received_at = Instant::now();
                                 if process_gateway_pipeline_frame(
                                     &service,
                                     frame,
+                                    received_at,
+                                    &mut response_batches_enabled,
                                     &permits,
+                                    &execution_permits,
                                     &mut tasks,
                                     &mut abort_handles,
                                     &mut cancelled_before_start,
@@ -1609,7 +1640,14 @@ impl GatewayService for DataRpcService {
                             }
                         },
                         completed = tasks.join_next(), if !tasks.is_empty() => {
-                            if !emit_gateway_pipeline_completion(&sender, &mut abort_handles, completed).await {
+                            if !emit_gateway_pipeline_completion(
+                                &sender,
+                                &service.request_metrics,
+                                &mut tasks,
+                                &mut abort_handles,
+                                completed,
+                                response_batches_enabled,
+                            ).await {
                                 return;
                             }
                         }
@@ -1620,8 +1658,11 @@ impl GatewayService for DataRpcService {
                     };
                     if !emit_gateway_pipeline_completion(
                         &sender,
+                        &service.request_metrics,
+                        &mut tasks,
                         &mut abort_handles,
                         Some(completed),
+                        response_batches_enabled,
                     )
                     .await
                     {
@@ -1637,18 +1678,23 @@ impl GatewayService for DataRpcService {
 async fn process_gateway_pipeline_frame(
     service: &DataRpcService,
     frame: GatewayPipelineClientFrame,
+    received_at: Instant,
+    response_batches_enabled: &mut bool,
     permits: &Arc<Semaphore>,
+    execution_permits: &Arc<Semaphore>,
     tasks: &mut JoinSet<(u128, GatewaySessionResponse)>,
     abort_handles: &mut BTreeMap<u128, AbortHandle>,
     cancelled_before_start: &mut BTreeMap<u128, RequestContext>,
     sender: &mpsc::Sender<Result<GatewayPipelineServerFrame, Status>>,
 ) -> Result<(), ()> {
+    let request_sent_unix_ns = frame.sent_unix_ns;
     match frame.payload {
         Some(
             dtg_execution::cluster_protocol::proto::gateway_pipeline_client_frame::Payload::Batch(
                 batch,
             ),
         ) => {
+            *response_batches_enabled |= batch.accepts_response_batches;
             let batch_too_large = batch.requests.len() > MAX_GATEWAY_PIPELINE_BATCH_REQUESTS
                 || batch
                     .requests
@@ -1746,9 +1792,24 @@ async fn process_gateway_pipeline_frame(
                         continue;
                     }
                 };
+                if let Some(transport_wait) = elapsed_since_unix_timestamp(request_sent_unix_ns) {
+                    service.request_metrics.record_detail(
+                        dtg_execution::RequestDetail::DataGatewayPipelineRequestTransportWait,
+                        dtg_execution::StageOutcome::Success,
+                        transport_wait,
+                    );
+                }
                 let service = service.clone();
+                let execution_permits = Arc::clone(execution_permits);
                 let handle = tasks.spawn(async move {
                     let _permit = permit;
+                    let _execution_permit =
+                        acquire_gateway_pipeline_execution_permit(execution_permits).await;
+                    service.request_metrics.record_detail(
+                        dtg_execution::RequestDetail::DataGatewayPipelineDispatchWait,
+                        dtg_execution::StageOutcome::Success,
+                        elapsed_nanoseconds(received_at),
+                    );
                     (
                         request_id,
                         execute_gateway_session_request(service, wire).await,
@@ -1792,38 +1853,166 @@ async fn process_gateway_pipeline_frame(
     Ok(())
 }
 
+async fn acquire_gateway_pipeline_execution_permit(
+    permits: Arc<Semaphore>,
+) -> OwnedSemaphorePermit {
+    permits
+        .acquire_owned()
+        .await
+        .expect("process-wide pipeline execution semaphore is never closed")
+}
+
 async fn emit_gateway_pipeline_completion(
     sender: &mpsc::Sender<Result<GatewayPipelineServerFrame, Status>>,
+    request_metrics: &Arc<RequestStageMetrics>,
+    tasks: &mut JoinSet<(u128, GatewaySessionResponse)>,
     abort_handles: &mut BTreeMap<u128, AbortHandle>,
     completed: Option<Result<(u128, GatewaySessionResponse), tokio::task::JoinError>>,
+    response_batches_enabled: bool,
 ) -> bool {
     let Some(completed) = completed else {
         return true;
     };
+    let mut responses = Vec::with_capacity(MAX_GATEWAY_PIPELINE_RESPONSE_BATCH_RESPONSES);
+    match take_gateway_pipeline_completion(abort_handles, completed) {
+        Ok(Some(response)) => responses.push(response),
+        Ok(None) => return true,
+        Err(error) => {
+            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+            return false;
+        }
+    }
+    if response_batches_enabled {
+        while responses.len() < MAX_GATEWAY_PIPELINE_RESPONSE_BATCH_RESPONSES {
+            let Some(completed) = tasks.try_join_next() else {
+                break;
+            };
+            match take_gateway_pipeline_completion(abort_handles, completed) {
+                Ok(Some(response)) => responses.push(response),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                    return false;
+                }
+            }
+        }
+    }
+    send_gateway_pipeline_completions(sender, request_metrics, responses).await
+}
+
+fn take_gateway_pipeline_completion(
+    abort_handles: &mut BTreeMap<u128, AbortHandle>,
+    completed: Result<(u128, GatewaySessionResponse), tokio::task::JoinError>,
+) -> Result<Option<GatewaySessionResponse>, tokio::task::JoinError> {
     match completed {
         Ok((request_id, response)) => {
             // Cancellation emits the only terminal response and removes the
             // abort handle. A task that won the completion race must therefore
             // be discarded rather than returning a second response/credit.
-            if abort_handles.remove(&request_id).is_none() {
-                return true;
-            }
-            send_gateway_pipeline_terminal(sender, GatewayPipelineServerFrame {
+            Ok(abort_handles.remove(&request_id).map(|_| response))
+        }
+        Err(error) if error.is_cancelled() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn send_gateway_pipeline_completions(
+    sender: &mpsc::Sender<Result<GatewayPipelineServerFrame, Status>>,
+    request_metrics: &Arc<RequestStageMetrics>,
+    responses: Vec<GatewaySessionResponse>,
+) -> bool {
+    let response_count = responses.len();
+    debug_assert_ne!(response_count, 0);
+    request_metrics.record_detail(
+        dtg_execution::RequestDetail::DataGatewayPipelineCompletionFrame,
+        dtg_execution::StageOutcome::Success,
+        0,
+    );
+    let batch_bytes = responses
+        .iter()
+        .map(prost_014::Message::encoded_len)
+        .sum::<usize>();
+    if response_count > 1 && batch_bytes <= MAX_GATEWAY_PIPELINE_RESPONSE_BATCH_BYTES {
+        let sent = send_gateway_pipeline_completion_frame(
+            sender,
+            request_metrics,
+            GatewayPipelineServerFrame {
+                payload: Some(
+                    dtg_execution::cluster_protocol::proto::gateway_pipeline_server_frame::Payload::ResponseBatch(
+                        dtg_execution::cluster_protocol::proto::GatewayPipelineResponseBatch {
+                            responses,
+                        },
+                    ),
+                ),
+                returned_credits: response_count as u32,
+                emitted_unix_ns: 0,
+            },
+            response_count,
+        )
+        .await;
+        return sent;
+    }
+    for response in responses {
+        if !send_gateway_pipeline_completion_frame(
+            sender,
+            request_metrics,
+            GatewayPipelineServerFrame {
                 payload: Some(
                     dtg_execution::cluster_protocol::proto::gateway_pipeline_server_frame::Payload::Response(
                         response,
                     ),
                 ),
                 returned_credits: 1,
-            })
-            .await
-        }
-        Err(error) if error.is_cancelled() => true,
-        Err(error) => {
-            let _ = sender.send(Err(Status::internal(error.to_string()))).await;
-            false
+                emitted_unix_ns: 0,
+            },
+            1,
+        )
+        .await
+        {
+            return false;
         }
     }
+    true
+}
+
+async fn send_gateway_pipeline_completion_frame(
+    sender: &mpsc::Sender<Result<GatewayPipelineServerFrame, Status>>,
+    request_metrics: &Arc<RequestStageMetrics>,
+    mut frame: GatewayPipelineServerFrame,
+    response_count: usize,
+) -> bool {
+    frame.emitted_unix_ns = unix_timestamp_nanoseconds();
+    let send_started = Instant::now();
+    let sent = send_gateway_pipeline_terminal(sender, frame).await;
+    let outcome = if sent {
+        dtg_execution::StageOutcome::Success
+    } else {
+        dtg_execution::StageOutcome::Error
+    };
+    let elapsed = elapsed_nanoseconds(send_started);
+    for _ in 0..response_count {
+        request_metrics.record_detail(
+            dtg_execution::RequestDetail::DataGatewayPipelineCompletionSendWait,
+            outcome,
+            elapsed,
+        );
+    }
+    sent
+}
+
+fn unix_timestamp_nanoseconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+fn elapsed_since_unix_timestamp(sent_unix_ns: u64) -> Option<u64> {
+    if sent_unix_ns == 0 {
+        return None;
+    }
+    unix_timestamp_nanoseconds().checked_sub(sent_unix_ns)
 }
 
 async fn send_gateway_pipeline_terminal(
@@ -1859,6 +2048,7 @@ fn gateway_pipeline_error_frame(
             ),
         ),
         returned_credits: 1,
+        emitted_unix_ns: 0,
     }
 }
 
@@ -1971,13 +2161,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use dtg_execution::RequestStageMetrics;
     use futures_util::StreamExt as _;
-    use tokio::sync::{Barrier, mpsc};
+    use tokio::sync::{Barrier, Semaphore, mpsc};
     use tokio::task::JoinSet;
 
     use super::{
         ColumnBatch, GatewaySessionResponse, PROTOCOL_MAJOR, RequestContext, StatusCode,
-        collect_fragment_results_bounded, emit_gateway_pipeline_completion,
+        acquire_gateway_pipeline_execution_permit, collect_fragment_results_bounded,
+        emit_gateway_pipeline_completion, gateway_pipeline_execution_limit,
         gateway_query_responses, gateway_session_frame, stream_fragment_results_bounded,
         stream_gateway_pipeline_results_bounded,
     };
@@ -2096,13 +2288,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_pipeline_execution_limit_applies_across_streams() {
+        let permits = Arc::new(Semaphore::new(1));
+        let first = acquire_gateway_pipeline_execution_permit(Arc::clone(&permits)).await;
+        let second = tokio::spawn({
+            let permits = Arc::clone(&permits);
+            async move { acquire_gateway_pipeline_execution_permit(permits).await }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut std::pin::pin!(second))
+                .await
+                .is_err(),
+            "a second pipeline stream must share the process execution budget"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn configured_pipeline_execution_limit_is_bounded_and_defaults_safely() {
+        assert_eq!(gateway_pipeline_execution_limit(None), 32);
+        assert_eq!(gateway_pipeline_execution_limit(Some("64")), 64);
+        assert_eq!(gateway_pipeline_execution_limit(Some("0")), 32);
+        assert_eq!(gateway_pipeline_execution_limit(Some("129")), 32);
+        assert_eq!(gateway_pipeline_execution_limit(Some("not-a-number")), 32);
+    }
+
+    #[tokio::test]
     async fn cancelled_pipeline_request_does_not_emit_a_second_terminal_response() {
         let (sender, mut receiver) = mpsc::channel(1);
+        let metrics = Arc::new(RequestStageMetrics::default());
         let mut tasks = JoinSet::new();
         tasks.spawn(async { (7_u128, GatewaySessionResponse::default()) });
         let completed = tasks.join_next().await;
 
-        assert!(emit_gateway_pipeline_completion(&sender, &mut BTreeMap::new(), completed,).await);
+        assert!(
+            emit_gateway_pipeline_completion(
+                &sender,
+                &metrics,
+                &mut tasks,
+                &mut BTreeMap::new(),
+                completed,
+                false,
+            )
+            .await
+        );
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pipeline_completion_records_the_output_queue_wait() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let metrics = Arc::new(RequestStageMetrics::default());
+        let mut tasks = JoinSet::new();
+        let handle = tasks.spawn(async { (7_u128, GatewaySessionResponse::default()) });
+        let mut abort_handles = BTreeMap::new();
+        abort_handles.insert(7, handle);
+        let completed = tasks.join_next().await;
+
+        assert!(
+            emit_gateway_pipeline_completion(
+                &sender,
+                &metrics,
+                &mut tasks,
+                &mut abort_handles,
+                completed,
+                false,
+            )
+            .await
+        );
+        assert!(receiver.try_recv().is_ok());
+        assert_eq!(
+            metrics.snapshot().details
+                [dtg_execution::RequestDetail::DataGatewayPipelineCompletionSendWait as usize]
+                .success,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_completion_batches_ready_siblings_when_the_client_opted_in() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let metrics = Arc::new(RequestStageMetrics::default());
+        let mut tasks = JoinSet::new();
+        let first = tasks.spawn(async { (7_u128, GatewaySessionResponse::default()) });
+        let second = tasks.spawn(async { (8_u128, GatewaySessionResponse::default()) });
+        let mut abort_handles = BTreeMap::new();
+        abort_handles.insert(7, first);
+        abort_handles.insert(8, second);
+        tokio::task::yield_now().await;
+        let completed = tasks.join_next().await;
+
+        assert!(
+            emit_gateway_pipeline_completion(
+                &sender,
+                &metrics,
+                &mut tasks,
+                &mut abort_handles,
+                completed,
+                true,
+            )
+            .await
+        );
+        let frame = receiver.try_recv().expect("batched completion frame");
+        let frame = frame.expect("completion stream status");
+        assert_eq!(frame.returned_credits, 2);
+        let Some(
+            dtg_execution::cluster_protocol::proto::gateway_pipeline_server_frame::Payload::ResponseBatch(batch),
+        ) = frame.payload
+        else {
+            panic!("ready completions must be emitted in a batch");
+        };
+        assert_eq!(batch.responses.len(), 2);
     }
 }

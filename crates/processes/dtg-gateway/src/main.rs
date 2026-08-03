@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use dtg_execution::{
-    GatewayExecution, GatewayExecutionTransportFactory, RequestMetricsSink,
-    ShardRoutedGatewayTransport, TonicGatewayProtocolV2TransportFactory,
+    DEFAULT_GATEWAY_PIPELINE_STREAMS, GatewayExecution, GatewayExecutionTransportFactory,
+    RequestMetricsSink, ShardRoutedGatewayTransport, TonicGatewayProtocolV2TransportFactory,
     TonicGatewayWriteTransport, encode_request_metrics_snapshot,
 };
 use dtg_gateway::{GatewayConfig, GatewayService, build_gateway_runtime};
@@ -23,8 +23,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("DTG_GATEWAY_QUERY_SESSIONS").map_or(true, |value| value != "0");
     let query_pipelines_enabled =
         std::env::var("DTG_GATEWAY_QUERY_PIPELINE").map_or(true, |value| value != "0");
+    let query_pipeline_streams = std::env::var("DTG_GATEWAY_QUERY_PIPELINE_STREAMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GATEWAY_PIPELINE_STREAMS);
     let factory = TonicGatewayProtocolV2TransportFactory::new(query_sessions_enabled)
-        .with_query_pipelines(query_pipelines_enabled);
+        .with_query_pipelines(query_pipelines_enabled)
+        .with_query_pipeline_streams(query_pipeline_streams);
     let default_transport = factory.connect(config.cluster_endpoint()).await?;
     let mut shard_transports = std::collections::BTreeMap::new();
     for (shard_id, endpoint) in config.shard_endpoints() {

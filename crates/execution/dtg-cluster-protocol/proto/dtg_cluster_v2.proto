@@ -161,6 +161,7 @@ message GatewaySessionResponse {
 
 message GatewayPipelineRequestBatch {
   repeated GatewayRequest requests = 1;
+  bool accepts_response_batches = 2;
 }
 
 message GatewayPipelineCancel {
@@ -172,18 +173,25 @@ message GatewayPipelineClientFrame {
     GatewayPipelineRequestBatch batch = 1;
     GatewayPipelineCancel cancel = 2;
   }
+  uint64 sent_unix_ns = 3;
 }
 
 message GatewayPipelineCredit {
   uint32 available_requests = 1;
 }
 
+message GatewayPipelineResponseBatch {
+  repeated GatewaySessionResponse responses = 1;
+}
+
 message GatewayPipelineServerFrame {
   oneof payload {
     GatewaySessionResponse response = 1;
     GatewayPipelineCredit credit = 2;
+    GatewayPipelineResponseBatch response_batch = 4;
   }
   uint32 returned_credits = 3;
+  uint64 emitted_unix_ns = 5;
 }
 
 service GatewayService {

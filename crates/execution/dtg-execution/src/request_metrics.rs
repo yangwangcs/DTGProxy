@@ -6,7 +6,7 @@ use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
 const REQUEST_STAGES: usize = 10;
-const REQUEST_DETAILS: usize = 37;
+const REQUEST_DETAILS: usize = 45;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -97,6 +97,14 @@ pub enum RequestDetail {
     BoltReadPipelineEnqueueWait,
     BoltReadPipelineExecutionWait,
     BoltReadPipelineOrderedWriteWait,
+    GatewayQueryPipelineCreditWait,
+    DataGatewayPipelineDispatchWait,
+    DataGatewayPipelineCompletionSendWait,
+    DataGatewayPipelineCompletionFrame,
+    GatewayQueryPipelineResponseTransportWait,
+    GatewayQueryPipelineResponseDispatchWait,
+    DataGatewayPipelineRequestTransportWait,
+    GatewayQueryPipelineWriterWait,
 }
 
 impl RequestDetail {
@@ -138,6 +146,14 @@ impl RequestDetail {
         Self::BoltReadPipelineEnqueueWait,
         Self::BoltReadPipelineExecutionWait,
         Self::BoltReadPipelineOrderedWriteWait,
+        Self::GatewayQueryPipelineCreditWait,
+        Self::DataGatewayPipelineDispatchWait,
+        Self::DataGatewayPipelineCompletionSendWait,
+        Self::DataGatewayPipelineCompletionFrame,
+        Self::GatewayQueryPipelineResponseTransportWait,
+        Self::GatewayQueryPipelineResponseDispatchWait,
+        Self::DataGatewayPipelineRequestTransportWait,
+        Self::GatewayQueryPipelineWriterWait,
     ];
 
     const fn index(self) -> usize {
@@ -183,6 +199,22 @@ impl RequestDetail {
             Self::BoltReadPipelineEnqueueWait => "bolt_read_pipeline_enqueue_wait",
             Self::BoltReadPipelineExecutionWait => "bolt_read_pipeline_execution_wait",
             Self::BoltReadPipelineOrderedWriteWait => "bolt_read_pipeline_ordered_write_wait",
+            Self::GatewayQueryPipelineCreditWait => "gateway_query_pipeline_credit_wait",
+            Self::DataGatewayPipelineDispatchWait => "data_gateway_pipeline_dispatch_wait",
+            Self::DataGatewayPipelineCompletionSendWait => {
+                "data_gateway_pipeline_completion_send_wait"
+            }
+            Self::DataGatewayPipelineCompletionFrame => "data_gateway_pipeline_completion_frame",
+            Self::GatewayQueryPipelineResponseTransportWait => {
+                "gateway_query_pipeline_response_transport_wait"
+            }
+            Self::GatewayQueryPipelineResponseDispatchWait => {
+                "gateway_query_pipeline_response_dispatch_wait"
+            }
+            Self::DataGatewayPipelineRequestTransportWait => {
+                "data_gateway_pipeline_request_transport_wait"
+            }
+            Self::GatewayQueryPipelineWriterWait => "gateway_query_pipeline_writer_wait",
         }
     }
 }
@@ -456,7 +488,7 @@ pub fn encode_request_metrics_snapshot(
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&serde_json::json!({
-        "schema_version": 9,
+        "schema_version": 14,
         "process_role": process_role,
         "unix_timestamp_ns": unix_timestamp_ns,
         "sequence": sequence,
@@ -561,7 +593,7 @@ mod tests {
             encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 9);
+        assert_eq!(value["schema_version"], 14);
         assert_eq!(value["process_role"], "gateway");
         assert_eq!(value["unix_timestamp_ns"], 7);
         assert_eq!(value["sequence"], 11);
@@ -569,7 +601,7 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "gateway_compile");
         assert_eq!(value["stages"][1]["success"], 1);
         assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
-        assert_eq!(value["details"].as_array().unwrap().len(), 37);
+        assert_eq!(value["details"].as_array().unwrap().len(), 45);
         assert_eq!(value["details"][12]["detail"], "data_read_view_cache_hit");
         assert_eq!(value["details"][12]["success"], 1);
         assert_eq!(value["details"][19]["detail"], "gateway_meta_prepare_write");
@@ -625,6 +657,38 @@ mod tests {
         assert_eq!(
             value["details"][36]["detail"],
             "bolt_read_pipeline_ordered_write_wait"
+        );
+        assert_eq!(
+            value["details"][37]["detail"],
+            "gateway_query_pipeline_credit_wait"
+        );
+        assert_eq!(
+            value["details"][38]["detail"],
+            "data_gateway_pipeline_dispatch_wait"
+        );
+        assert_eq!(
+            value["details"][39]["detail"],
+            "data_gateway_pipeline_completion_send_wait"
+        );
+        assert_eq!(
+            value["details"][40]["detail"],
+            "data_gateway_pipeline_completion_frame"
+        );
+        assert_eq!(
+            value["details"][41]["detail"],
+            "gateway_query_pipeline_response_transport_wait"
+        );
+        assert_eq!(
+            value["details"][42]["detail"],
+            "gateway_query_pipeline_response_dispatch_wait"
+        );
+        assert_eq!(
+            value["details"][43]["detail"],
+            "data_gateway_pipeline_request_transport_wait"
+        );
+        assert_eq!(
+            value["details"][44]["detail"],
+            "gateway_query_pipeline_writer_wait"
         );
         assert!(!encoded.contains("statement"));
         assert!(!encoded.contains("parameter"));
