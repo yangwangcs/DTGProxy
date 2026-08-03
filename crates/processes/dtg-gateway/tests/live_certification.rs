@@ -98,6 +98,7 @@ async fn four_process_functional_probes_and_real_bolt_query() {
         &[],
         &[
             ("DTG_DATA_RPC_ADDR", data_rpc.as_str()),
+            ("DTG_DATA_BACKEND_KIND", "fjall"),
             ("DTG_DATA_FJALL_ROOT", data_fjall.to_str().unwrap()),
             ("DTG_DATA_CONSENSUS_ROOT", data_raft.to_str().unwrap()),
             ("DTG_DATA_CAPABILITIES", CAPABILITIES),

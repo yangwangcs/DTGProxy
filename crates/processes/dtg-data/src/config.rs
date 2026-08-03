@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -58,6 +58,7 @@ impl std::error::Error for DataConfigError {}
 
 #[derive(Clone, Debug)]
 pub struct DataProcessConfig {
+    backend_kind: ProviderKind,
     rpc_addr: SocketAddr,
     gateway_unix_socket: Option<PathBuf>,
     fjall_root: PathBuf,
@@ -65,13 +66,13 @@ pub struct DataProcessConfig {
     consensus_root: PathBuf,
     endpoint_profiles: BTreeMap<String, EndpointProfile>,
     credential_profiles: BTreeMap<String, CredentialProfile>,
-    remote_providers: BTreeSet<String>,
     assignments: Vec<ReplicaBinding>,
 }
 
 impl DataProcessConfig {
     pub fn new(fjall_root: impl AsRef<Path>, consensus_root: impl AsRef<Path>) -> Self {
         Self {
+            backend_kind: ProviderKind::Fjall,
             rpc_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50052),
             gateway_unix_socket: None,
             fjall_root: fjall_root.as_ref().to_path_buf(),
@@ -79,7 +80,6 @@ impl DataProcessConfig {
             consensus_root: consensus_root.as_ref().to_path_buf(),
             endpoint_profiles: BTreeMap::new(),
             credential_profiles: BTreeMap::new(),
-            remote_providers: BTreeSet::new(),
             assignments: Vec::new(),
         }
     }
@@ -92,6 +92,8 @@ impl DataProcessConfig {
     pub fn from_environment(
         get: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Self, DataConfigError> {
+        let backend_kind =
+            parse_backend_kind(&required_environment_string(&get, "DTG_DATA_BACKEND_KIND")?)?;
         let fjall_root = get("DTG_DATA_FJALL_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./dtg-data/business"));
@@ -119,6 +121,7 @@ impl DataProcessConfig {
         let mut config = Self::new(fjall_root, consensus_root)
             .with_kuzu_root(kuzu_root)
             .with_rpc_addr(rpc_addr);
+        config.backend_kind = backend_kind;
         config.gateway_unix_socket = gateway_unix_socket;
         if let Some(assignments) = environment_string(&get, "DTG_DATA_ASSIGNMENTS")? {
             let capability_names =
@@ -172,15 +175,19 @@ impl DataProcessConfig {
     }
 
     #[must_use]
-    pub fn with_remote_provider(mut self, name: impl Into<String>) -> Self {
-        self.remote_providers.insert(name.into());
+    pub fn assign(mut self, binding: ReplicaBinding) -> Self {
+        self.assignments.push(binding);
         self
     }
 
     #[must_use]
-    pub fn assign(mut self, binding: ReplicaBinding) -> Self {
-        self.assignments.push(binding);
+    pub fn with_backend_kind(mut self, backend_kind: ProviderKind) -> Self {
+        self.backend_kind = backend_kind;
         self
+    }
+
+    pub fn backend_kind(&self) -> &ProviderKind {
+        &self.backend_kind
     }
 
     pub const fn rpc_addr(&self) -> SocketAddr {
@@ -217,10 +224,6 @@ impl DataProcessConfig {
         &self.credential_profiles
     }
 
-    pub(crate) fn remote_providers(&self) -> &BTreeSet<String> {
-        &self.remote_providers
-    }
-
     pub(crate) fn assignments(&self) -> &[ReplicaBinding] {
         &self.assignments
     }
@@ -251,6 +254,15 @@ fn configure_environment_bootstrap(
     mut config: DataProcessConfig,
     get: &impl Fn(&str) -> Option<OsString>,
 ) -> Result<DataProcessConfig, DataConfigError> {
+    if config
+        .assignments
+        .iter()
+        .any(|binding| binding.provider_kind() != config.backend_kind())
+    {
+        return Err(DataConfigError::InvalidAssignment(
+            "assignment provider does not match DTG_DATA_BACKEND_KIND".into(),
+        ));
+    }
     let has_postgresql = config
         .assignments
         .iter()
@@ -269,6 +281,17 @@ fn configure_environment_bootstrap(
             );
     }
     Ok(config)
+}
+
+fn parse_backend_kind(value: &str) -> Result<ProviderKind, DataConfigError> {
+    match value {
+        "fjall" => Ok(ProviderKind::Fjall),
+        "postgresql" => Ok(ProviderKind::PostgreSql),
+        "kuzu" => Ok(ProviderKind::Kuzu),
+        _ => Err(DataConfigError::InvalidEnvironment(
+            "DTG_DATA_BACKEND_KIND must be fjall, postgresql, or kuzu".into(),
+        )),
+    }
 }
 
 fn parse_assignment(
@@ -338,6 +361,7 @@ mod tests {
     #[test]
     fn environment_accepts_only_absolute_gateway_unix_socket_paths() {
         let absolute = DataProcessConfig::from_environment(|name| match name {
+            "DTG_DATA_BACKEND_KIND" => Some(OsString::from("fjall")),
             "DTG_DATA_GATEWAY_UNIX_SOCKET" => Some(OsString::from("/tmp/dtg-data.sock")),
             _ => None,
         })
@@ -348,6 +372,7 @@ mod tests {
         );
 
         let error = DataProcessConfig::from_environment(|name| match name {
+            "DTG_DATA_BACKEND_KIND" => Some(OsString::from("fjall")),
             "DTG_DATA_GATEWAY_UNIX_SOCKET" => Some(OsString::from("relative.sock")),
             _ => None,
         })
@@ -358,6 +383,7 @@ mod tests {
     #[test]
     fn environment_bootstrap_loads_postgresql_profile() {
         let values = BTreeMap::from([
+            ("DTG_DATA_BACKEND_KIND", OsString::from("postgresql")),
             (
                 "DTG_DATA_CAPABILITIES",
                 OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
@@ -389,6 +415,7 @@ mod tests {
     #[test]
     fn environment_bootstrap_loads_local_kuzu_root_without_credentials() {
         let values = BTreeMap::from([
+            ("DTG_DATA_BACKEND_KIND", OsString::from("kuzu")),
             (
                 "DTG_DATA_CAPABILITIES",
                 OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
@@ -408,6 +435,7 @@ mod tests {
     #[test]
     fn external_assignment_rejects_incomplete_profile() {
         let values = BTreeMap::from([
+            ("DTG_DATA_BACKEND_KIND", OsString::from("postgresql")),
             (
                 "DTG_DATA_CAPABILITIES",
                 OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
@@ -424,5 +452,33 @@ mod tests {
         let error =
             DataProcessConfig::from_environment(|name| values.get(name).cloned()).unwrap_err();
         assert!(error.to_string().contains("DTG_DATA_POSTGRES_CREDENTIAL"));
+    }
+
+    #[test]
+    fn environment_requires_one_declared_backend_kind() {
+        let error = DataProcessConfig::from_environment(|_| None).unwrap_err();
+        assert!(error.to_string().contains("DTG_DATA_BACKEND_KIND"));
+    }
+
+    #[test]
+    fn environment_rejects_an_assignment_for_another_backend_kind() {
+        let values = BTreeMap::from([
+            ("DTG_DATA_BACKEND_KIND", OsString::from("fjall")),
+            (
+                "DTG_DATA_CAPABILITIES",
+                OsString::from("adjacency,immutable-read-view,logical-snapshot,point"),
+            ),
+            (
+                "DTG_DATA_ASSIGNMENTS",
+                OsString::from("7:11:13:17:19:23:kuzu:1:1:kuzu-bench"),
+            ),
+        ]);
+        let error =
+            DataProcessConfig::from_environment(|name| values.get(name).cloned()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match DTG_DATA_BACKEND_KIND")
+        );
     }
 }

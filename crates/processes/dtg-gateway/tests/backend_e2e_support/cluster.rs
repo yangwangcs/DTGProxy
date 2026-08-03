@@ -191,6 +191,14 @@ impl DiagnosticCluster {
         let mut data_environment = vec![
             ("DTG_DATA_RPC_ADDR", data_address.to_string()),
             (
+                "DTG_DATA_BACKEND_KIND",
+                match spec.backend {
+                    Backend::Fjall => "fjall".into(),
+                    Backend::PostgreSql => "postgresql".into(),
+                    Backend::Kuzu => "kuzu".into(),
+                },
+            ),
+            (
                 "DTG_DATA_FJALL_ROOT",
                 cluster
                     .root

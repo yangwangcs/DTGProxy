@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, ffi::OsString};
 
 use dtg_data::{
     CredentialProfile, DataNodeBuilder, DataProcessConfig, DataRpcService, EndpointProfile,
-    LifecycleState,
+    LifecycleState, RemoteResolver,
 };
 use dtg_execution::cluster_protocol::PROTOCOL_MAJOR;
 use dtg_execution::cluster_protocol::checksum_bytes;
@@ -323,6 +323,7 @@ impl GatewayProtocolV2Client for InProcessDataGatewayClient {
 async fn environment_bootstrap_assignments_start_a_fenced_replica() {
     let root = tempfile::tempdir().unwrap();
     let values = BTreeMap::from([
+        ("DTG_DATA_BACKEND_KIND", OsString::from("fjall")),
         (
             "DTG_DATA_FJALL_ROOT",
             root.path().join("business").into_os_string(),
@@ -372,7 +373,7 @@ fn shard_context(binding: &ReplicaBinding) -> ShardContext {
 }
 
 #[tokio::test]
-async fn process_composes_official_providers_and_v2_lifecycle_metrics() {
+async fn process_composes_only_the_selected_official_provider_and_v2_lifecycle_metrics() {
     let root = tempfile::tempdir().unwrap();
     let config = DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
         .with_endpoint_profile(
@@ -386,14 +387,7 @@ async fn process_composes_official_providers_and_v2_lifecycle_metrics() {
         .with_kuzu_root(root.path().join("kuzu"));
     let node = DataNodeBuilder::from_config(config).start().await.unwrap();
 
-    assert_eq!(
-        node.provider_kinds(),
-        vec![
-            ProviderKind::Fjall,
-            ProviderKind::PostgreSql,
-            ProviderKind::Kuzu,
-        ]
-    );
+    assert_eq!(node.provider_kinds(), vec![ProviderKind::Fjall]);
     assert_eq!(node.rpc_service().protocol_major(), PROTOCOL_MAJOR);
     assert_eq!(node.lifecycle(), LifecycleState::Ready);
     assert_eq!(node.metrics().hosted_replicas(), 0);
@@ -1842,15 +1836,21 @@ async fn remote_provider_uses_the_versioned_storage_client_path() {
     let endpoint_profile = binding.endpoint_profile_ref().to_owned();
     let credential_profile = binding.credential_ref().to_owned();
     let config = DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
-        .with_remote_provider("third-party")
         .with_endpoint_profile(endpoint_profile, EndpointProfile::Remote(server.uri()))
         .with_credential_profile(
             credential_profile,
             CredentialProfile::RemoteSignedToken([0xd7; 32]),
-        )
-        .assign(binding);
+        );
 
-    let node = DataNodeBuilder::from_config(config).start().await.unwrap();
+    let node = DataNodeBuilder::new(config.consensus_root())
+        .with_provider(
+            ProviderKind::Remote("third-party".into()),
+            Arc::new(RemoteResolver::from_config("third-party", &config)),
+        )
+        .assign(binding)
+        .start()
+        .await
+        .unwrap();
 
     let failures = node.replica_failures().await;
     assert!(

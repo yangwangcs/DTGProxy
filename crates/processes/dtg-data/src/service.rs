@@ -41,7 +41,7 @@ use tokio::time::{Instant, timeout_at};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{DataProcessConfig, FjallResolver, KuzuResolver, PostgresResolver, RemoteResolver};
+use crate::{DataProcessConfig, FjallResolver, KuzuResolver, PostgresResolver};
 
 const APPLY_BATCH_WINDOW: Duration = Duration::from_micros(250);
 const APPLY_BATCH_MAX_COMMANDS: usize = 64;
@@ -261,25 +261,24 @@ impl DataNodeBuilder {
     }
 
     pub fn from_config(config: DataProcessConfig) -> Self {
-        let mut builder = Self::new(config.consensus_root())
-            .with_provider(
+        let mut builder = Self::new(config.consensus_root());
+        builder = match config.backend_kind() {
+            ProviderKind::Fjall => builder.with_provider(
                 ProviderKind::Fjall,
                 Arc::new(FjallResolver::new(config.fjall_root())),
-            )
-            .with_provider(
+            ),
+            ProviderKind::PostgreSql => builder.with_provider(
                 ProviderKind::PostgreSql,
                 Arc::new(PostgresResolver::from_config(&config)),
-            )
-            .with_provider(
+            ),
+            ProviderKind::Kuzu => builder.with_provider(
                 ProviderKind::Kuzu,
                 Arc::new(KuzuResolver::new(config.kuzu_root())),
-            );
-        for name in config.remote_providers() {
-            builder = builder.with_provider(
-                ProviderKind::Remote(name.clone()),
-                Arc::new(RemoteResolver::from_config(name, &config)),
-            );
-        }
+            ),
+            ProviderKind::Remote(_) => {
+                unreachable!("environment configuration rejects remote backends")
+            }
+        };
         for binding in config.assignments() {
             builder = builder.assign(binding.clone());
         }
