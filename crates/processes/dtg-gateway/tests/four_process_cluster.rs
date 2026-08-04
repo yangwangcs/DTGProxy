@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dtg_controller::ControllerConfig;
 use dtg_data::{DataNodeBuilder, DataProcessConfig, LifecycleState};
@@ -36,6 +37,8 @@ use tonic::Request;
 use tonic::codegen::tokio_stream::StreamExt;
 
 const FIXTURE_ROOT: &str = "../../../config/examples/clean-break-cluster";
+const STATIC_SHARD_CASE_TIMEOUT: Duration = Duration::from_secs(20);
+static NEXT_STATIC_SHARD_CASE_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[test]
 fn clean_break_fixtures_define_four_roles_and_two_heterogeneous_data_nodes() {
@@ -290,12 +293,13 @@ fn static_shard_capabilities() -> CapabilityManifest {
 
 fn static_shard_binding(
     capabilities: &CapabilityManifest,
+    provider: ProviderKind,
     shard_id: u64,
     replica_id: u64,
     namespace: &str,
 ) -> ReplicaBinding {
     let class = BackendClass::new(
-        ProviderKind::Fjall,
+        provider.clone(),
         1,
         1,
         capabilities.names().map(str::to_owned),
@@ -309,7 +313,7 @@ fn static_shard_binding(
         .replica_id(replica_id)
         .backend_generation(23)
         .backend_class_digest(class.digest())
-        .provider_kind(ProviderKind::Fjall)
+        .provider_kind(provider)
         .contract_version(1)
         .layout_version(1)
         .capability_digest(capabilities.digest())
@@ -438,45 +442,170 @@ fn endpoint_call_delta(before: &[usize], after: &[usize]) -> Vec<usize> {
 }
 
 #[tokio::test]
-async fn static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_endpoints() {
-    let root = tempfile::tempdir().unwrap();
-    let capabilities = static_shard_capabilities();
-    let bindings = [
-        static_shard_binding(&capabilities, 13, 19, "static-shard-13"),
-        static_shard_binding(&capabilities, 14, 20, "static-shard-14"),
-        static_shard_binding(&capabilities, 15, 21, "static-shard-15"),
-    ];
-    let mut nodes = Vec::new();
-    for (ordinal, binding) in bindings.iter().enumerate() {
-        nodes.push(
-            DataNodeBuilder::from_config(
-                DataProcessConfig::new(
-                    root.path().join(format!("data-{ordinal}/business")),
-                    root.path().join(format!("data-{ordinal}/raft")),
-                )
-                .assign(binding.clone()),
-            )
-            .start()
-            .await
-            .unwrap(),
-        );
+async fn static_shard_snapshot_routes_fjall() {
+    let result = run_static_shard_case(ProviderKind::Fjall, StaticShardRuntime::empty()).await;
+
+    assert_eq!(result.point_call_delta, [0, 0, 1]);
+    assert_eq!(result.adjacency_call_delta, [0, 0, 1]);
+    assert_eq!(result.count_call_delta, [1, 1, 1]);
+    assert!(result.fences.iter().all(|fence| fence.snapshot_immutable));
+}
+
+#[tokio::test]
+async fn static_shard_snapshot_routes_kuzu() {
+    let result = run_static_shard_case(ProviderKind::Kuzu, StaticShardRuntime::empty()).await;
+
+    assert_eq!(result.point_call_delta, [0, 0, 1]);
+    assert_eq!(result.adjacency_call_delta, [0, 0, 1]);
+    assert_eq!(result.count_call_delta, [1, 1, 1]);
+    assert!(result.fences.iter().all(|fence| fence.snapshot_immutable));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL endpoint and credential test environment"]
+async fn static_shard_snapshot_routes_postgresql() {
+    let runtime = StaticShardRuntime::from_environment();
+    let result = run_static_shard_case(ProviderKind::PostgreSql, runtime).await;
+
+    assert_eq!(result.point_call_delta, [0, 0, 1]);
+    assert_eq!(result.adjacency_call_delta, [0, 0, 1]);
+    assert_eq!(result.count_call_delta, [1, 1, 1]);
+    assert!(result.fences.iter().all(|fence| fence.snapshot_immutable));
+}
+
+struct StaticShardCase {
+    point_call_delta: [usize; 3],
+    adjacency_call_delta: [usize; 3],
+    count_call_delta: [usize; 3],
+    fences: Vec<FragmentFenceEvidence>,
+}
+
+#[derive(Clone, Debug)]
+struct StaticShardRuntime {
+    postgres_endpoint: String,
+    postgres_credential: String,
+}
+
+impl StaticShardRuntime {
+    fn empty() -> Self {
+        Self {
+            postgres_endpoint: String::new(),
+            postgres_credential: String::new(),
+        }
     }
 
-    let applied_indices = [
-        commit_static_shard(&nodes[0], &bindings[0], 101, vec![static_vertex(39)]).await,
-        commit_static_shard(&nodes[1], &bindings[1], 102, vec![static_vertex(40)]).await,
-        commit_static_shard(
-            &nodes[2],
-            &bindings[2],
-            103,
-            vec![
-                static_vertex(41),
-                static_vertex(44),
-                static_edge(73, 41, 44),
-            ],
-        )
-        .await,
+    fn from_environment() -> Self {
+        Self {
+            postgres_endpoint: std::env::var("DTG_STATIC_SHARD_POSTGRES_ENDPOINT")
+                .or_else(|_| std::env::var("DTG_BACKEND_E2E_POSTGRES_ENDPOINT"))
+                .or_else(|_| std::env::var("DTG_POSTGRES_URL"))
+                .expect("a PostgreSQL endpoint is required"),
+            postgres_credential: std::env::var("DTG_STATIC_SHARD_POSTGRES_CREDENTIAL")
+                .or_else(|_| std::env::var("DTG_BACKEND_E2E_POSTGRES_CREDENTIAL"))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+async fn run_static_shard_case(
+    backend: ProviderKind,
+    runtime: StaticShardRuntime,
+) -> StaticShardCase {
+    tokio::time::timeout(
+        STATIC_SHARD_CASE_TIMEOUT,
+        static_shard_case(backend, runtime),
+    )
+    .await
+    .expect("static three-Data-shard topology must complete before its bounded timeout")
+}
+
+async fn static_shard_case(backend: ProviderKind, runtime: StaticShardRuntime) -> StaticShardCase {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = static_shard_capabilities();
+    let case_id = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT_STATIC_SHARD_CASE_ID.fetch_add(1, Ordering::SeqCst)
+    );
+    let bindings = [
+        static_shard_binding(
+            &capabilities,
+            backend.clone(),
+            13,
+            19,
+            &format!("static-shard-{case_id}-13"),
+        ),
+        static_shard_binding(
+            &capabilities,
+            backend.clone(),
+            14,
+            20,
+            &format!("static-shard-{case_id}-14"),
+        ),
+        static_shard_binding(
+            &capabilities,
+            backend.clone(),
+            15,
+            21,
+            &format!("static-shard-{case_id}-15"),
+        ),
     ];
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| binding.namespace_id().as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3
+    );
+    let mut nodes = Vec::new();
+    for (ordinal, binding) in bindings.iter().enumerate() {
+        let config = DataProcessConfig::new(
+            root.path().join(format!("data-{ordinal}/business")),
+            root.path().join(format!("data-{ordinal}/raft")),
+        )
+        .with_backend_kind(backend.clone())
+        .with_kuzu_root(root.path().join(format!("data-{ordinal}/kuzu")))
+        .assign(binding.clone());
+        let config = if backend == ProviderKind::PostgreSql {
+            config
+                .with_endpoint_profile(
+                    "local",
+                    dtg_data::EndpointProfile::PostgreSql(runtime.postgres_endpoint.clone()),
+                )
+                .with_credential_profile(
+                    "local",
+                    dtg_data::CredentialProfile::PostgreSql(runtime.postgres_credential.clone()),
+                )
+        } else {
+            config
+        };
+        nodes.push(DataNodeBuilder::from_config(config).start().await.unwrap());
+    }
+    for node in &nodes {
+        assert_eq!(node.provider_kinds(), vec![backend.clone()]);
+    }
+
+    let applied_13 =
+        commit_static_shard(&nodes[0], &bindings[0], 101, vec![static_vertex(39)]).await;
+    let applied_14 =
+        commit_static_shard(&nodes[1], &bindings[1], 102, vec![static_vertex(40)]).await;
+    let applied_15 = commit_static_shard(
+        &nodes[2],
+        &bindings[2],
+        103,
+        vec![
+            static_vertex(41),
+            static_vertex(44),
+            static_edge(73, 41, 44),
+        ],
+    )
+    .await;
+    let applied_indices = [applied_13, applied_14, applied_15];
     assert_eq!(
         applied_indices.into_iter().collect::<BTreeSet<_>>().len(),
         1
@@ -520,10 +649,7 @@ async fn static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_en
         .await
         .unwrap();
     assert_eq!(point.rows(), &[vec![GatewayValue::Integer(41)]]);
-    assert_eq!(
-        endpoint_call_delta(&before_point, &endpoint_call_counts(&endpoints)),
-        vec![0, 0, 1]
-    );
+    let point_call_delta = endpoint_call_delta(&before_point, &endpoint_call_counts(&endpoints));
 
     let before_adjacency = endpoint_call_counts(&endpoints);
     let adjacency = gateway
@@ -534,10 +660,8 @@ async fn static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_en
         .await
         .unwrap();
     assert_eq!(adjacency.rows().len(), 1);
-    assert_eq!(
-        endpoint_call_delta(&before_adjacency, &endpoint_call_counts(&endpoints)),
-        vec![0, 0, 1]
-    );
+    let adjacency_call_delta =
+        endpoint_call_delta(&before_adjacency, &endpoint_call_counts(&endpoints));
 
     let before_count = endpoint_call_counts(&endpoints);
     let count = gateway
@@ -547,17 +671,14 @@ async fn static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_en
         .await
         .unwrap();
     assert_eq!(count.rows(), &[vec![GatewayValue::Integer(4)]]);
-    assert_eq!(
-        endpoint_call_delta(&before_count, &endpoint_call_counts(&endpoints)),
-        vec![1, 1, 1]
-    );
+    let count_call_delta = endpoint_call_delta(&before_count, &endpoint_call_counts(&endpoints));
 
     let evidence = endpoints
         .iter()
         .flat_map(|endpoint| endpoint.fences())
         .collect::<Vec<_>>();
     assert_eq!(evidence.len(), 5);
-    for fence in evidence {
+    for fence in &evidence {
         assert_eq!(fence.placement_epoch, 17);
         assert_eq!(fence.backend_generation, 23);
         assert_eq!(fence.catalog_revision, 29);
@@ -575,5 +696,13 @@ async fn static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_en
     for node in nodes {
         node.stop();
     }
+
+    StaticShardCase {
+        point_call_delta: point_call_delta.try_into().unwrap(),
+        adjacency_call_delta: adjacency_call_delta.try_into().unwrap(),
+        count_call_delta: count_call_delta.try_into().unwrap(),
+        fences: evidence,
+    }
 }
+
 mod support;
