@@ -328,8 +328,12 @@ impl GatewayExecutionTransport for MaterializingClusterTransport {
         &self,
         request: GatewayClusterRequest,
     ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
-        self.requests.lock().unwrap().push(request);
-        Box::pin(async { Ok(GatewayQueryResponse::Materialized(BTreeMap::new())) })
+        self.requests.lock().unwrap().push(request.clone());
+        Box::pin(async move {
+            Ok(GatewayQueryResponse::Materialized(
+                materialized_fragment_ids(&request),
+            ))
+        })
     }
 }
 
@@ -352,6 +356,80 @@ impl GatewayExecutionTransport for PendingClusterTransport {
     ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
         Box::pin(std::future::pending())
     }
+}
+
+struct DelayedClusterTransport {
+    delay: Duration,
+    query_calls: AtomicUsize,
+}
+
+struct FixedFragmentClusterTransport {
+    response_fragment_id: u32,
+}
+
+impl GatewayExecutionTransport for FixedFragmentClusterTransport {
+    fn execute(
+        &self,
+        _request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
+        Box::pin(async { Ok(GatewayResponse::Acknowledged) })
+    }
+
+    fn execute_query(
+        &self,
+        _request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        let fragment_id = self.response_fragment_id;
+        Box::pin(async move {
+            Ok(GatewayQueryResponse::Materialized(BTreeMap::from([(
+                fragment_id,
+                Vec::new(),
+            )])))
+        })
+    }
+}
+
+impl DelayedClusterTransport {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            query_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl GatewayExecutionTransport for DelayedClusterTransport {
+    fn execute(
+        &self,
+        _request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayResponse, GatewayExecutionError>> {
+        Box::pin(async { Ok(GatewayResponse::Acknowledged) })
+    }
+
+    fn execute_query(
+        &self,
+        request: GatewayClusterRequest,
+    ) -> GatewayFuture<'_, Result<GatewayQueryResponse, GatewayExecutionError>> {
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(GatewayQueryResponse::Materialized(
+                materialized_fragment_ids(&request),
+            ))
+        })
+    }
+}
+
+fn materialized_fragment_ids(
+    request: &GatewayClusterRequest,
+) -> BTreeMap<u32, Vec<dtg_query::ColumnBatch>> {
+    request
+        .physical_plan()
+        .into_iter()
+        .flat_map(|plan| plan.fragments())
+        .map(|fragment| (fragment.id().get(), Vec::new()))
+        .collect()
 }
 
 #[test]
@@ -1009,6 +1087,70 @@ fn process_routes_each_fenced_fragment_to_its_data_transport() {
             .get(),
         14
     );
+}
+
+#[tokio::test]
+async fn shard_routed_fragments_execute_concurrently() {
+    let delay = Duration::from_millis(150);
+    let default = Arc::new(DelayedClusterTransport::new(delay));
+    let secondary = Arc::new(DelayedClusterTransport::new(delay));
+    let execution = GatewayExecution::for_process(
+        Arc::new(ShardRoutedGatewayTransport::new(
+            default.clone(),
+            BTreeMap::from([(14, secondary.clone() as Arc<dyn GatewayExecutionTransport>)]),
+        )),
+        two_shard_planning_context(),
+    );
+
+    let started = std::time::Instant::now();
+    let response = execution
+        .execute_statement(
+            GatewayRequestContext::new(7, 107, u64::MAX, Vec::new()).unwrap(),
+            "MATCH (n) RETURN n.id".into(),
+            BTreeMap::new(),
+            None,
+            &GatewayCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let GatewayResponse::Rows(rows) = response else {
+        panic!("expected rows response")
+    };
+    assert_eq!(rows.fields(), &["n.id"]);
+    assert!(rows.rows().is_empty());
+    assert!(started.elapsed() < Duration::from_millis(240));
+    assert_eq!(default.query_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(secondary.query_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn shard_routed_transport_rejects_fragment_from_wrong_owner() {
+    let default = Arc::new(FixedFragmentClusterTransport {
+        response_fragment_id: 2,
+    });
+    let secondary = Arc::new(FixedFragmentClusterTransport {
+        response_fragment_id: 1,
+    });
+    let execution = GatewayExecution::for_process(
+        Arc::new(ShardRoutedGatewayTransport::new(
+            default,
+            BTreeMap::from([(14, secondary as Arc<dyn GatewayExecutionTransport>)]),
+        )),
+        two_shard_planning_context(),
+    );
+
+    let error = block_on(execution.execute_statement(
+        GatewayRequestContext::new(7, 108, u64::MAX, Vec::new()).unwrap(),
+        "MATCH (n) RETURN n.id".into(),
+        BTreeMap::new(),
+        None,
+        &GatewayCancellationToken::new(),
+    ))
+    .unwrap_err();
+
+    assert_eq!(error.code(), "DTG-CLUSTER-ROUTING");
+    assert_eq!(error.retry(), dtg_execution::GatewayRetry::Safe);
 }
 
 #[test]

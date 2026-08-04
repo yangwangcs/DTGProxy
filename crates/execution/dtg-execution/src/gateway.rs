@@ -51,6 +51,7 @@ use tonic::transport::{Channel, Endpoint};
 use crate::{ExecutionBuildError, RequestDetail, RequestStage, RequestStageMetrics, StageOutcome};
 
 const PARTIAL_VERTEX_COUNT_FIELD: &str = "__dtg_partial_vertex_count";
+const MAX_SHARD_QUERY_FANOUT: usize = 64;
 
 trait AnalyticsRuntime: Send + Sync {
     fn tick(
@@ -1056,29 +1057,57 @@ impl GatewayExecutionTransport for ShardRoutedGatewayTransport {
         for (shard_id, fragments) in grouped {
             let transport = self.routes.get(&shard_id).unwrap_or(&self.default).clone();
             let mut routed = request.clone();
+            let mut expected_fragment_ids = fragments
+                .iter()
+                .map(|fragment| fragment.id().get())
+                .collect::<Vec<_>>();
+            expected_fragment_ids.sort_unstable();
             let mut routed_plan = plan.clone();
             routed_plan.fragments = fragments;
             routed.physical_plan = Some(routed_plan);
-            requests.push((transport, routed));
+            requests.push((transport, routed, expected_fragment_ids));
         }
         Box::pin(async move {
+            if requests.len() > MAX_SHARD_QUERY_FANOUT {
+                return Err(GatewayExecutionError::new(
+                    "DTG-CLUSTER-ROUTING",
+                    "shard query fan-out exceeds the configured bound",
+                    GatewayRetry::Never,
+                ));
+            }
+            let responses = futures_util::future::try_join_all(requests.into_iter().map(
+                |(transport, request, expected_fragment_ids)| async move {
+                    let response = transport.execute_query(request).await?;
+                    Ok((expected_fragment_ids, response))
+                },
+            ))
+            .await?;
             let mut batches = BTreeMap::new();
-            for (transport, request) in requests {
-                let GatewayQueryResponse::Materialized(response) =
-                    transport.execute_query(request).await?
-                else {
+            for (expected_fragment_ids, response) in responses {
+                let GatewayQueryResponse::Materialized(response) = response else {
                     return Err(GatewayExecutionError::new(
                         "DTG-CLUSTER-ROUTING",
                         "shard-routed query transport returned a non-materialized response",
                         GatewayRetry::Safe,
                     ));
                 };
+                if !response
+                    .keys()
+                    .copied()
+                    .eq(expected_fragment_ids.into_iter())
+                {
+                    return Err(GatewayExecutionError::new(
+                        "DTG-CLUSTER-ROUTING",
+                        "shard route returned fragment IDs outside its routed request",
+                        GatewayRetry::Safe,
+                    ));
+                }
                 for (fragment_id, fragment_batches) in response {
                     if batches.insert(fragment_id, fragment_batches).is_some() {
                         return Err(GatewayExecutionError::new(
                             "DTG-CLUSTER-ROUTING",
                             "two shard routes returned the same fragment",
-                            GatewayRetry::Never,
+                            GatewayRetry::Safe,
                         ));
                     }
                 }
@@ -1106,30 +1135,62 @@ impl GatewayExecutionTransport for ShardRoutedGatewayTransport {
         for (shard_id, fragments) in grouped {
             let transport = self.routes.get(&shard_id).unwrap_or(&self.default).clone();
             let mut routed = request.clone();
+            let mut expected_fragment_ids = fragments
+                .iter()
+                .map(|fragment| fragment.id().get())
+                .collect::<Vec<_>>();
+            expected_fragment_ids.sort_unstable();
             let mut routed_plan = plan.clone();
             routed_plan.fragments = fragments;
             routed.physical_plan = Some(routed_plan);
-            requests.push((transport, routed));
+            requests.push((transport, routed, expected_fragment_ids));
         }
         Box::pin(async move {
+            if requests.len() > MAX_SHARD_QUERY_FANOUT {
+                return Err(GatewayExecutionError::new(
+                    "DTG-CLUSTER-ROUTING",
+                    "shard query fan-out exceeds the configured bound",
+                    GatewayRetry::Never,
+                ));
+            }
+            let responses = futures_util::future::try_join_all(requests.into_iter().map(
+                |(transport, request, expected_fragment_ids)| {
+                    let metrics = Arc::clone(&metrics);
+                    async move {
+                        let response = transport
+                            .execute_query_with_metrics(request, metrics)
+                            .await?;
+                        Ok((expected_fragment_ids, response))
+                    }
+                },
+            ))
+            .await?;
             let mut batches = BTreeMap::new();
-            for (transport, request) in requests {
-                let GatewayQueryResponse::Materialized(response) = transport
-                    .execute_query_with_metrics(request, Arc::clone(&metrics))
-                    .await?
-                else {
+            for (expected_fragment_ids, response) in responses {
+                let GatewayQueryResponse::Materialized(response) = response else {
                     return Err(GatewayExecutionError::new(
                         "DTG-CLUSTER-ROUTING",
                         "shard-routed query transport returned a non-materialized response",
                         GatewayRetry::Safe,
                     ));
                 };
+                if !response
+                    .keys()
+                    .copied()
+                    .eq(expected_fragment_ids.into_iter())
+                {
+                    return Err(GatewayExecutionError::new(
+                        "DTG-CLUSTER-ROUTING",
+                        "shard route returned fragment IDs outside its routed request",
+                        GatewayRetry::Safe,
+                    ));
+                }
                 for (fragment_id, fragment_batches) in response {
                     if batches.insert(fragment_id, fragment_batches).is_some() {
                         return Err(GatewayExecutionError::new(
                             "DTG-CLUSTER-ROUTING",
                             "two shard routes returned the same fragment",
-                            GatewayRetry::Never,
+                            GatewayRetry::Safe,
                         ));
                     }
                 }
@@ -1162,35 +1223,68 @@ impl GatewayExecutionTransport for ShardRoutedGatewayTransport {
         for (shard_id, fragments) in grouped {
             let transport = self.routes.get(&shard_id).unwrap_or(&self.default).clone();
             let mut routed = request.clone();
+            let mut expected_fragment_ids = fragments
+                .iter()
+                .map(|fragment| fragment.id().get())
+                .collect::<Vec<_>>();
+            expected_fragment_ids.sort_unstable();
             let mut routed_plan = plan.clone();
             routed_plan.fragments = fragments;
             routed.physical_plan = Some(routed_plan);
-            requests.push((transport, routed));
+            requests.push((transport, routed, expected_fragment_ids));
         }
         let cancellation = cancellation.clone();
         Box::pin(async move {
+            if requests.len() > MAX_SHARD_QUERY_FANOUT {
+                return Err(GatewayExecutionError::new(
+                    "DTG-CLUSTER-ROUTING",
+                    "shard query fan-out exceeds the configured bound",
+                    GatewayRetry::Never,
+                ));
+            }
+            let responses = futures_util::future::try_join_all(requests.into_iter().map(
+                |(transport, request, expected_fragment_ids)| {
+                    let cancellation = cancellation.clone();
+                    let metrics = Arc::clone(&metrics);
+                    async move {
+                        let response = transport
+                            .execute_query_with_metrics_and_cancellation(
+                                request,
+                                metrics,
+                                &cancellation,
+                            )
+                            .await?;
+                        Ok((expected_fragment_ids, response))
+                    }
+                },
+            ))
+            .await?;
             let mut batches = BTreeMap::new();
-            for (transport, request) in requests {
-                let GatewayQueryResponse::Materialized(response) = transport
-                    .execute_query_with_metrics_and_cancellation(
-                        request,
-                        Arc::clone(&metrics),
-                        &cancellation,
-                    )
-                    .await?
-                else {
+            for (expected_fragment_ids, response) in responses {
+                let GatewayQueryResponse::Materialized(response) = response else {
                     return Err(GatewayExecutionError::new(
                         "DTG-CLUSTER-ROUTING",
                         "shard-routed query transport returned a non-materialized response",
                         GatewayRetry::Safe,
                     ));
                 };
+                if !response
+                    .keys()
+                    .copied()
+                    .eq(expected_fragment_ids.into_iter())
+                {
+                    return Err(GatewayExecutionError::new(
+                        "DTG-CLUSTER-ROUTING",
+                        "shard route returned fragment IDs outside its routed request",
+                        GatewayRetry::Safe,
+                    ));
+                }
                 for (fragment_id, fragment_batches) in response {
                     if batches.insert(fragment_id, fragment_batches).is_some() {
                         return Err(GatewayExecutionError::new(
                             "DTG-CLUSTER-ROUTING",
                             "two shard routes returned the same fragment",
-                            GatewayRetry::Never,
+                            GatewayRetry::Safe,
                         ));
                     }
                 }

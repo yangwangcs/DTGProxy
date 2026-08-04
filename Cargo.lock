@@ -514,6 +514,7 @@ dependencies = [
  "dtg-storage",
  "dtg-storage-fjall",
  "dtg-transaction",
+ "futures-util",
  "prost 0.11.9",
  "raft",
  "serde_json",
