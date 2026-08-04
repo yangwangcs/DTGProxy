@@ -1229,7 +1229,12 @@ fn require_required_stages(observation: &RawObservation) -> io::Result<()> {
         .as_ref()
         .expect("data stage metrics were checked above");
     for detail in ["gateway_plan_routing", "gateway_transport_wait"] {
-        require_stage(detail, &gateway.delta.details, observation.operations)?;
+        require_stage(
+            detail,
+            &gateway.delta.details,
+            observation.operations,
+            observation.warmup_operations,
+        )?;
     }
     let data_details: &[&str] = if observation.workload.is_write() {
         &[
@@ -1242,19 +1247,36 @@ fn require_required_stages(observation: &RawObservation) -> io::Result<()> {
         &["data_validation", "data_execution", "data_provider_apply"]
     };
     for detail in data_details {
-        require_stage(detail, &data.delta.details, observation.operations)?;
+        require_stage(
+            detail,
+            &data.delta.details,
+            observation.operations,
+            observation.warmup_operations,
+        )?;
     }
     Ok(())
 }
 
-fn require_stage(name: &str, details: &[DetailMetricDelta], operations: u64) -> io::Result<()> {
+fn require_stage(
+    name: &str,
+    details: &[DetailMetricDelta],
+    operations: u64,
+    warmup_operations: u64,
+) -> io::Result<()> {
     let detail = details
         .iter()
         .find(|detail| detail.detail == name)
         .ok_or_else(|| invalid_data(format!("quick diagnostic observation lacks {name}")))?;
-    if detail.success != operations || detail.error != 0 || detail.cancelled != 0 {
+    let maximum_calls = operations.checked_add(warmup_operations).ok_or_else(|| {
+        invalid_data("quick diagnostic observation operation accounting overflowed")
+    })?;
+    if detail.success < operations
+        || detail.success > maximum_calls
+        || detail.error != 0
+        || detail.cancelled != 0
+    {
         return Err(invalid_data(format!(
-            "quick diagnostic observation has incomplete {name} evidence"
+            "quick diagnostic observation has unbounded {name} evidence"
         )));
     }
     Ok(())

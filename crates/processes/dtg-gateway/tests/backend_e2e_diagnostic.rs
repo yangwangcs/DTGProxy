@@ -260,6 +260,31 @@ async fn fjall_cell_uses_real_four_process_bolt_path() {
     cluster.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires release DTGProxy binaries"]
+async fn fjall_count_c64_stage_evidence_is_bounded_by_tracked_requests() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let spec = CellSpec::one(Backend::Fjall, Workload::CountVertices, 64, 1);
+    let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+    cluster.seed_read_dataset(4_096).await.unwrap();
+
+    let observation = cluster.measure_cell(spec).await.unwrap();
+    let routing_calls = observation
+        .gateway_stage_metrics
+        .as_ref()
+        .unwrap()
+        .delta
+        .details
+        .iter()
+        .find(|detail| detail.detail == "gateway_plan_routing")
+        .unwrap()
+        .success;
+
+    assert!(routing_calls >= observation.operations);
+    assert!(routing_calls <= observation.operations + observation.warmup_operations);
+    cluster.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires release DTGProxy binaries"]
 async fn fjall_one_hop_uses_the_real_four_process_bolt_path() {
@@ -1296,6 +1321,68 @@ fn quick_artifact_requires_required_stage_set() {
             .to_string()
             .contains("data_provider_apply")
     );
+}
+
+#[test]
+fn quick_artifact_accepts_stage_windows_that_overlap_warmup() {
+    let mut observations = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    let point_read = observations
+        .iter_mut()
+        .find(|observation| {
+            observation.workload == backend_e2e_support::Workload::PointLookup
+                && observation.concurrency == 1
+                && observation.repetition == 0
+        })
+        .unwrap();
+    point_read.warmup_operations = 1;
+    for detail in &mut point_read
+        .gateway_stage_metrics
+        .as_mut()
+        .unwrap()
+        .delta
+        .details
+    {
+        if matches!(
+            detail.detail.as_str(),
+            "gateway_plan_routing" | "gateway_transport_wait"
+        ) {
+            detail.success = 3;
+        }
+    }
+
+    backend_e2e_support::QuickDiagnosticArtifact::new("revision", observations).unwrap();
+}
+
+#[test]
+fn quick_artifact_rejects_stage_windows_beyond_tracked_requests() {
+    let mut observations = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    let point_read = observations
+        .iter_mut()
+        .find(|observation| {
+            observation.workload == backend_e2e_support::Workload::PointLookup
+                && observation.concurrency == 1
+                && observation.repetition == 0
+        })
+        .unwrap();
+    point_read.warmup_operations = 1;
+    for detail in &mut point_read
+        .gateway_stage_metrics
+        .as_mut()
+        .unwrap()
+        .delta
+        .details
+    {
+        if matches!(
+            detail.detail.as_str(),
+            "gateway_plan_routing" | "gateway_transport_wait"
+        ) {
+            detail.success = 4;
+        }
+    }
+
+    let error =
+        backend_e2e_support::QuickDiagnosticArtifact::new("revision", observations).unwrap_err();
+    assert!(error.to_string().contains("unbounded gateway_plan_routing"));
 }
 
 fn complete_quick_observations(
