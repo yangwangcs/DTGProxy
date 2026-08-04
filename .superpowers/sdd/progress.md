@@ -10,6 +10,8 @@ Closure Task 2: complete (commits 2ffd320..017c37b, review clean)
 Task 1: complete (uncommitted worktree; reviews fixed; shard-runtime 48/48; concurrent MERGE 20/20 twice)
 Task 2: complete (uncommitted worktree; multi-row atomic MERGE and explicit Bolt staging; relevant
 suite green; independent review clean)
+Middleware performance closure Task 2: complete (commit 167ef45; Fjall/Kuzu focused and full
+topology suites green; disposable PostgreSQL ignored topology passed; review pending)
 Task 3: complete (uncommitted worktree; six-package suite green; same reviewer Ready with no
 Critical or Important findings)
 Task 4: complete - current-only Cypher 25 query composition is implemented without a versioned
@@ -405,3 +407,6 @@ Clippy all pass. The Embedded Shard TCK now keeps fence-advance/delete assertion
 creates and pins the generation; the generic-bypass test remains an empty-state rejection test.
 Hosted CI still cannot attest to this uncommitted worktree, so the Goal remains active solely on that
 external production-certification evidence boundary.
+
+Middleware performance closure (2026-08-04):
+Task 1: complete (commits 2f77b67..8cf1a0e, review clean).

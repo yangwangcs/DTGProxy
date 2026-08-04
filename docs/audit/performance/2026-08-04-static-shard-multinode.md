@@ -1,14 +1,12 @@
 # 静态分片多节点 snapshot 查询验收
 
-日期：2026-08-04。验收提交：`ef97e90b74ff4f0f0525edee8551a21ccd53110a`；
-release process binaries 构建时的 Git revision：
-`085195f7205eaad4be7d942db01defb9ecf6391b`。验收提交只新增测试、fixture/assertion 修正和本审计，
+日期：2026-08-04。静态路由验收提交：`167ef45`；本审计记录的是测试层变更，
 未改动 release process runtime。
 
 ## 路由验收边界
 
-`static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_endpoints` 启动三套
-独立 Fjall `DataNode`，每套只装载一个静态 active shard（13、14、15），并通过生产
+`static_shard_snapshot_routes_fjall`、`static_shard_snapshot_routes_kuzu` 和显式忽略的
+`static_shard_snapshot_routes_postgresql` 分别启动三套同 backend 的独立 `DataNode`，每套只装载一个静态 active shard（13、14、15），并通过生产
 `GatewayProtocolV2Transport` 与 `ShardRoutedGatewayTransport` 的同一请求/响应协议接入一个
 Gateway service。测试 transport 只把生产 Data RPC service 保留在进程内，未伪造路由响应，也未
 绕过 Data 的 immutable read view。
@@ -27,15 +25,25 @@ applied index、`transaction_time=41`、`valid_at=10` 和 `snapshot_immutable=tr
 生产 response 不回显 `ReadFence`；本验收证明的是 Data 仅在这些固定 fence 下接受并成功执行请求，
 不声称 row payload 自带 fence metadata。
 
-验证命令：
+Fjall/Kuzu 默认验证命令：
 
 ```text
-cargo test --locked -p dtg-gateway --test four_process_cluster static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_endpoints
+cargo test --locked -p dtg-gateway --test four_process_cluster static_shard_snapshot_routes_fjall
+cargo test --locked -p dtg-gateway --test four_process_cluster static_shard_snapshot_routes_kuzu
 ```
 
-结果：通过（1 passed，3.82s）。TDD Red 阶段先移除 shard route map，点查按生产协议返回
-`replica is not hosted on this node`；补上 14→第二节点、15→第三节点的现有静态 route map
-后转绿。
+结果：两项均通过。PostgreSQL 需要显式提供 endpoint/credential，并保持手动忽略执行：
+
+```text
+DTG_STATIC_SHARD_POSTGRES_ENDPOINT=<endpoint> \
+DTG_STATIC_SHARD_POSTGRES_CREDENTIAL=<credential> \
+cargo test --locked -p dtg-gateway --test four_process_cluster \
+  static_shard_snapshot_routes_postgresql -- --ignored --nocapture
+```
+
+该命令已在一次性本地 PostgreSQL 17 实例上通过（1 passed，0 failed）。TDD Red 阶段先移除
+shard route map，点查按生产协议返回 `replica is not hosted on this node`；补上 14→第二节点、
+15→第三节点的现有静态 route map 后转绿。
 
 ## 选定 backend diagnostic
 
