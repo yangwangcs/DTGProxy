@@ -805,13 +805,11 @@ async fn run_apply_batcher(
                 dtg_execution::StageOutcome::Success,
                 elapsed_nanoseconds(request.queued_at),
             );
-            request_metrics.record_detail(
-                dtg_execution::RequestDetail::DataRaftQueue,
-                dtg_execution::StageOutcome::Success,
-                elapsed_nanoseconds(request.queued_at),
-            );
         }
         let execution = Arc::clone(&execution);
+        let raft_apply_timers = (0..batch.len())
+            .map(|_| request_metrics.start_detail(dtg_execution::RequestDetail::DataRaftApply))
+            .collect::<Vec<_>>();
         let provider_apply_timers = (0..batch.len())
             .map(|_| request_metrics.start_detail(dtg_execution::RequestDetail::DataProviderApply))
             .collect::<Vec<_>>();
@@ -825,6 +823,9 @@ async fn run_apply_batcher(
         .await;
         let completions = match result {
             Ok(Ok((dispatch_nanoseconds, timing))) => {
+                for timer in raft_apply_timers {
+                    timer.finish(dtg_execution::StageOutcome::Success);
+                }
                 for timer in provider_apply_timers {
                     timer.finish(dtg_execution::StageOutcome::Success);
                 }
@@ -869,12 +870,18 @@ async fn run_apply_batcher(
                 }
             }
             Ok(Err(error)) => {
+                for timer in raft_apply_timers {
+                    timer.finish(dtg_execution::StageOutcome::Error);
+                }
                 for timer in provider_apply_timers {
                     timer.finish(dtg_execution::StageOutcome::Error);
                 }
                 vec![Err(error.to_string()); batch.len()]
             }
             Err(error) => {
+                for timer in raft_apply_timers {
+                    timer.finish(dtg_execution::StageOutcome::Error);
+                }
                 for timer in provider_apply_timers {
                     timer.finish(dtg_execution::StageOutcome::Error);
                 }
@@ -1100,11 +1107,16 @@ impl DataRpcService {
         let command_id = command.header().command_id().get();
         let sender = self.apply_batch_sender(key)?;
         let (completion, response) = oneshot::channel();
+        let queue_timer = self
+            .request_metrics
+            .start_detail(dtg_execution::RequestDetail::DataRaftQueue);
         let admission_started = Instant::now();
-        let permit = sender
-            .reserve()
-            .await
-            .map_err(|_| self.execution_failure("Raft apply batch worker stopped"))?;
+        let permit = queue_timer.finish_result(
+            sender
+                .reserve()
+                .await
+                .map_err(|_| self.execution_failure("Raft apply batch worker stopped")),
+        )?;
         self.request_metrics.record_detail(
             dtg_execution::RequestDetail::DataRaftBatchAdmission,
             dtg_execution::StageOutcome::Success,
@@ -1767,12 +1779,7 @@ impl DataService for DataRpcService {
         };
         let command_id = command.header().command_id().get();
         let timer = self.request_metrics.start(RequestStage::DataRaftApply);
-        let apply_detail = self
-            .request_metrics
-            .start_detail(dtg_execution::RequestDetail::DataRaftApply);
-        let apply = apply_detail.finish_result(
-            timer.finish_result(self.apply_transaction_batched(key, command).await),
-        )?;
+        let apply = timer.finish_result(self.apply_transaction_batched(key, command).await)?;
         let receipt = apply.receipt;
         if receipt.command_id() != command_id {
             return Err(self.execution_failure("transaction command receipt identifier differs"));

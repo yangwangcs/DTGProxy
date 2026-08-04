@@ -675,6 +675,7 @@ pub struct RawObservation {
     pub row_count: u64,
     pub result_digest: String,
     pub query_digest: String,
+    pub transport_mode: String,
     pub gateway_stage_metrics: Option<StageMetricsWindow>,
     pub data_stage_metrics: Option<StageMetricsWindow>,
 }
@@ -1021,7 +1022,7 @@ pub struct QuickDiagnosticArtifact {
     pub format_version: u32,
     pub backend: Backend,
     pub revision: String,
-    pub transport_mode: &'static str,
+    pub transport_mode: String,
     pub repetitions: usize,
     pub observations: Vec<RawObservation>,
     pub summaries: Vec<QuickSummary>,
@@ -1037,11 +1038,17 @@ impl QuickDiagnosticArtifact {
             .first()
             .map(|observation| observation.backend)
             .ok_or_else(|| invalid_data("quick diagnostic has no observations"))?;
+        let transport_mode = observations[0].transport_mode.clone();
         let mut cells = BTreeSet::new();
         let mut result_identity = BTreeMap::<(Workload, usize), (u64, String, String)>::new();
         for observation in &observations {
             if observation.backend != backend {
                 return Err(invalid_data("quick diagnostic mixes backend families"));
+            }
+            if observation.transport_mode != transport_mode {
+                return Err(invalid_data(
+                    "quick diagnostic observations must use one transport mode",
+                ));
             }
             if !matches!(observation.concurrency, 1 | 8 | 64) {
                 return Err(invalid_data(
@@ -1202,7 +1209,7 @@ impl QuickDiagnosticArtifact {
             format_version: 1,
             backend,
             revision,
-            transport_mode: "session",
+            transport_mode,
             repetitions: 3,
             observations,
             summaries,

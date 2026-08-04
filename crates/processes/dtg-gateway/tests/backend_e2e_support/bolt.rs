@@ -324,6 +324,11 @@ pub async fn measure_pipeline_cell(
         row_count,
         result_digest,
         query_digest,
+        transport_mode: if depth == 1 {
+            "unary".into()
+        } else {
+            "pipeline".into()
+        },
         gateway_stage_metrics: None,
         data_stage_metrics: None,
     })

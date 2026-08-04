@@ -96,3 +96,25 @@ reached test execution. This is an environment limitation, not an assertion resu
 `process` test source and production crate were checked successfully without linking. Re-run
 `cargo test --locked -p dtg-data --test process middleware_stage_` on a host with sufficient
 free build space before treating the Data runtime behavior as fully certified.
+
+## Review-fix follow-up
+
+The task review identified overlapping write-path stage boundaries and a hard-coded transport
+label. The follow-up keeps `gateway_plan_routing` inside write command construction and finishes
+it before `GatewayTransportWait`; it records `data_raft_queue` around bounded channel admission
+and `data_raft_apply` only around the batcher's blocking Raft/provider apply. `RawObservation`
+now carries the measured Bolt transport mode (`unary` at depth one, `pipeline` otherwise), and a
+quick artifact rejects a mixed-mode run rather than labeling it as a fixed session.
+
+Fresh verification after the follow-up:
+
+```text
+cargo test --locked -p dtg-gateway --test backend_e2e_diagnostic quick_artifact_rejects_mixed_transport_modes
+1 passed
+
+cargo test --locked -p dtg-execution --test gateway_process middleware_stage_
+1 passed
+
+cargo test --locked -p dtg-data --test process middleware_stage_
+2 passed
+```

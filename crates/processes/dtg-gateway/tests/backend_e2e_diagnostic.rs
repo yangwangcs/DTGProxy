@@ -743,6 +743,7 @@ fn summary_groups_raw_observations_and_serializes_snake_case_enums() {
         row_count: 1,
         result_digest: "result".into(),
         query_digest: "query".into(),
+        transport_mode: "unary".into(),
         gateway_stage_metrics: None,
         data_stage_metrics: None,
     };
@@ -1018,7 +1019,7 @@ fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
     assert_eq!(serialized["format_version"], 1);
     assert_eq!(serialized["backend"], "fjall");
     assert_eq!(serialized["revision"], "test-revision");
-    assert_eq!(serialized["transport_mode"], "session");
+    assert_eq!(serialized["transport_mode"], "unary");
     assert_eq!(serialized["repetitions"], 3);
     assert_eq!(serialized["observations"].as_array().unwrap().len(), 45);
     assert_eq!(serialized["summaries"].as_array().unwrap().len(), 15);
@@ -1100,6 +1101,15 @@ fn quick_artifact_rejects_incomplete_matrix_and_changed_read_identity() {
     let error =
         backend_e2e_support::QuickDiagnosticArtifact::new("revision", missing_csr).unwrap_err();
     assert!(error.to_string().contains("lacks snapshot CSR cache hits"));
+}
+
+#[test]
+fn quick_artifact_rejects_mixed_transport_modes() {
+    let mut observations = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    observations[0].transport_mode = "pipeline".into();
+    let error =
+        backend_e2e_support::QuickDiagnosticArtifact::new("revision", observations).unwrap_err();
+    assert!(error.to_string().contains("one transport mode"));
 }
 
 #[test]
@@ -1216,6 +1226,7 @@ fn complete_quick_observations(
                         "stable-result".into()
                     },
                     query_digest: format!("{workload:?}"),
+                    transport_mode: "unary".into(),
                     gateway_stage_metrics: Some(gateway_stage_metrics),
                     data_stage_metrics: Some(data_stage_metrics),
                 });

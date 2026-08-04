@@ -2756,20 +2756,15 @@ impl GatewayExecution {
                         )
                     })?
                     .clone();
-                let routing = self
-                    .request_metrics
-                    .start_detail(RequestDetail::GatewayPlanRouting);
-                let outcome = routing.finish_result(
-                    execute_process_create(
-                        transport.as_ref(),
-                        context,
-                        write,
-                        &parameters,
-                        &current_planning_context,
-                        &self.request_metrics,
-                    )
-                    .await,
-                )?;
+                let outcome = execute_process_create(
+                    transport.as_ref(),
+                    context,
+                    write,
+                    &parameters,
+                    &current_planning_context,
+                    &self.request_metrics,
+                )
+                .await?;
                 advance_process_snapshot(planning_context, &outcome, !outcome.replayed)?;
                 validate_process_request_end(cancellation)?;
                 return Ok(GatewayResponse::Acknowledged);
@@ -4993,6 +4988,7 @@ async fn execute_process_create(
     planning_context: &PlanningContext,
     request_metrics: &Arc<RequestStageMetrics>,
 ) -> Result<ProcessWriteOutcome, GatewayExecutionError> {
+    let routing_timer = request_metrics.start_detail(RequestDetail::GatewayPlanRouting);
     let [catalog_shard] = planning_context.catalog().shards() else {
         return Err(GatewayExecutionError::new(
             "DTG-EXECUTION-WRITE-ROUTING",
@@ -5086,6 +5082,7 @@ async fn execute_process_create(
         .map_err(|error| process_write_error(error.to_string()))?,
     );
     let request = GatewayWriteRequest::new(route.clone(), transaction_id, command);
+    routing_timer.finish(StageOutcome::Success);
     let transport_wait = request_metrics.start_detail(RequestDetail::GatewayTransportWait);
     let receipt = match transport_wait.finish_result(
         request_metrics
