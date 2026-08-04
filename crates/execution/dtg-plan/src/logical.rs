@@ -5,7 +5,8 @@ use dtg_language_ir::{
 use dtg_storage::{EdgeId, TransactionTime, VertexId};
 use std::collections::BTreeSet;
 
-use crate::{PlanError, PlanningContext, PushdownKind};
+use crate::{PlanError, PlanningContext, PushdownKind, StaticShardRouter};
+use dtg_storage::ShardId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalReadOperation {
@@ -411,4 +412,21 @@ pub(crate) fn resolve_read_time(
         | Some(ValidTimePredicate::Changes { .. }) => return None,
     };
     Some((transaction_time, valid_at))
+}
+
+pub(crate) fn read_targets_shard(
+    request: &LogicalReadRequest,
+    router: &StaticShardRouter,
+    shard_id: ShardId,
+) -> bool {
+    match request.operation() {
+        LogicalReadOperation::VertexPoint(vertex_id)
+        | LogicalReadOperation::Adjacency { vertex_id, .. }
+        | LogicalReadOperation::Traversal { vertex_id, .. } => {
+            router.shard_for_vertex(*vertex_id) == shard_id
+        }
+        LogicalReadOperation::VertexScan
+        | LogicalReadOperation::EdgePoint(_)
+        | LogicalReadOperation::EdgeScan => true,
+    }
 }

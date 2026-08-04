@@ -13,7 +13,9 @@ pub use capability::{
     EXACT_VERTEX_SCAN_CAPABILITIES, PushdownDecision, PushdownGuarantee, PushdownKind,
     SemanticRequirements, decide_pushdown,
 };
-pub use catalog::{CatalogShard, CatalogSnapshot, PlanningContext, SnapshotRequirements};
+pub use catalog::{
+    CatalogShard, CatalogSnapshot, PlanningContext, SnapshotRequirements, StaticShardRouter,
+};
 pub use fragment::{Exchange, ExchangeKind, FragmentId, PlanFence, PlanFragment};
 pub use logical::{LogicalReadOperation, LogicalReadRequest};
 pub use physical::{
@@ -51,24 +53,34 @@ pub fn plan(
         return Err(PlanError::UnsupportedStatement);
     };
     let reads = logical::collect_reads(logical_plan, context)?;
+    let router = StaticShardRouter::new(context.catalog())?;
     let mut fragments = Vec::with_capacity(context.catalog().shards().len());
     let mut exchanges = Vec::with_capacity(context.catalog().shards().len());
     for (ordinal, shard) in context.catalog().shards().iter().enumerate() {
-        let id = FragmentId::new(u32::try_from(ordinal + 1).map_err(|_| {
-            PlanError::InvalidCatalog(
-                "fragment count exceeds the supported identifier range".into(),
-            )
-        })?);
+        let selected_reads = reads
+            .iter()
+            .filter(|request| {
+                logical::read_targets_shard(request, &router, shard.binding().shard_id())
+            })
+            .collect::<Vec<_>>();
+        if selected_reads.is_empty() {
+            continue;
+        }
         let fence = PlanFence::new(
             shard,
             context.catalog().version(),
             context.catalog().schema_version(),
             context.snapshot_requirements().clone(),
         );
-        let storage_accesses = reads
-            .iter()
+        let storage_accesses = selected_reads
+            .into_iter()
             .map(|request| storage_access(request, &fence, context))
             .collect::<Result<Vec<_>, _>>()?;
+        let id = FragmentId::new(u32::try_from(ordinal + 1).map_err(|_| {
+            PlanError::InvalidCatalog(
+                "fragment count exceeds the supported identifier range".into(),
+            )
+        })?);
         fragments.push(PlanFragment::new(id, fence, storage_accesses));
         exchanges.push(Exchange::gather(id));
     }

@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use dtg_storage::{
-    BindingRole, CapabilityManifest, Digest32, GraphId, ReplicaBinding, TransactionTime, Version,
+    BindingRole, CapabilityManifest, Digest32, GraphId, ProviderKind, ReplicaBinding, ShardId,
+    TransactionTime, Version, VertexId,
 };
 
 use crate::PlanError;
@@ -34,6 +35,7 @@ pub struct CatalogSnapshot {
     version: Version,
     schema_version: Version,
     graph_id: GraphId,
+    backend_provider: ProviderKind,
     shards: Vec<CatalogShard>,
 }
 
@@ -49,6 +51,7 @@ impl CatalogSnapshot {
             ));
         }
         let graph_id = shards[0].binding.graph_id();
+        let backend_provider = shards[0].binding.provider_kind().clone();
         let mut shard_ids = BTreeSet::new();
         for shard in &shards {
             if shard.binding.role() != BindingRole::Active {
@@ -61,12 +64,18 @@ impl CatalogSnapshot {
                     "catalog Shards must have one graph and unique Shard identities".into(),
                 ));
             }
+            if shard.binding.provider_kind() != &backend_provider {
+                return Err(PlanError::InvalidCatalog(
+                    "catalog active Shards must use one backend provider".into(),
+                ));
+            }
         }
         shards.sort_unstable_by_key(|shard| shard.binding.shard_id());
         Ok(Self {
             version,
             schema_version,
             graph_id,
+            backend_provider,
             shards,
         })
     }
@@ -83,8 +92,39 @@ impl CatalogSnapshot {
         self.graph_id
     }
 
+    pub const fn backend_provider(&self) -> &ProviderKind {
+        &self.backend_provider
+    }
+
     pub fn shards(&self) -> &[CatalogShard] {
         &self.shards
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaticShardRouter {
+    shard_ids: Vec<ShardId>,
+}
+
+impl StaticShardRouter {
+    pub fn new(catalog: &CatalogSnapshot) -> Result<Self, PlanError> {
+        if catalog.shards.is_empty() {
+            return Err(PlanError::InvalidCatalog(
+                "static shard router requires at least one shard".into(),
+            ));
+        }
+        Ok(Self {
+            shard_ids: catalog
+                .shards
+                .iter()
+                .map(|shard| shard.binding.shard_id())
+                .collect(),
+        })
+    }
+
+    pub fn shard_for_vertex(&self, vertex_id: VertexId) -> ShardId {
+        let index = (vertex_id.get() % self.shard_ids.len() as u128) as usize;
+        self.shard_ids[index]
     }
 }
 

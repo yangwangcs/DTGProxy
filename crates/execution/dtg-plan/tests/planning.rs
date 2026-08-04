@@ -23,8 +23,24 @@ fn binding(
     backend_generation: u64,
     capabilities: &CapabilityManifest,
 ) -> ReplicaBinding {
-    let class = BackendClass::new(
+    binding_for_provider(
         ProviderKind::Fjall,
+        shard_id,
+        placement_epoch,
+        backend_generation,
+        capabilities,
+    )
+}
+
+fn binding_for_provider(
+    provider_kind: ProviderKind,
+    shard_id: u64,
+    placement_epoch: u64,
+    backend_generation: u64,
+    capabilities: &CapabilityManifest,
+) -> ReplicaBinding {
+    let class = BackendClass::new(
+        provider_kind.clone(),
         1,
         1,
         capabilities.names().map(str::to_owned),
@@ -38,7 +54,7 @@ fn binding(
         .replica_id(shard_id)
         .backend_generation(backend_generation)
         .backend_class_digest(class.digest())
-        .provider_kind(ProviderKind::Fjall)
+        .provider_kind(provider_kind)
         .contract_version(1)
         .layout_version(1)
         .capability_digest(capabilities.digest())
@@ -441,7 +457,7 @@ fn plan_pins_catalog_schema_and_snapshot_requirements() {
 }
 
 #[test]
-fn one_fragment_is_created_per_pinned_shard_and_exchanges_are_explicit() {
+fn point_lookup_creates_one_fenced_owner_fragment_and_exchange() {
     let capabilities = exact_capabilities();
     let catalog = CatalogSnapshot::new(
         Version::new(2),
@@ -462,10 +478,57 @@ fn one_fragment_is_created_per_pinned_shard_and_exchanges_are_explicit() {
 
     let plan = plan(&point_query(), &context).unwrap();
 
-    assert_eq!(plan.fragments().len(), 2);
-    assert_eq!(plan.exchanges().len(), 2);
-    assert_eq!(plan.fragments()[0].fence().shard_id().get(), 13);
-    assert_eq!(plan.fragments()[1].fence().shard_id().get(), 17);
+    assert_eq!(plan.fragments().len(), 1);
+    assert_eq!(plan.exchanges().len(), 1);
+    assert_eq!(plan.fragments()[0].fence().shard_id().get(), 17);
+}
+
+#[test]
+fn static_owner_routes_point_and_adjacency_reads_to_one_shard() {
+    let capabilities = exact_capabilities();
+    let context = PlanningContext::new(
+        CatalogSnapshot::new(
+            Version::new(2),
+            Version::new(3),
+            vec![
+                CatalogShard::new(binding(17, 8, 4, &capabilities), 31),
+                CatalogShard::new(binding(13, 7, 3, &capabilities), 29),
+                CatalogShard::new(binding(19, 9, 5, &capabilities), 37),
+            ],
+        )
+        .unwrap(),
+        capabilities,
+        SnapshotRequirements::fixed(TransactionTime::new(23).unwrap(), 17),
+        Some(128),
+    )
+    .unwrap();
+
+    for program in [point_query(), point_expand_query()] {
+        let plan = plan(&program, &context).unwrap();
+        assert_eq!(plan.fragments().len(), 1);
+        assert_eq!(plan.exchanges().len(), 1);
+        assert_eq!(plan.fragments()[0].fence().shard_id().get(), 19);
+    }
+}
+
+#[test]
+fn catalog_rejects_mixed_active_backend_providers() {
+    let capabilities = exact_capabilities();
+
+    assert!(matches!(
+        CatalogSnapshot::new(
+            Version::new(2),
+            Version::new(3),
+            vec![
+                CatalogShard::new(binding(13, 7, 3, &capabilities), 29),
+                CatalogShard::new(
+                    binding_for_provider(ProviderKind::Kuzu, 17, 8, 4, &capabilities),
+                    31,
+                ),
+            ],
+        ),
+        Err(PlanError::InvalidCatalog(message)) if message.contains("one backend provider")
+    ));
 }
 
 #[test]
@@ -558,7 +621,7 @@ fn multi_shard_limit_is_a_single_global_operator_above_all_fragment_sources() {
         1
     );
     assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0].len(), 2);
+    assert_eq!(sources[0].len(), 1);
 }
 
 #[test]
