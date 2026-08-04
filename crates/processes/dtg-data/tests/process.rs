@@ -3,8 +3,8 @@ use std::time::Instant;
 use std::{collections::BTreeMap, ffi::OsString};
 
 use dtg_data::{
-    CredentialProfile, DataNodeBuilder, DataProcessConfig, DataRpcService, EndpointProfile,
-    LifecycleState, RemoteResolver,
+    CredentialProfile, DataNodeBuilder, DataNodeError, DataProcessConfig, DataRpcService,
+    EndpointProfile, LifecycleState, RemoteResolver,
 };
 use dtg_execution::cluster_protocol::PROTOCOL_MAJOR;
 use dtg_execution::cluster_protocol::checksum_bytes;
@@ -479,26 +479,17 @@ fn production_config_exposes_only_its_selected_provider() {
 #[tokio::test]
 async fn production_config_rejects_mismatched_assignment_before_opening_namespace() {
     let root = tempfile::tempdir().unwrap();
-    let mismatched = binding_for_provider(ProviderKind::Kuzu, "must-not-open");
-    let node = DataNodeBuilder::from_config(
-        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
-            .assign(mismatched.clone()),
-    )
-    .start()
-    .await
-    .unwrap();
+    let business_root = root.path().join("business");
+    let consensus_root = root.path().join("raft");
+    let config = DataProcessConfig::new(business_root.clone(), consensus_root.clone())
+        .assign(binding_for_provider(ProviderKind::Kuzu, "must-not-open"));
 
-    assert_eq!(node.provider_kinds(), vec![ProviderKind::Fjall]);
-    assert!(node.observed_replicas().await.is_empty());
-    let failures = node.replica_failures().await;
-    assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].binding(), &mismatched);
-    assert!(
-        failures[0]
-            .message()
-            .contains("does not match configured backend")
-    );
-    assert!(!root.path().join("business").join("must-not-open").exists());
+    let result = DataNodeBuilder::from_config(config).start().await;
+
+    assert!(matches!(result, Err(DataNodeError::Build(message))
+        if message.contains("does not match configured backend")));
+    assert!(!business_root.exists());
+    assert!(!consensus_root.exists());
 }
 
 #[tokio::test]

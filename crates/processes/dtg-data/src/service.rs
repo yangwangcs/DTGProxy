@@ -328,6 +328,18 @@ impl DataNodeBuilder {
     }
 
     pub async fn start(self) -> Result<DataNode, DataNodeError> {
+        if let Some(configured) = self.configured_provider_kind.as_ref() {
+            if let Some(binding) = self
+                .assignments
+                .iter()
+                .find(|binding| binding.provider_kind() != configured)
+            {
+                return Err(DataNodeError::Build(format!(
+                    "assignment provider {:?} does not match configured backend {:?}",
+                    binding.provider_kind(), configured
+                )));
+            }
+        }
         std::fs::create_dir_all(&self.consensus_root).map_err(|error| {
             DataNodeError::Build(format!("cannot create Fjall consensus root: {error}"))
         })?;
@@ -349,19 +361,7 @@ impl DataNodeBuilder {
         let (snapshot_ingest_sender, mut snapshot_ingest_receiver) =
             mpsc::channel(SNAPSHOT_INGEST_CHANNEL_CAPACITY);
         for binding in self.assignments {
-            let result = if let Some(configured) = self.configured_provider_kind.as_ref() {
-                if binding.provider_kind() != configured {
-                    Err(DataNodeError::Build(format!(
-                        "assignment provider {:?} does not match configured backend {:?}",
-                        binding.provider_kind(),
-                        configured
-                    )))
-                } else {
-                    add_assignment(&execution, &self.consensus_root, binding.clone()).await
-                }
-            } else {
-                add_assignment(&execution, &self.consensus_root, binding.clone()).await
-            };
+            let result = add_assignment(&execution, &self.consensus_root, binding.clone()).await;
             match result {
                 Ok(()) => {
                     state.metrics.record_hosted();
