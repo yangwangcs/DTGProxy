@@ -1,0 +1,63 @@
+# 静态分片多节点 snapshot 查询验收
+
+日期：2026-08-04。代码 revision：`085195f7205eaad4be7d942db01defb9ecf6391b`。
+
+## 路由验收边界
+
+`static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_endpoints` 启动三套
+独立 Fjall `DataNode`，每套只装载一个静态 active shard（13、14、15），并通过生产
+`GatewayProtocolV2Transport` 与 `ShardRoutedGatewayTransport` 的同一请求/响应协议接入一个
+Gateway service。测试 transport 只把生产 Data RPC service 保留在进程内，未伪造路由响应，也未
+绕过 Data 的 immutable read view。
+
+测试 workload 与验收结果：
+
+| 查询 | 预期 owner/fan-out | 实际 endpoint calls | 结果 |
+| --- | ---: | ---: | --- |
+| `MATCH (n) WHERE n.id = $id RETURN n.id`（id=41） | shard 15 / 1 | `[0, 0, 1]` | 通过，返回 id=41 |
+| `MATCH (a)-[r]->(b) WHERE a.id = $id RETURN r`（id=41） | shard 15 / 1 | `[0, 0, 1]` | 通过，返回 1 条邻接边 |
+| `MATCH (n) RETURN COUNT(*)` | shards 13,14,15 / 3 | `[1, 1, 1]` | 通过，合并计数=4 |
+
+五个 fragment response 的协议证据均保持：`catalog_revision=29`、`schema_version=31`、
+`placement_epoch=17`、`backend_generation=23`、同一 capability digest、各自 catalog
+applied index、`transaction_time=41`、`valid_at=10` 和 `snapshot_immutable=true`。
+
+验证命令：
+
+```text
+cargo test --locked -p dtg-gateway --test four_process_cluster static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_endpoints
+```
+
+结果：通过（1 passed，3.82s）。TDD Red 阶段先移除 shard route map，点查按生产协议返回
+`replica is not hosted on this node`；补上 14→第二节点、15→第三节点的现有静态 route map
+后转绿。
+
+## 选定 backend diagnostic
+
+三次诊断均使用当前 revision 构建的 release process binaries：
+
+```text
+cargo build --locked --release -p dtg-meta -p dtg-controller -p dtg-data -p dtg-gateway
+DTG_BACKEND_E2E_BIN_DIR=$PWD/target/release
+```
+
+每次 quick diagnostic 使用 1 个 disposable provider cell、5 个 workload
+（`create_vertex`、`point_lookup`、`one_hop_expand`、`two_hop_expand`、`count_vertices`）和
+3 个并发级别（1、8、64），共 15 cells；结果 digest 是该次运行的
+`backend;revision;cells;errors;runtime;workloads;concurrency` 摘要串的 SHA-256，不是伪造的
+吞吐证明或后端 artifact。
+
+| backend | 环境/命令 | cells | errors | 运行时间 | result digest | 结论 |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| Fjall | `DTG_BACKEND_E2E_SELECTED_BACKEND=fjall` | 15 | 0 | 148.83s | `503219c894f4a7ab5bd4d51951aebb1fdcb5a7e15104289544cf8f97bdda7731` | 通过 |
+| Kuzu | `DTG_BACKEND_E2E_SELECTED_BACKEND=kuzu` | 15 | 0 | 140.84s | `e14cd98ac562d45d9c9c3730896629f3812655531e2ab612d6d57b7d7194bba8` | 通过 |
+| PostgreSQL | `DTG_BACKEND_E2E_SELECTED_BACKEND=postgresql`，`DTG_BACKEND_E2E_POSTGRES_ENDPOINT=host=127.0.0.1 port=5432 dbname=dtg connect_timeout=1`，`DTG_BACKEND_E2E_POSTGRES_CREDENTIAL=user=dtg password=secret` | 0 | 1 | 1.28s | `627b5e4d267d093f13d67e3d3f196c09a20551a415fd4109958f738d2f95c271` | 未通过：本机 `127.0.0.1:5432` 无 PostgreSQL 服务，Data replica 未 hosted |
+
+PostgreSQL 结果明确保留为失败；它不代表 PostgreSQL adapter 通过，也不把 unavailable live
+service 计入成功。以上 quick diagnostic 是现有单 Data endpoint 的 backend smoke/性能诊断，
+多节点静态 shard 路由的完整 endpoint-call 验收由前一节的三 DataNode snapshot 测试负责。
+
+## 不在本任务范围
+
+没有实现迁移、重平衡、split/merge、follower read 或第二套 routing/RPC protocol；没有将
+单机 loopback 诊断解释为跨机器生产 SLO。

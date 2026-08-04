@@ -1,24 +1,44 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dtg_controller::ControllerConfig;
 use dtg_data::{DataNodeBuilder, DataProcessConfig, LifecycleState};
+use dtg_execution::cluster_protocol::proto::data_service_server::DataService;
+use dtg_execution::cluster_protocol::proto::gateway_service_server::GatewayService as ClusterGatewayService;
+use dtg_execution::cluster_protocol::proto::{
+    self, BoundedPayload, RequestContext, ShardContext, TransactionOperation, TransactionRequest,
+};
+use dtg_execution::cluster_protocol::{PROTOCOL_MAJOR, checksum_bytes};
 use dtg_execution::control::{CatalogState, ObservedNodeState, Version};
+use dtg_execution::planning::{
+    CatalogShard, CatalogSnapshot, PlanningContext, SnapshotRequirements,
+};
+use dtg_execution::shard::{CommitSingleShard, ShardCommand};
+use dtg_execution::storage::{
+    BackendClass, BindingRole, CapabilityManifest, CommandId, EdgeId, EdgeVersion, LogicalMutation,
+    Properties, ProviderKind, ReplicaBinding, TransactionTime, ValidInterval, VertexId,
+    VertexVersion,
+};
 use dtg_execution::transaction::TransactionId;
 use dtg_execution::{
     GatewayClusterRequest, GatewayExecution, GatewayExecutionError, GatewayExecutionTransport,
-    GatewayFuture, GatewayResponse, GatewayRows, GatewayValue,
+    GatewayFuture, GatewayProtocolV2Client, GatewayProtocolV2Transport, GatewayResponse,
+    GatewayRetry, GatewayRows, GatewayValue, ShardRoutedGatewayTransport,
 };
 use dtg_gateway::{GatewayConfig, GatewayService};
 use dtg_meta::MetaConfig;
 use serde_json::Value;
 use support::planning_context;
+use tonic::Request;
+use tonic::codegen::tokio_stream::StreamExt;
 
 const FIXTURE_ROOT: &str = "../../../config/examples/clean-break-cluster";
 
 #[test]
-fn clean_break_fixtures_define_four_roles_and_two_heterogeneous_data_nodes() {
+fn clean_break_fixtures_define_four_roles_and_single_provider_data_nodes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT);
     let meta = read(&root.join("meta-1.json"));
     let controller = read(&root.join("controller-1.json"));
@@ -32,8 +52,8 @@ fn clean_break_fixtures_define_four_roles_and_two_heterogeneous_data_nodes() {
         .collect::<BTreeSet<_>>();
     assert_eq!(cluster_ids, BTreeSet::from([9001]));
 
-    assert_eq!(providers(&data_1), approved_providers());
-    assert_eq!(providers(&data_2), approved_providers());
+    assert_eq!(provider(&data_1), "fjall");
+    assert_eq!(provider(&data_2), "fjall");
     assert_ne!(data_1["node_id"], data_2["node_id"]);
     assert_ne!(data_1["rpc_addr"], data_2["rpc_addr"]);
     assert_ne!(data_1["fjall_root"], data_2["fjall_root"]);
@@ -69,20 +89,8 @@ fn read(path: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
-fn providers(document: &Value) -> BTreeSet<String> {
-    document["provider_classes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|value| value.as_str().unwrap().to_owned())
-        .collect()
-}
-
-fn approved_providers() -> BTreeSet<String> {
-    ["fjall", "postgresql", "kuzu", "remote"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+fn provider(document: &Value) -> &str {
+    document["provider_class"].as_str().unwrap()
 }
 
 #[test]
@@ -179,5 +187,393 @@ async fn four_role_composition_uses_only_clean_break_process_contracts() {
 
     data.stop();
     assert_eq!(data.lifecycle(), LifecycleState::Stopped);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FragmentFenceEvidence {
+    shard_id: u32,
+    placement_epoch: u64,
+    backend_generation: u64,
+    catalog_revision: u64,
+    schema_version: u64,
+    capability_digest: Vec<u8>,
+    applied_index: u64,
+    transaction_time: i64,
+    valid_at: i64,
+    snapshot_immutable: bool,
+}
+
+struct InProcessDataEndpoint {
+    service: dtg_data::DataRpcService,
+    calls: AtomicUsize,
+    fences: Mutex<Vec<FragmentFenceEvidence>>,
+}
+
+impl InProcessDataEndpoint {
+    fn new(service: dtg_data::DataRpcService) -> Self {
+        Self {
+            service,
+            calls: AtomicUsize::new(0),
+            fences: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn fences(&self) -> Vec<FragmentFenceEvidence> {
+        self.fences.lock().unwrap().clone()
+    }
+}
+
+impl GatewayProtocolV2Client for InProcessDataEndpoint {
+    fn execute(
+        &self,
+        request: proto::GatewayRequest,
+    ) -> GatewayFuture<'_, Result<Vec<proto::GatewayResponse>, GatewayExecutionError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.fences
+            .lock()
+            .unwrap()
+            .extend(request.fragments.iter().map(|fragment| {
+                let context = fragment.context.as_ref().unwrap();
+                FragmentFenceEvidence {
+                    shard_id: context.shard_id,
+                    placement_epoch: context.placement_epoch,
+                    backend_generation: context.backend_generation,
+                    catalog_revision: context.catalog_version,
+                    schema_version: fragment.schema_version,
+                    capability_digest: fragment.capability_digest.clone(),
+                    applied_index: fragment.applied_index,
+                    transaction_time: fragment.transaction_time,
+                    valid_at: fragment.valid_at,
+                    snapshot_immutable: fragment.snapshot_immutable,
+                }
+            }));
+        let service = self.service.clone();
+        Box::pin(async move {
+            let mut stream = ClusterGatewayService::execute(&service, Request::new(request))
+                .await
+                .map_err(|error| {
+                    GatewayExecutionError::new(
+                        "DTG-TEST-DATA-RPC",
+                        error.to_string(),
+                        GatewayRetry::Never,
+                    )
+                })?
+                .into_inner();
+            let mut responses = Vec::new();
+            while let Some(response) = stream.next().await {
+                responses.push(response.map_err(|error| {
+                    GatewayExecutionError::new(
+                        "DTG-TEST-DATA-STREAM",
+                        error.to_string(),
+                        GatewayRetry::Never,
+                    )
+                })?);
+            }
+            Ok(responses)
+        })
+    }
+}
+
+fn static_shard_capabilities() -> CapabilityManifest {
+    CapabilityManifest::from_names([
+        "adjacency",
+        "immutable-read-view",
+        "logical-snapshot",
+        "point",
+    ])
+    .unwrap()
+}
+
+fn static_shard_binding(
+    capabilities: &CapabilityManifest,
+    shard_id: u64,
+    replica_id: u64,
+    namespace: &str,
+) -> ReplicaBinding {
+    let class = BackendClass::new(
+        ProviderKind::Fjall,
+        1,
+        1,
+        capabilities.names().map(str::to_owned),
+    )
+    .unwrap();
+    ReplicaBinding::builder()
+        .cluster_id(9001)
+        .graph_id(1)
+        .shard_id(shard_id)
+        .placement_epoch(17)
+        .replica_id(replica_id)
+        .backend_generation(23)
+        .backend_class_digest(class.digest())
+        .provider_kind(ProviderKind::Fjall)
+        .contract_version(1)
+        .layout_version(1)
+        .capability_digest(capabilities.digest())
+        .namespace_id(namespace)
+        .endpoint_profile_ref("local")
+        .credential_ref("local")
+        .role(BindingRole::Active)
+        .build()
+        .unwrap()
+}
+
+fn static_shard_context(binding: &ReplicaBinding, request_id: u128) -> ShardContext {
+    ShardContext {
+        request: Some(RequestContext {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: 1,
+            cluster_id: binding.cluster_id().get().to_be_bytes().to_vec(),
+            request_id: request_id.to_be_bytes().to_vec(),
+            deadline_unix_ms: u64::MAX,
+            trace_context: Vec::new(),
+        }),
+        graph_id: binding.graph_id().get(),
+        shard_id: u32::try_from(binding.shard_id().get()).unwrap(),
+        placement_epoch: binding.placement_epoch().get(),
+        backend_generation: binding.backend_generation().get(),
+        catalog_version: 29,
+    }
+}
+
+async fn commit_static_shard(
+    node: &dtg_data::DataNode,
+    binding: &ReplicaBinding,
+    command_id: u128,
+    mutations: Vec<LogicalMutation>,
+) -> u64 {
+    let item_count = u32::try_from(mutations.len()).unwrap();
+    let command = ShardCommand::CommitSingleShard(
+        CommitSingleShard::new(
+            CommandId::new(command_id).unwrap(),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            mutations,
+        )
+        .unwrap(),
+    );
+    let body = command.encode_current().unwrap();
+    node.rpc_service()
+        .apply_transaction(Request::new(TransactionRequest {
+            context: Some(static_shard_context(binding, command_id)),
+            transaction_id: command_id.to_be_bytes().to_vec(),
+            operation: TransactionOperation::Commit.into(),
+            idempotency_key: command_id.to_be_bytes().to_vec(),
+            payload: Some(BoundedPayload {
+                format_version: 1,
+                declared_len: u64::try_from(body.len()).unwrap(),
+                item_count,
+                checksum: checksum_bytes(&body).to_vec(),
+                body,
+            }),
+        }))
+        .await
+        .unwrap();
+    node.replica_observations().await[0].applied_index()
+}
+
+fn static_vertex(id: u128) -> LogicalMutation {
+    LogicalMutation::PutVertex(
+        VertexVersion::new(
+            VertexId::new(id).unwrap(),
+            Version::new(1),
+            ValidInterval::new(1, 100).unwrap(),
+            TransactionTime::new(41).unwrap(),
+            Properties::new(),
+        )
+        .unwrap(),
+    )
+}
+
+fn static_edge(id: u128, source: u128, target: u128) -> LogicalMutation {
+    LogicalMutation::PutEdge(
+        EdgeVersion::new(
+            EdgeId::new(id).unwrap(),
+            VertexId::new(source).unwrap(),
+            VertexId::new(target).unwrap(),
+            "KNOWS",
+            Version::new(1),
+            ValidInterval::new(1, 100).unwrap(),
+            TransactionTime::new(41).unwrap(),
+            Properties::new(),
+        )
+        .unwrap(),
+    )
+}
+
+fn static_shard_planning_context(
+    capabilities: CapabilityManifest,
+    shards: Vec<(ReplicaBinding, u64)>,
+) -> PlanningContext {
+    PlanningContext::new(
+        CatalogSnapshot::new(
+            Version::new(29),
+            Version::new(31),
+            shards
+                .into_iter()
+                .map(|(binding, applied_index)| CatalogShard::new(binding, applied_index))
+                .collect(),
+        )
+        .unwrap(),
+        capabilities,
+        SnapshotRequirements::fixed(TransactionTime::new(41).unwrap(), 10),
+        Some(128),
+    )
+    .unwrap()
+}
+
+fn endpoint_call_counts(endpoints: &[Arc<InProcessDataEndpoint>]) -> Vec<usize> {
+    endpoints.iter().map(|endpoint| endpoint.calls()).collect()
+}
+
+fn endpoint_call_delta(before: &[usize], after: &[usize]) -> Vec<usize> {
+    before
+        .iter()
+        .zip(after)
+        .map(|(before, after)| after - before)
+        .collect()
+}
+
+#[tokio::test]
+async fn static_shard_snapshot_routes_point_adjacency_and_count_to_three_data_endpoints() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = static_shard_capabilities();
+    let bindings = [
+        static_shard_binding(&capabilities, 13, 19, "static-shard-13"),
+        static_shard_binding(&capabilities, 14, 20, "static-shard-14"),
+        static_shard_binding(&capabilities, 15, 21, "static-shard-15"),
+    ];
+    let mut nodes = Vec::new();
+    for (ordinal, binding) in bindings.iter().enumerate() {
+        nodes.push(
+            DataNodeBuilder::from_config(
+                DataProcessConfig::new(
+                    root.path().join(format!("data-{ordinal}/business")),
+                    root.path().join(format!("data-{ordinal}/raft")),
+                )
+                .assign(binding.clone()),
+            )
+            .start()
+            .await
+            .unwrap(),
+        );
+    }
+
+    let applied_indices = [
+        commit_static_shard(&nodes[0], &bindings[0], 101, vec![static_vertex(39)]).await,
+        commit_static_shard(&nodes[1], &bindings[1], 102, vec![static_vertex(40)]).await,
+        commit_static_shard(
+            &nodes[2],
+            &bindings[2],
+            103,
+            vec![
+                static_vertex(41),
+                static_vertex(44),
+                static_edge(73, 41, 44),
+            ],
+        )
+        .await,
+    ];
+    assert_eq!(
+        applied_indices.into_iter().collect::<BTreeSet<_>>().len(),
+        1
+    );
+
+    let endpoints = nodes
+        .iter()
+        .map(|node| Arc::new(InProcessDataEndpoint::new(node.rpc_service())))
+        .collect::<Vec<_>>();
+    let transports = endpoints
+        .iter()
+        .map(|endpoint| {
+            Arc::new(GatewayProtocolV2Transport::new(endpoint.clone()))
+                as Arc<dyn GatewayExecutionTransport>
+        })
+        .collect::<Vec<_>>();
+    let transport = Arc::new(ShardRoutedGatewayTransport::new(
+        transports[0].clone(),
+        BTreeMap::from([(14, transports[1].clone()), (15, transports[2].clone())]),
+    ));
+    let planning_context = static_shard_planning_context(
+        capabilities.clone(),
+        bindings.iter().cloned().zip(applied_indices).collect(),
+    );
+    let gateway = GatewayService::new(
+        GatewayConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            9001,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap(),
+        GatewayExecution::for_process(transport, planning_context),
+    );
+
+    let before_point = endpoint_call_counts(&endpoints);
+    let point = gateway
+        .bolt()
+        .query("MATCH (n) WHERE n.id = $id RETURN n.id")
+        .param("id", 41_i64)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(point.rows(), &[vec![GatewayValue::Integer(41)]]);
+    assert_eq!(
+        endpoint_call_delta(&before_point, &endpoint_call_counts(&endpoints)),
+        vec![0, 0, 1]
+    );
+
+    let before_adjacency = endpoint_call_counts(&endpoints);
+    let adjacency = gateway
+        .bolt()
+        .query("MATCH (a)-[r]->(b) WHERE a.id = $id RETURN r")
+        .param("id", 41_i64)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(adjacency.rows().len(), 1);
+    assert_eq!(
+        endpoint_call_delta(&before_adjacency, &endpoint_call_counts(&endpoints)),
+        vec![0, 0, 1]
+    );
+
+    let before_count = endpoint_call_counts(&endpoints);
+    let count = gateway
+        .bolt()
+        .query("MATCH (n) RETURN COUNT(*)")
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(count.rows(), &[vec![GatewayValue::Integer(4)]]);
+    assert_eq!(
+        endpoint_call_delta(&before_count, &endpoint_call_counts(&endpoints)),
+        vec![1, 1, 1]
+    );
+
+    let evidence = endpoints
+        .iter()
+        .flat_map(|endpoint| endpoint.fences())
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 5);
+    for fence in evidence {
+        assert_eq!(fence.placement_epoch, 17);
+        assert_eq!(fence.backend_generation, 23);
+        assert_eq!(fence.catalog_revision, 29);
+        assert_eq!(fence.schema_version, 31);
+        assert_eq!(fence.capability_digest, capabilities.digest().get());
+        assert_eq!(
+            fence.applied_index,
+            applied_indices[usize::try_from(fence.shard_id - 13).unwrap()]
+        );
+        assert_eq!(fence.transaction_time, 41);
+        assert_eq!(fence.valid_at, 10);
+        assert!(fence.snapshot_immutable);
+    }
+
+    for node in nodes {
+        node.stop();
+    }
 }
 mod support;
