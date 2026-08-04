@@ -1,8 +1,8 @@
 # DTGProxy
 
-DTGProxy 是面向时态属性图的分布式中间件。它提供 T-Cypher 语言入口、可验证的快照读写、Shard/Raft 复制、跨分片事务协调，以及在 Fjall、PostgreSQL 和 Kuzu 三种官方后端之上的统一图数据模型。
+DTGProxy 是面向时态属性图的分布式中间件。它提供 T-Cypher 语言入口、可验证的快照读写、Shard/Raft 复制、跨分片事务协调，以及在 Fjall、PostgreSQL 或 Kuzu 之一之上的统一图数据模型。
 
-项目的目标不是把三种数据库同时叠在一次请求下，而是让每个逻辑分片明确绑定一种底层数据库：KV 时态图分片使用 Fjall，关系型分片使用 PostgreSQL，图原生分片使用 Kuzu。Gateway 按 catalog 的围栏信息路由到对应 Data 进程。
+一次集群只选择一种官方后端：Fjall、PostgreSQL 或 Kuzu。Gateway 按 catalog 的围栏信息把分片请求路由到对应 Data 进程；同一集群的 active replica 不会混用 provider。
 
 ## 架构
 
@@ -11,9 +11,9 @@ T-Cypher / Bolt client
           |
        Gateway
           |
-   Data (one backend kind per process)
-    |           |            |
-  Fjall     PostgreSQL      Kuzu
+   Data (one cluster-wide backend kind)
+                  |
+      Fjall / PostgreSQL / Kuzu (choose one)
 
 Meta + Controller: catalog, cross-shard coordination, recovery, migration
 ```
@@ -25,9 +25,11 @@ Meta + Controller: catalog, cross-shard coordination, recovery, migration
 
 ## 后端与部署
 
-一个 Data 进程由 `DTG_DATA_BACKEND_KIND` 固定为 `fjall`、`postgresql` 或 `kuzu` 之一；该进程只能承载该类后端的分片。需要哪种后端就启动对应的 Data 进程，不需要为了服务某个 Fjall 分片而同时启动 PostgreSQL 或 Kuzu。
+一个集群由 `DTG_DATA_BACKEND_KIND` 固定为 `fjall`、`postgresql` 或 `kuzu` 之一；每个 Data 进程只能承载该类后端的分片。需要哪种后端就以该 kind 启动集群的 Data 进程，不能为了服务另一个分片再启用其他 provider。
 
-同机三后端示例会启动三个独立 Data 进程：各自拥有独立的业务、共识和后端命名空间。PostgreSQL 可以由开发启动器在 loopback 上以随机凭据启动；Fjall 与 Kuzu 是嵌入式 provider，不需要另起数据库服务。
+生产 `DataProcessConfig` 也遵守同一约束：assignment 的 provider 必须与配置的 backend kind 一致；不匹配的 assignment 会在打开业务或共识命名空间前被拒绝。PostgreSQL 的 endpoint/credential profile 只会在 PostgreSQL Data 进程中加载。
+
+开发启动器可按所选 backend 启动本地集群。PostgreSQL 可以在 loopback 上以随机凭据启动；Fjall 与 Kuzu 是嵌入式 provider，不需要另起数据库服务。
 
 ```bash
 scripts/local-cluster.sh start --managed-postgres

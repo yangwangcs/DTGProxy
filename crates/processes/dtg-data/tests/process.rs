@@ -46,6 +46,35 @@ fn fjall_binding(namespace: &str) -> ReplicaBinding {
     fjall_binding_with_capabilities(namespace, &capabilities)
 }
 
+fn binding_for_provider(provider_kind: ProviderKind, namespace: &str) -> ReplicaBinding {
+    let capabilities = fjall_capabilities();
+    let class = BackendClass::new(
+        provider_kind.clone(),
+        1,
+        1,
+        capabilities.names().map(str::to_owned),
+    )
+    .unwrap();
+    ReplicaBinding::builder()
+        .cluster_id(7)
+        .graph_id(11)
+        .shard_id(13)
+        .placement_epoch(17)
+        .replica_id(19)
+        .backend_generation(23)
+        .backend_class_digest(class.digest())
+        .provider_kind(provider_kind)
+        .contract_version(1)
+        .layout_version(1)
+        .capability_digest(capabilities.digest())
+        .namespace_id(namespace)
+        .endpoint_profile_ref("local")
+        .credential_ref("local")
+        .role(BindingRole::Active)
+        .build()
+        .unwrap()
+}
+
 fn fjall_capabilities() -> CapabilityManifest {
     CapabilityManifest::from_names([
         "adjacency",
@@ -399,6 +428,77 @@ async fn process_composes_only_the_selected_official_provider_and_v2_lifecycle_m
     assert_eq!(node.lifecycle(), LifecycleState::Draining);
     node.stop();
     assert_eq!(node.lifecycle(), LifecycleState::Stopped);
+}
+
+#[test]
+fn production_config_exposes_only_its_selected_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let configs = [
+        (
+            DataProcessConfig::new(root.path().join("fjall"), root.path().join("fjall-raft"))
+                .assign(binding_for_provider(ProviderKind::Fjall, "fjall-shard")),
+            ProviderKind::Fjall,
+        ),
+        (
+            DataProcessConfig::new(
+                root.path().join("postgres"),
+                root.path().join("postgres-raft"),
+            )
+            .with_backend_kind(ProviderKind::PostgreSql)
+            .with_endpoint_profile(
+                "local",
+                EndpointProfile::PostgreSql("host=127.0.0.1 port=5432 dbname=dtg".into()),
+            )
+            .with_credential_profile(
+                "local",
+                CredentialProfile::PostgreSql("user=dtg password=secret".into()),
+            )
+            .assign(binding_for_provider(
+                ProviderKind::PostgreSql,
+                "postgres-shard",
+            )),
+            ProviderKind::PostgreSql,
+        ),
+        (
+            DataProcessConfig::new(root.path().join("kuzu"), root.path().join("kuzu-raft"))
+                .with_backend_kind(ProviderKind::Kuzu)
+                .with_kuzu_root(root.path().join("kuzu-business"))
+                .assign(binding_for_provider(ProviderKind::Kuzu, "kuzu-shard")),
+            ProviderKind::Kuzu,
+        ),
+    ];
+
+    for (config, expected) in configs {
+        assert_eq!(
+            DataNodeBuilder::from_config(config).provider_kinds(),
+            vec![expected]
+        );
+    }
+}
+
+#[tokio::test]
+async fn production_config_rejects_mismatched_assignment_before_opening_namespace() {
+    let root = tempfile::tempdir().unwrap();
+    let mismatched = binding_for_provider(ProviderKind::Kuzu, "must-not-open");
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(mismatched.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+
+    assert_eq!(node.provider_kinds(), vec![ProviderKind::Fjall]);
+    assert!(node.observed_replicas().await.is_empty());
+    let failures = node.replica_failures().await;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].binding(), &mismatched);
+    assert!(
+        failures[0]
+            .message()
+            .contains("does not match configured backend")
+    );
+    assert!(!root.path().join("business").join("must-not-open").exists());
 }
 
 #[tokio::test]

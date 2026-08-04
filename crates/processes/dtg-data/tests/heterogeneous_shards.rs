@@ -125,7 +125,9 @@ fn binding(provider_kind: ProviderKind, shard_id: u64) -> ReplicaBinding {
 }
 
 #[tokio::test]
-async fn one_data_node_hosts_three_independent_backend_classes() {
+// This intentionally exercises the legacy hand-built fixture path. Production
+// DataProcessConfig construction is single-provider and covered by process.rs.
+async fn fixture_builder_hosts_three_independent_backend_classes() {
     let node = fixture_data_node()
         .assign(fjall_shard(1))
         .assign(postgres_shard(2))

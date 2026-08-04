@@ -257,6 +257,8 @@ pub struct DataNodeBuilder {
     execution: DataExecutionBuilder,
     assignments: Vec<ReplicaBinding>,
     raft_transport: Arc<dyn RaftTransport>,
+    configured_provider_kind: Option<ProviderKind>,
+    provider_kinds: Vec<ProviderKind>,
 }
 
 impl DataNodeBuilder {
@@ -266,11 +268,15 @@ impl DataNodeBuilder {
             execution: DataExecution::builder(),
             assignments: Vec::new(),
             raft_transport: Arc::new(RejectingRaftTransport),
+            configured_provider_kind: None,
+            provider_kinds: Vec::new(),
         }
     }
 
     pub fn from_config(config: DataProcessConfig) -> Self {
+        let configured_provider_kind = config.backend_kind().clone();
         let mut builder = Self::new(config.consensus_root());
+        builder.configured_provider_kind = Some(configured_provider_kind);
         builder = match config.backend_kind() {
             ProviderKind::Fjall => builder.with_provider(
                 ProviderKind::Fjall,
@@ -300,8 +306,13 @@ impl DataNodeBuilder {
         kind: ProviderKind,
         resolver: Arc<dyn ProviderResolver>,
     ) -> Self {
-        self.execution = self.execution.with_provider(kind, resolver);
+        self.execution = self.execution.with_provider(kind.clone(), resolver);
+        self.provider_kinds.push(kind);
         self
+    }
+
+    pub fn provider_kinds(&self) -> Vec<ProviderKind> {
+        self.provider_kinds.clone()
     }
 
     #[must_use]
@@ -338,7 +349,20 @@ impl DataNodeBuilder {
         let (snapshot_ingest_sender, mut snapshot_ingest_receiver) =
             mpsc::channel(SNAPSHOT_INGEST_CHANNEL_CAPACITY);
         for binding in self.assignments {
-            match add_assignment(&execution, &self.consensus_root, binding.clone()).await {
+            let result = if let Some(configured) = self.configured_provider_kind.as_ref() {
+                if binding.provider_kind() != configured {
+                    Err(DataNodeError::Build(format!(
+                        "assignment provider {:?} does not match configured backend {:?}",
+                        binding.provider_kind(),
+                        configured
+                    )))
+                } else {
+                    add_assignment(&execution, &self.consensus_root, binding.clone()).await
+                }
+            } else {
+                add_assignment(&execution, &self.consensus_root, binding.clone()).await
+            };
+            match result {
                 Ok(()) => {
                     state.metrics.record_hosted();
                     observed
