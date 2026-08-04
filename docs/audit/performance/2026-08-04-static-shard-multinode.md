@@ -62,7 +62,7 @@ cargo test --locked -p dtg-gateway --test backend_e2e_diagnostic \
 | --- | --- | ---: | ---: | ---: | --- | --- |
 | Fjall | `DTG_BACKEND_E2E_SELECTED_BACKEND=fjall` | 15 | 0 | 156.96s | 见下表，三个并发级别一致 | 通过 |
 | Kuzu | `DTG_BACKEND_E2E_SELECTED_BACKEND=kuzu` | 15 | 0 | 137.05s | 见下表，三个并发级别一致 | 通过 |
-| PostgreSQL | `DTG_BACKEND_E2E_SELECTED_BACKEND=postgresql`，`DTG_BACKEND_E2E_POSTGRES_ENDPOINT=host=127.0.0.1 port=5432 dbname=dtg connect_timeout=1`，`DTG_BACKEND_E2E_POSTGRES_CREDENTIAL=user=dtg password=secret` | 0 | 1 | 1.28s | 无结果 digest | 未通过：本机 `127.0.0.1:5432` 无 PostgreSQL 服务，Data replica 未 hosted |
+| PostgreSQL | 临时 loopback PostgreSQL（随机端口/口令；同一串行运行） | 15 | 0 | 177.76s | 见下表，三个并发级别一致 | 通过 |
 
 Fjall 与 Kuzu 的实际 Bolt result digests 相同；每个值都在 concurrency 1、8、64 三个 cell 中
 重复得到：
@@ -75,8 +75,8 @@ Fjall 与 Kuzu 的实际 Bolt result digests 相同；每个值都在 concurrenc
 | `two_hop_expand` | `0243b831c62abf2b92d28a902ddddd2f585d4c59cff0a7d8c892f17ba06ee012` |
 | `count_vertices` | `472d2580d4b07a844e8441cf554cac7e166ebd475f490b72a1dbe672b738ea7f` |
 
-PostgreSQL 结果明确保留为失败；它不代表 PostgreSQL adapter 通过，也不把 unavailable live
-service 计入成功。以上 quick diagnostic 是现有单 Data endpoint 的 backend smoke/性能诊断，
+PostgreSQL 的临时实例已在诊断结束后停止并清理；其 storage live TCK 也在同一主机通过 4/4。
+以上 quick diagnostic 是现有单 Data endpoint 的 backend smoke/性能诊断，
 多节点静态 shard 路由的完整 endpoint-call 验收由前一节的三 DataNode snapshot 测试负责。
 
 ## 不在本任务范围
