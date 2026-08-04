@@ -12,17 +12,18 @@ postgres_credential=""
 managed_postgres=false
 postgres_started=false
 active_process_id=""
+backend_kind="fjall"
 
 usage() {
   cat >&2 <<'USAGE'
 usage:
-  scripts/local-cluster.sh start --managed-postgres [--root PATH]
-  scripts/local-cluster.sh start --postgres-url URL [--root PATH]
+  scripts/local-cluster.sh start --backend <fjall|postgresql|kuzu> [--managed-postgres | --postgres-url URL] [--root PATH]
   scripts/local-cluster.sh stop [--root PATH]
   scripts/local-cluster.sh status [--root PATH]
 
-`--managed-postgres` is for local development only. It creates a disposable,
-loopback-only PostgreSQL instance owned by the selected runtime directory.
+`--managed-postgres` and `--postgres-url` are only valid with
+`--backend postgresql`. The managed option creates a disposable, loopback-only
+PostgreSQL instance owned by the selected runtime directory.
 USAGE
 }
 
@@ -283,19 +284,21 @@ start_cluster() {
   umask 077
   mkdir -p "$(runtime_path logs)" "$(runtime_path pids)"
   : >"$(runtime_path owned)"
+  printf '%s\n' "$backend_kind" >"$(runtime_path backend-kind)"
   trap 'cleanup_and_exit $?' ERR
   trap 'cleanup_and_exit 130' INT
   trap 'cleanup_and_exit 143' TERM
   prepare_binaries
-  if [[ $managed_postgres == true ]]; then
-    start_managed_postgres
-  else
-    postgres_endpoint="$postgres_url"
-    postgres_credential=""
-    printf '%s\n' "$postgres_url" >"$(runtime_path postgres/connection)"
-    chmod 600 "$(runtime_path postgres/connection)"
+  if [[ $backend_kind == postgresql ]]; then
+    if [[ $managed_postgres == true ]]; then
+      start_managed_postgres
+    else
+      postgres_endpoint="$postgres_url"
+      postgres_credential=""
+      printf '%s\n' "$postgres_url" >"$(runtime_path postgres/connection)"
+      chmod 600 "$(runtime_path postgres/connection)"
+    fi
   fi
-  [[ -n $postgres_url ]] || fail "PostgreSQL URL is required"
 
   local meta_port controller_port data_1_port data_2_port data_3_port gateway_port
   meta_port="$(find_free_port 55101 55120)"
@@ -309,9 +312,9 @@ start_cluster() {
 
   start_process meta "$meta_port" "$repo_root/target/debug/dtgproxy-meta" --config "$(runtime_path meta.json)"
   start_process controller "$controller_port" "$repo_root/target/debug/dtgproxy-controller" --config "$(runtime_path controller.json)"
-  start_data data-1 "$data_1_port" "9001:11:1:1:11:1:fjall:1:1:local-fjall" fjall
-  start_data data-2 "$data_2_port" "9001:11:2:1:12:1:postgresql:1:1:local-postgres" postgresql
-  start_data data-3 "$data_3_port" "9001:11:3:1:13:1:kuzu:1:1:local-kuzu" kuzu
+  start_data data-1 "$data_1_port" "9001:11:1:1:11:1:$backend_kind:1:1:local-$backend_kind-1" "$backend_kind"
+  start_data data-2 "$data_2_port" "9001:11:2:1:12:1:$backend_kind:1:1:local-$backend_kind-2" "$backend_kind"
+  start_data data-3 "$data_3_port" "9001:11:3:1:13:1:$backend_kind:1:1:local-$backend_kind-3" "$backend_kind"
 
   DTG_GATEWAY_BIND="127.0.0.1:$gateway_port" \
   DTG_GATEWAY_CLUSTER_ID=9001 \
@@ -326,7 +329,7 @@ start_cluster() {
   DTG_GATEWAY_VALID_AT=1 \
   DTG_GATEWAY_LOGICAL_SCAN_BOUND=10 \
   DTG_GATEWAY_CAPABILITIES="$capabilities" \
-  DTG_GATEWAY_SHARDS="1:1:11:1:0:fjall:1:1:local-fjall,2:1:12:1:0:postgresql:1:1:local-postgres,3:1:13:1:0:kuzu:1:1:local-kuzu" \
+  DTG_GATEWAY_SHARDS="1:1:11:1:0:$backend_kind:1:1:local-$backend_kind-1,2:1:12:1:0:$backend_kind:1:1:local-$backend_kind-2,3:1:13:1:0:$backend_kind:1:1:local-$backend_kind-3" \
   "$repo_root/target/debug/dtgproxy-gateway" >>"$(runtime_path logs/gateway.log)" 2>&1 &
   local gateway_process_id=$!
   printf '%s\n' "$gateway_process_id" >"$(runtime_path pids/gateway.pid)"
@@ -338,6 +341,15 @@ start_cluster() {
 
 status_cluster() {
   [[ -d $cluster_root ]] || fail "runtime root does not exist: $cluster_root"
+  local configured_backend="unknown"
+  if [[ -f "$(runtime_path backend-kind)" ]]; then
+    configured_backend="$(<"$(runtime_path backend-kind)")"
+  fi
+  case "$configured_backend" in
+    fjall|postgresql|kuzu) ;;
+    *) configured_backend="unknown" ;;
+  esac
+  printf 'backend: %s\n' "$configured_backend"
   for name in meta controller data-1 data-2 data-3 gateway; do
     local pid_file="$(runtime_path "pids/$name.pid")"
     if [[ -f $pid_file ]] && kill -0 "$(<"$pid_file")" 2>/dev/null; then
@@ -346,7 +358,9 @@ status_cluster() {
       printf '%s: stopped\n' "$name"
     fi
   done
-  if [[ -f "$(runtime_path postgres/managed)" ]]; then
+  if [[ $configured_backend != postgresql ]]; then
+    printf 'postgres: not selected\n'
+  elif [[ -f "$(runtime_path postgres/managed)" ]]; then
     printf 'postgres: managed\n'
   elif [[ -f "$(runtime_path postgres/connection)" ]]; then
     printf 'postgres: external\n'
@@ -362,6 +376,11 @@ case "$command" in
   start)
     while [[ $# -gt 0 ]]; do
       case "$1" in
+        --backend)
+          shift
+          [[ $# -gt 0 ]] || { usage; exit 2; }
+          backend_kind="$1"
+          ;;
         --managed-postgres) managed_postgres=true ;;
         --postgres-url)
           shift
@@ -377,8 +396,17 @@ case "$command" in
       esac
       shift
     done
-    [[ $managed_postgres == true && -z $postgres_url || $managed_postgres == false && -n $postgres_url ]] || \
-      fail 'start requires exactly one of --managed-postgres or --postgres-url URL'
+    case "$backend_kind" in
+      postgresql)
+        [[ $managed_postgres == true && -z $postgres_url || $managed_postgres == false && -n $postgres_url ]] || \
+          fail 'PostgreSQL start requires exactly one of --managed-postgres or --postgres-url URL'
+        ;;
+      fjall|kuzu)
+        [[ $managed_postgres == false && -z $postgres_url ]] || \
+          fail "--managed-postgres and --postgres-url require --backend postgresql"
+        ;;
+      *) fail '--backend must be fjall, postgresql, or kuzu' ;;
+    esac
     validate_root true
     require_tool cargo
     require_tool jq

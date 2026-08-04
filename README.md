@@ -32,12 +32,17 @@ Meta + Controller: catalog, cross-shard coordination, recovery, migration
 开发启动器可按所选 backend 启动本地集群。PostgreSQL 可以在 loopback 上以随机凭据启动；Fjall 与 Kuzu 是嵌入式 provider，不需要另起数据库服务。
 
 ```bash
-scripts/local-cluster.sh start --managed-postgres
+# 三选一；每次只启动所选后端的三个 Data 分片
+scripts/local-cluster.sh start --backend fjall
+scripts/local-cluster.sh start --backend kuzu
+scripts/local-cluster.sh start --backend postgresql --managed-postgres
+
 scripts/local-cluster.sh status
 scripts/local-cluster.sh stop
 ```
 
-该启动器仅管理它记录的 PID，`stop` 会校验可执行文件；生产环境应改由 systemd、launchd 或 Kubernetes 管理进程和 PostgreSQL。
+`--managed-postgres` 与 `--postgres-url` 只适用于 PostgreSQL。该启动器仅管理它记录的 PID，
+`stop` 会校验可执行文件；生产环境应改由 systemd、launchd 或 Kubernetes 管理进程和 PostgreSQL。
 
 ## 一致性与写入
 

@@ -10,7 +10,8 @@ DTGProxy 由 `dtgproxy-gateway`、`dtgproxy-data`、`dtgproxy-meta` 和 `dtgprox
 fjall | postgresql | kuzu
 ```
 
-其 `DTG_DATA_ASSIGNMENTS` 中的所有分片必须匹配这个值。为不同后端部署独立 Data 进程：
+其 `DTG_DATA_ASSIGNMENTS` 中的所有分片必须匹配这个值。一个集群的 active Data 副本
+只能使用同一种后端；若需运行其他后端，应部署为另一套独立集群：
 
 ```text
 data-fjall       DTG_DATA_BACKEND_KIND=fjall
@@ -25,12 +26,25 @@ Gateway 只连接当前请求目标分片的 Data endpoint；一个 Fjall 请求
 ## 本地安全启动
 
 ```bash
-scripts/local-cluster.sh start --managed-postgres
+# Fjall（默认值；显式指定便于脚本化）
+scripts/local-cluster.sh start --backend fjall
+
+# Kuzu
+scripts/local-cluster.sh start --backend kuzu
+
+# PostgreSQL：启动器管理一个临时的、仅 loopback 可达的实例
+scripts/local-cluster.sh start --backend postgresql --managed-postgres
+
+# 或连接用户自行管理的 PostgreSQL
+scripts/local-cluster.sh start --backend postgresql --postgres-url 'host=127.0.0.1 port=5432 dbname=dtgproxy user=dtgproxy sslmode=disable'
+
 scripts/local-cluster.sh status
 scripts/local-cluster.sh stop
 ```
 
-启动器只监听 loopback，创建私有运行目录和随机 PostgreSQL 凭据，并只记录、停止它自己启动且可执行文件匹配的进程。`--postgres-url` 可改用你管理的本机 PostgreSQL；不要把开发启动器用于生产。
+`--managed-postgres` 与 `--postgres-url` 只可同 `--backend postgresql` 使用。启动器只监听
+loopback，创建私有运行目录和随机 PostgreSQL 凭据，并只记录、停止它自己启动且可执行文件
+匹配的进程。不要把开发启动器用于生产。
 
 ## 网络与安全
 
