@@ -17,8 +17,8 @@
 
 ## 未达目标与已知限制
 
-完整 Bolt 路径的 c64 点查尚未达到 100k QPS 目标；本机 release 矩阵的最高 Fjall c64 点查为
-22.65k QPS。Data admission 微基准的 p99 37.667 µs 不代表完整 `COMMITTED` 写。结果均为单机、
+完整 Bolt 路径的 c64 点查尚未达到 100k QPS 目标；当前提交的本机 release 矩阵中，最高 c64
+点查为 Kuzu 的 6.08k QPS。Data admission 微基准的 p99 37.667 µs 不代表完整 `COMMITTED` 写。结果均为单机、
 串行 provider 诊断，不能外推为生产 SLO 或多机扩展结论。
 
 `dtg-execution` 的既有 lib unit target 仍因未解析的 `ProcessWriteAccounting` 符号无法链接；

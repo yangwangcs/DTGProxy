@@ -8,13 +8,12 @@
 
 | 后端 | artifact | revision | SHA-256 |
 | --- | --- | --- | --- |
-| Fjall | `fjall-r3.json` | `a73f1ec` | `7ddc49b60e5593314a559316cefb592734ed9e83d5a3d2fc707e542d876e345c` |
-| Kuzu | `kuzu-r1.json` | `a73f1ec` | `b41dc3f57d5bab742bc2b3eed5c81fcbd312840a37ec0912ba53b02d2988a889` |
-| PostgreSQL | `postgresql-r2.json` | `fd03bf2` | `646413d36cd171ec76d0aa4e0d1dd34e7eeae8ee93997e0820f4f5fde0a1f8f0` |
+| Fjall | `fjall-final.json` | `0c6467b` | `5902e08e8e9aec307e7575b38d97e26a5b5cd3a6d3aa70ac7d7b0bad3049fb55` |
+| Kuzu | `kuzu-final.json` | `0c6467b` | `4f535a1ed467cc499145adf5e0306e56f7d7c77d286b0260993ce8e5ff4df53c` |
+| PostgreSQL | `postgresql-final.json` | `0c6467b` | `20b8e8fa87e0364476c97e3d2dc172a38beeff323ea7489851a55145e4f80097` |
 
-`fd03bf2` 仅在预热前固定 Data/Gateway 指标基线，未修改执行或计时路径；Fjall/Kuzu 的吞吐与
-延迟仍可复现，但其阶段均值不与 PostgreSQL 混合比较。PostgreSQL 使用临时随机凭据、随机端口、
-仅 `127.0.0.1` 监听的实例，进程退出后已停止并清理。
+三份 artifact 均在包含显式预热前 Data/Gateway 指标基线和有界 worker drain 的当前提交上生成。
+PostgreSQL 使用临时随机凭据、随机端口、仅 `127.0.0.1` 监听的实例，进程退出后已停止并清理。
 
 复现命令：
 
