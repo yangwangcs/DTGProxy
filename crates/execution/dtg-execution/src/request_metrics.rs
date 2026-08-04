@@ -6,7 +6,7 @@ use std::time::Instant;
 
 const HISTOGRAM_BUCKETS: usize = 64;
 const REQUEST_STAGES: usize = 10;
-const REQUEST_DETAILS: usize = 43;
+const REQUEST_DETAILS: usize = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -103,6 +103,13 @@ pub enum RequestDetail {
     GatewayQueryPipelineWriterWait,
     DataSnapshotIngestAdmission,
     DataSnapshotIngestReceiptLookup,
+    GatewayPlanRouting,
+    GatewayTransportWait,
+    DataValidation,
+    DataExecution,
+    DataRaftQueue,
+    DataRaftApply,
+    DataProviderApply,
 }
 
 impl RequestDetail {
@@ -150,6 +157,13 @@ impl RequestDetail {
         Self::GatewayQueryPipelineWriterWait,
         Self::DataSnapshotIngestAdmission,
         Self::DataSnapshotIngestReceiptLookup,
+        Self::GatewayPlanRouting,
+        Self::GatewayTransportWait,
+        Self::DataValidation,
+        Self::DataExecution,
+        Self::DataRaftQueue,
+        Self::DataRaftApply,
+        Self::DataProviderApply,
     ];
 
     const fn index(self) -> usize {
@@ -209,6 +223,13 @@ impl RequestDetail {
             Self::GatewayQueryPipelineWriterWait => "gateway_query_pipeline_writer_wait",
             Self::DataSnapshotIngestAdmission => "data_snapshot_ingest_admission",
             Self::DataSnapshotIngestReceiptLookup => "data_snapshot_ingest_receipt_lookup",
+            Self::GatewayPlanRouting => "gateway_plan_routing",
+            Self::GatewayTransportWait => "gateway_transport_wait",
+            Self::DataValidation => "data_validation",
+            Self::DataExecution => "data_execution",
+            Self::DataRaftQueue => "data_raft_queue",
+            Self::DataRaftApply => "data_raft_apply",
+            Self::DataProviderApply => "data_provider_apply",
         }
     }
 }
@@ -482,7 +503,7 @@ pub fn encode_request_metrics_snapshot(
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&serde_json::json!({
-        "schema_version": 15,
+        "schema_version": 16,
         "process_role": process_role,
         "unix_timestamp_ns": unix_timestamp_ns,
         "sequence": sequence,
@@ -587,7 +608,7 @@ mod tests {
             encode_request_metrics_snapshot("gateway", 7, 11, &metrics.snapshot()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 15);
+        assert_eq!(value["schema_version"], 16);
         assert_eq!(value["process_role"], "gateway");
         assert_eq!(value["unix_timestamp_ns"], 7);
         assert_eq!(value["sequence"], 11);
@@ -595,7 +616,7 @@ mod tests {
         assert_eq!(value["stages"][1]["stage"], "gateway_compile");
         assert_eq!(value["stages"][1]["success"], 1);
         assert_eq!(value["stages"][1]["buckets"].as_array().unwrap().len(), 64);
-        assert_eq!(value["details"].as_array().unwrap().len(), 43);
+        assert_eq!(value["details"].as_array().unwrap().len(), 50);
         assert_eq!(value["details"][9]["detail"], "data_read_view_cache_hit");
         assert_eq!(value["details"][9]["success"], 1);
         assert_eq!(value["details"][16]["detail"], "data_raft_batch_admission");
@@ -691,6 +712,13 @@ mod tests {
             value["details"][42]["detail"],
             "data_snapshot_ingest_receipt_lookup"
         );
+        assert_eq!(value["details"][43]["detail"], "gateway_plan_routing");
+        assert_eq!(value["details"][44]["detail"], "gateway_transport_wait");
+        assert_eq!(value["details"][45]["detail"], "data_validation");
+        assert_eq!(value["details"][46]["detail"], "data_execution");
+        assert_eq!(value["details"][47]["detail"], "data_raft_queue");
+        assert_eq!(value["details"][48]["detail"], "data_raft_apply");
+        assert_eq!(value["details"][49]["detail"], "data_provider_apply");
         assert!(!encoded.contains("statement"));
         assert!(!encoded.contains("parameter"));
     }

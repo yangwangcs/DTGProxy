@@ -2756,15 +2756,20 @@ impl GatewayExecution {
                         )
                     })?
                     .clone();
-                let outcome = execute_process_create(
-                    transport.as_ref(),
-                    context,
-                    write,
-                    &parameters,
-                    &current_planning_context,
-                    &self.request_metrics,
-                )
-                .await?;
+                let routing = self
+                    .request_metrics
+                    .start_detail(RequestDetail::GatewayPlanRouting);
+                let outcome = routing.finish_result(
+                    execute_process_create(
+                        transport.as_ref(),
+                        context,
+                        write,
+                        &parameters,
+                        &current_planning_context,
+                        &self.request_metrics,
+                    )
+                    .await,
+                )?;
                 advance_process_snapshot(planning_context, &outcome, !outcome.replayed)?;
                 validate_process_request_end(cancellation)?;
                 return Ok(GatewayResponse::Acknowledged);
@@ -2790,6 +2795,9 @@ impl GatewayExecution {
                         ));
                     };
                     let timer = self.request_metrics.start(RequestStage::GatewayPlan);
+                    let routing = self
+                        .request_metrics
+                        .start_detail(RequestDetail::GatewayPlanRouting);
                     let result = (|| {
                         let planning_context = planning_context.read().map_err(|_| {
                             GatewayExecutionError::new(
@@ -2812,7 +2820,8 @@ impl GatewayExecution {
                             self.lower_plan_with_parameters(&physical_plan, &parameters)?;
                         Ok((Some(physical_plan), Some(executable_plan)))
                     })();
-                    timer.finish_result(result)?
+                    let result = routing.finish_result(result)?;
+                    timer.finish_result(Ok::<_, GatewayExecutionError>(result))?
                 }
                 _ => (None, None),
             };
@@ -2854,6 +2863,9 @@ impl GatewayExecution {
             };
             let response = if let Some(executable_plan) = executable_plan {
                 let timer = self.request_metrics.start(RequestStage::GatewayInternalRpc);
+                let transport_wait = self
+                    .request_metrics
+                    .start_detail(RequestDetail::GatewayTransportWait);
                 let remote = transport
                     .execute_query_with_metrics_and_cancellation(
                         request,
@@ -2861,7 +2873,8 @@ impl GatewayExecution {
                         cancellation,
                     )
                     .await;
-                let remote = timer.finish_result(remote)?;
+                let remote = transport_wait.finish_result(remote)?;
+                let remote = timer.finish_result(Ok::<_, GatewayExecutionError>(remote))?;
                 match remote {
                     GatewayQueryResponse::Final(response) => response,
                     GatewayQueryResponse::Materialized(fragment_batches) => {
@@ -2940,7 +2953,11 @@ impl GatewayExecution {
                 }
             } else {
                 let timer = self.request_metrics.start(RequestStage::GatewayInternalRpc);
-                timer.finish_result(transport.execute(request).await)?
+                let transport_wait = self
+                    .request_metrics
+                    .start_detail(RequestDetail::GatewayTransportWait);
+                let response = transport_wait.finish_result(transport.execute(request).await)?;
+                timer.finish_result(Ok::<_, GatewayExecutionError>(response))?
             };
             validate_process_request_end(cancellation)?;
             Ok(response)
@@ -5069,10 +5086,12 @@ async fn execute_process_create(
         .map_err(|error| process_write_error(error.to_string()))?,
     );
     let request = GatewayWriteRequest::new(route.clone(), transaction_id, command);
-    let receipt = match request_metrics
-        .start_detail(RequestDetail::GatewayDataApplyRpc)
-        .finish_result(transport.apply_single_shard(request).await)
-    {
+    let transport_wait = request_metrics.start_detail(RequestDetail::GatewayTransportWait);
+    let receipt = match transport_wait.finish_result(
+        request_metrics
+            .start_detail(RequestDetail::GatewayDataApplyRpc)
+            .finish_result(transport.apply_single_shard(request).await),
+    ) {
         Ok(receipt) => receipt,
         Err(error) => return Err(error),
     };

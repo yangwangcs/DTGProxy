@@ -535,6 +535,59 @@ const REQUEST_METRIC_DETAILS_V15: [&str; 43] = [
     "data_snapshot_ingest_receipt_lookup",
 ];
 
+const REQUEST_METRIC_DETAILS_V16: [&str; 50] = [
+    "gateway_query_request_encode",
+    "gateway_query_response_collect",
+    "gateway_query_response_decode",
+    "gateway_query_local_materialize",
+    "gateway_data_apply_rpc",
+    "data_route_lock_wait",
+    "data_route_lookup",
+    "data_raft_propose",
+    "data_raft_drive_ready",
+    "data_read_view_cache_hit",
+    "data_read_view_cache_miss",
+    "data_read_view_open",
+    "data_temporal_point_evaluation",
+    "data_temporal_scan_id_collection",
+    "data_temporal_scan_visibility",
+    "data_raft_lock_wait",
+    "data_raft_batch_admission",
+    "data_raft_batch_queue",
+    "data_raft_blocking_dispatch",
+    "data_adjacency_cache_hit",
+    "data_adjacency_cache_miss",
+    "data_adjacency_backend_expand",
+    "data_snapshot_csr_cache_hit",
+    "data_snapshot_csr_cache_miss",
+    "data_snapshot_csr_build",
+    "gateway_query_session_submit",
+    "gateway_query_session_response_wait",
+    "data_gateway_session_execution",
+    "gateway_query_pipeline_submit",
+    "gateway_query_pipeline_response_wait",
+    "bolt_read_pipeline_enqueue_wait",
+    "bolt_read_pipeline_execution_wait",
+    "bolt_read_pipeline_ordered_write_wait",
+    "gateway_query_pipeline_credit_wait",
+    "data_gateway_pipeline_dispatch_wait",
+    "data_gateway_pipeline_completion_send_wait",
+    "data_gateway_pipeline_completion_frame",
+    "gateway_query_pipeline_response_transport_wait",
+    "gateway_query_pipeline_response_dispatch_wait",
+    "data_gateway_pipeline_request_transport_wait",
+    "gateway_query_pipeline_writer_wait",
+    "data_snapshot_ingest_admission",
+    "data_snapshot_ingest_receipt_lookup",
+    "gateway_plan_routing",
+    "gateway_transport_wait",
+    "data_validation",
+    "data_execution",
+    "data_raft_queue",
+    "data_raft_apply",
+    "data_provider_apply",
+];
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
@@ -753,9 +806,9 @@ fn validate_metrics_snapshot(
     snapshot: &ProcessMetricsSnapshot,
     expected_role: &str,
 ) -> io::Result<()> {
-    if !matches!(snapshot.schema_version, 1..=15) {
+    if !matches!(snapshot.schema_version, 1..=16) {
         return Err(invalid_data(
-            "request metrics schema version must be between 1 and 15",
+            "request metrics schema version must be between 1 and 16",
         ));
     }
     if snapshot.process_role != expected_role {
@@ -796,6 +849,7 @@ fn validate_metrics_snapshot(
             13 => &REQUEST_METRIC_DETAILS_V13,
             14 => &REQUEST_METRIC_DETAILS_V14,
             15 => &REQUEST_METRIC_DETAILS_V15,
+            16 => &REQUEST_METRIC_DETAILS_V16,
             _ => unreachable!("schema v1 is handled above"),
         };
         if snapshot.details.len() != expected_details.len()
@@ -951,6 +1005,15 @@ pub struct QuickSummary {
     pub p50_ns: u64,
     pub p95_ns: u64,
     pub p99_ns: u64,
+    pub gateway_stage_means: Vec<StageMean>,
+    pub data_stage_means: Vec<StageMean>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StageMean {
+    pub stage: String,
+    pub calls: u64,
+    pub mean_nanoseconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -958,6 +1021,7 @@ pub struct QuickDiagnosticArtifact {
     pub format_version: u32,
     pub backend: Backend,
     pub revision: String,
+    pub transport_mode: &'static str,
     pub repetitions: usize,
     pub observations: Vec<RawObservation>,
     pub summaries: Vec<QuickSummary>,
@@ -1000,6 +1064,7 @@ impl QuickDiagnosticArtifact {
                     "quick diagnostic observation lacks bracketing stage metrics",
                 ));
             }
+            require_required_stages(observation)?;
             if matches!(
                 observation.workload,
                 Workload::OneHopExpand | Workload::TwoHopExpand
@@ -1118,6 +1183,18 @@ impl QuickDiagnosticArtifact {
                     p50_ns: summary.p50_ns,
                     p95_ns: summary.p95_ns,
                     p99_ns: summary.p99_ns,
+                    gateway_stage_means: stage_means(
+                        &observations,
+                        summary.workload,
+                        summary.concurrency,
+                        true,
+                    ),
+                    data_stage_means: stage_means(
+                        &observations,
+                        summary.workload,
+                        summary.concurrency,
+                        false,
+                    ),
                 }
             })
             .collect();
@@ -1125,11 +1202,112 @@ impl QuickDiagnosticArtifact {
             format_version: 1,
             backend,
             revision,
+            transport_mode: "session",
             repetitions: 3,
             observations,
             summaries,
         })
     }
+}
+
+fn require_required_stages(observation: &RawObservation) -> io::Result<()> {
+    let gateway = observation
+        .gateway_stage_metrics
+        .as_ref()
+        .expect("gateway stage metrics were checked above");
+    let data = observation
+        .data_stage_metrics
+        .as_ref()
+        .expect("data stage metrics were checked above");
+    for detail in ["gateway_plan_routing", "gateway_transport_wait"] {
+        require_stage(detail, &gateway.delta.details, observation.operations)?;
+    }
+    let data_details: &[&str] = if observation.workload.is_write() {
+        &[
+            "data_validation",
+            "data_raft_queue",
+            "data_raft_apply",
+            "data_provider_apply",
+        ]
+    } else {
+        &["data_validation", "data_execution", "data_provider_apply"]
+    };
+    for detail in data_details {
+        require_stage(detail, &data.delta.details, observation.operations)?;
+    }
+    Ok(())
+}
+
+fn require_stage(name: &str, details: &[DetailMetricDelta], operations: u64) -> io::Result<()> {
+    let detail = details
+        .iter()
+        .find(|detail| detail.detail == name)
+        .ok_or_else(|| invalid_data(format!("quick diagnostic observation lacks {name}")))?;
+    if detail.success != operations || detail.error != 0 || detail.cancelled != 0 {
+        return Err(invalid_data(format!(
+            "quick diagnostic observation has incomplete {name} evidence"
+        )));
+    }
+    Ok(())
+}
+
+fn stage_means(
+    observations: &[RawObservation],
+    workload: Workload,
+    concurrency: usize,
+    gateway: bool,
+) -> Vec<StageMean> {
+    let required: &[&str] = if gateway {
+        &["gateway_plan_routing", "gateway_transport_wait"]
+    } else if workload.is_write() {
+        &[
+            "data_validation",
+            "data_raft_queue",
+            "data_raft_apply",
+            "data_provider_apply",
+        ]
+    } else {
+        &["data_validation", "data_execution", "data_provider_apply"]
+    };
+    required
+        .iter()
+        .map(|name| {
+            let (calls, total_nanoseconds) = observations
+                .iter()
+                .filter(|observation| {
+                    observation.workload == workload && observation.concurrency == concurrency
+                })
+                .map(|observation| {
+                    let window = if gateway {
+                        observation.gateway_stage_metrics.as_ref()
+                    } else {
+                        observation.data_stage_metrics.as_ref()
+                    }
+                    .expect("required stage metrics were validated");
+                    let detail = window
+                        .delta
+                        .details
+                        .iter()
+                        .find(|detail| detail.detail == *name)
+                        .expect("required stage was validated");
+                    (detail.success, detail.total_nanoseconds)
+                })
+                .fold(
+                    (0_u64, 0_u64),
+                    |(calls, total), (next_calls, next_total)| {
+                        (
+                            calls.saturating_add(next_calls),
+                            total.saturating_add(next_total),
+                        )
+                    },
+                );
+            StageMean {
+                stage: (*name).into(),
+                calls,
+                mean_nanoseconds: total_nanoseconds / calls,
+            }
+        })
+        .collect()
 }
 
 pub fn write_quick_artifact(path: &Path, artifact: &QuickDiagnosticArtifact) -> io::Result<()> {

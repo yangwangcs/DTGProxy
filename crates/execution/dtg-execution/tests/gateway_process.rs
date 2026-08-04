@@ -11,7 +11,7 @@ use dtg_execution::{
     GatewayExecutionTransport, GatewayFuture, GatewayProtocolV2Client, GatewayProtocolV2Transport,
     GatewayQueryResponse, GatewayRequestContext, GatewayResponse, GatewayRows, GatewayValue,
     GatewayWriteReceipt, GatewayWriteRequest, GatewayWriteTransport, RequestDetail, RequestStage,
-    ShardRoutedGatewayTransport, StageOutcome,
+    ShardRoutedGatewayTransport, StageOutcome, encode_request_metrics_snapshot,
 };
 use dtg_language_ir::{
     Aggregate, AggregateFunction, AggregateKind, BinaryOperator, Field, GraphScope, LogicalExpr,
@@ -903,7 +903,7 @@ fn process_execution_decodes_protocol_v2_typed_rows() {
 }
 
 #[test]
-fn process_executes_remote_point_query_at_gateway() {
+fn middleware_stage_point_read_observes_gateway_boundaries_exactly_once() {
     let client = Arc::new(RecordingProtocolClient::with_fixture(
         ProtocolFixture::RawPoint,
     ));
@@ -946,6 +946,19 @@ fn process_executes_remote_point_query_at_gateway() {
         assert_eq!(stage.success, 1);
         assert_eq!(stage.error, 0);
         assert_eq!(stage.cancelled, 0);
+    }
+    let encoded = encode_request_metrics_snapshot("gateway", 1, 1, &metrics).unwrap();
+    let details = serde_json::from_str::<serde_json::Value>(&encoded).unwrap();
+    for detail in ["gateway_plan_routing", "gateway_transport_wait"] {
+        let snapshot = details["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|snapshot| snapshot["detail"] == detail)
+            .unwrap_or_else(|| panic!("missing required middleware stage {detail}"));
+        assert_eq!(snapshot["success"], 1, "{detail} must finish once");
+        assert_eq!(snapshot["error"], 0, "{detail} must not fail");
+        assert_eq!(snapshot["cancelled"], 0, "{detail} must not cancel");
     }
 }
 

@@ -538,7 +538,7 @@ async fn v2_rpc_rejects_malformed_requests_and_records_metrics() {
 }
 
 #[tokio::test]
-async fn apply_transaction_proposes_the_typed_shard_command() {
+async fn middleware_stage_committed_write_observes_data_boundaries_exactly_once() {
     let root = tempfile::tempdir().unwrap();
     let binding = fjall_binding("rpc-transaction");
     let node = DataNodeBuilder::from_config(
@@ -609,6 +609,22 @@ async fn apply_transaction_proposes_the_typed_shard_command() {
             .find_map(|(recorded, snapshot)| (recorded == detail).then_some(snapshot))
             .unwrap();
         assert_eq!(snapshot.success, 1);
+    }
+    for detail in [
+        "DataValidation",
+        "DataRaftQueue",
+        "DataRaftApply",
+        "DataProviderApply",
+    ] {
+        let snapshot = metrics
+            .details()
+            .find_map(|(recorded, snapshot)| {
+                (format!("{recorded:?}") == detail).then_some(snapshot)
+            })
+            .unwrap_or_else(|| panic!("missing required middleware stage {detail}"));
+        assert_eq!(snapshot.success, 1, "{detail} must finish once");
+        assert_eq!(snapshot.error, 0, "{detail} must not fail");
+        assert_eq!(snapshot.cancelled, 0, "{detail} must not cancel");
     }
 }
 
@@ -1175,7 +1191,7 @@ async fn execute_fragment_reads_the_fenced_replica_store() {
 }
 
 #[tokio::test]
-async fn gateway_encoder_logical_vertex_point_reaches_the_data_service() {
+async fn middleware_stage_point_read_observes_data_boundaries_exactly_once() {
     let root = tempfile::tempdir().unwrap();
     let capabilities = fjall_capabilities();
     let binding = fjall_binding_with_capabilities("gateway-logical-point", &capabilities);
@@ -1221,6 +1237,7 @@ async fn gateway_encoder_logical_vertex_point_reaches_the_data_service() {
         .await
         .unwrap();
     let applied_index = node.replica_observations().await[0].applied_index();
+    let before = node.request_metrics().snapshot();
     let body = logical_vertex_point_body(&binding, &capabilities, applied_index);
     let mut stream = node
         .rpc_service()
@@ -1247,6 +1264,32 @@ async fn gateway_encoder_logical_vertex_point_reaches_the_data_service() {
     let batch = stream.next().await.unwrap().unwrap();
     assert_eq!(batch.row_count, 1);
     assert!(stream.next().await.is_none());
+    let after = node.request_metrics().snapshot();
+    for detail in [
+        RequestDetail::DataValidation,
+        RequestDetail::DataExecution,
+        RequestDetail::DataProviderApply,
+    ] {
+        let before = before
+            .details()
+            .find_map(|(recorded, snapshot)| (recorded == detail).then_some(snapshot))
+            .unwrap();
+        let after = after
+            .details()
+            .find_map(|(recorded, snapshot)| (recorded == detail).then_some(snapshot))
+            .unwrap();
+        assert_eq!(
+            after.success - before.success,
+            1,
+            "{detail:?} must finish once"
+        );
+        assert_eq!(after.error - before.error, 0, "{detail:?} must not fail");
+        assert_eq!(
+            after.cancelled - before.cancelled,
+            0,
+            "{detail:?} must not cancel"
+        );
+    }
 }
 
 #[tokio::test]

@@ -1018,6 +1018,7 @@ fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
     assert_eq!(serialized["format_version"], 1);
     assert_eq!(serialized["backend"], "fjall");
     assert_eq!(serialized["revision"], "test-revision");
+    assert_eq!(serialized["transport_mode"], "session");
     assert_eq!(serialized["repetitions"], 3);
     assert_eq!(serialized["observations"].as_array().unwrap().len(), 45);
     assert_eq!(serialized["summaries"].as_array().unwrap().len(), 15);
@@ -1034,6 +1035,11 @@ fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
     assert_eq!(summary["p50_ns"], 10);
     assert_eq!(summary["p95_ns"], 20);
     assert_eq!(summary["p99_ns"], 20);
+    assert_eq!(
+        summary["gateway_stage_means"][0]["stage"],
+        "gateway_plan_routing"
+    );
+    assert_eq!(summary["data_stage_means"][0]["stage"], "data_validation");
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("quick.json");
     backend_e2e_support::write_quick_artifact(&output, &artifact).unwrap();
@@ -1119,6 +1125,33 @@ fn quick_artifact_rejects_writes_without_one_persisted_vertex_per_create() {
     );
 }
 
+#[test]
+fn quick_artifact_requires_required_stage_set() {
+    let mut observations = complete_quick_observations(backend_e2e_support::Backend::Fjall, 3);
+    let point_read = observations
+        .iter_mut()
+        .find(|observation| {
+            observation.workload == backend_e2e_support::Workload::PointLookup
+                && observation.concurrency == 1
+                && observation.repetition == 0
+        })
+        .unwrap();
+    point_read
+        .data_stage_metrics
+        .as_mut()
+        .unwrap()
+        .delta
+        .details
+        .retain(|detail| detail.detail != "data_provider_apply");
+
+    assert!(
+        backend_e2e_support::QuickDiagnosticArtifact::new("revision", observations)
+            .unwrap_err()
+            .to_string()
+            .contains("data_provider_apply")
+    );
+}
+
 fn complete_quick_observations(
     backend: backend_e2e_support::Backend,
     repetitions: u8,
@@ -1133,7 +1166,20 @@ fn complete_quick_observations(
             backend_e2e_support::Workload::CountVertices,
         ] {
             for concurrency in [1, 8, 64] {
+                let mut gateway_stage_metrics = synthetic_stage_metrics_window_v6("gateway");
+                for detail in ["gateway_plan_routing", "gateway_transport_wait"] {
+                    add_required_stage_detail(&mut gateway_stage_metrics, detail);
+                }
                 let mut data_stage_metrics = synthetic_stage_metrics_window_v6("data");
+                for detail in [
+                    "data_validation",
+                    "data_execution",
+                    "data_raft_queue",
+                    "data_raft_apply",
+                    "data_provider_apply",
+                ] {
+                    add_required_stage_detail(&mut data_stage_metrics, detail);
+                }
                 if matches!(
                     workload,
                     backend_e2e_support::Workload::OneHopExpand
@@ -1170,7 +1216,7 @@ fn complete_quick_observations(
                         "stable-result".into()
                     },
                     query_digest: format!("{workload:?}"),
-                    gateway_stage_metrics: Some(synthetic_stage_metrics_window("gateway")),
+                    gateway_stage_metrics: Some(gateway_stage_metrics),
                     data_stage_metrics: Some(data_stage_metrics),
                 });
             }
@@ -1179,17 +1225,18 @@ fn complete_quick_observations(
     observations
 }
 
-fn stage_metrics_line(role: &str, timestamp: u64, sequence: u64, success: u64) -> String {
-    stage_metrics_line_with(role, timestamp, sequence, success, 1)
+fn add_required_stage_detail(window: &mut backend_e2e_support::StageMetricsWindow, name: &str) {
+    let mut detail = window.delta.details[0].clone();
+    detail.detail = name.into();
+    detail.success = 2;
+    detail.error = 0;
+    detail.cancelled = 0;
+    detail.total_nanoseconds = 2;
+    window.delta.details.push(detail);
 }
 
-fn synthetic_stage_metrics_window(role: &str) -> backend_e2e_support::StageMetricsWindow {
-    let log = format!(
-        "{}\n{}\n",
-        stage_metrics_line(role, 10, 1, 1),
-        stage_metrics_line(role, 20, 2, 2),
-    );
-    stage_metrics_window_from_log(&log, role, 15, 20).unwrap()
+fn stage_metrics_line(role: &str, timestamp: u64, sequence: u64, success: u64) -> String {
+    stage_metrics_line_with(role, timestamp, sequence, success, 1)
 }
 
 fn synthetic_stage_metrics_window_v6(role: &str) -> backend_e2e_support::StageMetricsWindow {

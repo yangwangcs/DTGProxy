@@ -336,7 +336,8 @@ impl DataNodeBuilder {
             {
                 return Err(DataNodeError::Build(format!(
                     "assignment provider {:?} does not match configured backend {:?}",
-                    binding.provider_kind(), configured
+                    binding.provider_kind(),
+                    configured
                 )));
             }
         }
@@ -804,8 +805,16 @@ async fn run_apply_batcher(
                 dtg_execution::StageOutcome::Success,
                 elapsed_nanoseconds(request.queued_at),
             );
+            request_metrics.record_detail(
+                dtg_execution::RequestDetail::DataRaftQueue,
+                dtg_execution::StageOutcome::Success,
+                elapsed_nanoseconds(request.queued_at),
+            );
         }
         let execution = Arc::clone(&execution);
+        let provider_apply_timers = (0..batch.len())
+            .map(|_| request_metrics.start_detail(dtg_execution::RequestDetail::DataProviderApply))
+            .collect::<Vec<_>>();
         let dispatch_started = Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             let dispatch_nanoseconds = elapsed_nanoseconds(dispatch_started);
@@ -816,6 +825,9 @@ async fn run_apply_batcher(
         .await;
         let completions = match result {
             Ok(Ok((dispatch_nanoseconds, timing))) => {
+                for timer in provider_apply_timers {
+                    timer.finish(dtg_execution::StageOutcome::Success);
+                }
                 for _ in &batch {
                     request_metrics.record_detail(
                         dtg_execution::RequestDetail::DataRaftBlockingDispatch,
@@ -856,8 +868,18 @@ async fn run_apply_batcher(
                         .collect()
                 }
             }
-            Ok(Err(error)) => vec![Err(error.to_string()); batch.len()],
-            Err(error) => vec![Err(format!("Raft batch worker failed: {error}")); batch.len()],
+            Ok(Err(error)) => {
+                for timer in provider_apply_timers {
+                    timer.finish(dtg_execution::StageOutcome::Error);
+                }
+                vec![Err(error.to_string()); batch.len()]
+            }
+            Err(error) => {
+                for timer in provider_apply_timers {
+                    timer.finish(dtg_execution::StageOutcome::Error);
+                }
+                vec![Err(format!("Raft batch worker failed: {error}")); batch.len()]
+            }
         };
         for (request, completion) in batch.into_iter().zip(completions) {
             let _ = request.completion.send(completion);
@@ -1322,6 +1344,9 @@ impl DataRpcService {
             .as_ref()
             .and_then(|context| context.request.clone());
         let timer = self.request_metrics.start(RequestStage::DataValidation);
+        let validation_detail = self
+            .request_metrics
+            .start_detail(dtg_execution::RequestDetail::DataValidation);
         let validation: Result<_, Status> = (|| {
             let shard_context: ShardRequestContext = wire
                 .context
@@ -1333,7 +1358,8 @@ impl DataRpcService {
                 validate_execution_fragment(wire.clone()).map_err(|error| self.invalid(error))?;
             Ok((shard_context, payload))
         })();
-        let (shard_context, payload) = timer.finish_result(validation)?;
+        let (shard_context, payload) =
+            validation_detail.finish_result(timer.finish_result(validation))?;
         let timer = self.request_metrics.start(RequestStage::DataRouting);
         let lookup = timer.finish_result(
             self.execution
@@ -1372,17 +1398,27 @@ impl DataRpcService {
         let timer = self
             .request_metrics
             .start(RequestStage::DataProviderExecution);
-        let rows = timer.finish_result(
-            self.execution
-                .execute_fragment(
-                    key,
-                    wire.applied_index,
-                    transaction_time,
-                    wire.valid_at,
-                    payload.body(),
-                )
-                .await
-                .map_err(|error| self.execution_failure(error)),
+        let execution_detail = self
+            .request_metrics
+            .start_detail(dtg_execution::RequestDetail::DataExecution);
+        let provider_apply = self
+            .request_metrics
+            .start_detail(dtg_execution::RequestDetail::DataProviderApply);
+        let rows = provider_apply.finish_result(
+            execution_detail.finish_result(
+                timer.finish_result(
+                    self.execution
+                        .execute_fragment(
+                            key,
+                            wire.applied_index,
+                            transaction_time,
+                            wire.valid_at,
+                            payload.body(),
+                        )
+                        .await
+                        .map_err(|error| self.execution_failure(error)),
+                ),
+            ),
         )?;
         encode_fragment_batches(response_context, wire.fragment_id, rows)
             .map_err(|error| self.execution_failure(error))
@@ -1668,6 +1704,9 @@ impl DataService for DataRpcService {
             .as_ref()
             .and_then(|context| context.request.clone());
         let timer = self.request_metrics.start(RequestStage::DataValidation);
+        let validation_detail = self
+            .request_metrics
+            .start_detail(dtg_execution::RequestDetail::DataValidation);
         let validation: Result<_, Status> = (|| {
             let shard_context: ShardRequestContext = wire
                 .context
@@ -1686,7 +1725,8 @@ impl DataService for DataRpcService {
             }
             Ok((shard_context, command))
         })();
-        let (shard_context, command) = timer.finish_result(validation)?;
+        let (shard_context, command) =
+            validation_detail.finish_result(timer.finish_result(validation))?;
         let snapshot_commit = wire.operation
             == dtg_execution::cluster_protocol::proto::TransactionOperation::CommitSnapshot as i32;
         let timer = self.request_metrics.start(RequestStage::DataRouting);
@@ -1727,7 +1767,12 @@ impl DataService for DataRpcService {
         };
         let command_id = command.header().command_id().get();
         let timer = self.request_metrics.start(RequestStage::DataRaftApply);
-        let apply = timer.finish_result(self.apply_transaction_batched(key, command).await)?;
+        let apply_detail = self
+            .request_metrics
+            .start_detail(dtg_execution::RequestDetail::DataRaftApply);
+        let apply = apply_detail.finish_result(
+            timer.finish_result(self.apply_transaction_batched(key, command).await),
+        )?;
         let receipt = apply.receipt;
         if receipt.command_id() != command_id {
             return Err(self.execution_failure("transaction command receipt identifier differs"));
