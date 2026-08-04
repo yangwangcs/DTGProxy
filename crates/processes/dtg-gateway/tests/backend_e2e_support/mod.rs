@@ -9,8 +9,8 @@ use std::time::Duration;
 pub use artifact::{
     Backend, CellSpec, CommittedSnapshotIngestArtifact, ProcessMetricsSnapshot,
     QuickDiagnosticArtifact, RawObservation, StageMetricsWindow, Summary, Workload, percentile_ns,
-    stage_metrics_window_from_log, summarize, write_committed_snapshot_ingest_artifact,
-    write_quick_artifact,
+    stage_metrics_window_from_log, stage_metrics_window_from_log_after_sequence, summarize,
+    write_committed_snapshot_ingest_artifact, write_quick_artifact,
 };
 pub use bolt::{
     BoltResult, BoltSession, BoltValue, measure_cell as measure_cell_with_durations,

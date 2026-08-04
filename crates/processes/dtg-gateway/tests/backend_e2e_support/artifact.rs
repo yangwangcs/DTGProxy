@@ -756,6 +756,53 @@ pub fn stage_metrics_window_from_log(
     measurement_started_at_unix_ns: u64,
     measurement_finished_at_unix_ns: u64,
 ) -> io::Result<StageMetricsWindow> {
+    let snapshots = parse_metrics_snapshots(log, expected_role)?;
+
+    let before = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.unix_timestamp_ns <= measurement_started_at_unix_ns)
+        .max_by_key(|snapshot| snapshot.unix_timestamp_ns)
+        .cloned()
+        .ok_or_else(|| invalid_data("request metrics lack a pre-measurement snapshot"))?;
+    let after = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.unix_timestamp_ns >= measurement_finished_at_unix_ns)
+        .min_by_key(|snapshot| snapshot.unix_timestamp_ns)
+        .cloned()
+        .ok_or_else(|| invalid_data("request metrics lack a post-measurement snapshot"))?;
+
+    stage_metrics_window(before, after)
+}
+
+pub fn stage_metrics_window_from_log_after_sequence(
+    log: &str,
+    expected_role: &str,
+    before_sequence: u64,
+    measurement_finished_at_unix_ns: u64,
+) -> io::Result<StageMetricsWindow> {
+    let snapshots = parse_metrics_snapshots(log, expected_role)?;
+    let before = snapshots
+        .iter()
+        .find(|snapshot| snapshot.sequence == before_sequence)
+        .cloned()
+        .ok_or_else(|| invalid_data("request metrics lack the explicit baseline snapshot"))?;
+    let after = snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.sequence > before_sequence
+                && snapshot.unix_timestamp_ns >= measurement_finished_at_unix_ns
+        })
+        .min_by_key(|snapshot| snapshot.unix_timestamp_ns)
+        .cloned()
+        .ok_or_else(|| invalid_data("request metrics lack a post-measurement snapshot"))?;
+
+    stage_metrics_window(before, after)
+}
+
+fn parse_metrics_snapshots(
+    log: &str,
+    expected_role: &str,
+) -> io::Result<Vec<ProcessMetricsSnapshot>> {
     let snapshots = log
         .lines()
         .filter_map(|line| line.strip_prefix(REQUEST_METRICS_PREFIX))
@@ -784,20 +831,16 @@ pub fn stage_metrics_window_from_log(
         }
         previous = Some(snapshot);
     }
+    Ok(snapshots)
+}
 
-    let before = snapshots
-        .iter()
-        .filter(|snapshot| snapshot.unix_timestamp_ns <= measurement_started_at_unix_ns)
-        .max_by_key(|snapshot| snapshot.unix_timestamp_ns)
-        .cloned()
-        .ok_or_else(|| invalid_data("request metrics lack a pre-measurement snapshot"))?;
-    let after = snapshots
-        .iter()
-        .filter(|snapshot| snapshot.unix_timestamp_ns >= measurement_finished_at_unix_ns)
-        .min_by_key(|snapshot| snapshot.unix_timestamp_ns)
-        .cloned()
-        .ok_or_else(|| invalid_data("request metrics lack a post-measurement snapshot"))?;
-
+fn stage_metrics_window(
+    before: ProcessMetricsSnapshot,
+    after: ProcessMetricsSnapshot,
+) -> io::Result<StageMetricsWindow> {
+    if after.sequence <= before.sequence {
+        return Err(invalid_data("request metrics sequence did not increase"));
+    }
     Ok(StageMetricsWindow {
         delta: metric_delta(&before, &after),
         before,

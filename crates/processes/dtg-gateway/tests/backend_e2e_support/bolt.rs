@@ -273,7 +273,6 @@ pub async fn measure_pipeline_cell(
     tokio::time::sleep_until(warmup_deadline.into()).await;
     let measurement_started_at_unix_ns = unix_time_nanos();
     tokio::time::sleep_until(measurement_deadline.into()).await;
-    let measurement_finished_at_unix_ns = unix_time_nanos();
 
     let mut latency_samples_ns = Vec::new();
     let mut operations = 0_u64;
@@ -304,6 +303,7 @@ pub async fn measure_pipeline_cell(
             }
         }
     }
+    let measurement_finished_at_unix_ns = unix_time_nanos();
     let (_, row_count, result_digest) = identity.unwrap_or((Vec::new(), 0, String::new()));
     Ok(RawObservation {
         backend: cell.backend,

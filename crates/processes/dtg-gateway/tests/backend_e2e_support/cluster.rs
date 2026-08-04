@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 
 use super::{
     Backend, BoltSession, BoltValue, CellSpec, ProcessMetricsSnapshot, RawObservation,
-    StageMetricsWindow, Workload, stage_metrics_window_from_log,
+    StageMetricsWindow, Workload, stage_metrics_window_from_log_after_sequence,
 };
 
 const CAPABILITIES: &str = "adjacency,immutable-read-view,logical-snapshot,point";
@@ -344,10 +344,14 @@ impl DiagnosticCluster {
     }
 
     pub async fn measure_cell(&self, spec: CellSpec) -> io::Result<RawObservation> {
+        let (gateway_baseline, data_baseline) = tokio::try_join!(
+            self.next_request_metrics_snapshot_after_latest("gateway"),
+            self.next_request_metrics_snapshot_after_latest("data"),
+        )?;
         let mut observation = super::measure_cell(self.bolt_address(), spec).await?;
         let (gateway_stage_metrics, data_stage_metrics) = tokio::try_join!(
-            self.stage_metrics_window("gateway", &observation),
-            self.stage_metrics_window("data", &observation),
+            self.stage_metrics_window("gateway", &observation, gateway_baseline.sequence),
+            self.stage_metrics_window("data", &observation, data_baseline.sequence),
         )?;
         observation.gateway_stage_metrics = Some(gateway_stage_metrics);
         observation.data_stage_metrics = Some(data_stage_metrics);
@@ -536,6 +540,10 @@ impl DiagnosticCluster {
         spec: CellSpec,
         depth: usize,
     ) -> io::Result<RawObservation> {
+        let (gateway_baseline, data_baseline) = tokio::try_join!(
+            self.next_request_metrics_snapshot_after_latest("gateway"),
+            self.next_request_metrics_snapshot_after_latest("data"),
+        )?;
         let mut observation = super::measure_pipeline_cell_with_durations(
             self.bolt_address(),
             spec,
@@ -545,8 +553,8 @@ impl DiagnosticCluster {
         )
         .await?;
         let (gateway_stage_metrics, data_stage_metrics) = tokio::try_join!(
-            self.stage_metrics_window("gateway", &observation),
-            self.stage_metrics_window("data", &observation),
+            self.stage_metrics_window("gateway", &observation, gateway_baseline.sequence),
+            self.stage_metrics_window("data", &observation, data_baseline.sequence),
         )?;
         observation.gateway_stage_metrics = Some(gateway_stage_metrics);
         observation.data_stage_metrics = Some(data_stage_metrics);
@@ -594,6 +602,31 @@ impl DiagnosticCluster {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    async fn next_request_metrics_snapshot_after_latest(
+        &self,
+        process: &str,
+    ) -> io::Result<ProcessMetricsSnapshot> {
+        let after_sequence = match self.last_request_metrics_line(process) {
+            Ok(line) => serde_json::from_str::<ProcessMetricsSnapshot>(&line)
+                .map_err(|error| {
+                    invalid_data(format!(
+                        "{process} exported invalid request metrics: {error}"
+                    ))
+                })?
+                .sequence
+                .into(),
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidData
+                    && error.to_string().contains("did not export request metrics") =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        self.next_request_metrics_snapshot(process, after_sequence)
+            .await
     }
 
     pub async fn shutdown(&mut self) -> io::Result<()> {
@@ -706,15 +739,16 @@ impl DiagnosticCluster {
         &self,
         process: &str,
         observation: &RawObservation,
+        baseline_sequence: u64,
     ) -> io::Result<StageMetricsWindow> {
         let log_path = self.process_log_path(process)?.to_owned();
         let deadline = tokio::time::Instant::now() + POST_MEASUREMENT_METRICS_WAIT;
         loop {
             let log = std::fs::read_to_string(&log_path)?;
-            match stage_metrics_window_from_log(
+            match stage_metrics_window_from_log_after_sequence(
                 &log,
                 process,
-                observation.measurement_started_at_unix_ns,
+                baseline_sequence,
                 observation.measurement_finished_at_unix_ns,
             ) {
                 // The exporter is periodic and may be delayed while the process is

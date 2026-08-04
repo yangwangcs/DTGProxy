@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use backend_e2e_support::{
     Backend, CellSpec, CommittedSnapshotIngestArtifact, DiagnosticCluster, DiagnosticRuntime,
     RawObservation, SNAPSHOT_INGEST_DIAGNOSTIC_BATCH_LEN, Workload, percentile_ns,
-    stage_metrics_window_from_log,
+    stage_metrics_window_from_log, stage_metrics_window_from_log_after_sequence,
 };
 
 #[derive(serde::Serialize)]
@@ -858,6 +858,21 @@ fn stage_metrics_window_requires_valid_bracketing_cumulative_snapshots() {
     assert_eq!(window.delta.stages[0].buckets[0], 4);
     let delta = serde_json::to_value(&window.delta.stages[0]).unwrap();
     assert!(delta.get("max_nanoseconds").is_none());
+}
+
+#[test]
+fn stage_metrics_window_can_start_from_an_explicit_post_setup_snapshot() {
+    let log = format!(
+        "ordinary stderr\n{}\n{}\n{}\n",
+        stage_metrics_line("data", 10, 1, 2),
+        stage_metrics_line("data", 15, 2, 5),
+        stage_metrics_line("data", 20, 3, 9),
+    );
+
+    let window = stage_metrics_window_from_log_after_sequence(&log, "data", 2, 20).unwrap();
+    assert_eq!(window.before.sequence, 2);
+    assert_eq!(window.after.sequence, 3);
+    assert_eq!(window.delta.stages[0].success, 4);
 }
 
 #[test]
