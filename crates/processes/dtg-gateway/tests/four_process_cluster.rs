@@ -38,7 +38,7 @@ use tonic::codegen::tokio_stream::StreamExt;
 const FIXTURE_ROOT: &str = "../../../config/examples/clean-break-cluster";
 
 #[test]
-fn clean_break_fixtures_define_four_roles_and_single_provider_data_nodes() {
+fn clean_break_fixtures_define_four_roles_and_two_heterogeneous_data_nodes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT);
     let meta = read(&root.join("meta-1.json"));
     let controller = read(&root.join("controller-1.json"));
@@ -53,7 +53,7 @@ fn clean_break_fixtures_define_four_roles_and_single_provider_data_nodes() {
     assert_eq!(cluster_ids, BTreeSet::from([9001]));
 
     assert_eq!(provider(&data_1), "fjall");
-    assert_eq!(provider(&data_2), "fjall");
+    assert_eq!(provider(&data_2), "postgresql");
     assert_ne!(data_1["node_id"], data_2["node_id"]);
     assert_ne!(data_1["rpc_addr"], data_2["rpc_addr"]);
     assert_ne!(data_1["fjall_root"], data_2["fjall_root"]);

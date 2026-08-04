@@ -30,6 +30,7 @@ struct QuickResult {
     p95_ms: f64,
     p99_ms: f64,
     errors: u64,
+    result_digest: String,
 }
 
 #[derive(serde::Serialize)]
@@ -124,6 +125,7 @@ async fn quick_selected_backend_e2e_comparison() {
                     p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
                     p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
                     errors: observation.errors,
+                    result_digest: observation.result_digest.clone(),
                 };
                 println!(
                     "DTG_BACKEND_E2E_QUICK_RESULT={}",
@@ -269,6 +271,7 @@ async fn fjall_one_hop_uses_the_real_four_process_bolt_path() {
             p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
             p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
             errors: observation.errors,
+            result_digest: observation.result_digest.clone(),
         })
         .unwrap()
     );
@@ -440,6 +443,7 @@ async fn fjall_two_hop_uses_the_real_four_process_bolt_path() {
             p95_ms: percentile_ns(&observation.latency_samples_ns, 95) as f64 / 1_000_000.0,
             p99_ms: percentile_ns(&observation.latency_samples_ns, 99) as f64 / 1_000_000.0,
             errors: observation.errors,
+            result_digest: observation.result_digest.clone(),
         })
         .unwrap()
     );
