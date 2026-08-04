@@ -10,8 +10,13 @@ Closure Task 2: complete (commits 2ffd320..017c37b, review clean)
 Task 1: complete (uncommitted worktree; reviews fixed; shard-runtime 48/48; concurrent MERGE 20/20 twice)
 Task 2: complete (uncommitted worktree; multi-row atomic MERGE and explicit Bolt staging; relevant
 suite green; independent review clean)
-Middleware performance closure Task 2: complete (commit 167ef45; Fjall/Kuzu focused and full
-topology suites green; disposable PostgreSQL ignored topology passed; review pending)
+Middleware performance closure Task 2: complete (commits 8cf1a0e..aef9d59; Fjall/Kuzu focused
+and full topology suites green; disposable PostgreSQL ignored topology passed; review clean)
+Middleware performance closure Task 3: complete (commits c07fdfb..e0304da; stage boundary fixes,
+transport-mode provenance, Gateway/Data/artifact focused suites green; independent re-review clean)
+Middleware performance closure Task 4: complete (pipeline stream selection avoids the per-request
+load-vector allocation while retaining bounded least-loaded selection and tie rotation; focused
+Gateway stage regression plus real four-process Fjall Bolt diagnostic passed)
 Task 3: complete (uncommitted worktree; six-package suite green; same reviewer Ready with no
 Critical or Important findings)
 Task 4: complete - current-only Cypher 25 query composition is implemented without a versioned

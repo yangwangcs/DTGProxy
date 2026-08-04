@@ -911,13 +911,10 @@ impl TonicGatewayPipelinePool {
     }
 
     fn select_stream(&self) -> Option<Arc<TonicGatewayPipelineClient>> {
-        let loads = self
-            .streams
-            .iter()
-            .map(|stream| stream.pending_load())
-            .collect::<Vec<_>>();
-        select_gateway_pipeline_stream(&loads, &self.next)
-            .and_then(|index| self.streams.get(index).cloned())
+        select_gateway_pipeline_stream(self.streams.len(), &self.next, |index| {
+            self.streams[index].pending_load()
+        })
+        .map(|index| Arc::clone(&self.streams[index]))
     }
 }
 
@@ -939,24 +936,33 @@ fn reserve_gateway_pipeline_pool_pending(pending: &AtomicUsize) -> bool {
     }
 }
 
-fn select_gateway_pipeline_stream(loads: &[usize], next: &AtomicUsize) -> Option<usize> {
-    if loads.is_empty() {
+fn select_gateway_pipeline_stream(
+    stream_count: usize,
+    next: &AtomicUsize,
+    pending_load: impl Fn(usize) -> usize,
+) -> Option<usize> {
+    if stream_count == 0 {
         return None;
     }
-    let start = next.fetch_add(1, Ordering::Relaxed) % loads.len();
+    // Select directly from the bounded stream set. The previous implementation
+    // materialized a load vector for every request, adding an allocation and a
+    // second pass precisely on the hot pipeline submission path.
+    let start = next.fetch_add(1, Ordering::Relaxed) % stream_count;
     let mut selected = None;
-    for offset in 0..loads.len() {
-        let index = (start + offset) % loads.len();
-        let load = loads[index];
+    let mut selected_load = usize::MAX;
+    for offset in 0..stream_count {
+        let index = (start + offset) % stream_count;
+        let load = pending_load(index);
         if load == usize::MAX {
             continue;
         }
-        if selected.is_none_or(|selected_index| load < loads[selected_index]) {
+        if load < selected_load {
             selected = Some(index);
+            selected_load = load;
         }
     }
     if let Some(index) = selected {
-        next.store((index + 1) % loads.len(), Ordering::Relaxed);
+        next.store((index + 1) % stream_count, Ordering::Relaxed);
     }
     selected
 }
@@ -5434,16 +5440,18 @@ mod write_receipt_tests {
     #[test]
     fn pipeline_pool_prefers_the_least_loaded_stream_and_rotates_ties() {
         let next = AtomicUsize::new(0);
+        let loads = [8, 2, 2, 9];
         assert_eq!(
-            select_gateway_pipeline_stream(&[8, 2, 2, 9], &next),
+            select_gateway_pipeline_stream(loads.len(), &next, |index| loads[index]),
             Some(1)
         );
         assert_eq!(
-            select_gateway_pipeline_stream(&[8, 2, 2, 9], &next),
+            select_gateway_pipeline_stream(loads.len(), &next, |index| loads[index]),
             Some(2)
         );
+        let unavailable = [usize::MAX; 4];
         assert_eq!(
-            select_gateway_pipeline_stream(&[usize::MAX; 4], &next),
+            select_gateway_pipeline_stream(unavailable.len(), &next, |index| unavailable[index]),
             None
         );
     }
