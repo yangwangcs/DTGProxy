@@ -5,8 +5,7 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$repo_root"
 
 test -x scripts/local-cluster.sh
-rg -F 'start --managed-postgres' scripts/local-cluster.sh >/dev/null
-rg -F 'start --postgres-url URL' scripts/local-cluster.sh >/dev/null
+rg -F '[--managed-postgres | --postgres-url URL]' scripts/local-cluster.sh >/dev/null
 rg -F 'start --backend <fjall|postgresql|kuzu>' scripts/local-cluster.sh >/dev/null
 rg -F 'stop [--root PATH]' scripts/local-cluster.sh >/dev/null
 rg -F 'status [--root PATH]' scripts/local-cluster.sh >/dev/null
