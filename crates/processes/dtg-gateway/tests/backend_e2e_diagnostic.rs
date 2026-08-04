@@ -13,8 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use backend_e2e_support::{
-    Backend, CellSpec, DiagnosticCluster, DiagnosticRuntime, RawObservation, Workload,
-    percentile_ns, stage_metrics_window_from_log,
+    Backend, CellSpec, CommittedSnapshotIngestArtifact, DiagnosticCluster, DiagnosticRuntime,
+    RawObservation, SNAPSHOT_INGEST_DIAGNOSTIC_BATCH_LEN, Workload, percentile_ns,
+    stage_metrics_window_from_log,
 };
 
 #[derive(serde::Serialize)]
@@ -153,6 +154,61 @@ fn current_revision() -> String {
         .expect("git revision must be UTF-8")
         .trim()
         .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires release DTGProxy binaries and the selected live backend"]
+async fn committed_snapshot_ingest_selected_backend() {
+    let runtime = DiagnosticRuntime::from_env().unwrap();
+    let backend = match env::var("DTG_BACKEND_E2E_SELECTED_BACKEND").as_deref() {
+        Ok("fjall") => Backend::Fjall,
+        Ok("postgresql") => Backend::PostgreSql,
+        Ok("kuzu") => Backend::Kuzu,
+        _ => panic!("DTG_BACKEND_E2E_SELECTED_BACKEND must be fjall, postgresql, or kuzu"),
+    };
+    let output = env::var_os("DTG_BACKEND_E2E_COMMITTED_INGEST_OUTPUT").map(PathBuf::from);
+    let repetitions = if output.is_some() {
+        let configured = env::var("DTG_BACKEND_E2E_COMMITTED_INGEST_REPETITIONS")
+            .expect("DTG_BACKEND_E2E_COMMITTED_INGEST_REPETITIONS is required with output")
+            .parse::<u8>()
+            .expect("DTG_BACKEND_E2E_COMMITTED_INGEST_REPETITIONS must be an integer");
+        assert_eq!(
+            configured, 3,
+            "committed ingest artifact requires three repetitions"
+        );
+        configured
+    } else {
+        1
+    };
+    let mut observations = Vec::with_capacity(usize::from(repetitions));
+    for repetition in 0..repetitions {
+        let spec = CellSpec::one(backend, Workload::PointLookup, 1, repetition);
+        let mut cluster = DiagnosticCluster::start(&runtime, spec).await.unwrap();
+        let observation = cluster
+            .measure_committed_snapshot_ingest_batch(SNAPSHOT_INGEST_DIAGNOSTIC_BATCH_LEN)
+            .await
+            .unwrap();
+        cluster.shutdown().await.unwrap();
+        assert_eq!(observation.errors, 0);
+        assert_eq!(
+            observation.committed_operations,
+            SNAPSHOT_INGEST_DIAGNOSTIC_BATCH_LEN as u64
+        );
+        assert_eq!(
+            observation.persisted_operations,
+            observation.committed_operations
+        );
+        println!(
+            "DTG_COMMITTED_SNAPSHOT_INGEST_RESULT={}",
+            serde_json::to_string(&observation).unwrap()
+        );
+        observations.push(observation);
+    }
+    if let Some(output) = output {
+        let artifact =
+            CommittedSnapshotIngestArtifact::new(current_revision(), observations).unwrap();
+        backend_e2e_support::write_committed_snapshot_ingest_artifact(&output, &artifact).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1045,6 +1101,50 @@ fn quick_artifact_requires_three_complete_repetitions_and_refuses_overwrite() {
     let output = directory.path().join("quick.json");
     backend_e2e_support::write_quick_artifact(&output, &artifact).unwrap();
     assert!(backend_e2e_support::write_quick_artifact(&output, &artifact).is_err());
+}
+
+#[test]
+fn committed_snapshot_ingest_artifact_requires_durable_three_repeat_evidence() {
+    let observations = (0..3)
+        .map(
+            |repetition| backend_e2e_support::CommittedSnapshotIngestObservation {
+                backend: Backend::Fjall,
+                repetition,
+                batch_len: 64,
+                committed_operations: 64,
+                persisted_operations: 64,
+                errors: 0,
+                measured_duration_ns: 1_000,
+            },
+        )
+        .collect();
+    let artifact = CommittedSnapshotIngestArtifact::new("test-revision", observations).unwrap();
+    assert_eq!(artifact.repetitions, 3);
+    assert_eq!(artifact.summary.committed_operations, 192);
+    assert_eq!(artifact.summary.persisted_operations, 192);
+    assert_eq!(artifact.summary.throughput_ops_per_second, 64_000_000.0);
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("committed-ingest.json");
+    backend_e2e_support::write_committed_snapshot_ingest_artifact(&output, &artifact).unwrap();
+    assert!(
+        backend_e2e_support::write_committed_snapshot_ingest_artifact(&output, &artifact).is_err()
+    );
+
+    let incomplete = vec![backend_e2e_support::CommittedSnapshotIngestObservation {
+        backend: Backend::Fjall,
+        repetition: 0,
+        batch_len: 64,
+        committed_operations: 64,
+        persisted_operations: 63,
+        errors: 0,
+        measured_duration_ns: 1_000,
+    }];
+    let error = CommittedSnapshotIngestArtifact::new("revision", incomplete).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("lacks durable completion evidence")
+    );
 }
 
 #[test]

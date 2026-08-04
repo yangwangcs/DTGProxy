@@ -17,6 +17,10 @@ transport-mode provenance, Gateway/Data/artifact focused suites green; independe
 Middleware performance closure Task 4: complete (pipeline stream selection avoids the per-request
 load-vector allocation while retaining bounded least-loaded selection and tie rotation; focused
 Gateway stage regression plus real four-process Fjall Bolt diagnostic passed)
+Middleware performance closure Task 5: complete (snapshot ingest batch completion driver waits for
+all receipts to reach COMMITTED, retries receipt polling by ID, derives the read snapshot from the
+latest commit time, and audits COUNT(*) against committed_operations; Data contract and Fjall live
+diagnostics passed)
 Task 3: complete (uncommitted worktree; six-package suite green; same reviewer Ready with no
 Critical or Important findings)
 Task 4: complete - current-only Cypher 25 query composition is implemented without a versioned

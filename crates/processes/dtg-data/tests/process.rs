@@ -774,6 +774,132 @@ async fn snapshot_ingest_acknowledges_once_and_exposes_its_committed_receipt() {
 }
 
 #[tokio::test]
+async fn snapshot_ingest_committed_batch_is_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let capabilities = fjall_capabilities();
+    let binding = fjall_binding_with_capabilities("snapshot-ingest-committed-batch", &capabilities);
+    let node = DataNodeBuilder::from_config(
+        DataProcessConfig::new(root.path().join("business"), root.path().join("raft"))
+            .assign(binding.clone()),
+    )
+    .start()
+    .await
+    .unwrap();
+    let service = node.rpc_service();
+    let receipt_ids = [1_001_u128, 1_002, 1_003];
+    let batch = SnapshotIngestBatch {
+        request: Some(shard_context(&binding).request.unwrap()),
+        items: receipt_ids
+            .iter()
+            .enumerate()
+            .map(|(offset, receipt_id)| SnapshotIngestItem {
+                receipt_id: receipt_id.to_be_bytes().to_vec(),
+                transaction: Some(snapshot_transaction_request(
+                    &binding,
+                    2_001 + u128::try_from(offset).unwrap(),
+                    3_001 + u128::try_from(offset).unwrap(),
+                )),
+            })
+            .collect(),
+    };
+    let mut admitted = service
+        .accept_snapshot_ingest(Request::new(batch))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut admitted_receipts = Vec::with_capacity(receipt_ids.len());
+    while let Some(receipt) = admitted.next().await {
+        admitted_receipts.push(receipt.unwrap());
+    }
+    assert_eq!(admitted_receipts.len(), receipt_ids.len());
+    assert!(admitted_receipts.iter().all(|receipt| {
+        receipt.state == SnapshotIngestState::Pending as i32
+            || receipt.state == SnapshotIngestState::Committed as i32
+    }));
+
+    let committed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let mut terminal = Vec::with_capacity(receipt_ids.len());
+            for receipt_id in receipt_ids {
+                let receipt = service
+                    .get_snapshot_ingest_receipt(Request::new(SnapshotIngestReceiptRequest {
+                        request: Some(shard_context(&binding).request.unwrap()),
+                        receipt_id: receipt_id.to_be_bytes().to_vec(),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .receipt
+                    .unwrap();
+                terminal.push(receipt);
+            }
+            if terminal
+                .iter()
+                .all(|receipt| receipt.state != SnapshotIngestState::Pending as i32)
+            {
+                break terminal;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("snapshot ingest batch should reach terminal receipts");
+    assert!(
+        committed
+            .iter()
+            .all(|receipt| receipt.state == SnapshotIngestState::Committed as i32)
+    );
+    assert!(committed.iter().all(|receipt| receipt.commit_time > 0));
+
+    let applied_index = node.replica_observations().await[0].applied_index();
+    let committed_snapshot_time = TransactionTime::new(
+        committed
+            .iter()
+            .map(|receipt| receipt.commit_time)
+            .max()
+            .expect("committed batch is non-empty"),
+    )
+    .unwrap();
+    let context = PlanningContext::new(
+        CatalogSnapshot::new(
+            Version::new(29),
+            Version::new(31),
+            vec![CatalogShard::new(binding, applied_index)],
+        )
+        .unwrap(),
+        capabilities,
+        SnapshotRequirements::fixed(committed_snapshot_time, 10),
+        Some(128),
+    )
+    .unwrap();
+    let execution = GatewayExecution::for_process(
+        Arc::new(GatewayProtocolV2Transport::new(Arc::new(
+            InProcessDataGatewayClient {
+                service: node.rpc_service(),
+            },
+        ))),
+        context,
+    );
+    let response = execution
+        .execute_statement(
+            GatewayRequestContext::new(7, 1_001, u64::MAX, Vec::new()).unwrap(),
+            "MATCH (n) RETURN COUNT(*)".into(),
+            BTreeMap::new(),
+            None,
+            &GatewayCancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let GatewayResponse::Rows(rows) = response else {
+        panic!("expected count rows")
+    };
+    assert_eq!(
+        rows.rows(),
+        &[vec![dtg_execution::GatewayValue::Integer(3)]]
+    );
+}
+
+#[tokio::test]
 async fn snapshot_ingest_rejects_a_reused_receipt_with_different_content() {
     let root = tempfile::tempdir().unwrap();
     let binding = fjall_binding("snapshot-ingest-digest");

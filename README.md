@@ -52,6 +52,8 @@ scripts/local-cluster.sh stop
 
 批量摄入使用 `DataService.AcceptSnapshotIngest`：每批最多 64 项、64 KiB，Data 仅在项目进入本地有界队列后返回 `PENDING`/`ACCEPTED` 回执。它不代表持久化或可读；客户端必须以同一 receipt ID 轮询 `GetSnapshotIngestReceipt` 或安全重试，直至 `COMMITTED` 或 `REJECTED`。进程崩溃可丢失尚未完成的内存回执，但同一 Shard command ID 的重试仍是幂等的。
 
+批量写的性能审计与单条写分开：批量计时从 `AcceptSnapshotIngest` admission 开始，直到本批所有 receipt 都达到 `COMMITTED`；只有此时才计入 `committed_operations`。诊断随后用本批最新提交时间建立不可变读快照，并通过 `MATCH (n) RETURN COUNT(*)` 核对 `persisted_operations == committed_operations`。因此 `PENDING`、未知回执、拒绝项或仅进入内存队列的项目都不会被算作落盘。
+
 ## 性能解释
 
 性能数字必须区分边界：
@@ -123,6 +125,23 @@ CREATE (n:Bench {value: 1}) VALID FROM 1
 读取单元格格式为 `QPS; p50/p95/p99`。这些是开发机端到端诊断，不是裸后端吞吐、生产
 SLO 或跨机器横向扩展承诺。高并发单条强提交会显著增加排队和尾延迟；高吞吐写入应使用
 批量摄入并轮询至 `COMMITTED`，而不是把单条提交写当作导入基准。
+
+批量 `COMMITTED` 诊断使用 64 项 snapshot batch，输出独立 artifact（不与 45-cell
+T-Cypher 矩阵混合）：
+
+```bash
+DTG_BACKEND_E2E_BIN_DIR="$PWD/target/release" \
+DTG_BACKEND_E2E_SELECTED_BACKEND=fjall \
+DTG_BACKEND_E2E_COMMITTED_INGEST_REPETITIONS=3 \
+DTG_BACKEND_E2E_COMMITTED_INGEST_OUTPUT="$PWD/target/backend-e2e/fjall-committed-ingest.json" \
+cargo test --locked --release -p dtg-gateway --test backend_e2e_diagnostic \
+  committed_snapshot_ingest_selected_backend -- --ignored --exact --nocapture
+```
+
+将 `fjall` 替换为 `kuzu` 或 `postgresql` 即可复用同一方案；PostgreSQL 仍需提供临时
+loopback endpoint/credential。artifact 中分别记录 admission→`COMMITTED` 的批量吞吐、
+`committed_operations`、`persisted_operations`、错误数和三次重复汇总，不把批量结果冒充
+单条强一致写入或 Data admission 微基准。
 
 原始、版本化 artifact 位于（被 Git 忽略以避免提交大型延迟样本）：
 `target/backend-e2e-committed-20260803-r2/fjall.json`、

@@ -5,6 +5,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::CommittedSnapshotIngestObservation;
+
 const REQUEST_METRICS_PREFIX: &str = "DTG_REQUEST_STAGE_METRICS=";
 const REQUEST_METRIC_STAGES: [&str; 10] = [
     "bolt_decode",
@@ -1328,6 +1330,126 @@ pub fn write_quick_artifact(path: &Path, artifact: &QuickDiagnosticArtifact) -> 
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "quick diagnostic output has no parent directory",
+        )
+    })?;
+    let mut output = OpenOptions::new().create_new(true).write(true).open(path)?;
+    serde_json::to_writer_pretty(&mut output, artifact).map_err(io::Error::other)?;
+    output.write_all(b"\n")?;
+    output.sync_all()?;
+    File::open(parent)?.sync_all()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CommittedSnapshotIngestSummary {
+    pub backend: Backend,
+    pub batch_len: u64,
+    pub repetitions: usize,
+    pub committed_operations: u64,
+    pub persisted_operations: u64,
+    pub measured_duration_ns: u64,
+    pub throughput_ops_per_second: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CommittedSnapshotIngestArtifact {
+    pub format_version: u32,
+    pub backend: Backend,
+    pub revision: String,
+    pub repetitions: usize,
+    pub observations: Vec<CommittedSnapshotIngestObservation>,
+    pub summary: CommittedSnapshotIngestSummary,
+}
+
+impl CommittedSnapshotIngestArtifact {
+    pub fn new(
+        revision: impl Into<String>,
+        observations: Vec<CommittedSnapshotIngestObservation>,
+    ) -> io::Result<Self> {
+        let revision = revision.into();
+        if revision.trim().is_empty() {
+            return Err(invalid_data("committed snapshot ingest revision is empty"));
+        }
+        let first = observations
+            .first()
+            .ok_or_else(|| invalid_data("committed snapshot ingest has no observations"))?;
+        let backend = first.backend;
+        let batch_len = first.batch_len;
+        if batch_len == 0 {
+            return Err(invalid_data(
+                "committed snapshot ingest batch length is zero",
+            ));
+        }
+        let mut repetitions = BTreeSet::new();
+        let mut committed_operations = 0_u64;
+        let mut persisted_operations = 0_u64;
+        let mut measured_duration_ns = 0_u64;
+        for observation in &observations {
+            if observation.backend != backend || observation.batch_len != batch_len {
+                return Err(invalid_data(
+                    "committed snapshot ingest artifact mixes backend families or batch sizes",
+                ));
+            }
+            if observation.errors != 0
+                || observation.committed_operations != batch_len
+                || observation.persisted_operations != observation.committed_operations
+                || observation.measured_duration_ns == 0
+            {
+                return Err(invalid_data(
+                    "committed snapshot ingest observation lacks durable completion evidence",
+                ));
+            }
+            if !repetitions.insert(observation.repetition) {
+                return Err(invalid_data(
+                    "committed snapshot ingest repeats a repetition",
+                ));
+            }
+            committed_operations =
+                committed_operations.saturating_add(observation.committed_operations);
+            persisted_operations =
+                persisted_operations.saturating_add(observation.persisted_operations);
+            measured_duration_ns =
+                measured_duration_ns.saturating_add(observation.measured_duration_ns);
+        }
+        if repetitions != BTreeSet::from([0, 1, 2]) || observations.len() != 3 {
+            return Err(invalid_data(
+                "committed snapshot ingest requires exactly three complete repetitions",
+            ));
+        }
+        let summary = CommittedSnapshotIngestSummary {
+            backend,
+            batch_len,
+            repetitions: 3,
+            committed_operations,
+            persisted_operations,
+            measured_duration_ns,
+            throughput_ops_per_second: committed_operations as f64 * 1_000_000_000.0
+                / measured_duration_ns as f64,
+        };
+        Ok(Self {
+            format_version: 1,
+            backend,
+            revision,
+            repetitions: 3,
+            observations,
+            summary,
+        })
+    }
+}
+
+pub fn write_committed_snapshot_ingest_artifact(
+    path: &Path,
+    artifact: &CommittedSnapshotIngestArtifact,
+) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "committed snapshot ingest output path must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "committed snapshot ingest output has no parent directory",
         )
     })?;
     let mut output = OpenOptions::new().create_new(true).write(true).open(path)?;

@@ -6,24 +6,25 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dtg_execution::cluster_protocol::proto::controller_service_client::ControllerServiceClient;
 use dtg_execution::cluster_protocol::proto::data_service_client::DataServiceClient;
 use dtg_execution::cluster_protocol::proto::meta_service_client::MetaServiceClient;
 use dtg_execution::cluster_protocol::proto::{
     BoundedPayload, CatalogWatchRequest, ControlObservation, ExecutionFragment, RequestContext,
-    RetryDisposition, ShardContext, StatusCode, TransactionOperation, TransactionRequest,
-    TypedStatus,
+    RetryDisposition, ShardContext, SnapshotIngestBatch, SnapshotIngestItem,
+    SnapshotIngestReceiptRequest, SnapshotIngestState, StatusCode, TransactionOperation,
+    TransactionRequest, TypedStatus,
 };
 use dtg_execution::cluster_protocol::{
     PROTOCOL_MAJOR, SUPPORTED_MINOR_MAX, checksum_bytes, validate_typed_status,
 };
-use dtg_execution::shard::{CommitSingleShard, ShardCommand};
+use dtg_execution::shard::{CommitSingleShard, CommitSingleShardTransaction, ShardCommand};
 use dtg_execution::storage::{
     BackendClass, BindingRole, CapabilityManifest, CommandId, EdgeId, EdgeVersion, LogicalMutation,
-    Properties, ProviderKind, ReplicaBinding, TransactionTime, ValidInterval, Value, Version,
-    VertexId, VertexVersion,
+    Properties, ProviderKind, ReplicaBinding, TransactionId, TransactionTime, ValidInterval, Value,
+    Version, VertexId, VertexVersion,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -38,6 +39,18 @@ const CAPABILITIES: &str = "adjacency,immutable-read-view,logical-snapshot,point
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const POST_MEASUREMENT_METRICS_WAIT: Duration = Duration::from_millis(1_250);
 static NEXT_CELL_ID: AtomicU64 = AtomicU64::new(1);
+pub const SNAPSHOT_INGEST_DIAGNOSTIC_BATCH_LEN: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct CommittedSnapshotIngestObservation {
+    pub backend: Backend,
+    pub repetition: u8,
+    pub batch_len: u64,
+    pub committed_operations: u64,
+    pub persisted_operations: u64,
+    pub errors: u64,
+    pub measured_duration_ns: u64,
+}
 
 pub struct DiagnosticRuntime {
     bin_dir: PathBuf,
@@ -229,7 +242,7 @@ impl DiagnosticCluster {
             let applied_index = cluster
                 .observe_applied_index(identity.request_id(3))
                 .await?;
-            cluster.start_gateway(applied_index)?;
+            cluster.start_gateway_at(applied_index, 41)?;
             cluster.wait_for_port(gateway_address, "gateway").await?;
         }
         Ok(cluster)
@@ -290,7 +303,7 @@ impl DiagnosticCluster {
             self.apply_seed_batch(&mut client, edge_command_id, edge_mutations)
                 .await?
         };
-        self.start_gateway(applied_index)?;
+        self.start_gateway_at(applied_index, 41)?;
         self.wait_for_port(self.gateway_address, "gateway").await
     }
 
@@ -371,6 +384,139 @@ impl DiagnosticCluster {
                 "write persistence verification did not return a single non-negative COUNT(*)",
             )),
         }
+    }
+
+    pub async fn measure_committed_snapshot_ingest_batch(
+        &mut self,
+        batch_len: usize,
+    ) -> io::Result<CommittedSnapshotIngestObservation> {
+        if batch_len == 0 || batch_len > SNAPSHOT_INGEST_DIAGNOSTIC_BATCH_LEN {
+            return Err(invalid_input(format!(
+                "snapshot ingest diagnostic batch length must be within 1..={SNAPSHOT_INGEST_DIAGNOSTIC_BATCH_LEN}"
+            )));
+        }
+        if self.children.iter().any(|child| child.name == "gateway") {
+            return Err(invalid_input(
+                "snapshot ingest diagnostic must start before Gateway to use its committed snapshot time",
+            ));
+        }
+        let base = request_seed(self.binding.namespace_id().as_str()).saturating_add(10_000);
+        let receipt_ids = (0..batch_len)
+            .map(|offset| base.saturating_add(u128::try_from(offset).unwrap()))
+            .collect::<Vec<_>>();
+        let batch = SnapshotIngestBatch {
+            request: Some(shard_context(&self.binding, base).request.unwrap()),
+            items: receipt_ids
+                .iter()
+                .enumerate()
+                .map(|(offset, receipt_id)| SnapshotIngestItem {
+                    receipt_id: receipt_id.to_be_bytes().to_vec(),
+                    transaction: Some(snapshot_ingest_transaction(
+                        &self.binding,
+                        base.saturating_add(1_000)
+                            .saturating_add(u128::try_from(offset).unwrap()),
+                        base.saturating_add(2_000)
+                            .saturating_add(u128::try_from(offset).unwrap()),
+                    )),
+                })
+                .collect(),
+        };
+        let started = Instant::now();
+        let mut client = DataServiceClient::connect(format!("http://{}", self.data_address))
+            .await
+            .map_err(io_other)?;
+        let mut admitted = client
+            .accept_snapshot_ingest(batch)
+            .await
+            .map_err(io_other)?
+            .into_inner();
+        let mut admitted_receipts = Vec::with_capacity(batch_len);
+        while let Some(receipt) = admitted.message().await.map_err(io_other)? {
+            admitted_receipts.push(receipt);
+        }
+        if admitted_receipts.len() != batch_len
+            || admitted_receipts.iter().any(|receipt| {
+                receipt.state != SnapshotIngestState::Pending as i32
+                    && receipt.state != SnapshotIngestState::Committed as i32
+            })
+        {
+            return Err(invalid_data(
+                "snapshot ingest diagnostic received an invalid admission receipt set",
+            ));
+        }
+
+        let (committed_operations, applied_index, snapshot_time) =
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mut committed_operations = 0_u64;
+                    let mut applied_index = 0_u64;
+                    let mut snapshot_time = 0_i64;
+                    for receipt_id in &receipt_ids {
+                        let response = match client
+                            .get_snapshot_ingest_receipt(SnapshotIngestReceiptRequest {
+                                request: Some(
+                                    shard_context(&self.binding, *receipt_id).request.unwrap(),
+                                ),
+                                receipt_id: receipt_id.to_be_bytes().to_vec(),
+                            })
+                            .await
+                        {
+                            Ok(response) => response.into_inner(),
+                            Err(_) => continue,
+                        };
+                        let Some(receipt) = response.receipt else {
+                            continue;
+                        };
+                        match receipt.state {
+                            state if state == SnapshotIngestState::Pending as i32 => {}
+                            state if state == SnapshotIngestState::Committed as i32 => {
+                                committed_operations = committed_operations.saturating_add(1);
+                                applied_index = applied_index.max(receipt.applied_index);
+                                snapshot_time = snapshot_time.max(receipt.commit_time);
+                            }
+                            _ => {
+                                return Err(invalid_data(
+                                    "snapshot ingest diagnostic receipt was rejected",
+                                ));
+                            }
+                        }
+                    }
+                    if committed_operations == u64::try_from(batch_len).unwrap() {
+                        return Ok((committed_operations, applied_index, snapshot_time));
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "snapshot ingest diagnostic did not reach COMMITTED receipts",
+                )
+            })??;
+        let measured_duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if applied_index == 0 || snapshot_time <= 0 {
+            return Err(invalid_data(
+                "snapshot ingest diagnostic committed receipts lack a read fence",
+            ));
+        }
+        self.start_gateway_at(applied_index, snapshot_time)?;
+        self.wait_for_port(self.gateway_address, "gateway").await?;
+        let persisted_operations = self.persisted_vertex_count().await?;
+        if persisted_operations != committed_operations {
+            return Err(invalid_data(format!(
+                "snapshot ingest persistence verification failed: committed {committed_operations} items but COUNT(*) returned {persisted_operations}"
+            )));
+        }
+        Ok(CommittedSnapshotIngestObservation {
+            backend: self.spec.backend,
+            repetition: self.spec.repetition,
+            batch_len: u64::try_from(batch_len).unwrap(),
+            committed_operations,
+            persisted_operations,
+            errors: 0,
+            measured_duration_ns,
+        })
     }
 
     pub async fn measure_pipeline_cell(
@@ -468,7 +614,7 @@ impl DiagnosticCluster {
         Err(invalid_data("Data applied index did not stabilize"))
     }
 
-    fn start_gateway(&mut self, applied_index: u64) -> io::Result<()> {
+    fn start_gateway_at(&mut self, applied_index: u64, transaction_time: i64) -> io::Result<()> {
         let shard = gateway_shard_spec(&self.binding, applied_index);
         let logical_scan_bound = match self.spec.workload {
             Workload::PointLookup
@@ -498,7 +644,7 @@ impl DiagnosticCluster {
             ),
             ("DTG_GATEWAY_CATALOG_VERSION", "31".into()),
             ("DTG_GATEWAY_SCHEMA_VERSION", "31".into()),
-            ("DTG_GATEWAY_TRANSACTION_TIME", "41".into()),
+            ("DTG_GATEWAY_TRANSACTION_TIME", transaction_time.to_string()),
             ("DTG_GATEWAY_VALID_AT", "10".into()),
             ("DTG_GATEWAY_LOGICAL_SCAN_BOUND", logical_scan_bound.into()),
             ("DTG_GATEWAY_CAPABILITIES", CAPABILITIES.into()),
@@ -632,6 +778,44 @@ fn bench_edge(id: u128, source: u128, target: u128) -> io::Result<LogicalMutatio
         )
         .map_err(invalid_data)?,
     ))
+}
+
+fn snapshot_ingest_transaction(
+    binding: &ReplicaBinding,
+    command_id: u128,
+    vertex_id: u128,
+) -> TransactionRequest {
+    let vertex = VertexVersion::new(
+        VertexId::new(vertex_id).expect("diagnostic vertex ID is non-zero"),
+        Version::new(1),
+        ValidInterval::new(1, 10_000).expect("diagnostic valid interval is valid"),
+        TransactionTime::new(42).expect("diagnostic transaction time is valid"),
+        Properties::new(),
+    )
+    .expect("diagnostic vertex is valid");
+    let command = ShardCommand::CommitSingleShardTransaction(
+        CommitSingleShardTransaction::new(
+            CommandId::new(command_id).expect("diagnostic command ID is non-zero"),
+            binding.placement_epoch().get(),
+            binding.backend_generation().get(),
+            TransactionId::new(command_id).expect("diagnostic transaction ID is non-zero"),
+            TransactionTime::new(41).expect("diagnostic transaction start time is valid"),
+            1,
+            dtg_execution::storage::Digest32::new([7; 32]),
+            vec![LogicalMutation::PutVertex(vertex)],
+        )
+        .expect("diagnostic snapshot transaction is valid"),
+    );
+    let body = command
+        .encode_current()
+        .expect("diagnostic command encodes");
+    TransactionRequest {
+        context: Some(shard_context(binding, command_id)),
+        transaction_id: command_id.to_be_bytes().to_vec(),
+        operation: TransactionOperation::CommitSnapshot.into(),
+        idempotency_key: command_id.to_be_bytes().to_vec(),
+        payload: Some(payload(body, 1)),
+    }
 }
 
 impl Drop for DiagnosticCluster {
