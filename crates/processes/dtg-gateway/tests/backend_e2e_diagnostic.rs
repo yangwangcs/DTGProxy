@@ -1135,11 +1135,47 @@ fn committed_snapshot_ingest_artifact_requires_durable_three_repeat_evidence() {
         repetition: 0,
         batch_len: 64,
         committed_operations: 64,
-        persisted_operations: 63,
+        persisted_operations: 64,
         errors: 0,
         measured_duration_ns: 1_000,
     }];
     let error = CommittedSnapshotIngestArtifact::new("revision", incomplete).unwrap_err();
+    assert!(error.to_string().contains("three complete repetitions"));
+
+    let incomplete_commit = (0..3)
+        .map(
+            |repetition| backend_e2e_support::CommittedSnapshotIngestObservation {
+                backend: Backend::Fjall,
+                repetition,
+                batch_len: 64,
+                committed_operations: 63,
+                persisted_operations: 63,
+                errors: 0,
+                measured_duration_ns: 1_000,
+            },
+        )
+        .collect();
+    let error = CommittedSnapshotIngestArtifact::new("revision", incomplete_commit).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("lacks durable completion evidence")
+    );
+
+    let failed = (0..3)
+        .map(
+            |repetition| backend_e2e_support::CommittedSnapshotIngestObservation {
+                backend: Backend::Fjall,
+                repetition,
+                batch_len: 64,
+                committed_operations: 64,
+                persisted_operations: 64,
+                errors: 1,
+                measured_duration_ns: 1_000,
+            },
+        )
+        .collect();
+    let error = CommittedSnapshotIngestArtifact::new("revision", failed).unwrap_err();
     assert!(
         error
             .to_string()

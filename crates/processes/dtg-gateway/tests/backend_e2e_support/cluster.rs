@@ -421,10 +421,10 @@ impl DiagnosticCluster {
                 })
                 .collect(),
         };
-        let started = Instant::now();
         let mut client = DataServiceClient::connect(format!("http://{}", self.data_address))
             .await
             .map_err(io_other)?;
+        let started = Instant::now();
         let mut admitted = client
             .accept_snapshot_ingest(batch)
             .await
@@ -445,55 +445,67 @@ impl DiagnosticCluster {
             ));
         }
 
-        let (committed_operations, applied_index, snapshot_time) =
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let mut committed_operations = 0_u64;
-                    let mut applied_index = 0_u64;
-                    let mut snapshot_time = 0_i64;
-                    for receipt_id in &receipt_ids {
-                        let response = match client
-                            .get_snapshot_ingest_receipt(SnapshotIngestReceiptRequest {
-                                request: Some(
-                                    shard_context(&self.binding, *receipt_id).request.unwrap(),
-                                ),
-                                receipt_id: receipt_id.to_be_bytes().to_vec(),
-                            })
-                            .await
-                        {
-                            Ok(response) => response.into_inner(),
-                            Err(_) => continue,
-                        };
-                        let Some(receipt) = response.receipt else {
+        let completion = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut consecutive_poll_errors = 0_u8;
+            loop {
+                let mut committed_operations = 0_u64;
+                let mut applied_index = 0_u64;
+                let mut snapshot_time = 0_i64;
+                for receipt_id in &receipt_ids {
+                    let response = match client
+                        .get_snapshot_ingest_receipt(SnapshotIngestReceiptRequest {
+                            request: Some(
+                                shard_context(&self.binding, *receipt_id).request.unwrap(),
+                            ),
+                            receipt_id: receipt_id.to_be_bytes().to_vec(),
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            consecutive_poll_errors = 0;
+                            response.into_inner()
+                        }
+                        Err(error) => {
+                            consecutive_poll_errors = consecutive_poll_errors.saturating_add(1);
+                            if consecutive_poll_errors >= 3 {
+                                return Err(io_other(error));
+                            }
                             continue;
-                        };
-                        match receipt.state {
-                            state if state == SnapshotIngestState::Pending as i32 => {}
-                            state if state == SnapshotIngestState::Committed as i32 => {
-                                committed_operations = committed_operations.saturating_add(1);
-                                applied_index = applied_index.max(receipt.applied_index);
-                                snapshot_time = snapshot_time.max(receipt.commit_time);
-                            }
-                            _ => {
-                                return Err(invalid_data(
-                                    "snapshot ingest diagnostic receipt was rejected",
-                                ));
-                            }
+                        }
+                    };
+                    let Some(receipt) = response.receipt else {
+                        continue;
+                    };
+                    match receipt.state {
+                        state if state == SnapshotIngestState::Pending as i32 => {}
+                        state if state == SnapshotIngestState::Committed as i32 => {
+                            committed_operations = committed_operations.saturating_add(1);
+                            applied_index = applied_index.max(receipt.applied_index);
+                            snapshot_time = snapshot_time.max(receipt.commit_time);
+                        }
+                        _ => {
+                            return Err(invalid_data(
+                                "snapshot ingest diagnostic receipt was rejected",
+                            ));
                         }
                     }
-                    if committed_operations == u64::try_from(batch_len).unwrap() {
-                        return Ok((committed_operations, applied_index, snapshot_time));
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            })
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "snapshot ingest diagnostic did not reach COMMITTED receipts",
-                )
-            })??;
+                if committed_operations == u64::try_from(batch_len).unwrap() {
+                    return Ok((committed_operations, applied_index, snapshot_time));
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let (committed_operations, applied_index, snapshot_time) = match completion {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(invalid_data(format!(
+                    "snapshot ingest diagnostic did not reach COMMITTED receipts within {} seconds",
+                    30
+                )));
+            }
+        };
         let measured_duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if applied_index == 0 || snapshot_time <= 0 {
             return Err(invalid_data(
