@@ -13,6 +13,7 @@ use super::{CellSpec, RawObservation, Workload};
 const BOLT_MAGIC: [u8; 4] = [0x60, 0x60, 0xb0, 0x17];
 const BOLT_V5_4: [u8; 4] = [0, 0, 4, 5];
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BoltValue {
@@ -279,7 +280,15 @@ pub async fn measure_pipeline_cell(
     let mut warmup_operations = 0_u64;
     let mut measured_duration_ns = 0_u64;
     let mut identity = None;
-    while let Some(worker) = workers.join_next().await {
+    let worker_drain_deadline = Instant::now() + WORKER_DRAIN_TIMEOUT;
+    while !workers.is_empty() {
+        let remaining = worker_drain_deadline.saturating_duration_since(Instant::now());
+        let worker = tokio::time::timeout(remaining, workers.join_next())
+            .await
+            .map_err(|_| invalid_data("measurement workers did not drain before the deadline"))?;
+        let Some(worker) = worker else {
+            break;
+        };
         let worker = worker
             .map_err(|error| invalid_data(format!("measurement worker failed: {error}")))??;
         latency_samples_ns.extend(worker.latency_samples_ns);
